@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"internal/testenv"
+	"math/rand/v2"
 	"net/netip"
 	"reflect"
 	"runtime"
@@ -1143,6 +1144,9 @@ func TestLookupIPAddrConcurrentCallsForNetworks(t *testing.T) {
 	origTestHookLookupIP := testHookLookupIP
 	defer func() { testHookLookupIP = origTestHookLookupIP }()
 
+	origTestHookShuffleRand := testHookShuffleRand
+	defer func() { testHookShuffleRand = origTestHookShuffleRand }()
+
 	queries := [][]string{
 		{"udp", "golang.org"},
 		{"udp4", "golang.org"},
@@ -1150,14 +1154,19 @@ func TestLookupIPAddrConcurrentCallsForNetworks(t *testing.T) {
 		{"udp", "golang.org"},
 		{"udp", "golang.org"},
 	}
+	// same commonPrefixLen
+	ipv4LocalHost := []IPAddr{
+		{IP: IPv4(127, 0, 0, 4)},
+		{IP: IPv4(127, 0, 0, 5)},
+		{IP: IPv4(127, 0, 0, 6)},
+		{IP: IPv4(127, 0, 0, 7)},
+	}
 	results := map[[2]string][]IPAddr{
-		{"udp", "golang.org"}: {
-			{IP: IPv4(127, 0, 0, 1)},
-			{IP: IPv6loopback},
-		},
-		{"udp4", "golang.org"}: {
-			{IP: IPv4(127, 0, 0, 1)},
-		},
+		{"udp", "golang.org"}: append(
+			ipv4LocalHost,
+			IPAddr{IP: IPv6loopback},
+		),
+		{"udp4", "golang.org"}: ipv4LocalHost,
 		{"udp6", "golang.org"}: {
 			{IP: IPv6loopback},
 		},
@@ -1176,12 +1185,20 @@ func TestLookupIPAddrConcurrentCallsForNetworks(t *testing.T) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		return results[[2]string{network, host}], nil
+		return slices.Clone(results[[2]string{network, host}]), nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	wg := sync.WaitGroup{}
+	var shuffleOnce atomic.Bool
+	shuffleRand := rand.New(rand.NewPCG(1, 2))
+	var shuffleRandMu sync.Mutex
+	testHookShuffleRand = func(n int, swap func(i, j int)) {
+		shuffleRandMu.Lock()
+		defer shuffleRandMu.Unlock()
+		shuffleRand.Shuffle(n, swap)
+	}
 	for _, q := range queries {
 		network := q[0]
 		host := q[1]
@@ -1193,12 +1210,30 @@ func TestLookupIPAddrConcurrentCallsForNetworks(t *testing.T) {
 				t.Errorf("lookupIPAddr(%v, %v): unexpected error: %v", network, host, err)
 			}
 			wantIPs := results[[2]string{network, host}]
-			if !reflect.DeepEqual(gotIPs, wantIPs) {
+			// ignore order
+			if !reflect.DeepEqual(sortedIPAddrStrings(gotIPs), sortedIPAddrStrings(wantIPs)) {
 				t.Errorf("lookupIPAddr(%v, %v): mismatched IPAddr results\n\tGot: %v\n\tWant: %v", network, host, gotIPs, wantIPs)
+			}
+			// order check
+			if !reflect.DeepEqual(gotIPs, wantIPs) {
+				shuffleOnce.Store(true)
 			}
 		}()
 	}
 	wg.Wait()
+	// N lookups do not always return the same order
+	if !shuffleOnce.Load() {
+		t.Errorf("N lookups do not always return the same order")
+	}
+}
+
+func sortedIPAddrStrings(ipAddrs []IPAddr) []string {
+	ret := make([]string, len(ipAddrs))
+	for i, ipAddr := range ipAddrs {
+		ret[i] = ipAddr.String() + "\000" + ipAddr.Zone
+	}
+	slices.Sort(ret)
+	return ret
 }
 
 // Issue 53995: Resolver.LookupIP should return error for empty host name.
