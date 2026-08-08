@@ -56,3 +56,4 @@ _testmain.go
 ## not change
 tmp-*
 .gocache-*
+.gopath-*
