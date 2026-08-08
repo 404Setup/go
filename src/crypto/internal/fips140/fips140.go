@@ -5,31 +5,9 @@
 package fips140
 
 import (
-	"crypto/internal/fips140deps/godebug"
 	"errors"
 	"runtime"
 )
-
-// Enabled reports whether FIPS 140 mode is enabled at run time. When
-// GOFIPS140=off, the compiler treats direct reads of Enabled as false so that
-// FIPS-only branches can be eliminated.
-var Enabled bool
-
-var debug bool
-
-func init() {
-	v := godebug.Value("#fips140")
-	switch v {
-	case "on", "only":
-		Enabled = true
-	case "debug":
-		Enabled = true
-		debug = true
-	case "off", "":
-	default:
-		panic("fips140: unknown GODEBUG setting fips140=" + v)
-	}
-}
 
 // Supported returns an error if FIPS 140-3 mode can't be enabled.
 func Supported() error {

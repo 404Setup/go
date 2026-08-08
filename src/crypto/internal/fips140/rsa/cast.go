@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"crypto/internal/fips140"
 	"crypto/internal/fips140/bigmod"
-	_ "crypto/internal/fips140/check"
 	"errors"
 	"sync"
 )

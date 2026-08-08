@@ -7,7 +7,6 @@ package pbkdf2
 import (
 	"bytes"
 	"crypto/internal/fips140"
-	_ "crypto/internal/fips140/check"
 	"crypto/internal/fips140/sha256"
 	"errors"
 )

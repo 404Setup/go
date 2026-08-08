@@ -7,7 +7,6 @@ package ed25519
 import (
 	"bytes"
 	"crypto/internal/fips140"
-	_ "crypto/internal/fips140/check"
 	"errors"
 	"sync"
 )

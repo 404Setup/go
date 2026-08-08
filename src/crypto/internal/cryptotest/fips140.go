@@ -25,8 +25,8 @@ func MustSupportFIPS140(tb testing.TB) {
 }
 
 // builtWithFIPS140 reports whether cmd/go embedded a non-off GOFIPS140
-// setting. Without that setting, the compiler treats the internal Enabled
-// flag as a build-time false value, so GODEBUG cannot turn FIPS mode on.
+// setting. Without that setting, the internal Enabled flag is a compile-time
+// false constant, so GODEBUG cannot turn FIPS mode on.
 func builtWithFIPS140(tb testing.TB) bool {
 	tb.Helper()
 	info, ok := debug.ReadBuildInfo()

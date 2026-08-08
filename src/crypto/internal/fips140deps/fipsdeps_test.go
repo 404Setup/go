@@ -34,6 +34,7 @@ var AllowedInternalPackages = map[string]bool{
 }
 
 func TestImports(t *testing.T) {
+	// Check the enabled source variant even in the default GOFIPS140=off test run.
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "list", "-f", `{{$path := .ImportPath -}}
 {{range .Imports -}}
 {{$path}} {{.}}
@@ -43,7 +44,7 @@ func TestImports(t *testing.T) {
 {{end -}}
 {{range .XTestImports -}}
 {{$path}} {{.}}
-{{end -}}`, "crypto/internal/fips140/...")
+{{end -}}`, "-tags=gofips140", "crypto/internal/fips140/...")
 	bout, err := testenv.CleanCmdEnv(cmd).CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list: %v\n%s", err, bout)

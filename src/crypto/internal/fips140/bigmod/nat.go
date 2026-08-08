@@ -5,7 +5,6 @@
 package bigmod
 
 import (
-	_ "crypto/internal/fips140/check"
 	"crypto/internal/fips140deps/byteorder"
 	"errors"
 	"math/bits"

@@ -5,7 +5,6 @@
 package edwards25519
 
 import (
-	_ "crypto/internal/fips140/check"
 	"crypto/internal/fips140/edwards25519/field"
 	"errors"
 )

@@ -115,7 +115,10 @@ func TestGOFIPS140DeadCode(t *testing.T) {
 	if err := os.WriteFile(src, []byte(`
 package main
 
-import "crypto/fips140"
+import (
+	"crypto/fips140"
+	"crypto/rand"
+)
 
 //go:noinline
 func fipsOnly() {
@@ -123,6 +126,8 @@ func fipsOnly() {
 }
 
 func main() {
+	var b [1]byte
+	rand.Read(b[:])
 	if fips140.Enabled() {
 		fipsOnly()
 	}
@@ -159,6 +164,16 @@ func main() {
 			hasSymbol := bytes.Contains(out, []byte(" main.fipsOnly"))
 			if hasSymbol != tt.wantSymbol {
 				t.Fatalf("fipsOnly symbol present = %v; want %v", hasSymbol, tt.wantSymbol)
+			}
+			if tt.gofips140 == "off" {
+				for _, symbol := range []string{
+					" crypto/internal/fips140/drbg.memory",
+					" crypto/internal/fips140/check.init.0",
+				} {
+					if bytes.Contains(out, []byte(symbol)) {
+						t.Errorf("GOFIPS140=off target contains %s", symbol)
+					}
+				}
 			}
 		})
 	}

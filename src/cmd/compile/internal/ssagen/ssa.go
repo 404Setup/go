@@ -3034,31 +3034,6 @@ func (s *state) expr(n ir.Node) *ssa.Value {
 	return s.exprCheckPtr(n, true)
 }
 
-// buildConfigBool returns the value of global boolean variables whose value is
-// fixed by the compiler's build configuration. This is intentionally a small
-// allowlist: treating an ordinary global as immutable would be incorrect in the
-// presence of assignments, unsafe, or go:linkname.
-//
-// Folding these loads before SSA optimization lets SCCP simplify the control
-// flow and lets deadcode remove the untaken branch and its dependencies.
-func buildConfigBool(n *ir.Name) (value bool, ok bool) {
-	if base.Flag.N != 0 || n.Class != ir.PEXTERN || n.Addrtaken() || n.Type().Kind() != types.TBOOL {
-		return false, false
-	}
-	sym := n.Sym()
-	if sym == nil || sym.Pkg == nil {
-		return false, false
-	}
-
-	switch {
-	case buildcfg.GOFIPS140 == "off" &&
-		sym.Pkg.Path == "crypto/internal/fips140" && sym.Name == "Enabled":
-		return false, true
-	default:
-		return false, false
-	}
-}
-
 func (s *state) exprCheckPtr(n ir.Node, checkPtrOK bool) *ssa.Value {
 	if ir.HasUniquePos(n) {
 		// ONAMEs and named OLITERALs have the line number
@@ -3104,9 +3079,6 @@ func (s *state) exprCheckPtr(n ir.Node, checkPtrOK bool) *ssa.Value {
 			// "value" of a function is the address of the function's closure
 			sym := staticdata.FuncLinksym(n)
 			return s.entryNewValue1A(ssa.OpAddr, types.NewPtr(n.Type()), sym, s.sb)
-		}
-		if value, ok := buildConfigBool(n); ok {
-			return s.constBool(value)
 		}
 		if s.canSSA(n) {
 			return s.variable(n, n.Type())

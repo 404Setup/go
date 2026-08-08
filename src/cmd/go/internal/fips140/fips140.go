@@ -21,9 +21,10 @@
 // [Init] must be called to initialize the FIPS logic. It may fail and
 // call base.Fatalf.
 //
-// When GOFIPS140=off, [Enabled] returns false. The compiler treats the internal
-// FIPS enable flag as a build-time false value, allowing FIPS-only branches to
-// be removed. Such a binary cannot enable FIPS mode at run time.
+// When GOFIPS140=off, [Enabled] returns false. FIPS-only source files are
+// excluded and the internal FIPS enable flag is a build-time false value,
+// allowing FIPS-only branches to be removed. Such a binary cannot enable FIPS
+// mode at run time.
 //
 // When GOFIPS140 is anything else, [Enabled] returns true, and the build
 // sets the default GODEBUG to include fips140=on. This will make
@@ -174,6 +175,10 @@ func initVersion() {
 		version = "off"
 		return
 	}
+	// Make the selected FIPS mode available to the source file build
+	// constraints. This lets packages provide a compile-time disabled
+	// implementation without requiring compiler knowledge of their symbols.
+	cfg.BuildContext.BuildTags = append(cfg.BuildContext.BuildTags, "gofips140")
 	if v == "latest" {
 		version = "latest"
 		return

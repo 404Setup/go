@@ -7,7 +7,6 @@ package gcm
 import (
 	"crypto/internal/fips140"
 	"crypto/internal/fips140/aes"
-	_ "crypto/internal/fips140/check"
 	"errors"
 )
 

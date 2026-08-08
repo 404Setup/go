@@ -12,6 +12,4 @@
 // can't be represented.
 package nistec
 
-import _ "crypto/internal/fips140/check"
-
 //go:generate go run generate.go

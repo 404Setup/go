@@ -7,7 +7,6 @@
 package ssh
 
 import (
-	_ "crypto/internal/fips140/check"
 	"hash"
 )
 
