@@ -10,6 +10,9 @@ import (
 	"runtime"
 )
 
+// Enabled reports whether FIPS 140 mode is enabled at run time. When
+// GOFIPS140=off, the compiler treats direct reads of Enabled as false so that
+// FIPS-only branches can be eliminated.
 var Enabled bool
 
 var debug bool

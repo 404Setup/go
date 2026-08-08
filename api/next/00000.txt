@@ -1,0 +1,25 @@
+pkg sync/v2, func NewCond(sync.Locker) *sync.Cond #80000
+pkg sync/v2, func OnceFunc(func()) func() #80000
+pkg sync/v2, func OnceValue[$0 interface{}](func() $0) func() $0 #80000
+pkg sync/v2, func OnceValues[$0 interface{}, $1 interface{}](func() ($0, $1)) func() ($0, $1) #80000
+pkg sync/v2, method (*Map[$0, $1]) Clear() #80000
+pkg sync/v2, method (*Map[$0, $1]) CompareAndDelete($0, $1) bool #80000
+pkg sync/v2, method (*Map[$0, $1]) CompareAndSwap($0, $1, $1) bool #80000
+pkg sync/v2, method (*Map[$0, $1]) Delete($0) #80000
+pkg sync/v2, method (*Map[$0, $1]) Load($0) ($1, bool) #80000
+pkg sync/v2, method (*Map[$0, $1]) LoadAndDelete($0) ($1, bool) #80000
+pkg sync/v2, method (*Map[$0, $1]) LoadOrStore($0, $1) ($1, bool) #80000
+pkg sync/v2, method (*Map[$0, $1]) Range(func($0, $1) bool) #80000
+pkg sync/v2, method (*Map[$0, $1]) Store($0, $1) #80000
+pkg sync/v2, method (*Map[$0, $1]) Swap($0, $1) ($1, bool) #80000
+pkg sync/v2, method (*Pool[$0]) Get() $0 #80000
+pkg sync/v2, method (*Pool[$0]) Put($0) #80000
+pkg sync/v2, type Cond = sync.Cond #80000
+pkg sync/v2, type Locker = sync.Locker #80000
+pkg sync/v2, type Map[$0 comparable, $1 interface{}] struct #80000
+pkg sync/v2, type Mutex = sync.Mutex #80000
+pkg sync/v2, type Once = sync.Once #80000
+pkg sync/v2, type Pool[$0 interface{}] struct #80000
+pkg sync/v2, type Pool[$0 interface{}] struct, New func() $0 #80000
+pkg sync/v2, type RWMutex = sync.RWMutex #80000
+pkg sync/v2, type WaitGroup = sync.WaitGroup #80000

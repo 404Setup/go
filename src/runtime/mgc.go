@@ -2150,7 +2150,9 @@ func gcResetMarkState() {
 
 // Hooks for other packages
 
-var poolcleanup func()
+// poolcleanups contains the cleanup hooks registered by sync implementations.
+// Keep all hooks: packages such as sync/v2 may coexist with sync in one binary.
+var poolcleanups []func()
 var boringCaches []unsafe.Pointer // for crypto/internal/boring
 
 // sync_runtime_registerPoolCleanup should be an internal detail,
@@ -2164,7 +2166,7 @@ var boringCaches []unsafe.Pointer // for crypto/internal/boring
 //
 //go:linkname sync_runtime_registerPoolCleanup sync.runtime_registerPoolCleanup
 func sync_runtime_registerPoolCleanup(f func()) {
-	poolcleanup = f
+	poolcleanups = append(poolcleanups, f)
 }
 
 //go:linkname boring_registerCache crypto/internal/boring/bcache.registerCache
@@ -2174,8 +2176,8 @@ func boring_registerCache(p unsafe.Pointer) {
 
 func clearpools() {
 	// clear sync.Pools
-	if poolcleanup != nil {
-		poolcleanup()
+	for _, cleanup := range poolcleanups {
+		cleanup()
 	}
 
 	// clear boringcrypto caches

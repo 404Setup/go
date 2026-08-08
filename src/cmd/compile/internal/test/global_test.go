@@ -104,3 +104,62 @@ func main() {
 		}
 	}
 }
+
+// Verify that build-controlled constants expose dead branches to the compiler
+// without changing builds where the value remains a run-time setting.
+func TestGOFIPS140DeadCode(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(src, []byte(`
+package main
+
+import "crypto/fips140"
+
+//go:noinline
+func fipsOnly() {
+	println("FIPS-only code")
+}
+
+func main() {
+	if fips140.Enabled() {
+		fipsOnly()
+	}
+}
+`), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		gofips140  string
+		wantSymbol bool
+	}{
+		{gofips140: "off", wantSymbol: false},
+		{gofips140: "latest", wantSymbol: true},
+	} {
+		t.Run(tt.gofips140, func(t *testing.T) {
+			dst := filepath.Join(dir, "test-"+tt.gofips140)
+			cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", dst, src)
+			for _, entry := range cmd.Environ() {
+				if !strings.HasPrefix(entry, "GOFIPS140=") {
+					cmd.Env = append(cmd.Env, entry)
+				}
+			}
+			cmd.Env = append(cmd.Env, "GOFIPS140="+tt.gofips140)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("could not build target: %v\n%s", err, out)
+			}
+
+			cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", dst)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("could not read target: %v\n%s", err, out)
+			}
+			hasSymbol := bytes.Contains(out, []byte(" main.fipsOnly"))
+			if hasSymbol != tt.wantSymbol {
+				t.Fatalf("fipsOnly symbol present = %v; want %v", hasSymbol, tt.wantSymbol)
+			}
+		})
+	}
+}

@@ -18,9 +18,13 @@ import (
 // Enabled reports whether the cryptography libraries are operating in FIPS
 // 140-3 mode.
 //
-// It can be controlled at runtime using the GODEBUG setting "fips140". If set
-// to "on", FIPS 140-3 mode is enabled. If set to "only", non-approved
-// cryptography functions will additionally return errors or panic.
+// In binaries built with GOFIPS140 set to a non-off value, it can be
+// controlled at runtime using the GODEBUG setting "fips140". If set to "on",
+// FIPS 140-3 mode is enabled. If set to "only", non-approved cryptography
+// functions will additionally return errors or panic.
+//
+// In binaries built with GOFIPS140=off, Enabled always returns false and the
+// compiler may eliminate FIPS-only code.
 //
 // This can't be changed after the program has started.
 func Enabled() bool {

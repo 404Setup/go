@@ -8,6 +8,7 @@ import (
 	"crypto/internal/fips140"
 	"internal/testenv"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,9 +16,29 @@ import (
 
 func MustSupportFIPS140(tb testing.TB) {
 	tb.Helper()
+	if !builtWithFIPS140(tb) {
+		tb.Skip("test requires a binary built with GOFIPS140")
+	}
 	if err := fips140.Supported(); err != nil {
 		tb.Skipf("test requires FIPS 140 mode: %v", err)
 	}
+}
+
+// builtWithFIPS140 reports whether cmd/go embedded a non-off GOFIPS140
+// setting. Without that setting, the compiler treats the internal Enabled
+// flag as a build-time false value, so GODEBUG cannot turn FIPS mode on.
+func builtWithFIPS140(tb testing.TB) bool {
+	tb.Helper()
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "GOFIPS140" {
+			return true
+		}
+	}
+	return false
 }
 
 // MustMinimumFIPS140ModuleVersion skips the test if compiled against a lower
