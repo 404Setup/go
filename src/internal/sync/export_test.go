@@ -9,6 +9,10 @@ import (
 	"unsafe"
 )
 
+func HashTrieMapInitialized[K comparable, V any](m *HashTrieMap[K, V]) bool {
+	return m.inited.Load() != 0
+}
+
 // NewBadHashTrieMap creates a new HashTrieMap for the provided key and value
 // but with an intentionally bad hash function.
 func NewBadHashTrieMap[K, V comparable]() *HashTrieMap[K, V] {
@@ -28,6 +32,7 @@ func NewTruncHashTrieMap[K, V comparable]() *HashTrieMap[K, V] {
 	// Stub out the good hash function with a terrible one.
 	// Everything should still work as expected.
 	var m HashTrieMap[K, V]
+	m.init()
 	var mx map[string]int
 	mapType := abi.TypeOf(mx).MapType()
 	hasher := mapType.Hasher

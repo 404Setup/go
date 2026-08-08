@@ -62,7 +62,9 @@ type equalFunc func(unsafe.Pointer, unsafe.Pointer) bool
 // value is present.
 // The ok result indicates whether value was found in the map.
 func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
-	ht.init()
+	if ht.inited.Load() == 0 {
+		return value, false
+	}
 	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
 
 	i := ht.root.Load()
@@ -72,7 +74,7 @@ func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 
 		n := i.children[(hash>>hashShift)&nChildrenMask].Load()
 		if n == nil {
-			return *new(V), false
+			return value, false
 		}
 		if n.isEntry {
 			return n.entry().lookup(key)
@@ -307,16 +309,19 @@ func (ht *HashTrieMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 // LoadAndDelete deletes the value for a key, returning the previous value if any.
 // The loaded result reports whether the key was present.
 func (ht *HashTrieMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
-	ht.init()
+	if ht.inited.Load() == 0 {
+		return value, false
+	}
 	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	var zero V
 
 	// Find a node with the key and compare with it. n != nil if we found the node.
-	i, hashShift, slot, n := ht.find(key, hash, nil, *new(V))
+	i, hashShift, slot, n := ht.find(key, hash, nil, zero)
 	if n == nil {
 		if i != nil {
 			i.mu.Unlock()
 		}
-		return *new(V), false
+		return value, false
 	}
 
 	// Try to delete the entry.
@@ -324,7 +329,7 @@ func (ht *HashTrieMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 	if !loaded {
 		// Nothing was actually deleted, which means the node is no longer there.
 		i.mu.Unlock()
-		return *new(V), false
+		return value, false
 	}
 	if e != nil {
 		// We didn't actually delete the whole entry, just one entry in the chain.
@@ -479,9 +484,10 @@ func (ht *HashTrieMap[K, V]) find(key K, hash uintptr, valEqual equalFunc, value
 // does not block other methods on the receiver; even yield itself may call any
 // method on the HashTrieMap.
 func (ht *HashTrieMap[K, V]) All() func(yield func(K, V) bool) {
-	ht.init()
 	return func(yield func(key K, value V) bool) {
-		ht.iter(ht.root.Load(), yield)
+		if ht.inited.Load() != 0 {
+			ht.iter(ht.root.Load(), yield)
+		}
 	}
 }
 
@@ -491,8 +497,9 @@ func (ht *HashTrieMap[K, V]) All() func(yield func(K, V) bool) {
 // This exists for compatibility with sync.Map; All should be preferred.
 // It provides the same guarantees as sync.Map, and All.
 func (ht *HashTrieMap[K, V]) Range(yield func(K, V) bool) {
-	ht.init()
-	ht.iter(ht.root.Load(), yield)
+	if ht.inited.Load() != 0 {
+		ht.iter(ht.root.Load(), yield)
+	}
 }
 
 func (ht *HashTrieMap[K, V]) iter(i *indirect[K, V], yield func(key K, value V) bool) bool {
@@ -520,7 +527,9 @@ func (ht *HashTrieMap[K, V]) iter(i *indirect[K, V], yield func(key K, value V) 
 
 // Clear deletes all the entries, resulting in an empty HashTrieMap.
 func (ht *HashTrieMap[K, V]) Clear() {
-	ht.init()
+	if ht.inited.Load() == 0 {
+		return
+	}
 
 	// It's sufficient to just drop the root on the floor, but the root
 	// must always be non-nil.

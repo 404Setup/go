@@ -5,7 +5,6 @@
 package sync
 
 import (
-	"internal/race"
 	rtatomic "internal/runtime/atomic"
 	"runtime"
 	"sync/atomic"
@@ -48,8 +47,10 @@ type Pool[T any] struct {
 }
 
 type poolItem[T any] struct {
+	// poolRaceToken has zero size in normal builds. Keep it first so it does
+	// not increase the size of poolItem when race instrumentation is disabled.
+	race  poolRaceToken
 	value T
-	race  uint8
 }
 
 type poolLocalInternal[T any] struct {
@@ -67,28 +68,15 @@ type poolLocal[T any] struct {
 	pad [128]byte
 }
 
-// from runtime
-//
-//go:linkname runtime_randn runtime.randn
-func runtime_randn(n uint32) uint32
-
-var poolRaceHash [128]uint64
-
-func poolRaceAddr(i uint8) unsafe.Pointer {
-	return unsafe.Pointer(&poolRaceHash[i])
-}
-
 // Put adds x to the pool.
 func (p *Pool[T]) Put(x T) {
+	if p == nil {
+		panic("nil Pool")
+	}
+
 	item := poolItem[T]{value: x}
-	if race.Enabled {
-		if runtime_randn(4) == 0 {
-			// Match sync.Pool's deliberate random drop under the race detector.
-			return
-		}
-		item.race = uint8(runtime_randn(uint32(len(poolRaceHash))))
-		race.ReleaseMerge(poolRaceAddr(item.race))
-		race.Disable()
+	if !poolRacePut(&item) {
+		return
 	}
 	l, _ := p.pin()
 	if !l.privateSet {
@@ -98,9 +86,7 @@ func (p *Pool[T]) Put(x T) {
 		l.shared.pushHead(item)
 	}
 	runtime_procUnpin()
-	if race.Enabled {
-		race.Enable()
-	}
+	poolRacePutDone()
 }
 
 // Get selects an arbitrary value from the Pool, removes it from the Pool, and
@@ -111,9 +97,11 @@ func (p *Pool[T]) Put(x T) {
 // If the pool is empty and p.New is non-nil, Get returns the result of calling
 // p.New. Otherwise, Get returns the zero value of T.
 func (p *Pool[T]) Get() T {
-	if race.Enabled {
-		race.Disable()
+	if p == nil {
+		panic("nil Pool")
 	}
+
+	poolRaceGet()
 	l, pid := p.pin()
 	item, ok := l.private, l.privateSet
 	if ok {
@@ -127,12 +115,7 @@ func (p *Pool[T]) Get() T {
 		}
 	}
 	runtime_procUnpin()
-	if race.Enabled {
-		race.Enable()
-		if ok {
-			race.Acquire(poolRaceAddr(item.race))
-		}
-	}
+	poolRaceGetDone(&item, ok)
 	if ok {
 		return item.value
 	}
@@ -183,10 +166,6 @@ func (p *Pool[T]) getSlow(pid int) (poolItem[T], bool) {
 // pin pins the current goroutine to P, disables preemption, and returns the
 // local shard for that P. The caller must call runtime_procUnpin when done.
 func (p *Pool[T]) pin() (*poolLocal[T], int) {
-	if p == nil {
-		panic("nil Pool")
-	}
-
 	pid := runtime_procPin()
 	// pinSlow stores local before localSize; load them in the opposite order.
 	// With preemption disabled, GC cannot run between these loads.

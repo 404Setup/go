@@ -5,6 +5,7 @@
 package sync_test
 
 import (
+	"reflect"
 	"sync"
 	syncv2 "sync/v2"
 	"testing"
@@ -45,18 +46,36 @@ func TestMap(t *testing.T) {
 	m.Store("a", 1)
 	m.Store("b", 2)
 	seen := make(map[string]int)
-	m.Range(func(key string, value int) bool {
+	for key, value := range m.All() {
 		seen[key] = value
+	}
+	if len(seen) != 2 || seen["a"] != 1 || seen["b"] != 2 {
+		t.Fatalf("All visited %v", seen)
+	}
+	seenRange := make(map[string]int)
+	m.Range(func(key string, value int) bool {
+		seenRange[key] = value
 		return true
 	})
-	if len(seen) != 2 || seen["a"] != 1 || seen["b"] != 2 {
-		t.Fatalf("Range visited %v", seen)
+	if !reflect.DeepEqual(seenRange, seen) {
+		t.Fatalf("Range visited %v; All visited %v", seenRange, seen)
+	}
+
+	visits := 0
+	for key := range m.All() {
+		visits++
+		if _, ok := m.Load(key); !ok {
+			t.Fatalf("Load(%q) failed during All", key)
+		}
+		break
+	}
+	if visits != 1 {
+		t.Fatalf("early-stop All visited %v entries; want 1", visits)
 	}
 	m.Clear()
-	m.Range(func(key string, value int) bool {
-		t.Fatalf("Range visited %q after Clear", key)
-		return true
-	})
+	for key := range m.All() {
+		t.Fatalf("All visited %q after Clear", key)
+	}
 }
 
 func TestMapConcurrent(t *testing.T) {
@@ -95,12 +114,26 @@ func TestMapConcurrent(t *testing.T) {
 }
 
 func TestMapComparePanicsForNonComparableValue(t *testing.T) {
-	var m syncv2.Map[string, []int]
-	m.Store("key", []int{1})
-	defer func() {
-		if recover() == nil {
-			t.Fatal("CompareAndSwap did not panic for a non-comparable value type")
-		}
-	}()
-	m.CompareAndSwap("key", []int{1}, []int{2})
+	for _, test := range []struct {
+		name string
+		call func(*syncv2.Map[string, []int])
+	}{
+		{"CompareAndSwap", func(m *syncv2.Map[string, []int]) {
+			m.CompareAndSwap("key", []int{1}, []int{2})
+		}},
+		{"CompareAndDelete", func(m *syncv2.Map[string, []int]) {
+			m.CompareAndDelete("key", []int{1})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var m syncv2.Map[string, []int]
+			m.Store("key", []int{1})
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("%s did not panic for a non-comparable value type", test.name)
+				}
+			}()
+			test.call(&m)
+		})
+	}
 }

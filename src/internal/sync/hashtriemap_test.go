@@ -22,6 +22,26 @@ func TestHashTrieMap(t *testing.T) {
 	})
 }
 
+func TestHashTrieMapEmptyOperationsDoNotInitialize(t *testing.T) {
+	yield := func(string, int) bool { return true }
+	allocs := testing.AllocsPerRun(1000, func() {
+		var m isync.HashTrieMap[string, int]
+		m.Load("missing")
+		m.LoadAndDelete("missing")
+		m.Delete("missing")
+		m.Range(yield)
+		m.Clear()
+		if isync.HashTrieMapInitialized(&m) {
+			panic("empty operation initialized HashTrieMap")
+		}
+	})
+	// Escape analysis currently moves m itself to the heap. There must be no
+	// second allocation for an unused root node.
+	if allocs > 1 {
+		t.Fatalf("empty read operations allocated %v times per run; want at most 1", allocs)
+	}
+}
+
 func TestHashTrieMapBadHash(t *testing.T) {
 	testHashTrieMap(t, func() *isync.HashTrieMap[string, int] {
 		return isync.NewBadHashTrieMap[string, int]()

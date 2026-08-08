@@ -11,7 +11,26 @@ import (
 	"runtime/debug"
 	syncv1 "sync"
 	"testing"
+	"unsafe"
 )
+
+func TestPoolItemLayout(t *testing.T) {
+	if got, want := unsafe.Sizeof(poolItem[uintptr]{}), unsafe.Sizeof(uintptr(0)); got != want {
+		t.Fatalf("sizeof(poolItem[uintptr]) = %v; want %v", got, want)
+	}
+}
+
+func TestPoolSteadyStateDoesNotAllocate(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	var p Pool[[4]uintptr]
+	p.Put([4]uintptr{})
+	if allocs := testing.AllocsPerRun(1000, func() {
+		value := p.Get()
+		p.Put(value)
+	}); allocs != 0 {
+		t.Fatalf("Pool Get/Put allocated %v times per iteration; want 0", allocs)
+	}
+}
 
 func TestPoolStoresZeroValue(t *testing.T) {
 	defer debug.SetGCPercent(debug.SetGCPercent(-1))
@@ -22,6 +41,18 @@ func TestPoolStoresZeroValue(t *testing.T) {
 	p.Put(0)
 	if got := p.Get(); got != 0 {
 		t.Fatalf("Get() = %v; want stored zero value", got)
+	}
+	runtime_procUnpin()
+}
+
+func TestPoolStoresNil(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	p := Pool[*int]{New: func() *int { return new(int) }}
+
+	runtime_procPin()
+	p.Put(nil)
+	if got := p.Get(); got != nil {
+		t.Fatalf("Get() = %v; want stored nil", got)
 	}
 	runtime_procUnpin()
 }

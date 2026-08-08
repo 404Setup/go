@@ -2,6 +2,7 @@ pkg sync/v2, func NewCond(sync.Locker) *sync.Cond #80000
 pkg sync/v2, func OnceFunc(func()) func() #80000
 pkg sync/v2, func OnceValue[$0 interface{}](func() $0) func() $0 #80000
 pkg sync/v2, func OnceValues[$0 interface{}, $1 interface{}](func() ($0, $1)) func() ($0, $1) #80000
+pkg sync/v2, method (*Map[$0, $1]) All() iter.Seq2[$0, $1] #80000
 pkg sync/v2, method (*Map[$0, $1]) Clear() #80000
 pkg sync/v2, method (*Map[$0, $1]) CompareAndDelete($0, $1) bool #80000
 pkg sync/v2, method (*Map[$0, $1]) CompareAndSwap($0, $1, $1) bool #80000

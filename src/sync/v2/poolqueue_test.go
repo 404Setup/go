@@ -88,7 +88,7 @@ func TestNilPool(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			defer func() {
 				if recover() == nil {
-					t.Fatal("operation on nil Pool did not panic")
+					t.Fatalf("%s on nil Pool did not panic", test.name)
 				}
 			}()
 			test.f()

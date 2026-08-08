@@ -4,7 +4,10 @@
 
 package sync
 
-import isync "internal/sync"
+import (
+	isync "internal/sync"
+	"iter"
+)
 
 // Map is like a Go map[K]V but is safe for concurrent use by multiple
 // goroutines without additional locking or coordination. Loads, stores, and
@@ -93,6 +96,17 @@ func (m *Map[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 // If there is no current value for key, CompareAndDelete returns false.
 func (m *Map[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 	return m.m.CompareAndDelete(key, old)
+}
+
+// All returns an iterator over each key and value present in the map.
+//
+// All does not necessarily correspond to any consistent snapshot of the Map's
+// contents: no key will be visited more than once, but if the value for any key
+// is stored or deleted concurrently, the iterator may reflect any mapping for
+// that key from any point during iteration. The iterator does not block other
+// methods on the receiver; even yield itself may call any method on m.
+func (m *Map[K, V]) All() iter.Seq2[K, V] {
+	return m.m.All()
 }
 
 // Range calls f sequentially for each key and value present in the map. If f

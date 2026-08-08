@@ -13,6 +13,27 @@ import (
 
 var benchmarkSink atomic.Uint64
 
+func BenchmarkMapLoadFreshEmpty(b *testing.B) {
+	b.Run("v1", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var m sync.Map
+			if _, ok := m.Load(i); ok {
+				b.Fatal("unexpected value")
+			}
+		}
+	})
+	b.Run("v2", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var m syncv2.Map[int, int]
+			if _, ok := m.Load(i); ok {
+				b.Fatal("unexpected value")
+			}
+		}
+	})
+}
+
 // These benchmarks intentionally use identical workloads for sync and sync/v2.
 // Run with `-bench='(Map|Pool)' -benchmem` to compare throughput and allocation
 // behavior on the same machine.
