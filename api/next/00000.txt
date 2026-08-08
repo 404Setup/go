@@ -1,3 +1,122 @@
+pkg container/v2, func NewDeque[$0 interface{}](...$0) *Deque[$0] #80000
+pkg container/v2, func NewMap[$0 interface{}, $1 interface{}](Compare[$0]) *Map[$0, $1] #80000
+pkg container/v2, func NewOrderedMap[$0 cmp.Ordered, $1 interface{}]() *Map[$0, $1] #80000
+pkg container/v2, func NewOrderedSet[$0 cmp.Ordered]() *Set[$0] #80000
+pkg container/v2, func NewPriorityQueue[$0 interface{}](func($0, $0) int, ...$0) *PriorityQueue[$0] #80000
+pkg container/v2, func NewQueue[$0 interface{}](...$0) *Queue[$0] #80000
+pkg container/v2, func NewSet[$0 interface{}](Compare[$0]) *Set[$0] #80000
+pkg container/v2, func NewStack[$0 interface{}](...$0) *Stack[$0] #80000
+pkg container/v2, func NewVector[$0 interface{}](...$0) *Vector[$0] #80000
+pkg container/v2, func ShrinkMap[$0 interface{ ~map[$1]$2 }, $1 comparable, $2 interface{}]($0) $0 #80000
+pkg container/v2, func ShrinkSlice[$0 interface{ ~[]$1 }, $1 interface{}]($0) $0 #80000
+pkg container/v2, method (*Deque[$0]) All() iter.Seq2[int, $0] #80000
+pkg container/v2, method (*Deque[$0]) At(int) $0 #80000
+pkg container/v2, method (*Deque[$0]) Back() ($0, bool) #80000
+pkg container/v2, method (*Deque[$0]) Cap() int #80000
+pkg container/v2, method (*Deque[$0]) Clear() #80000
+pkg container/v2, method (*Deque[$0]) Front() ($0, bool) #80000
+pkg container/v2, method (*Deque[$0]) Grow(int) #80000
+pkg container/v2, method (*Deque[$0]) Insert(int, $0) #80000
+pkg container/v2, method (*Deque[$0]) Len() int #80000
+pkg container/v2, method (*Deque[$0]) PopBack() ($0, bool) #80000
+pkg container/v2, method (*Deque[$0]) PopFront() ($0, bool) #80000
+pkg container/v2, method (*Deque[$0]) PushBack($0) #80000
+pkg container/v2, method (*Deque[$0]) PushFront($0) #80000
+pkg container/v2, method (*Deque[$0]) Remove(int) $0 #80000
+pkg container/v2, method (*Deque[$0]) Set(int, $0) #80000
+pkg container/v2, method (*Deque[$0]) Shrink() #80000
+pkg container/v2, method (*Deque[$0]) Slice() []$0 #80000
+pkg container/v2, method (*Deque[$0]) Values() iter.Seq[$0] #80000
+pkg container/v2, method (*Map[$0, $1]) All() iter.Seq2[$0, $1] #80000
+pkg container/v2, method (*Map[$0, $1]) Backward() iter.Seq2[$0, $1] #80000
+pkg container/v2, method (*Map[$0, $1]) Cap() int #80000
+pkg container/v2, method (*Map[$0, $1]) Clear() #80000
+pkg container/v2, method (*Map[$0, $1]) Clone() *Map[$0, $1] #80000
+pkg container/v2, method (*Map[$0, $1]) Delete($0) #80000
+pkg container/v2, method (*Map[$0, $1]) First() ($0, $1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) Grow(int) #80000
+pkg container/v2, method (*Map[$0, $1]) Keys() iter.Seq[$0] #80000
+pkg container/v2, method (*Map[$0, $1]) Last() ($0, $1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) Len() int #80000
+pkg container/v2, method (*Map[$0, $1]) Load($0) ($1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) LoadAndDelete($0) ($1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) LoadOrStore($0, $1) ($1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) LowerBound($0) ($0, $1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) Shrink() #80000
+pkg container/v2, method (*Map[$0, $1]) Store($0, $1) #80000
+pkg container/v2, method (*Map[$0, $1]) Swap($0, $1) ($1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) UpperBound($0) ($0, $1, bool) #80000
+pkg container/v2, method (*Map[$0, $1]) Values() iter.Seq[$1] #80000
+pkg container/v2, method (*PriorityQueue[$0]) Cap() int #80000
+pkg container/v2, method (*PriorityQueue[$0]) Clear() #80000
+pkg container/v2, method (*PriorityQueue[$0]) Grow(int) #80000
+pkg container/v2, method (*PriorityQueue[$0]) Len() int #80000
+pkg container/v2, method (*PriorityQueue[$0]) Peek() ($0, bool) #80000
+pkg container/v2, method (*PriorityQueue[$0]) Pop() ($0, bool) #80000
+pkg container/v2, method (*PriorityQueue[$0]) Push($0) #80000
+pkg container/v2, method (*PriorityQueue[$0]) Remove(int) $0 #80000
+pkg container/v2, method (*PriorityQueue[$0]) Shrink() #80000
+pkg container/v2, method (*PriorityQueue[$0]) Slice() []$0 #80000
+pkg container/v2, method (*PriorityQueue[$0]) Update(int, $0) #80000
+pkg container/v2, method (*PriorityQueue[$0]) Values() iter.Seq[$0] #80000
+pkg container/v2, method (*Queue[$0]) Cap() int #80000
+pkg container/v2, method (*Queue[$0]) Clear() #80000
+pkg container/v2, method (*Queue[$0]) Dequeue() ($0, bool) #80000
+pkg container/v2, method (*Queue[$0]) Enqueue($0) #80000
+pkg container/v2, method (*Queue[$0]) Grow(int) #80000
+pkg container/v2, method (*Queue[$0]) Len() int #80000
+pkg container/v2, method (*Queue[$0]) Peek() ($0, bool) #80000
+pkg container/v2, method (*Queue[$0]) Shrink() #80000
+pkg container/v2, method (*Queue[$0]) Slice() []$0 #80000
+pkg container/v2, method (*Queue[$0]) Values() iter.Seq[$0] #80000
+pkg container/v2, method (*Set[$0]) Add($0) bool #80000
+pkg container/v2, method (*Set[$0]) All() iter.Seq[$0] #80000
+pkg container/v2, method (*Set[$0]) Backward() iter.Seq[$0] #80000
+pkg container/v2, method (*Set[$0]) Cap() int #80000
+pkg container/v2, method (*Set[$0]) Clear() #80000
+pkg container/v2, method (*Set[$0]) Clone() *Set[$0] #80000
+pkg container/v2, method (*Set[$0]) Contains($0) bool #80000
+pkg container/v2, method (*Set[$0]) Delete($0) bool #80000
+pkg container/v2, method (*Set[$0]) First() ($0, bool) #80000
+pkg container/v2, method (*Set[$0]) Grow(int) #80000
+pkg container/v2, method (*Set[$0]) Last() ($0, bool) #80000
+pkg container/v2, method (*Set[$0]) Len() int #80000
+pkg container/v2, method (*Set[$0]) LowerBound($0) ($0, bool) #80000
+pkg container/v2, method (*Set[$0]) Shrink() #80000
+pkg container/v2, method (*Set[$0]) UpperBound($0) ($0, bool) #80000
+pkg container/v2, method (*Stack[$0]) Cap() int #80000
+pkg container/v2, method (*Stack[$0]) Clear() #80000
+pkg container/v2, method (*Stack[$0]) Grow(int) #80000
+pkg container/v2, method (*Stack[$0]) Len() int #80000
+pkg container/v2, method (*Stack[$0]) Peek() ($0, bool) #80000
+pkg container/v2, method (*Stack[$0]) Pop() ($0, bool) #80000
+pkg container/v2, method (*Stack[$0]) Push($0) #80000
+pkg container/v2, method (*Stack[$0]) Shrink() #80000
+pkg container/v2, method (*Stack[$0]) Slice() []$0 #80000
+pkg container/v2, method (*Stack[$0]) Values() iter.Seq[$0] #80000
+pkg container/v2, method (*Vector[$0]) All() iter.Seq2[int, $0] #80000
+pkg container/v2, method (*Vector[$0]) Append(...$0) #80000
+pkg container/v2, method (*Vector[$0]) At(int) $0 #80000
+pkg container/v2, method (*Vector[$0]) Cap() int #80000
+pkg container/v2, method (*Vector[$0]) Clear() #80000
+pkg container/v2, method (*Vector[$0]) Delete(int, int) #80000
+pkg container/v2, method (*Vector[$0]) Grow(int) #80000
+pkg container/v2, method (*Vector[$0]) Insert(int, ...$0) #80000
+pkg container/v2, method (*Vector[$0]) Len() int #80000
+pkg container/v2, method (*Vector[$0]) Pop() ($0, bool) #80000
+pkg container/v2, method (*Vector[$0]) Remove(int) $0 #80000
+pkg container/v2, method (*Vector[$0]) Set(int, $0) #80000
+pkg container/v2, method (*Vector[$0]) Shrink() #80000
+pkg container/v2, method (*Vector[$0]) Slice() []$0 #80000
+pkg container/v2, method (*Vector[$0]) Values() iter.Seq[$0] #80000
+pkg container/v2, type Compare[$0 interface{}] func($0, $0) int #80000
+pkg container/v2, type Deque[$0 interface{}] struct #80000
+pkg container/v2, type Map[$0 interface{}, $1 interface{}] struct #80000
+pkg container/v2, type PriorityQueue[$0 interface{}] struct #80000
+pkg container/v2, type Queue[$0 interface{}] struct #80000
+pkg container/v2, type Set[$0 interface{}] struct #80000
+pkg container/v2, type Stack[$0 interface{}] struct #80000
+pkg container/v2, type Vector[$0 interface{}] struct #80000
 pkg sync/v2, func NewCond(sync.Locker) *sync.Cond #80000
 pkg sync/v2, func OnceFunc(func()) func() #80000
 pkg sync/v2, func OnceValue[$0 interface{}](func() $0) func() $0 #80000
@@ -11,8 +130,21 @@ pkg sync/v2, method (*Map[$0, $1]) Load($0) ($1, bool) #80000
 pkg sync/v2, method (*Map[$0, $1]) LoadAndDelete($0) ($1, bool) #80000
 pkg sync/v2, method (*Map[$0, $1]) LoadOrStore($0, $1) ($1, bool) #80000
 pkg sync/v2, method (*Map[$0, $1]) Range(func($0, $1) bool) #80000
+pkg sync/v2, method (*Map[$0, $1]) Shrink() #80000
 pkg sync/v2, method (*Map[$0, $1]) Store($0, $1) #80000
 pkg sync/v2, method (*Map[$0, $1]) Swap($0, $1) ($1, bool) #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) All() iter.Seq2[$0, $1] #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) Clear() #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) CompareAndDelete($0, $1) bool #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) CompareAndSwap($0, $1, $1) bool #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) Delete($0) #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) Load($0) ($1, bool) #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) LoadAndDelete($0) ($1, bool) #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) LoadOrStore($0, $1) ($1, bool) #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) Range(func($0, $1) bool) #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) Shrink() #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) Store($0, $1) #80000
+pkg sync/v2, method (*OrderedMap[$0, $1]) Swap($0, $1) ($1, bool) #80000
 pkg sync/v2, method (*Pool[$0]) Get() $0 #80000
 pkg sync/v2, method (*Pool[$0]) Put($0) #80000
 pkg sync/v2, type Cond = sync.Cond #80000
@@ -20,6 +152,7 @@ pkg sync/v2, type Locker = sync.Locker #80000
 pkg sync/v2, type Map[$0 comparable, $1 interface{}] struct #80000
 pkg sync/v2, type Mutex = sync.Mutex #80000
 pkg sync/v2, type Once = sync.Once #80000
+pkg sync/v2, type OrderedMap[$0 comparable, $1 interface{}] struct #80000
 pkg sync/v2, type Pool[$0 interface{}] struct #80000
 pkg sync/v2, type Pool[$0 interface{}] struct, New func() $0 #80000
 pkg sync/v2, type RWMutex = sync.RWMutex #80000

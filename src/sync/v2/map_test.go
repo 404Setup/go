@@ -5,6 +5,7 @@
 package sync_test
 
 import (
+	"maps"
 	"reflect"
 	"sync"
 	syncv2 "sync/v2"
@@ -45,10 +46,7 @@ func TestMap(t *testing.T) {
 
 	m.Store("a", 1)
 	m.Store("b", 2)
-	seen := make(map[string]int)
-	for key, value := range m.All() {
-		seen[key] = value
-	}
+	seen := maps.Collect(m.All())
 	if len(seen) != 2 || seen["a"] != 1 || seen["b"] != 2 {
 		t.Fatalf("All visited %v", seen)
 	}
@@ -84,11 +82,10 @@ func TestMapConcurrent(t *testing.T) {
 	const keysPerGoroutine = 128
 
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
-		g := g
+	for g := range goroutines {
 		wg.Go(func() {
 			base := g * keysPerGoroutine
-			for i := 0; i < keysPerGoroutine; i++ {
+			for i := range keysPerGoroutine {
 				key := base + i
 				m.Store(key, key)
 				if got, ok := m.Load(key); !ok || got != key {
@@ -110,6 +107,69 @@ func TestMapConcurrent(t *testing.T) {
 	})
 	if count != goroutines*keysPerGoroutine {
 		t.Fatalf("Range visited %v entries; want %v", count, goroutines*keysPerGoroutine)
+	}
+}
+
+func TestMapShrink(t *testing.T) {
+	var m syncv2.Map[int, int]
+	const entries = 2048
+	const keep = 32
+	for i := range entries {
+		m.Store(i, i*2)
+	}
+	for i := range entries - keep {
+		m.Delete(i)
+	}
+
+	m.Shrink()
+	for i := entries - keep; i < entries; i++ {
+		if got, ok := m.Load(i); !ok || got != i*2 {
+			t.Fatalf("Load(%v) after Shrink = %v, %v; want %v, true", i, got, ok, i*2)
+		}
+	}
+	m.Store(entries, entries*2)
+	if got, ok := m.Load(entries); !ok || got != entries*2 {
+		t.Fatalf("Load after Store following Shrink = %v, %v; want %v, true", got, ok, entries*2)
+	}
+
+	m.Clear()
+	m.Shrink()
+	if _, ok := m.Load(entries); ok {
+		t.Fatal("Load found an entry after Clear and Shrink")
+	}
+	m.Store(1, 2)
+	if got, ok := m.Load(1); !ok || got != 2 {
+		t.Fatalf("reused Map Load(1) = %v, %v; want 2, true", got, ok)
+	}
+}
+
+func TestMapConcurrentShrink(t *testing.T) {
+	var m syncv2.Map[int, int]
+	const writers = 8
+	const entriesPerWriter = 512
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for writer := range writers {
+		wg.Go(func() {
+			<-start
+			base := writer * entriesPerWriter
+			for i := range entriesPerWriter {
+				key := base + i
+				m.Store(key, key)
+			}
+		})
+	}
+	close(start)
+	for range 64 {
+		m.Shrink()
+	}
+	wg.Wait()
+	m.Shrink()
+
+	for key := range writers * entriesPerWriter {
+		if got, ok := m.Load(key); !ok || got != key {
+			t.Fatalf("Load(%v) = %v, %v after concurrent Shrink; want %v, true", key, got, ok, key)
+		}
 	}
 }
 
