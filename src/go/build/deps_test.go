@@ -132,6 +132,8 @@ var depsRules = `
 	< container/heap
 	< unique;
 
+	sort < container/v2;
+
 	RUNTIME
 	< io;
 
@@ -226,6 +228,8 @@ var depsRules = `
 	# It does not include package log, which should be avoided in core packages.
 	arena, strconv, unicode
 	< reflect;
+
+	reflect < sync/v2;
 
 	os, reflect
 	< internal/fmtsort
