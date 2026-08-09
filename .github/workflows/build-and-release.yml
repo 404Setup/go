@@ -1,0 +1,207 @@
+name: Build and release Go
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: >-
+      ${{
+        !startsWith(github.event.head_commit.message, '[skip ci]') &&
+        !startsWith(github.event.head_commit.message, '[ci skip]')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      bootstrap-version: ${{ steps.bootstrap.outputs.version }}
+      commit-time: ${{ steps.release.outputs.commit-time }}
+      raw-version: ${{ steps.release.outputs.raw-version }}
+      targets: ${{ steps.release.outputs.targets }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Read bootstrap version
+        id: bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^const minBootstrap = "go\([^"]*\)"$/\1/p' src/cmd/dist/buildtool.go)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.bootstrap.outputs.version }}
+          cache: false
+
+      - name: Build and run the full test suite
+        working-directory: src
+        shell: bash
+        run: ./all.bash
+
+      - name: Read release metadata
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          raw_version="$(<VERSION.cache)"
+          version="${raw_version%% *}"
+          if [[ ! "$version" =~ ^go[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "VERSION.cache does not begin with a valid release tag: $raw_version" >&2
+            exit 1
+          fi
+
+          commit_time="$(git show -s --format=%cI "$GITHUB_SHA")"
+          targets="$(
+            bin/go tool dist list |
+              awk -F/ '$1 != "android" && $1 != "ios" && $1 != "js" && $1 != "wasip1"' |
+              jq -R -s -c 'split("\n") | map(select(length > 0))'
+          )"
+
+          echo "commit-time=$commit_time" >> "$GITHUB_OUTPUT"
+          echo "raw-version=$raw_version" >> "$GITHUB_OUTPUT"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Package ${{ matrix.target }}
+    needs: validate
+    if: ${{ needs.validate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.validate.outputs.targets) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ needs.validate.outputs.bootstrap-version }}
+          cache: false
+
+      - name: Build distribution
+        id: package
+        shell: bash
+        env:
+          COMMIT_TIME: ${{ needs.validate.outputs.commit-time }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          goos="${TARGET%/*}"
+          goarch="${TARGET#*/}"
+          printf '%s\ntime %s\n' "$VERSION" "$COMMIT_TIME" > VERSION
+
+          export GOOS="$goos"
+          export GOARCH="$goarch"
+          export CGO_ENABLED=0
+          if [[ "$TARGET" == "linux/arm" ]]; then
+            export GOARM=6
+          fi
+
+          (cd src && ./make.bash -distpack)
+
+          extension=tar.gz
+          if [[ "$goos" == "windows" ]]; then
+            extension=zip
+          fi
+          source_archive="pkg/distpack/${VERSION}.${goos}-${goarch}.${extension}"
+          test -f "$source_archive"
+
+          release_arch="$goarch"
+          if [[ "$TARGET" == "linux/arm" ]]; then
+            release_arch=armv6l
+          fi
+          release_archive="${VERSION}.${goos}-${release_arch}.${extension}"
+
+          mkdir release
+          cp "$source_archive" "release/$release_archive"
+          if [[ "$TARGET" == "linux/amd64" ]]; then
+            cp "pkg/distpack/${VERSION}.src.tar.gz" release/
+          fi
+
+          echo "name=${goos}-${release_arch}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ steps.package.outputs.name }}
+          path: release/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs:
+      - validate
+      - package
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum ./* > SHA256SUMS
+
+      - name: Attest release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: release/*
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RAW_VERSION: ${{ needs.validate.outputs.raw-version }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          Automated build of commit \`$GITHUB_SHA\` from \`master\`.
+
+          VERSION.cache: \`$RAW_VERSION\`
+
+          The archives were produced by the Go tree's \`make.bash -distpack\` command after the full \`all.bash\` test suite passed. SHA-256 checksums are in \`SHA256SUMS\`.
+
+          GitHub build provenance is available for every asset. Verify a downloaded file with \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`.
+          EOF
+
+          gh release create "$VERSION" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --notes-file release-notes.md \
+            --prerelease
