@@ -802,9 +802,45 @@ func TestWriteStringStringWriter(t *testing.T) {
 	}
 }
 
+func TestWriteStringStringWriterShortWrite(t *testing.T) {
+	tw := &shortStringWriter{}
+	b := NewWriterSize(tw, 8)
+
+	const s = "123456789"
+	n, err := b.WriteString(s)
+	if n != len(s) || err != nil {
+		t.Fatalf("WriteString(%q) = %d, %v; want %d, nil", s, n, err, len(s))
+	}
+	if tw.writeStringCalls != 1 {
+		t.Fatalf("WriteString called underlying StringWriter %d times; want 1", tw.writeStringCalls)
+	}
+	if got, want := b.Buffered(), 4; got != want {
+		t.Fatalf("Buffered() = %d; want %d", got, want)
+	}
+	if err := b.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := tw.String(); got != s {
+		t.Fatalf("underlying writer contains %q; want %q", got, s)
+	}
+}
+
 type teststringwriter struct {
 	write       string
 	writeString string
+}
+
+type shortStringWriter struct {
+	strings.Builder
+	writeStringCalls int
+}
+
+func (w *shortStringWriter) WriteString(s string) (int, error) {
+	w.writeStringCalls++
+	if w.writeStringCalls == 1 {
+		s = s[:len(s)-4]
+	}
+	return w.Builder.WriteString(s)
 }
 
 func (w *teststringwriter) Write(b []byte) (int, error) {
@@ -1995,5 +2031,22 @@ func BenchmarkWriterFlush(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		bw.WriteString(str)
 		bw.Flush()
+	}
+}
+
+func BenchmarkWriteString(b *testing.B) {
+	small := strings.Repeat("x", 50)
+	huge := strings.Repeat("x", 8<<10)
+	for _, tc := range []struct{ name, s string }{
+		{"small", small},
+		{"huge", huge},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			bw := NewWriter(io.Discard)
+			for b.Loop() {
+				bw.WriteString(tc.s)
+			}
+		})
 	}
 }
