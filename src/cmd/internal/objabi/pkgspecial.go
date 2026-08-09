@@ -88,7 +88,7 @@ var extraNoInstrumentPkgs = []string{
 	"-internal/bytealg",
 }
 
-var noRaceFuncPkgs = []string{"sync", "sync/v2", "sync/atomic", "internal/sync", "internal/runtime/atomic"}
+var noRaceFuncPkgs = []string{"sync", "sync/v2", "sync/atomic", "sync/atomic/v2", "internal/sync", "internal/runtime/atomic"}
 
 var allowAsmABIPkgs = []string{
 	"runtime",

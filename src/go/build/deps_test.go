@@ -109,6 +109,7 @@ var depsRules = `
 	< runtime
 	< runtime/secret
 	< sync/atomic
+	< sync/atomic/v2
 	< internal/sync
 	< weak
 	< internal/synctest

@@ -117,6 +117,11 @@ pkg container/v2, type Queue[$0 interface{}] struct #80000
 pkg container/v2, type Set[$0 interface{}] struct #80000
 pkg container/v2, type Stack[$0 interface{}] struct #80000
 pkg container/v2, type Vector[$0 interface{}] struct #80000
+pkg sync/atomic/v2, method (*Value[$0]) CompareAndSwap($0, $0) bool #80000
+pkg sync/atomic/v2, method (*Value[$0]) Load() $0 #80000
+pkg sync/atomic/v2, method (*Value[$0]) Store($0) #80000
+pkg sync/atomic/v2, method (*Value[$0]) Swap($0) $0 #80000
+pkg sync/atomic/v2, type Value[$0 interface{}] struct #80000
 pkg sync/v2, func NewCond(sync.Locker) *sync.Cond #80000
 pkg sync/v2, func OnceFunc(func()) func() #80000
 pkg sync/v2, func OnceValue[$0 interface{}](func() $0) func() $0 #80000

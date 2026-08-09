@@ -198,6 +198,19 @@ func simdCreditMultiplier(fn *ir.Func) int32 {
 	return 1
 }
 
+func isAtomicV2InlineCandidate(fn *ir.Func) bool {
+	if fn.Sym().Pkg.Path != "sync/atomic/v2" {
+		return false
+	}
+	// CompareAndSwap is deliberately excluded. Its boxed path carries nested
+	// generic equality and boxing dictionaries that cannot yet be safely
+	// inlined across packages.
+	name := fn.Sym().Name
+	return strings.HasSuffix(name, ").Load") ||
+		strings.HasSuffix(name, ").Store") ||
+		strings.HasSuffix(name, ").Swap")
+}
+
 // inlineBudget determines the max budget for function 'fn' prior to
 // analyzing the hairiness of the body of 'fn'. We pass in the pgo
 // profile if available (which can change the budget), also a
@@ -212,6 +225,12 @@ func inlineBudget(fn *ir.Func, profile *pgoir.Profile, relaxed bool, verbose boo
 	budget := int32(inlineMaxBudget)
 
 	budget *= simdCreditMultiplier(fn)
+	if isAtomicV2InlineCandidate(fn) {
+		// Value's representation branches are fixed by its type argument and
+		// disappear after inlining. The regular budget counts every mutually
+		// exclusive branch and otherwise leaves the type dispatch on hot paths.
+		budget = max(budget, 4*inlineMaxBudget)
+	}
 
 	if IsPgoHotFunc(fn, profile) {
 		budget = inlineHotMaxBudget
@@ -982,6 +1001,11 @@ func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller, closureCal
 	}
 
 	simdMaxCost := simdCreditMultiplier(callee) * maxCost
+	if !bigCaller && isAtomicV2InlineCandidate(callee) {
+		// Match the budget used when computing these generic methods. Their
+		// representation dispatch folds away after instantiation.
+		maxCost = max(maxCost, 4*inlineMaxBudget)
+	}
 
 	if callee.ClosureParent != nil {
 		maxCost *= 2           // favor inlining closures

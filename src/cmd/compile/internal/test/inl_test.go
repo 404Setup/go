@@ -230,6 +230,11 @@ func TestIntendedInlining(t *testing.T) {
 			"(*Pointer[go.shape.int]).Store",
 			"(*Pointer[go.shape.int]).Swap",
 		},
+		"sync/atomic/v2": {
+			"(*Value[go.shape.int]).Load",
+			"(*Value[go.shape.int]).Store",
+			"(*Value[go.shape.int]).Swap",
+		},
 		"testing": {
 			"(*B).Loop",
 		},
