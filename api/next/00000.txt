@@ -123,6 +123,7 @@ pkg sync/atomic/v2, method (*Value[$0]) Store($0) #80000
 pkg sync/atomic/v2, method (*Value[$0]) Swap($0) $0 #80000
 pkg sync/atomic/v2, type Value[$0 interface{}] struct #80000
 pkg sync/v2, func NewCond(sync.Locker) *sync.Cond #80000
+pkg sync/v2, func NewPool[$0 interface{}](func() $0) *Pool[$0] #80000
 pkg sync/v2, func OnceFunc(func()) func() #80000
 pkg sync/v2, func OnceValue[$0 interface{}](func() $0) func() $0 #80000
 pkg sync/v2, func OnceValues[$0 interface{}, $1 interface{}](func() ($0, $1)) func() ($0, $1) #80000

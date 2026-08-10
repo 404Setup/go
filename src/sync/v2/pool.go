@@ -68,7 +68,7 @@ type poolLocal[T any] struct {
 	pad [128]byte
 }
 
-// NewPool create a new sync pool.
+// NewPool creates a new Pool whose New function is newf.
 func NewPool[T any](newf func() T) *Pool[T] {
 	return &Pool[T]{
 		New: newf,
