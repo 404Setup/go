@@ -68,6 +68,13 @@ type poolLocal[T any] struct {
 	pad [128]byte
 }
 
+// NewPool create a new sync pool.
+func NewPool[T any](newf func() T) *Pool[T] {
+	return &Pool[T]{
+		New: newf,
+	}
+}
+
 // Put adds x to the pool.
 func (p *Pool[T]) Put(x T) {
 	if p == nil {
