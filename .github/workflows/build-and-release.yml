@@ -199,6 +199,28 @@ jobs:
           GitHub build provenance is available for every asset. Verify a downloaded file with \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`.
           EOF
 
+          # Keep only the newest development snapshot for a prerelease series.
+          if [[ "$VERSION" =~ ^(go[0-9]+\.[0-9]+)(-devel_[A-Za-z0-9._-]+|alpha[0-9]+|beta[0-9]+|rc[0-9]+)$ ]]; then
+            release_series="${BASH_REMATCH[1]}"
+            previous_tag="$(
+              gh release list \
+                --repo "$GITHUB_REPOSITORY" \
+                --limit 1 \
+                --order desc \
+                --json tagName,isPrerelease \
+                --jq '.[0] | select(.isPrerelease) | .tagName // empty'
+            )"
+
+            devel_prefix="${release_series}-devel_"
+            if [[ "$previous_tag" == "$devel_prefix"* && "$previous_tag" != "$VERSION" ]]; then
+              echo "Deleting previous development prerelease: $previous_tag"
+              gh release delete "$previous_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --cleanup-tag \
+                --yes
+            fi
+          fi
+
           gh release create "$VERSION" release/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
