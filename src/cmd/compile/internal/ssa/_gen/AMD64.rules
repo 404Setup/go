@@ -405,6 +405,14 @@
 (CondSelect <t> x y (SET(EQ|NE|L|G|LE|GE|A|B|AE|BE|EQF|NEF|GF|GEF) cond)) && is16BitInt(t)
     => (CMOVW(EQ|NE|LT|GT|LE|GE|HI|CS|CC|LS|EQF|NEF|GTF|GEF) y x cond)
 
+// Float min/max comparison-select idioms lower to a single instruction.
+// These ops carry their semantics directly (no embedded comparison), so the
+// lowering always triggers.
+(Min64FSel ...) => (MINSD ...)
+(Min32FSel ...) => (MINSS ...)
+(Max64FSel ...) => (MAXSD ...)
+(Max32FSel ...) => (MAXSS ...)
+
 (CondSelect <t> x y check) && !check.Type.IsFlags() && check.Type.Size() == 8 && (is64BitInt(t) || isPtr(t))
     => (CMOVQNE y x (CMPQconst [0] check))
 (CondSelect <t> x y check) && !check.Type.IsFlags() && check.Type.Size() == 8 && is32BitInt(t)
@@ -524,6 +532,22 @@
 (Select1     (AddTupleFirst32   _ tuple)) => (Select1 tuple)
 (Select0 <t> (AddTupleFirst64 val tuple)) => (ADDQ val (Select0 <t> tuple))
 (Select1     (AddTupleFirst64   _ tuple)) => (Select1 tuple)
+
+(Select1 xadd:(XADDLlock [off] {sym} val ptr mem)) && xadd.Uses == 1 && clobber(xadd) => (ADDLlock [off] {sym} ptr val mem)
+(Select1 xadd:(XADDQlock [off] {sym} val ptr mem)) && xadd.Uses == 1 && clobber(xadd) => (ADDQlock [off] {sym} ptr val mem)
+// FIXME: remove when we teach rewrite to remove dead values
+(AddTupleFirst32 _ _) && v.Uses == 0 => (Invalid)
+(AddTupleFirst64 _ _) && v.Uses == 0 => (Invalid)
+
+// Atomic subtracts.
+(ADDLlock [off] {sym} ptr n:(NEGL val) mem) && n.Uses == 1 => (SUBLlock [off] {sym} ptr val mem)
+(ADDQlock [off] {sym} ptr n:(NEGQ val) mem) && n.Uses == 1 => (SUBQlock [off] {sym} ptr val mem)
+
+// Atomic inc and dec.
+(ADDLlock [off] {sym} ptr (MOVLconst [1]) mem) => (INCLlock [off] {sym} ptr mem)
+(ADDQlock [off] {sym} ptr (MOVQconst [1]) mem) => (INCQlock [off] {sym} ptr mem)
+(ADDLlock [off] {sym} ptr (MOVLconst [-1]) mem) => (DECLlock [off] {sym} ptr mem)
+(ADDQlock [off] {sym} ptr (MOVQconst [-1]) mem) => (DECQlock [off] {sym} ptr mem)
 
 // Atomic compare and swap.
 (AtomicCompareAndSwap32 ptr old new_ mem) => (CMPXCHGLlock ptr old new_ mem)

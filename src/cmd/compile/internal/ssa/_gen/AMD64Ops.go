@@ -843,10 +843,12 @@ func init() {
 		{name: "VFNMADD231SD", argLength: 3, reg: fp31, resultInArg0: true, asm: "VFNMADD231SD"},
 
 		// Note that these operations don't exactly match the semantics of Go's
-		// builtin min. In particular, these aren't commutative, because on various
-		// special cases the 2nd argument is preferred.
+		// builtin min/max. In particular, these aren't commutative, because on
+		// various special cases the 2nd argument is preferred.
 		{name: "MINSD", argLength: 2, reg: fp21, resultInArg0: true, asm: "MINSD", earlyOk: true}, // min(arg0,arg1)
 		{name: "MINSS", argLength: 2, reg: fp21, resultInArg0: true, asm: "MINSS", earlyOk: true}, // min(arg0,arg1)
+		{name: "MAXSD", argLength: 2, reg: fp21, resultInArg0: true, asm: "MAXSD", earlyOk: true}, // max(arg0,arg1)
+		{name: "MAXSS", argLength: 2, reg: fp21, resultInArg0: true, asm: "MAXSS", earlyOk: true}, // max(arg0,arg1)
 
 		{name: "SBBQcarrymask", argLength: 1, reg: flagsgp, asm: "SBBQ", earlyOk: true},                    // (int64)(-1) if carry is set, 0 if carry is clear.
 		{name: "SBBLcarrymask", argLength: 1, reg: flagsgp, asm: "SBBL", earlyOk: true, zeroUpperBits: 32}, // (int32)(-1) if carry is set, 0 if carry is clear.
@@ -1201,7 +1203,7 @@ func init() {
 		{name: "XCHGL", argLength: 3, reg: gpstorexchg, asm: "XCHGL", aux: "SymOff", resultInArg0: true, faultOnNilArg1: true, hasSideEffects: true, symEffect: "RdWr", zeroUpperBits: 32},
 		{name: "XCHGQ", argLength: 3, reg: gpstorexchg, asm: "XCHGQ", aux: "SymOff", resultInArg0: true, faultOnNilArg1: true, hasSideEffects: true, symEffect: "RdWr"},
 
-		// Atomic adds.
+		// Atomic adds and exchange.
 		// *(arg1+auxint+aux) += arg0.  arg2=mem.
 		// Returns a tuple of <old contents of *(arg1+auxint+aux), memory>.
 		// Note: arg0 and arg1 are backwards compared to MOVLstore (to facilitate resultInArg0)!
@@ -1209,6 +1211,32 @@ func init() {
 		{name: "XADDQlock", argLength: 3, reg: gpstorexchg, asm: "XADDQ", typ: "(UInt64,Mem)", aux: "SymOff", resultInArg0: true, clobberFlags: true, faultOnNilArg1: true, hasSideEffects: true, symEffect: "RdWr"},
 		{name: "AddTupleFirst32", argLength: 2}, // arg1=tuple <x,y>.  Returns <x+arg0,y>.
 		{name: "AddTupleFirst64", argLength: 2}, // arg1=tuple <x,y>.  Returns <x+arg0,y>.
+
+		// Atomic adds, used when we do atomic.Add* and do not use the returned value.
+		// (*arg0+auxint+aux) += arg1.  arg2=mem.
+		// returns memory
+		// Note: arg0 and arg1 are backwards compared to XADD*lock.
+		{name: "ADDLlock", argLength: 3, reg: gpstore, asm: "ADDL", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
+		{name: "ADDQlock", argLength: 3, reg: gpstore, asm: "ADDQ", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
+
+		// Atomic subtracts, used when we do atomic.Add* and do not use the returned value.
+		// (*arg0+auxint+aux) -= arg1.  arg2=mem.
+		// returns memory
+		// Note: arg0 and arg1 are backwards compared to XADD*lock.
+		{name: "SUBLlock", argLength: 3, reg: gpstore, asm: "SUBL", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
+		{name: "SUBQlock", argLength: 3, reg: gpstore, asm: "SUBQ", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
+
+		// TODO: ADDlockconst & SUBlockconst
+
+		// Atomic inc & dec.
+		// (*arg0+auxint+aux) += 1.  arg1=mem.
+		// (*arg0+auxint+aux) -= 1.  arg1=mem.
+		// returns memory
+		// Note: arg0 is backwards compared to XADD*lock.
+		{name: "INCLlock", argLength: 2, reg: gpstoreconst, asm: "INCL", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
+		{name: "INCQlock", argLength: 2, reg: gpstoreconst, asm: "INCQ", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
+		{name: "DECLlock", argLength: 2, reg: gpstoreconst, asm: "DECL", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
+		{name: "DECQlock", argLength: 2, reg: gpstoreconst, asm: "DECQ", typ: "Mem", aux: "SymOff", clobberFlags: true, faultOnNilArg0: true, hasSideEffects: true, symEffect: "RdWr"},
 
 		// Compare and swap.
 		// arg0 = pointer, arg1 = old value, arg2 = new value, arg3 = memory.

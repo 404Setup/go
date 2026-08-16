@@ -298,6 +298,14 @@
 (FCMPD x (FMOVDconst [0])) => (FCMPD0 x)
 (FCMPD (FMOVDconst [0]) x) => (InvertFlags (FCMPD0 x))
 
+// Float min/max comparison-select idioms lower to a compare plus FCSEL on the
+// FP registers. The ops carry their semantics directly, so lowering always
+// triggers.
+(Min64FSel x y) => (FCSELD [OpARM64LessThanF] x y (FCMPD x y))
+(Min32FSel x y) => (FCSELS [OpARM64LessThanF] x y (FCMPS x y))
+(Max64FSel x y) => (FCSELD [OpARM64GreaterThanF] x y (FCMPD x y))
+(Max32FSel x y) => (FCSELS [OpARM64GreaterThanF] x y (FCMPS x y))
+
 // CSEL needs a flag-generating argument. Synthesize a TSTW if necessary.
 (CondSelect x y boolval) && flagArg(boolval) != nil => (CSEL [boolval.Op] x y flagArg(boolval))
 (CondSelect x y boolval) && flagArg(boolval) == nil => (CSEL [OpARM64NotEqual] x y (TSTWconst [1] boolval))
@@ -326,7 +334,7 @@
 (Store {t} ptr val mem) && t.Size() == 1 => (MOVBstore ptr val mem)
 (Store {t} ptr val mem) && t.Size() == 2 => (MOVHstore ptr val mem)
 (Store {t} ptr val mem) && t.Size() == 4 && !t.IsFloat() => (MOVWstore ptr val mem)
-(Store {t} ptr val mem) && t.Size() == 8 && !t.IsFloat() => (MOVDstore ptr val mem)
+(Store {t} ptr val mem) && t.Size() == 8 && !t.IsFloat() && !t.IsSIMD() => (MOVDstore ptr val mem)
 (Store {t} ptr val mem) && t.Size() == 4 &&  t.IsFloat() => (FMOVSstore ptr val mem)
 (Store {t} ptr val mem) && t.Size() == 8 &&  t.IsFloat() => (FMOVDstore ptr val mem)
 (Store {t} ptr val mem) && t.Size() == 16 => (FMOVQstore ptr val mem)
@@ -1363,6 +1371,8 @@
 // absorb InvertFlags into conditional instructions
 (CSEL  [cc] x y (InvertFlags cmp)) => (CSEL  [arm64Invert(cc)] x y cmp)
 (CSEL0 [cc] x   (InvertFlags cmp)) => (CSEL0 [arm64Invert(cc)] x   cmp)
+(FCSELD [cc] x y (InvertFlags cmp)) => (FCSELD [arm64Invert(cc)] x y cmp)
+(FCSELS [cc] x y (InvertFlags cmp)) => (FCSELS [arm64Invert(cc)] x y cmp)
 (CSETM [cc]     (InvertFlags cmp)) => (CSETM [arm64Invert(cc)]     cmp)
 (CSINC [cc] x y (InvertFlags cmp)) => (CSINC [arm64Invert(cc)] x y cmp)
 (CSINV [cc] x y (InvertFlags cmp)) => (CSINV [arm64Invert(cc)] x y cmp)
@@ -1871,3 +1881,18 @@
 
 // SIMD zero
 (ZeroSIMD <t>) && t.Size() == 16 => (VMOVI16B [0] <t>)
+
+// SVE
+(LoadMasked8 <t> ptr mask mem) && t.Size() == 32 => (ZLD1BPredload ptr mask mem)
+(StoreMasked8 {t} ptr mask val mem) && t.Size() == 32 => (ZST1BPredstore ptr val mask mem)
+(Count8s r) => (Select0 <types.TypeMask> (PWHILELTB (MOVDconst [0]) r))
+(GreaterInt8s x y) => (Select0 <types.TypeMask> (ZCMPGTB x y (Select0 <types.TypeMask> (PWHILELTB (MOVDconst [0]) (MOVDconst [32])))))
+(MergeInt8s ...) => (ZSELB ...)
+(AddInt8s x y) => (ZADDBPred x y (Select0 <types.TypeMask> (PWHILELTB (MOVDconst [0]) (MOVDconst [32]))))
+(ScalableVectorLen) => (RDVL [1])
+(ZeroSIMD <t>) && t.Size() == 8 && t.IsSIMD() => (PPFALSE)
+(ZeroSIMD <t>) && t.Size() == 32 && t.IsSIMD() => (ZDUPBconst [0])
+(Load <t> ptr mem) && t.Size() == 32 && t.IsSIMD() => (ZLDRload ptr mem)
+(Store {t} ptr val mem) && t.Size() == 32 && t.IsSIMD() => (ZSTRstore ptr val mem)
+(Load <t> ptr mem) && t.Size() == 8 && t.IsSIMD() => (PLDRload ptr mem)
+(Store {t} ptr val mem) && t.Size() == 8 && t.IsSIMD() => (PSTRstore ptr val mem)

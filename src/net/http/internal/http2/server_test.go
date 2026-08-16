@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -865,10 +866,15 @@ func testServer_Request_Get_Host(t *testing.T) {
 	const host = "example.com"
 	testServerRequest(t, func(st *serverTester) {
 		st.writeHeaders(HeadersFrameParam{
-			StreamID:      1, // clients send odd numbers
-			BlockFragment: st.encodeHeader(":authority", "", "host", host),
-			EndStream:     true,
-			EndHeaders:    true,
+			StreamID: 1, // clients send odd numbers
+			BlockFragment: st.encodeHeaderRaw(
+				":method", "GET",
+				":path", "/",
+				":scheme", "https",
+				"host", host,
+			),
+			EndStream:  true,
+			EndHeaders: true,
 		})
 	}, func(r *http.Request) {
 		if r.Host != host {
@@ -2360,6 +2366,80 @@ func testServer_Response_Empty_Data_Not_FlowControlled(t *testing.T) {
 			endStream: false,
 		})
 
+		st.wantData(wantData{
+			streamID:  1,
+			endStream: true,
+			size:      0,
+		})
+	})
+}
+
+// TestServer_Response_FlushReleasesWriteBuffer verifies that a handler's
+// write buffer is released back to the pool by an empty-leaving Flush and
+// lazily reacquired by the next write, so that handlers parked mid-response
+// (long polls) don't pin a 4KB buffer per stream.
+func TestServer_Response_FlushReleasesWriteBuffer(t *testing.T) {
+	synctest.Test(t, testServer_Response_FlushReleasesWriteBuffer)
+}
+func testServer_Response_FlushReleasesWriteBuffer(t *testing.T) {
+	const msg = "hello, "
+	const msg2 = "world"
+	largeMsg := bytes.Repeat([]byte("a"), HandlerChunkWriteSize*2)
+	testServerResponse(t, func(w http.ResponseWriter, r *http.Request) error {
+		if ResponseWriterHasWriteBufferForTesting(w) {
+			return fmt.Errorf("write buffer allocated before first write")
+		}
+		io.WriteString(w, msg)
+		if !ResponseWriterHasWriteBufferForTesting(w) {
+			return fmt.Errorf("write buffer not allocated after buffered write")
+		}
+		w.(http.Flusher).Flush()
+		if ResponseWriterHasWriteBufferForTesting(w) {
+			return fmt.Errorf("write buffer not released by Flush")
+		}
+		io.WriteString(w, msg2)
+		if !ResponseWriterHasWriteBufferForTesting(w) {
+			return fmt.Errorf("write buffer not reacquired by write after Flush")
+		}
+		w.(http.Flusher).Flush()
+		if ResponseWriterHasWriteBufferForTesting(w) {
+			return fmt.Errorf("write buffer not released by second Flush")
+		}
+		// A []byte write larger than the 4KB write buffer bypasses
+		// the buffer entirely, going directly to the chunkWriter and
+		// leaving the buffer allocated but empty. Flush must
+		// release it in that case too.
+		w.Write(largeMsg)
+		if !ResponseWriterHasWriteBufferForTesting(w) {
+			return fmt.Errorf("write buffer not allocated by large write")
+		}
+		w.(http.Flusher).Flush()
+		if ResponseWriterHasWriteBufferForTesting(w) {
+			return fmt.Errorf("write buffer not released by Flush after buffer-bypassing write")
+		}
+		return nil
+	}, func(st *serverTester) {
+		getSlash(st)
+		st.wantHeaders(wantHeader{
+			streamID:  1,
+			endStream: false,
+		})
+		st.wantData(wantData{
+			streamID:  1,
+			endStream: false,
+			data:      []byte(msg),
+		})
+		st.wantData(wantData{
+			streamID:  1,
+			endStream: false,
+			data:      []byte(msg2),
+		})
+		st.wantData(wantData{
+			streamID:  1,
+			endStream: false,
+			data:      largeMsg,
+			multiple:  true,
+		})
 		st.wantData(wantData{
 			streamID:  1,
 			endStream: true,
@@ -5087,6 +5167,147 @@ func testServerSettingsFlowControlUpdateWithinLimit(t *testing.T) {
 	st.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
 	st.wantSettingsAck()
 	st.wantIdle()
+}
+
+func TestServerAuthorityAndHostHeader(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		h        http.Header
+		valid    bool
+		wantHost string
+	}{{
+		name: "authority host mismatch",
+		h: http.Header{
+			":authority": {"example.tld"},
+			"host":       {"other.tld"},
+		},
+	}, {
+		// The RFCs aren't explicit on whether a :authority and host that
+		// differ only in case is a mismatch. We treat it as a mismatch because
+		// there doesn't seem to be a good reason not to.
+		name: "authority host case differs",
+		h: http.Header{
+			":authority": {"example.tld"},
+			"host":       {"EXAMPLE.TLD"},
+		},
+	}, {
+		name: "authority and multiple host",
+		h: http.Header{
+			":authority": {"example.tld"},
+			"host":       {"example.tld", "example.tld"},
+		},
+	}, {
+		name: "multiple host only",
+		h: http.Header{
+			"host": {"example.tld", "example.tld"},
+		},
+	}, {
+		name: "multiple authority only",
+		h: http.Header{
+			":authority": {"example.tld", "example.tld"},
+		},
+	}, {
+		name: "empty authority",
+		h: http.Header{
+			":authority": {""},
+		},
+	}, {
+		name: "invalid authority",
+		h: http.Header{
+			":authority": {"example . tld"},
+		},
+	}, {
+		name: "invalid host",
+		h: http.Header{
+			"host": {"example . tld"},
+		},
+	}, {
+		name: "authority only",
+		h: http.Header{
+			":authority": {"example.tld"},
+		},
+		valid:    true,
+		wantHost: "example.tld",
+	}, {
+		name: "host only",
+		h: http.Header{
+			"host": {"example.tld"},
+		},
+		valid:    true,
+		wantHost: "example.tld",
+	}, {
+		name: "authority host match",
+		h: http.Header{
+			":authority": {"example.tld"},
+			"host":       {"example.tld"},
+		},
+		valid:    true,
+		wantHost: "example.tld",
+	}, {
+		name: "authority host match with port",
+		h: http.Header{
+			":authority": {"example.tld:443"},
+			"host":       {"example.tld:443"},
+		},
+		valid:    true,
+		wantHost: "example.tld:443",
+	}, {
+		name: "authority host mismatch with port",
+		h: http.Header{
+			":authority": {"example.tld:80"},
+			"host":       {"example.tld:443"},
+		},
+	}, {
+		name: "userinfo in authority",
+		h: http.Header{
+			":authority": {"user:pass@example.tld"},
+		},
+	}, {
+		name: "userinfo in host",
+		h: http.Header{
+			"host": {"user:pass@example.tld"},
+		},
+	}, {
+		name:     "neither authority nor host",
+		h:        http.Header{},
+		valid:    true,
+		wantHost: "",
+	}} {
+		synctest.Subtest(t, test.name, func(t *testing.T) {
+			st := newServerTester(t, nil)
+			st.greet()
+
+			h := []string{
+				":method", "GET",
+				":scheme", "https",
+				":path", "/",
+			}
+			for _, k := range slices.Sorted(maps.Keys(test.h)) {
+				for _, v := range test.h[k] {
+					h = append(h, k, v)
+				}
+			}
+
+			st.writeHeaders(HeadersFrameParam{
+				StreamID:      1, // clients send odd numbers
+				BlockFragment: st.encodeHeaderRaw(h...),
+				EndStream:     false, // data coming
+				EndHeaders:    true,
+			})
+
+			if test.valid {
+				call := st.nextHandlerCall()
+				if got, want := call.req.Host, test.wantHost; got != want {
+					t.Errorf("handler got Host %q, want %q", got, want)
+				}
+				if h, ok := call.req.Header["Host"]; ok {
+					t.Errorf(`handler got Header["Host"] = %q, want unset`, h)
+				}
+			} else {
+				st.wantRSTStream(1, ErrCodeProtocol)
+			}
+		})
+	}
 }
 
 func TestConsistentConstants(t *testing.T) {

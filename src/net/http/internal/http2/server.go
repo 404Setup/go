@@ -75,9 +75,20 @@ var (
 
 var responseWriterStatePool = sync.Pool{
 	New: func() any {
-		rws := &responseWriterState{}
-		rws.bw = bufio.NewWriterSize(chunkWriter{rws}, handlerChunkWriteSize)
-		return rws
+		return &responseWriterState{}
+	},
+}
+
+// handlerWriterPool is a pool of the bufio.Writers used by
+// responseWriterState (rws.bw) to buffer handler response writes.
+//
+// The buffers are acquired from the pool lazily on the first buffered
+// write and, notably, are returned to it by Flush when empty, so that a
+// handler that's parked mid-response for a long time (e.g. streaming a
+// long poll) doesn't pin a buffer per stream.
+var handlerWriterPool = sync.Pool{
+	New: func() any {
+		return bufio.NewWriterSize(nil, handlerChunkWriteSize)
 	},
 }
 
@@ -2129,12 +2140,25 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState, priority
 func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*responseWriter, *ServerRequest, error) {
 	sc.serveG.check()
 
-	rp := httpcommon.ServerRequestParam{
-		Method:    f.PseudoValue("method"),
-		Scheme:    f.PseudoValue("scheme"),
-		Authority: f.PseudoValue("authority"),
-		Path:      f.PseudoValue("path"),
-		Protocol:  f.PseudoValue("protocol"),
+	rp := httpcommon.ServerRequestParam{}
+	for _, hf := range f.Fields {
+		// No pseudo-headers may have a zero-length value.
+		// Rejecting them here means we can assume "" means "no header" below.
+		if hf.Name == "" || (hf.Name[0] == ':' && len(hf.Value) == 0) {
+			return nil, nil, sc.countError("invalid_pseudo_header", streamError(f.StreamID, ErrCodeProtocol))
+		}
+		switch hf.Name {
+		case ":method":
+			rp.Method = hf.Value
+		case ":scheme":
+			rp.Scheme = hf.Value
+		case ":authority":
+			rp.Authority = hf.Value
+		case ":path":
+			rp.Path = hf.Value
+		case ":protocol":
+			rp.Protocol = hf.Value
+		}
 	}
 
 	// extended connect is disabled, so we should not see :protocol
@@ -2246,11 +2270,8 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 
 func (sc *serverConn) newResponseWriter(st *stream) *responseWriter {
 	rws := responseWriterStatePool.Get().(*responseWriterState)
-	bwSave := rws.bw
 	*rws = responseWriterState{} // zero all the fields
 	rws.conn = sc
-	rws.bw = bwSave
-	rws.bw.Reset(chunkWriter{rws})
 	rws.stream = st
 	return &responseWriter{rws: rws}
 }
@@ -2498,7 +2519,13 @@ type responseWriterState struct {
 	conn   *serverConn
 
 	// TODO: adjust buffer writing sizes based on server config, frame size updates from peer, etc
-	bw *bufio.Writer // writing to a chunkWriter{this *responseWriterState}
+	//
+	// bw buffers handler writes, writing to a chunkWriter{this
+	// *responseWriterState}. It is nil until the first buffered write
+	// (see responseWriter.write) and is returned to handlerWriterPool
+	// (and set nil again) whenever a Flush leaves it empty, so a
+	// handler parked mid-response doesn't pin a buffer.
+	bw *bufio.Writer
 
 	// mutated by http.Handler goroutine:
 	handlerHeader Header   // nil until called
@@ -2780,12 +2807,19 @@ func (w *responseWriter) Flush() {
 func (w *responseWriter) FlushError() error {
 	rws := w.rws
 	if rws == nil {
-		panic("Header called after Handler finished")
+		panic("Flush called after Handler finished")
 	}
 	var err error
-	if rws.bw.Buffered() > 0 {
+	if rws.bw != nil && rws.bw.Buffered() > 0 {
 		err = rws.bw.Flush()
+		if err == nil {
+			rws.releaseWriteBuffer()
+		}
 	} else {
+		if rws.bw != nil {
+			// If a >4KB write allocated a bufio before it flushed itself, release.
+			rws.releaseWriteBuffer()
+		}
 		// The bufio.Writer won't call chunkWriter.Write
 		// (writeChunk with zero bytes), so we have to do it
 		// ourselves to force the HTTP response header and/or
@@ -2939,6 +2973,10 @@ func (w *responseWriter) write(lenData int, dataB []byte, dataS string) (n int, 
 		return 0, errors.New("http2: handler wrote more than declared Content-Length")
 	}
 
+	if rws.bw == nil {
+		rws.bw = handlerWriterPool.Get().(*bufio.Writer)
+		rws.bw.Reset(chunkWriter{rws})
+	}
 	if dataB != nil {
 		return rws.bw.Write(dataB)
 	} else {
@@ -2946,10 +2984,23 @@ func (w *responseWriter) write(lenData int, dataB []byte, dataS string) (n int, 
 	}
 }
 
+// releaseWriteBuffer returns rws.bw to handlerWriterPool.
+func (rws *responseWriterState) releaseWriteBuffer() {
+	bw := rws.bw
+	rws.bw = nil
+	bw.Reset(nil) // don't retain the chunkWriter's rws pointer in the pool
+	handlerWriterPool.Put(bw)
+}
+
 func (w *responseWriter) handlerDone() {
 	rws := w.rws
 	rws.handlerDone = true
 	w.Flush()
+	if rws.bw != nil {
+		// A failed Flush left data (and a sticky error) behind;
+		// discard both and recycle the buffer.
+		rws.releaseWriteBuffer()
+	}
 	w.rws = nil
 	responseWriterStatePool.Put(rws)
 }
