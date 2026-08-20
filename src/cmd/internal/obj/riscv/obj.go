@@ -1542,7 +1542,11 @@ func validateRVVi(ctxt *obj.Link, ins *instruction) {
 }
 
 func validateRVVu(ctxt *obj.Link, ins *instruction) {
-	wantImmU(ctxt, ins, ins.imm, 5)
+	nbits := uint(5)
+	if ins.as == AVRORVI {
+		nbits = 6
+	}
+	wantImmU(ctxt, ins, ins.imm, nbits)
 	wantVectorReg(ctxt, ins, "vd", ins.rd)
 	wantNoneReg(ctxt, ins, "rs1", ins.rs1)
 	wantVectorReg(ctxt, ins, "vs2", ins.rs2)
@@ -2029,7 +2033,13 @@ func encodeRVVi(ins *instruction) uint32 {
 }
 
 func encodeRVVu(ins *instruction) uint32 {
-	return encodeR(ins.as, immU(ins.as, ins.imm, 5), regV(ins.rs2), regV(ins.rd), ins.funct3, ins.funct7)
+	nbits := uint(5)
+	if ins.as == AVRORVI {
+		nbits = 6
+	}
+	imm := immU(ins.as, ins.imm, nbits)
+	funct7 := ins.funct7 | (imm>>5)<<1
+	return encodeR(ins.as, imm&0x1f, regV(ins.rs2), regV(ins.rd), ins.funct3, funct7)
 }
 
 func encodeRVVV(ins *instruction) uint32 {
@@ -5182,6 +5192,13 @@ func assemble(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	}
 
 	obj.MarkUnsafePoints(ctxt, cursym.Func().Text, newprog, isUnsafePoint, nil)
+
+	// generate jump table entries.
+	for _, jt := range cursym.Func().JumpTables {
+		for i, p := range jt.Targets {
+			jt.Sym.WriteAddr(ctxt, int64(i)*8, 8, cursym, p.Pc)
+		}
+	}
 }
 
 func isUnsafePoint(p *obj.Prog) bool {

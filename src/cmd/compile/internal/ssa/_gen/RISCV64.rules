@@ -39,6 +39,8 @@
 (Select1 (Sub64borrow x y c)) =>
 	(OR (SLTU <typ.UInt64> x s:(SUB <typ.UInt64> x y)) (SLTU <typ.UInt64> s (SUB <typ.UInt64> s c)))
 
+(JumpTable idx) => (JUMPTABLE {ssa.MakeJumpTableSym(b)} idx (MOVaddr <typ.Uintptr> {ssa.MakeJumpTableSym(b)} (SB)))
+
 // (x + y) / 2 => (x / 2) + (y / 2) + (x & y & 1)
 (Avg64u <t> x y) => (ADD (ADD <t> (SRLI <t> [1] x) (SRLI <t> [1] y)) (ANDI <t> [1] (AND <t> x y)))
 
@@ -494,6 +496,11 @@
 			(SLLI <typ.UInt64> [3] (ANDI <typ.UInt64> [3] ptr)))) mem)
 
 (AtomicAnd32 ...) => (LoweredAtomicAnd32 ...)
+
+(AtomicAnd32value ...) => (LoweredAtomicAnd32value ...)
+(AtomicAnd64value ...) => (LoweredAtomicAnd64value ...)
+(AtomicOr32value ...) => (LoweredAtomicOr32value ...)
+(AtomicOr64value ...) => (LoweredAtomicOr64value ...)
 
 (AtomicCompareAndSwap32 ptr old new mem) => (LoweredAtomicCas32 ptr (SignExt32to64 old) new mem)
 (AtomicCompareAndSwap64 ...) => (LoweredAtomicCas64 ...)

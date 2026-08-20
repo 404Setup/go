@@ -62,6 +62,12 @@ func RewriteValue(v *ssa.Value) bool {
 	case ssaop.OpAtomicAnd32:
 		v.Op = ssaop.OpRISCV64LoweredAtomicAnd32
 		return true
+	case ssaop.OpAtomicAnd32value:
+		v.Op = ssaop.OpRISCV64LoweredAtomicAnd32value
+		return true
+	case ssaop.OpAtomicAnd64value:
+		v.Op = ssaop.OpRISCV64LoweredAtomicAnd64value
+		return true
 	case ssaop.OpAtomicAnd8:
 		return rewriteValue_OpAtomicAnd8(v)
 	case ssaop.OpAtomicCompareAndSwap32:
@@ -89,6 +95,12 @@ func RewriteValue(v *ssa.Value) bool {
 		return true
 	case ssaop.OpAtomicOr32:
 		v.Op = ssaop.OpRISCV64LoweredAtomicOr32
+		return true
+	case ssaop.OpAtomicOr32value:
+		v.Op = ssaop.OpRISCV64LoweredAtomicOr32value
+		return true
+	case ssaop.OpAtomicOr64value:
+		v.Op = ssaop.OpRISCV64LoweredAtomicOr64value
 		return true
 	case ssaop.OpAtomicOr8:
 		return rewriteValue_OpAtomicOr8(v)
@@ -11382,6 +11394,19 @@ func RewriteBlock(b *ssa.Block) bool {
 			v0 := b.NewValue0(cond.Pos, ssaop.OpRISCV64MOVBUreg, typ.UInt64)
 			v0.AddArg(cond)
 			b.ResetWithControl(block.BlockRISCV64BNEZ, v0)
+			return true
+		}
+	case block.BlockJumpTable:
+		// match: (JumpTable idx)
+		// result: (JUMPTABLE {ssa.MakeJumpTableSym(b)} idx (MOVaddr <typ.Uintptr> {ssa.MakeJumpTableSym(b)} (SB)))
+		for {
+			idx := b.Controls[0]
+			v0 := b.NewValue0(b.Pos, ssaop.OpRISCV64MOVaddr, typ.Uintptr)
+			v0.Aux = ssa.SymToAux(ssa.MakeJumpTableSym(b))
+			v1 := b.NewValue0(b.Pos, ssaop.OpSB, typ.Uintptr)
+			v0.AddArg(v1)
+			b.ResetWithControl2(block.BlockRISCV64JUMPTABLE, idx, v0)
+			b.Aux = ssa.SymToAux(ssa.MakeJumpTableSym(b))
 			return true
 		}
 	}

@@ -182,6 +182,9 @@ var depsRules = `
 	MATH
 	< runtime/metrics;
 
+	MATH
+	< simd/internal/spec;
+
 	MATH, unicode/utf8
 	< strconv;
 
