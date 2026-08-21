@@ -75,11 +75,17 @@ func (_ Compiler) Compile(f *ssa.Func, htmlWriter ssa.HTMLWriter) {
 		checkFunc(f)
 	}
 	const logMemStats = false
-	for _, p := range passes {
+	// use a pass variable that's shared between individual passes, but tied to
+	// this function. This lets developers set pass.Debug (and other fields) to
+	// some other value inside a pass function, without interfering with other
+	// functions
+	var p ssa.Pass
+	for _, p = range passes {
 		if !f.Config.Optimize && !p.Required || p.Disabled {
 			continue
 		}
 		f.Pass = &p
+		f.HTMLWriter = htmlWriter
 		phaseName = p.Name
 		if f.Log() {
 			f.Logf("  pass %s begin\n", p.Name)
@@ -109,6 +115,7 @@ func (_ Compiler) Compile(f *ssa.Func, htmlWriter ssa.HTMLWriter) {
 		// Need something less crude than "Log the whole intermediate result".
 		if f.Log() || htmlWriter.Enabled() {
 			time := tEnd.Sub(tStart).Nanoseconds()
+			time -= htmlWriter.TimeFormatting().Nanoseconds()
 			var stats string
 			if logMemStats {
 				var mEnd runtime.MemStats
