@@ -105,6 +105,7 @@ const (
 	BlockMIPSGEZ
 	BlockMIPSFPT
 	BlockMIPSFPF
+	BlockMIPSJUMPTABLE
 
 	BlockMIPS64EQ
 	BlockMIPS64NE
@@ -114,6 +115,7 @@ const (
 	BlockMIPS64GEZ
 	BlockMIPS64FPT
 	BlockMIPS64FPF
+	BlockMIPS64JUMPTABLE
 
 	BlockPPC64EQ
 	BlockPPC64NE
@@ -255,23 +257,25 @@ var blockString = [...]string{
 	BlockLOONG64BLTU:      "BLTU",
 	BlockLOONG64JUMPTABLE: "JUMPTABLE",
 
-	BlockMIPSEQ:  "EQ",
-	BlockMIPSNE:  "NE",
-	BlockMIPSLTZ: "LTZ",
-	BlockMIPSLEZ: "LEZ",
-	BlockMIPSGTZ: "GTZ",
-	BlockMIPSGEZ: "GEZ",
-	BlockMIPSFPT: "FPT",
-	BlockMIPSFPF: "FPF",
+	BlockMIPSEQ:        "EQ",
+	BlockMIPSNE:        "NE",
+	BlockMIPSLTZ:       "LTZ",
+	BlockMIPSLEZ:       "LEZ",
+	BlockMIPSGTZ:       "GTZ",
+	BlockMIPSGEZ:       "GEZ",
+	BlockMIPSFPT:       "FPT",
+	BlockMIPSFPF:       "FPF",
+	BlockMIPSJUMPTABLE: "JUMPTABLE",
 
-	BlockMIPS64EQ:  "EQ",
-	BlockMIPS64NE:  "NE",
-	BlockMIPS64LTZ: "LTZ",
-	BlockMIPS64LEZ: "LEZ",
-	BlockMIPS64GTZ: "GTZ",
-	BlockMIPS64GEZ: "GEZ",
-	BlockMIPS64FPT: "FPT",
-	BlockMIPS64FPF: "FPF",
+	BlockMIPS64EQ:        "EQ",
+	BlockMIPS64NE:        "NE",
+	BlockMIPS64LTZ:       "LTZ",
+	BlockMIPS64LEZ:       "LEZ",
+	BlockMIPS64GTZ:       "GTZ",
+	BlockMIPS64GEZ:       "GEZ",
+	BlockMIPS64FPT:       "FPT",
+	BlockMIPS64FPF:       "FPF",
+	BlockMIPS64JUMPTABLE: "JUMPTABLE",
 
 	BlockPPC64EQ:  "EQ",
 	BlockPPC64NE:  "NE",

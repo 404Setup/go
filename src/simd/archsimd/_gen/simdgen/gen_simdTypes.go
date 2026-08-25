@@ -34,6 +34,38 @@ func (x simdType) ElemBits() int {
 	return x.Size / x.Lanes
 }
 
+// ElemBytes is the element width in bytes.
+func (x simdType) ElemBytes() int {
+	return x.ElemBits() / 8
+}
+
+// PredUint16s is the number of uint16s that hold a whole SVE predicate: one bit
+// per vector byte, at the maximum vector length. It bounds the scratch buffer a
+// mask's String needs to read its own bits.
+func (x simdType) PredUint16s() int {
+	return (maxVectorBits/8 + 15) / 16
+}
+
+// IsScalable reports whether this vector type's length is only known at run
+// time. A scalable target's godefs run produces only scalable types, so the
+// target decides it.
+func (x simdType) IsScalable() bool {
+	return CurrentArch().Scalable
+}
+
+// LenExpr is the body expression of the type's Len() method. A fixed-width type
+// has a constant lane count; a scalable vector's active lane count is the
+// runtime vector length (bytes) divided by the element size.
+func (x simdType) LenExpr() string {
+	if !x.IsScalable() {
+		return fmt.Sprint(x.Lanes)
+	}
+	if elemBytes := x.ElemBits() / 8; elemBytes > 1 {
+		return fmt.Sprintf("vl() / %d", elemBytes)
+	}
+	return "vl()"
+}
+
 func (x *simdType) Name_() string {
 	return x.Name
 }
@@ -163,8 +195,16 @@ func compareSimdTypePairs(x, y simdTypePair) int {
 }
 
 func simdPackageHeader() string {
+	// A shared-package target's Go API files (SVE: types_sve.go, ops_sve.go) carry a
+	// "sve" name suffix, which is not a GOARCH, so unlike types_arm64.go they get
+	// no implicit build constraint. Add the GOARCH explicitly so they only build
+	// on their host arch and don't clash with other arches' tag types (e.g. v256).
+	constraint := "goexperiment.simd"
+	if a := CurrentArch(); a.sharesBackendPackage() {
+		constraint += " && " + a.Arch
+	}
 	return generatedHeader() + `
-//go:build goexperiment.simd
+//go:build ` + constraint + `
 
 package archsimd
 `
@@ -188,6 +228,90 @@ type {{.Name}} struct {
 {{.Fields}}
 }
 
+{{end}}
+
+{{define "scalableTypeTmpl"}}
+{{- if eq .Type "mask"}}
+// {{.Name}} is a scalable mask for a SIMD vector of {{.ElemBits}}-bit elements.
+//
+// An SVE predicate holds one bit per byte of the vector it governs, so a
+// {{.Name}} carries one bit for each byte of the runtime vector length, and
+// lane i is governed by bit {{if gt .ElemBytes 1}}{{.ElemBytes}}*i. The bits in between are ignored{{else}}i{{end}}.
+{{- else}}
+// {{.Name}} is a scalable SIMD vector of {{.Base}}s.
+{{- end}}
+type {{.Name}} struct {
+{{.Fields}}
+}
+
+{{end}}
+
+{{define "sveMaskLoadStore"}}
+// Load{{.Name}} loads a {{.Name}} from the predicate bits packed into bits.
+// The bits are concatenated in little-endian order: bit i of bits[j] governs
+// vector byte 16*j+i, and so lane k is governed by bit {{if gt .ElemBytes 1}}{{.ElemBytes}}*k{{else}}k{{end}}.
+//
+// One uint16 covers 16 bytes of vector, the length of the smallest vector SVE
+// defines, so bits must hold one uint16 per 16 bytes of the runtime vector
+// length. Load{{.Name}} panics if bits is shorter than that.
+//
+// Asm: Emulated (a length check that can panic, then PLDR (predicate)).
+func Load{{.Name}}(bits []uint16) {{.Name}} {
+	if len(bits) < (vl()+15)/16 {
+		panic("simd: Load{{.Name}}: bits is too short to hold the predicate")
+	}
+	return load{{.Name}}(bits)
+}
+
+//go:noescape
+func load{{.Name}}(bits []uint16) {{.Name}}
+
+// Store stores m's predicate bits into bits, concatenated in little-endian
+// order: bit i of bits[j] governs vector byte 16*j+i, and so lane k is
+// governed by bit {{if gt .ElemBytes 1}}{{.ElemBytes}}*k{{else}}k{{end}}.
+//
+// bits must hold one uint16 per 16 bytes of the runtime vector length; Store
+// panics if it is shorter.
+//
+// Asm: Emulated (a length check that can panic, then PSTR (predicate)).
+func (m {{.Name}}) Store(bits []uint16) {
+	if len(bits) < (vl()+15)/16 {
+		panic("simd: {{.Name}}.Store: bits is too short to hold the predicate")
+	}
+	m.store(bits)
+}
+
+//go:noescape
+func (m {{.Name}}) store(bits []uint16)
+{{end}}
+
+{{define "sveStringTmpl"}}
+{{- if eq .Type "mask"}}
+// String returns a string representation of SIMD mask m: 1 for an active lane,
+// 0 for an inactive one. Only the {{.LenExpr}} lanes that exist at the runtime
+// vector length are shown.
+func (m {{.Name}}) String() string {
+	var bits [{{.PredUint16s}}]uint16
+	m.Store(bits[:])
+	var s [{{.Lanes}}]{{.Base}}
+	n := {{.LenExpr}}
+	for i := range n {
+		if b := i{{if gt .ElemBytes 1}} * {{.ElemBytes}}{{end}}; bits[b/16]>>(b%16)&1 != 0 {
+			s[i] = 1
+		}
+	}
+	return sliceToString(s[:n])
+}
+{{- else}}
+// String returns a string representation of SIMD vector x. Only the x.Len()
+// elements that exist at the runtime vector length are shown.
+func (x {{.Name}}) String() string {
+	var s [{{.Lanes}}]{{.Base}}
+	n := x.Len()
+	x.Store(s[:])
+	return sliceToString(s[:n])
+}
+{{- end}}
 {{end}}
 `
 
@@ -229,7 +353,7 @@ func ({{.FeatureVar}}Features) {{.Feature}}() bool {
 
 const simdLoadStoreTemplate = `
 // Len returns the number of elements in {{.Article}} {{.Name}}.
-func (x {{.Name}}) Len() int { return {{.Lanes}} }
+func (x {{.Name}}) Len() int { return {{.LenExpr}} }
 
 // Load{{.Name}}Array loads {{.Article}} {{.Name}} from an array.
 //
@@ -240,6 +364,76 @@ func Load{{.Name}}Array(y *[{{.Lanes}}]{{.Base}}) {{.Name}}
 //
 //go:noescape
 func (x {{.Name}}) StoreArray(y *[{{.Lanes}}]{{.Base}})
+`
+
+// simdScalableLoadStoreTemplate is the load/store surface for scalable (SVE)
+// types: partial and slice-based rather than fixed-array. The exported Load/Store
+// functions are ordinary Go (the "emulation"): they compute how many elements to
+// move — min(len(s), Len()), and nothing for an empty or nil slice — and call the
+// unexported raw predicated load/store intrinsic. Keeping the length logic in Go
+// (rather than in the intrinsic) makes the bounds behavior explicit and safe.
+const simdScalableLoadStoreTemplate = `
+// Len returns the number of elements in {{.Article}} {{.Name}}.
+func (x {{.Name}}) Len() int { return {{.LenExpr}} }
+
+// Load{{.Name}} loads {{.Article}} {{.Name}} from the first Len() elements of s.
+// It panics if len(s) < Len().
+//
+// Asm: Emulated (a length check that can panic, then ZLDR).
+func Load{{.Name}}(s []{{.Base}}) {{.Name}} {
+	var z {{.Name}}
+	if len(s) < z.Len() {
+		panic("simd: Load{{.Name}}: slice shorter than the vector")
+	}
+	return load{{.Name}}(s)
+}
+
+//go:noescape
+func load{{.Name}}(s []{{.Base}}) {{.Name}}
+
+// Store stores x's Len() elements into the first Len() elements of s. It panics
+// if len(s) < Len().
+//
+// Asm: Emulated (a length check that can panic, then ZSTR).
+func (x {{.Name}}) Store(s []{{.Base}}) {
+	if len(s) < x.Len() {
+		panic("simd: {{.Name}}.Store: slice shorter than the vector")
+	}
+	x.store(s)
+}
+
+//go:noescape
+func (x {{.Name}}) store(s []{{.Base}})
+
+// Load{{.Name}}Part loads {{.Article}} {{.Name}} from s, reading n = min(len(s),
+// Len()) elements and returning the vector and n; the remaining elements are
+// zero.
+//
+// Asm: Emulated (predicate construction + LD1B).
+func Load{{.Name}}Part(s []{{.Base}}) ({{.Name}}, int) {
+	if len(s) == 0 {
+		return {{.Name}}{}, 0
+	}
+	return load{{.Name}}Part(s), min(len(s), {{.Name}}{}.Len())
+}
+
+//go:noescape
+func load{{.Name}}Part(s []{{.Base}}) {{.Name}}
+
+// StorePart stores the low n = min(len(s), Len()) elements of x into s and
+// returns n.
+//
+// Asm: Emulated (predicate construction + ST1B).
+func (x {{.Name}}) StorePart(s []{{.Base}}) int {
+	if len(s) == 0 {
+		return 0
+	}
+	x.storePart(s)
+	return min(len(s), x.Len())
+}
+
+//go:noescape
+func (x {{.Name}}) storePart(s []{{.Base}})
 `
 
 const simdMaskFromValTemplate = `
@@ -492,8 +686,12 @@ func parseSIMDTypes(ops []Operation) simdTypeMap {
 		tagFieldS := fmt.Sprintf("%s v%d", tagFieldNameS, *arg.Bits)
 		valFieldS := fmt.Sprintf("vals%s[%d]%s", strings.Repeat(" ", len(tagFieldNameS)-3), lanes, base)
 		fields := fmt.Sprintf("\t%s\n\t%s", tagFieldS, valFieldS)
+		if arg.Class == "mask" && CurrentArch().isSVE() {
+			fields = fmt.Sprintf("\t%s psve\n\tvals uint%d", strings.ToLower(*arg.Go), maxVectorBits/8)
+		}
 		hasNot := CurrentArch().Arch == "arm64"
 		if arg.Class == "mask" {
+			// vectorCounterpart will only be used for fixed-width vector types.
 			vectorCounterpart := strings.ReplaceAll(*arg.Go, "Mask", "Int")
 			reshapedVectorWithAndOr := fmt.Sprintf("Int32x%d", *arg.Bits/32)
 			ret[*arg.Bits] = append(ret[*arg.Bits], simdType{*arg.Go, lanes, base, fields, arg.Class, vectorCounterpart, reshapedVectorWithAndOr, *arg.Bits, hasNot})
@@ -567,10 +765,22 @@ func typesFromTypeMap(typeMap simdTypeMap) []simdType {
 func writeSIMDTypes(buffer *bytes.Buffer, typeMap simdTypeMap) {
 	t := templateOf(simdTypesTemplates, "types_amd64")
 	loadStore := templateOf(simdLoadStoreTemplate, "loadstore_amd64")
+	scalableLoadStore := templateOf(simdScalableLoadStoreTemplate, "loadstore_scalable")
 	maskedLoadStore := templateOf(simdMaskedLoadStoreTemplate, "maskedloadstore_amd64")
 	maskFromVal := templateOf(simdMaskFromValTemplate, "maskFromVal_amd64")
 
 	buffer.WriteString(simdPackageHeader())
+
+	if CurrentArch().isSVE() {
+		// SVE predicates are represented as-is (a P register), not as data vectors,
+		// so their Go types are tagged with psve rather than a v<N> vector tag.
+		buffer.WriteString(`
+// psve is a tag type that tells the compiler that this is an SVE predicate.
+type psve struct {
+	_sve [0]func() // uncomparable
+}
+`)
+	}
 
 	sizes := make([]int, 0, len(typeMap))
 	for size, types := range typeMap {
@@ -591,11 +801,21 @@ func writeSIMDTypes(buffer *bytes.Buffer, typeMap simdTypeMap) {
 			if typeDef.Lanes == 1 {
 				continue
 			}
-			if err := t.ExecuteTemplate(buffer, "typeTmpl", typeDef); err != nil {
+			typeTmplName := "typeTmpl"
+			if typeDef.IsScalable() {
+				typeTmplName = "scalableTypeTmpl"
+			}
+			if err := t.ExecuteTemplate(buffer, typeTmplName, typeDef); err != nil {
 				panic(fmt.Errorf("failed to execute type template for type %s: %w", typeDef.Name, err))
 			}
 			if typeDef.Type != "mask" {
-				if err := loadStore.ExecuteTemplate(buffer, "loadstore_amd64", typeDef); err != nil {
+				// Scalable (SVE) types get a partial, slice-based load/store; the
+				// fixed-width types get the array load/store.
+				ls, lsName := loadStore, "loadstore_amd64"
+				if typeDef.IsScalable() {
+					ls, lsName = scalableLoadStore, "loadstore_scalable"
+				}
+				if err := ls.ExecuteTemplate(buffer, lsName, typeDef); err != nil {
 					panic(fmt.Errorf("failed to execute loadstore template for type %s: %w", typeDef.Name, err))
 				}
 				// restrict to AVX2 masked loads/stores first.
@@ -604,6 +824,12 @@ func writeSIMDTypes(buffer *bytes.Buffer, typeMap simdTypeMap) {
 						panic(fmt.Errorf("failed to execute maskedloadstore template for type %s: %w", typeDef.Name, err))
 					}
 				}
+			} else if CurrentArch().isSVE() {
+				// SVE predicates expose raw-bit memory APIs: exported wrappers that
+				// bounds-check (and may panic) around unexported PLDR/PSTR intrinsics.
+				if err := t.ExecuteTemplate(buffer, "sveMaskLoadStore", typeDef); err != nil {
+					panic(fmt.Errorf("failed to execute sveMaskLoadStore template for type %s: %w", typeDef.Name, err))
+				}
 			} else {
 				// ARM64 NEON comparisons produce all-0/all-1 per lane, so
 				// FromBits/ToBits (x86 mask register conversions) are not needed.
@@ -611,6 +837,14 @@ func writeSIMDTypes(buffer *bytes.Buffer, typeMap simdTypeMap) {
 					if err := maskFromVal.ExecuteTemplate(buffer, "maskFromVal_amd64", typeDef); err != nil {
 						panic(fmt.Errorf("failed to execute maskFromVal template for type %s: %w", typeDef.Name, err))
 					}
+				}
+			}
+			// Scalable types print only the lanes that exist at the runtime vector
+			// length, so their String is generated here rather than by tmplgen (which
+			// generates the fixed-width ones from a constant lane count).
+			if typeDef.IsScalable() {
+				if err := t.ExecuteTemplate(buffer, "sveStringTmpl", typeDef); err != nil {
+					panic(fmt.Errorf("failed to execute sveStringTmpl template for type %s: %w", typeDef.Name, err))
 				}
 			}
 		}
@@ -822,14 +1056,19 @@ func writeSIMDStubs(f, fI *bytes.Buffer, ops []Operation, typeMap simdTypeMap, d
 		}
 	}
 
-	masks := masksFromTypeMap(typeMap)
-	for _, mask := range masks {
-		tpl := stubTemplates.Get("mask")
-		if tpl == nil {
-			panic(fmt.Errorf("template mask not found"))
-		}
-		if err := tpl.Execute(f, mask); err != nil {
-			panic(fmt.Errorf("failed to execute mask template for mask %s: %w", mask.Name, err))
+	// The AVX mask stub declares mask methods (To/asMask/And/Or/Not) that treat a
+	// mask as its data-vector counterpart. An SVE predicate is a P-register with no
+	// such counterpart; its raw-bit memory APIs (Load/Store) are generated into
+	// types_sve.go instead, so nothing is emitted here for SVE masks.
+	if !CurrentArch().isSVE() {
+		for _, mask := range masksFromTypeMap(typeMap) {
+			tpl := stubTemplates.Get("mask")
+			if tpl == nil {
+				panic(fmt.Errorf("template mask not found"))
+			}
+			if err := tpl.Execute(f, mask); err != nil {
+				panic(fmt.Errorf("failed to execute mask template for mask %s: %w", mask.Name, err))
+			}
 		}
 	}
 }

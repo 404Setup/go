@@ -13,8 +13,9 @@ import (
 // merges them with existing ops from other architectures, and returns the
 // result as a buffer ready for writing.
 func writeSIMDGenericOps(buffer *bytes.Buffer, ops []Operation, genericOpsFilePath string) {
-	// Generate fresh ops for current arch.
-	currentArch := CurrentArch().Arch
+	// Generate fresh ops for the current target, keyed by GoTypeArch (see its doc
+	// in arch.go for why the shared-file merge must not key on Arch).
+	currentArch := CurrentArch().GoTypeArch
 	var newOps []sgutil.GenericOpsData
 	for _, op := range ops {
 		if op.NoGenericOps != nil && *op.NoGenericOps == "true" {
@@ -26,8 +27,10 @@ func writeSIMDGenericOps(buffer *bytes.Buffer, ops []Operation, genericOpsFilePa
 		_, _, _, immType, gOp, _ := op.shape()
 
 		newOps = append(newOps, sgutil.GenericOpsData{
-			OpName:  gOp.GenericName(),
-			OpInLen: len(gOp.In),
+			OpName: gOp.GenericName(),
+			// An implicit-all-true predicate is a machine-op input only; the
+			// generic op is unpredicated, so exclude it from the arg count.
+			OpInLen: len(gOp.In) - gOp.implicitPredCount(),
 			Comm:    op.Commutative,
 			HasAux:  immType == VarImm || immType == VarImmLim || immType == ConstVarImm,
 			Archs:   []string{currentArch},

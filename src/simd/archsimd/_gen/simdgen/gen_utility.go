@@ -164,6 +164,14 @@ func (op *Operation) shape() (shapeIn inShape, shapeOut outShape, maskType maskS
 	hasVreg := false
 	hasListIn := false
 	for _, in := range op.In {
+		if in.isImplicitAllTrue() {
+			// An SVE implicit-all-true governing predicate is not part of the Go
+			// API: it must not count as a mask input here, so the op classifies as
+			// an unpredicated (PureVregIn/NoMask) op. The machine op and lowering
+			// rule reconstruct it separately (regShape counts it by class; the rule
+			// synthesizes an all-true predicate).
+			continue
+		}
 		if in.ListNumber != nil {
 			hasListIn = true
 		}
@@ -347,6 +355,12 @@ func (op *Operation) regShape(mem memShape) (string, error) {
 		panic("simdgen does not understand memory as output as of now")
 	}
 	regInfo += fixedName
+	if CurrentArch().isSVE() && strings.HasPrefix(regInfo, "v") {
+		// SVE vectors live in the scalable Z bank, not the NEON V bank, so name
+		// their shapes with a "z" (z21, z11, ...). This keeps the generated
+		// lowering helpers (simdZ21) and regInfo keys distinct from NEON's.
+		regInfo = "z" + regInfo[1:]
+	}
 	return regInfo, nil
 }
 
@@ -409,6 +423,12 @@ func (op Operation) goNormalType() string {
 func (op Operation) SSAType() string {
 	if op.Out[0].Class == "greg" {
 		return fmt.Sprintf("types.Types[types.T%s]", strings.ToUpper(op.goNormalType()))
+	}
+	if op.Out[0].Class == "mask" && CurrentArch().isSVE() {
+		// SVE predicates are represented as-is (a real mask/P-register value),
+		// not as a data vector. On AVX a mask is a vector at the generic-op level
+		// (types.TypeVec*), so this only applies to the scalable target.
+		return "types.TypeMask"
 	}
 	return fmt.Sprintf("types.TypeVec%d", *op.Out[0].Bits)
 }
@@ -558,7 +578,9 @@ func classifyOp(op Operation) (string, Operation, error) {
 		}
 		return class, op, nil
 	} else {
-		switch l := len(gOp.In); l {
+		// Implicit-all-true predicates are machine-op inputs only; they are absent
+		// from the Go API, so they must not affect which opLenN/stub class is picked.
+		switch l := len(gOp.In) - gOp.implicitPredCount(); l {
 		case 1, 2, 3, 4:
 			class = classes[l]
 		default:
