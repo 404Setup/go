@@ -1,6 +1,6 @@
 env GO111MODULE=off
 
-[short] skip
+[GOARCH:riscv64] skip 'broken on riscv64: #81175'
 
 go test -coverpkg=all -covermode=atomic x
 stdout ok[\s\S]+?coverage

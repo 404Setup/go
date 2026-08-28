@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"simd/archsimd/_gen/simdgen/types"
 	"sort"
 	"strings"
 )
@@ -78,7 +79,7 @@ func writeSIMDMachineOps(buffer *bytes.Buffer, ops []Operation) {
 	// Determine the "best" version of an instruction to use
 	best := make(map[string]Operation)
 	var mOpOrder []string
-	countOverrides := func(s []Operand) int {
+	countOverrides := func(s []types.Operand) int {
 		a := 0
 		for _, o := range s {
 			if o.OverwriteBase != nil {
@@ -146,7 +147,11 @@ func writeSIMDMachineOps(buffer *bytes.Buffer, ops []Operation) {
 		var outType string
 		if shapeOut == OneVregOut || shapeOut == OneVregOutAtIn || shapeOut == OneVregOutScalar || gOp.Out[0].OverwriteClass != nil {
 			// If class overwrite is happening, that's not really a mask but a vreg.
-			outType = fmt.Sprintf("Vec%d", *gOp.Out[0].Bits)
+			if gOp.Out[0].Bits.Scalable {
+				outType = fmt.Sprintf("Vec%d", types.MaxVectorBits)
+			} else {
+				outType = fmt.Sprintf("Vec%d", gOp.Out[0].Bits.N())
+			}
 		} else if shapeOut == OneGregOut {
 			outType = gOp.GoType() // this is a straight Go type, not a VecNNN type
 		} else if shapeOut == OneKmaskOut {
@@ -181,7 +186,7 @@ func writeSIMDMachineOps(buffer *bytes.Buffer, ops []Operation) {
 		if hasMerging && !resultInArg0 {
 			// We have to copy the slice here because the sort will be visible from other
 			// aliases when no reslicing is happening.
-			newIn := make([]Operand, len(op.In), len(op.In)+1)
+			newIn := make([]types.Operand, len(op.In), len(op.In)+1)
 			copy(newIn, op.In)
 			op.In = newIn
 			op.In = append(op.In, op.Out[0])

@@ -1726,10 +1726,14 @@ func (t *Transport) dialConnFor(w *wantConn) {
 
 	const isClientConn = false
 	pc, err := t.dialConn(ctx, w.cm, isClientConn, nil)
+	if err == nil && pc.alt != nil {
+		// HTTP/2 and HTTP/3 connections can be shared.
+		// Add to the idle connection pool before trying to deliver to w.
+		t.putOrCloseIdleConn(pc)
+	}
 	delivered := w.tryDeliver(pc, err, time.Time{})
-	if err == nil && (!delivered || pc.alt != nil) {
-		// pconn was not passed to w,
-		// or it is HTTP/2 and can be shared.
+	if err == nil && !delivered && pc.alt == nil {
+		// HTTP/1 pconn was not passed to w.
 		// Add to the idle connection pool.
 		t.putOrCloseIdleConn(pc)
 	}
@@ -3205,7 +3209,7 @@ func schemePort(scheme string) string {
 
 func idnaASCIIFromURL(url *url.URL) string {
 	addr := url.Hostname()
-	if v, err := idnaASCII(addr); err == nil {
+	if v, err := idnaASCII(addr); err == nil && v != "" {
 		addr = v
 	}
 	return addr
