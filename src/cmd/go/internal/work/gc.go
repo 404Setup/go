@@ -6,6 +6,7 @@ package work
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"internal/buildcfg"
 	"internal/platform"
@@ -53,16 +54,14 @@ func pkgPath(a *Action) string {
 	return ppath
 }
 
-func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, pgoProfile, coverCfg string, gofiles []string) (ofile string, output []byte, err error) {
+func (gcToolchain) gc(b *Builder, a *Action, export string, importcfg, embedcfg []byte, symabis string, asmhdr bool, pgoProfile, coverCfg string, gofiles []string) (ofile string, output []byte, err error) {
 	p := a.Package
 	sh := b.Shell(a)
 	objdir := a.Objdir
-	if archive != "" {
-		ofile = archive
-	} else {
-		out := "_go_.o"
-		ofile = objdir + out
+	if export == "" {
+		export = objdir + "_go_.x"
 	}
+	ofile = objdir + "_go_.o"
 
 	pkgpath := pkgPath(a)
 	defaultGcFlags := []string{"-p", pkgpath}
@@ -133,7 +132,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 		defaultGcFlags = append(defaultGcFlags, fmt.Sprintf("-c=%d", c))
 	}
 
-	args := []any{cfg.BuildToolexec, base.Tool("compile"), "-o", ofile, "-trimpath", a.trimpath(), defaultGcFlags, gcflags}
+	args := []any{cfg.BuildToolexec, base.Tool("compile"), "-o", export, "-linkobj", ofile, "-trimpath", a.trimpath(), defaultGcFlags, gcflags}
 	if p.Internal.LocalPrefix == "" {
 		args = append(args, "-nolocalimports")
 	} else {
@@ -150,9 +149,6 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 			return "", nil, err
 		}
 		args = append(args, "-embedcfg", objdir+"embedcfg")
-	}
-	if ofile == archive {
-		args = append(args, "-pack")
 	}
 	if asmhdr {
 		args = append(args, "-asmhdr", objdir+"go_asm.h")
@@ -506,6 +502,22 @@ func packInternal(afile string, ofiles []string) error {
 			src.Close()
 			return err
 		}
+		if filepath.Base(ofile) == "_go_.o" {
+			header := []byte("!<arch>\n")
+			b := make([]byte, len(header))
+			// If this is an archive, copy the inner entries over.
+			if _, err := io.ReadFull(src, b[:]); err == nil && bytes.Equal(header, b) {
+				_, err := io.Copy(w, src)
+				src.Close()
+				if err != nil {
+					return fmt.Errorf("copying %s to %s: %v", ofile, afile, err)
+				}
+				continue
+			}
+			// Otherwise, seek back to the beginning and continue to add
+			// the full file to the archive.
+			src.Seek(0, 0)
+		}
 		// Note: Not using %-16.16s format because we care
 		// about bytes, not runes.
 		name := fi.Name()
@@ -571,14 +583,14 @@ func pluginPath(a *Action) string {
 		// For linking, use the main package's build ID instead of
 		// the binary's build ID, so it is the same hash used in
 		// compiling and linking.
-		// When compiling, we use actionID/actionID (instead of
-		// actionID/contentID) as a temporary build ID to compute
+		// When compiling, we use actionID/actionID/actionID, instead of
+		// actionID/contentID(export)/contentID(object), as a temporary build ID to compute
 		// the hash. Do the same here. (See buildid.go:useCache)
 		// The build ID matters because it affects the overall hash
 		// in the plugin's pseudo-import path returned below.
 		// We need to use the same import path when compiling and linking.
 		id := strings.Split(buildID, buildIDSeparator)
-		buildID = id[1] + buildIDSeparator + id[1]
+		buildID = id[1] + buildIDSeparator + id[1] + buildIDSeparator + id[1]
 	}
 	fmt.Fprintf(h, "build ID: %s\n", buildID)
 	for _, file := range str.StringList(p.GoFiles, p.CgoFiles, p.SFiles) {

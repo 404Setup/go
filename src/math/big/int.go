@@ -356,7 +356,7 @@ func (z *Int) Mod(x, y *Int) *Int {
 // See [Int.QuoRem] for T-division and modulus (like Go).
 func (z *Int) DivMod(x, y, m *Int) (*Int, *Int) {
 	y0 := y // save y
-	if z == y || alias(z.abs, y.abs) {
+	if z == y || m == y || alias(z.abs, y.abs) || alias(m.abs, y.abs) {
 		y0 = new(Int).Set(y)
 	}
 	z.QuoRem(x, y, m)
@@ -403,7 +403,7 @@ func (z *Int) Divide(x, y, r *Int, mode RoundingMode) (*Int, *Int) {
 		r_abs = r.abs
 	}
 	y_abs := y.abs // save y
-	if z == y || alias(z_abs, y.abs) {
+	if z == y || r == y || alias(z_abs, y.abs) || alias(r_abs, y.abs) {
 		y_abs = nat(nil).set(y.abs)
 	}
 	neg := x.neg != y.neg

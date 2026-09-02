@@ -373,7 +373,7 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	for _, a1 := range a.Deps {
 		p1 := a1.Package
 		if p1 != nil && p1 != p { // p can show up in its own action deps in a cache or cgo action
-			fmt.Fprintf(h, "import %s %s\n", p1.ImportPath, contentID(a1.buildID))
+			fmt.Fprintf(h, "import %s %s\n", p1.ImportPath, buildExportID(a1.buildID))
 		}
 		if a1.Mode == "preprocess PGO profile" {
 			fmt.Fprintf(h, "pgofile %s\n", b.fileHash(a1.built))
@@ -1454,6 +1454,17 @@ type vetConfig struct {
 	SucceedOnTypecheckFailure bool // awful hack; see #18395 and below
 }
 
+// exportConfig is the configuration passed to the export tool describing a single package.
+type exportConfig struct {
+	ImportPath  string            // package path
+	Compiler    string            // gc or gccgo, provided to makeTypesImporter
+	GoVersion   string            // minimum required Go version, such as "go1.21.0"
+	GoFiles     []string          // absolute paths to package source files
+	ImportMap   map[string]string // maps import path to package path
+	PackageFile map[string]string // maps package path to file of type information
+	Output      string            // where to write file of type information
+}
+
 // analysisModuleFromModulePublic converts a modinfo.ModulePublic to a analysis.Module.
 func analysisModuleFromModulePublic(m *modinfo.ModulePublic) *analysis.Module {
 	if m == nil {
@@ -1770,6 +1781,98 @@ cachemiss:
 	return nil
 }
 
+func (b *Builder) export(ctx context.Context, a *Action) error {
+	if err := b.doExport(a); err != nil {
+		return err
+	}
+	// Propagate artifacts to package on success.
+	a.Package.Export = a.built
+	a.Package.BuildID = a.buildID
+	return nil
+}
+
+func (b *Builder) doExport(a *Action) error {
+	// Build input, hash it, and check for cache hit.
+	ecfg := b.buildExportConfig(a)
+	if b.useCache(a, b.exportActionID(a, ecfg), a.Target, !b.IsCmdList) {
+		return nil
+	}
+	// Miss.
+	sh := b.Shell(a)
+	if err := sh.Mkdir(a.Objdir); err != nil {
+		return err
+	}
+	// Serialize input, call tool, and update build ID.
+	js, err := json.MarshalIndent(ecfg, "", "\t")
+	if err != nil {
+		return err
+	}
+	js = append(js, '\n')
+	in := a.Objdir + "export.cfg"
+	if err := sh.writeFile(in, js); err != nil {
+		return err
+	}
+	tool := base.Tool("export")
+	if err := sh.run(a.Package.Dir, a.Package.ImportPath, nil, cfg.BuildToolexec, tool, in); err != nil {
+		return err
+	}
+	if err := b.updateBuildID(a, a.Target); err != nil {
+		return err
+	}
+	a.built = a.Target
+	return nil
+}
+
+func (b *Builder) buildExportConfig(a *Action) *exportConfig {
+	v := gover.Local()
+	if a.Package.Module != nil {
+		v = a.Package.Module.GoVersion
+		if v == "" {
+			v = gover.DefaultGoModVersion
+		}
+	}
+
+	srcs := str.StringList(a.Package.GoFiles, a.Package.CgoFiles)
+	ecfg := &exportConfig{
+		ImportPath:  a.Package.ImportPath,
+		Compiler:    cfg.BuildToolchainName,
+		GoVersion:   "go" + v,
+		GoFiles:     make([]string, len(srcs)),
+		ImportMap:   make(map[string]string),
+		PackageFile: make(map[string]string),
+		Output:      a.Target,
+	}
+	for i, f := range srcs {
+		ecfg.GoFiles[i] = filepath.Join(a.Package.Dir, f)
+	}
+	for i, r := range a.Package.Internal.RawImports {
+		ecfg.ImportMap[r] = a.Package.Imports[i]
+	}
+	for _, dep := range a.Deps {
+		ecfg.PackageFile[dep.Package.ImportPath] = dep.built
+	}
+	return ecfg
+}
+
+func (b *Builder) exportActionID(a *Action, ecfg *exportConfig) cache.ActionID {
+	h := cache.NewHash("export " + a.Package.ImportPath)
+	// The tool binary itself.
+	fmt.Fprintf(h, "export %s\n", b.toolID("export"))
+	// Flags.
+	fmt.Fprintf(h, "importPath %s\n", ecfg.ImportPath)
+	fmt.Fprintf(h, "compiler %s\n", ecfg.Compiler)
+	fmt.Fprintf(h, "goVersion %s\n", ecfg.GoVersion)
+	// Source file contents.
+	for _, file := range ecfg.GoFiles {
+		fmt.Fprintf(h, "goFile %s %s\n", file, b.fileHash(file))
+	}
+	// Any dependencies.
+	for _, dep := range a.Deps {
+		fmt.Fprintf(h, "packageFile %s=%s\n", dep.Package.ImportPath, buildExportID(dep.buildID))
+	}
+	return cache.ActionID(h.Sum())
+}
+
 var stdoutMu sync.Mutex // serializes concurrent writes (of e.g. JSON values) to stdout
 
 // copyToStdout copies the stream to stdout while holding the lock.
@@ -1812,15 +1915,17 @@ func (b *Builder) linkActionID(a *Action) cache.ActionID {
 				if buildID == "" {
 					buildID = b.buildID(a1.built)
 				}
-				fmt.Fprintf(h, "packagefile %s=%s\n", p1.ImportPath, contentID(buildID))
+				fmt.Fprintf(h, "packagefile %s=%s\n", p1.ImportPath, buildObjectID(buildID))
 			}
-			// Because we put package main's full action ID into the binary's build ID,
-			// we must also put the full action ID into the binary's action ID hash.
+			// Because we put package main's action ID and object data content ID into the binary's build ID,
+			// we must also put the action ID and object data content ID into the binary's action ID hash.
+			// We only put in the object data content ID, which was hashed from everything other than the export data,
+			// and not the export data content ID, because the export data is not given to the linker.
 			if p1.Name == "main" {
-				fmt.Fprintf(h, "packagemain %s\n", a1.buildID)
+				fmt.Fprintf(h, "packagemain %s\n", buildActionID(a1.buildID)+buildIDSeparator+buildObjectID(a1.buildID))
 			}
 			if p1.Shlib != "" {
-				fmt.Fprintf(h, "packageshlib %s=%s\n", p1.ImportPath, contentID(b.buildID(p1.Shlib)))
+				fmt.Fprintf(h, "packageshlib %s=%s\n", p1.ImportPath, buildObjectID(b.buildID(p1.Shlib)))
 			}
 		}
 	}
@@ -2145,16 +2250,16 @@ func (b *Builder) linkSharedActionID(a *Action) cache.ActionID {
 			continue
 		}
 		if p1 != nil {
-			fmt.Fprintf(h, "packagefile %s=%s\n", p1.ImportPath, contentID(b.buildID(a1.built)))
+			fmt.Fprintf(h, "packagefile %s=%s\n", p1.ImportPath, buildObjectID(b.buildID(a1.built)))
 			if p1.Shlib != "" {
-				fmt.Fprintf(h, "packageshlib %s=%s\n", p1.ImportPath, contentID(b.buildID(p1.Shlib)))
+				fmt.Fprintf(h, "packageshlib %s=%s\n", p1.ImportPath, buildObjectID(b.buildID(p1.Shlib)))
 			}
 		}
 	}
 	// Files named on command line are special.
 	for _, a1 := range a.Deps[0].Deps {
 		p1 := a1.Package
-		fmt.Fprintf(h, "top %s=%s\n", p1.ImportPath, contentID(b.buildID(a1.built)))
+		fmt.Fprintf(h, "top %s=%s\n", p1.ImportPath, buildObjectID(b.buildID(a1.built)))
 	}
 
 	return h.Sum()

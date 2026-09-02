@@ -758,7 +758,7 @@ func (b *Writer) WriteString(s string) (int, error) {
 
 	sw, ok := b.wr.(io.StringWriter)
 
-	nn := 0
+	total := 0
 	if ok && b.Buffered() == 0 {
 		// Large write, empty buffer, and the underlying writer supports
 		// WriteString: forward the write to the underlying StringWriter.
@@ -768,34 +768,32 @@ func (b *Writer) WriteString(s string) (int, error) {
 		if n == len(s) || b.err != nil {
 			return n, b.err
 		}
-		nn = n
+		total = n
 		s = s[n:]
 	}
 
-	if len(s) > b.Available() {
-		for {
-			var n int
-			if b.Buffered() == 0 && ok {
-				n, b.err = sw.WriteString(s)
-			} else {
-				n = copy(b.buf[b.n:], s)
-				b.n += n
-				b.Flush()
-			}
-			nn += n
-			s = s[n:]
-			if len(s) <= b.Available() || b.err != nil {
-				break
-			}
+	for {
+		var n int
+		if ok && b.Buffered() == 0 {
+			n, b.err = sw.WriteString(s)
+		} else {
+			n = copy(b.buf[b.n:], s)
+			b.n += n
+			b.Flush()
+		}
+		total += n
+		s = s[n:]
+		if len(s) <= b.Available() || b.err != nil {
+			break
 		}
 	}
 	if b.err != nil {
-		return nn, b.err
+		return total, b.err
 	}
 	n := copy(b.buf[b.n:], s)
 	b.n += n
-	nn += n
-	return nn, nil
+	total += n
+	return total, nil
 }
 
 // ReadFrom implements [io.ReaderFrom]. If the underlying writer

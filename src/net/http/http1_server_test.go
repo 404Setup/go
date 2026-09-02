@@ -6,16 +6,103 @@ package http_test
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"internal/nettest"
-	"internal/synctest"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 )
+
+func TestHTTP1ServerInvalidTrailers(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request string
+	}{{
+		name: "invalid trailer",
+		request: joinCRLF(
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Trailer: Park",
+			"Transfer-Encoding: chunked",
+			"",
+			"3",
+			"xxx",
+			"0",
+			"I'm not a valid trailer",
+			"GET /smuggled HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 0",
+			"",
+		),
+	}, {
+		name: "trailer section ends with bare LF",
+		request: joinCRLF(
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Transfer-Encoding: chunked",
+			"",
+			"3",
+			"xxx",
+			"0",
+			"\nGET /smuggled HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 0",
+			"",
+		),
+	}, {
+		name: "trailer line ends with bare LF",
+		request: joinCRLF(
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Transfer-Encoding: chunked",
+			"",
+			"3",
+			"xxx",
+			"0",
+			"A: 1\nB: 2",
+			"",
+		),
+	}, {
+		name: "bare CR before end of trailers",
+		request: joinCRLF(
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Transfer-Encoding: chunked",
+			"",
+			"3",
+			"xxx",
+			"0",
+			"Foo: bar\r\r\n\r\n",
+		),
+	}} {
+		synctest.Subtest(t, test.name, func(t *testing.T) {
+			handler := newTestHandler(t)
+			st := newHTTP1ServerTest(t, handler.ServeHTTP)
+			defer handler.Close()
+
+			conn := st.dial()
+			conn.writeMessage(test.request)
+
+			call := handler.nextCall()
+			http.NewResponseController(call.w).EnableFullDuplex()
+			n, err := io.Copy(io.Discard, call.req.Body)
+			if err == nil {
+				t.Errorf("read %v request data bytes without error; want error", n)
+			}
+			call.exit()
+
+			// We should close the connection after sending the response.
+			conn.wantResponse("HTTP/1.1 200 OK", nil)
+			conn.wantClosed()
+		})
+	}
+}
 
 // An http1ServerTest tests an HTTP/1 server using a fake network.
 // It must be used in a synctest bubble.
@@ -82,6 +169,18 @@ func (tc *http1TestConn) writeMessage(lines ...string) {
 	}
 }
 
+// readRequest reads a request from the connection (not including the request body).
+func (tc *http1TestConn) readRequest() *http.Request {
+	t := tc.t
+	t.Helper()
+	synctest.Wait()
+	req, err := http.ReadRequest(tc.bufr)
+	if err != nil {
+		t.Fatalf("ReadRequest: %v", err)
+	}
+	return req
+}
+
 // readResponse reads a response from the connection (not including the response body).
 func (tc *http1TestConn) readResponse() *http.Response {
 	t := tc.t
@@ -92,6 +191,60 @@ func (tc *http1TestConn) readResponse() *http.Response {
 		t.Fatalf("ReadResponse: %v", err)
 	}
 	return resp
+}
+
+func (tc *http1TestConn) wantResponse(wantStart string, wantHeaders http.Header) {
+	t := tc.t
+	t.Helper()
+	synctest.Wait()
+	gotStart, err := tc.bufr.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read from conn: %q, %v; want start line %q", gotStart, err, wantStart)
+	}
+	if got, want := gotStart, wantStart+"\r\n"; got != want {
+		t.Fatalf("read start line:\n%q\nwant:\n%q", got, want)
+	}
+	gotHeaders := make(http.Header)
+	for {
+		line, err := tc.bufr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read from conn: %v (want header)", err)
+		}
+		line, ok := strings.CutSuffix(line, "\r\n")
+		if !ok {
+			t.Fatalf("header line has no CRLF suffix: %q", line)
+		}
+		if line == "" {
+			break
+		}
+		k, v, ok := strings.Cut(line, ": ")
+		if !ok {
+			t.Fatalf("invalid header line: %q", line)
+		}
+		gotHeaders[k] = append(gotHeaders[k], v)
+	}
+	for k, wantv := range wantHeaders {
+		gotv := gotHeaders[k]
+		if !slices.Equal(gotv, wantv) {
+			t.Errorf("header %v = %q, want %q", k, gotv, wantv)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+}
+
+// wantBytes asserts that the given bytes can be read from the connection.
+func (tc *http1TestConn) wantBytes(want []byte) {
+	t := tc.t
+	t.Helper()
+	synctest.Wait()
+	got := make([]byte, len(want))
+	n, err := io.ReadFull(tc.bufr, got)
+	got = got[:n]
+	if err != nil || !bytes.Equal(want, got) {
+		t.Fatalf("want bytes %q, got %q and error %v", want, got, err)
+	}
 }
 
 // wantIdle asserts that the connection is not closed and has no pending data to read.
@@ -115,18 +268,27 @@ func (tc *http1TestConn) wantClosed() {
 }
 
 type testHandler struct {
-	t     *testing.T
-	mu    sync.Mutex
-	calls []*testHandlerCall
+	t      *testing.T
+	mu     sync.Mutex
+	calls  []*testHandlerCall
+	closed bool
 }
 
 func newTestHandler(t *testing.T) *testHandler {
 	h := &testHandler{t: t}
-	t.Cleanup(h.Close)
+	t.Cleanup(func() {
+		// testHandler.Close should be called before the server shuts down.
+		// Catch the case where we forgot to do this.
+		if !h.closed {
+			t.Errorf("testHandler.Close not called")
+		}
+	})
 	return h
 }
 
 func (h *testHandler) Close() {
+	h.t.Helper()
+	synctest.Wait()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if len(h.calls) > 0 {
@@ -136,6 +298,7 @@ func (h *testHandler) Close() {
 		call.exit()
 	}
 	h.calls = nil
+	h.closed = true
 }
 
 func (h *testHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -145,6 +308,9 @@ func (h *testHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		ch:  make(chan func()),
 	}
 	h.mu.Lock()
+	if h.closed {
+		h.t.Errorf("test handler called after close")
+	}
 	h.calls = append(h.calls, call)
 	h.mu.Unlock()
 	for f := range call.ch {
@@ -189,4 +355,8 @@ func (call *testHandlerCall) exit() {
 	call.closeOnce.Do(func() {
 		close(call.ch)
 	})
+}
+
+func joinCRLF(s ...string) string {
+	return strings.Join(s, "\r\n")
 }

@@ -128,10 +128,10 @@ type Action struct {
 }
 
 // BuildActionID returns the action ID section of a's build ID.
-func (a *Action) BuildActionID() string { return actionID(a.buildID) }
+func (a *Action) BuildActionID() string { return buildActionID(a.buildID) }
 
 // BuildContentID returns the content ID section of a's build ID.
-func (a *Action) BuildContentID() string { return contentID(a.buildID) }
+func (a *Action) BuildContentID() string { return buildObjectID(a.buildID) }
 
 // BuildID returns a's build ID.
 func (a *Action) BuildID() string { return a.buildID }
@@ -859,6 +859,24 @@ func (b *Builder) vetAction(s *modload.Loader, mode, depMode BuildMode, p *load.
 		return a
 	})
 	return a
+}
+
+// ExportAction returns an action to export the type information of p.
+func (b *Builder) ExportAction(p *load.Package) *Action {
+	return b.cacheAction("export", p, func() *Action {
+		a := &Action{
+			Mode:    "export",
+			Package: p,
+			Deps:    make([]*Action, len(p.Internal.Imports)),
+			Actor:   ActorFunc((*Builder).export),
+			Objdir:  b.NewObjdir(),
+		}
+		a.Target = a.Objdir + "export"
+		for i, imp := range p.Internal.Imports {
+			a.Deps[i] = b.ExportAction(imp)
+		}
+		return a
+	})
 }
 
 // LinkAction returns the action for linking p into an executable
