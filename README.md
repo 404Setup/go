@@ -11,7 +11,6 @@ This fork is a personal Go branch maintained by 404Setup.
 
 - std: sync/v2 - It implements generic versions of `sync.Pool` and `sync.Map`, as well as an atomic ordered map.
 - std: sync/atomic/v2 - Implemented a generic version of `atomic.Value`
-- std: container/v2 - Implemented ordered containers
 - gc: Slightly optimized some parts of sync.Pool (I'm not sure if it works because its commits are mixed up with other commits, so I can't test it)
 - compiler: To resolve a passive, malicious memory leak bug from Kaspersky, GOFIPS140 was actually removed from the binary when it was disabled. Previously, it would always be compiled instead of being eliminated by the dead code eliminater.
 

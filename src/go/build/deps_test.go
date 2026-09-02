@@ -132,8 +132,6 @@ var depsRules = `
 	< container/heap
 	< unique;
 
-	sort < container/v2;
-
 	RUNTIME
 	< io;
 
