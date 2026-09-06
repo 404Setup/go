@@ -161,7 +161,7 @@ func init() {
 		gpspsbg    = gpspg.union(buildReg("SB"))
 		fp         = buildReg("F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 F25 F26 F27 F28 F29 F30 F31")
 		pred       = buildReg("P0 P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P12 P13 P14 P15")
-		callerSave = gp.union(fp).union(buildReg("g")) // runtime.setg (and anything calling it) may clobber g
+		callerSave = gp.union(fp).union(pred).union(buildReg("g")) // runtime.setg (and anything calling it) may clobber g
 		r25        = buildReg("R25")
 		r24to25    = buildReg("R24 R25")
 		f16to17    = buildReg("F16 F17")
@@ -203,7 +203,10 @@ func init() {
 		fp31           = regInfo{inputs: []regMask{fp, fp, fp}, outputs: []regMask{fp}}
 		fp2flags       = regInfo{inputs: []regMask{fp, fp}}
 		fp1flags       = regInfo{inputs: []regMask{fp}}
+		fp1predfp      = regInfo{inputs: []regMask{fp, pred}, outputs: []regMask{fp}}
 		fp2predpred    = regInfo{inputs: []regMask{fp, fp, pred}, outputs: []regMask{pred}}
+		fp2predfp      = regInfo{inputs: []regMask{fp, fp, pred}, outputs: []regMask{fp}}
+		fp3predfp      = regInfo{inputs: []regMask{fp, fp, fp, pred}, outputs: []regMask{fp}}
 		predload       = regInfo{inputs: []regMask{gpspsbg}, outputs: []regMask{pred}}
 		predstore      = regInfo{inputs: []regMask{gpspsbg, pred}}
 		fpload         = regInfo{inputs: []regMask{gpspsbg}, outputs: []regMask{fp}}
@@ -839,6 +842,10 @@ func init() {
 		// scalable Z bank reuses the fp register masks.
 		{name: "ZLDRload", argLength: 2, reg: fpload, aux: "SymOff", asm: "ZLDR", typ: "Vec256", faultOnNilArg0: true, symEffect: "Read"}, // load from arg0 + auxInt + aux.  arg1=mem.
 		{name: "ZSTRstore", argLength: 3, reg: fpstore, aux: "SymOff", asm: "ZSTR", faultOnNilArg0: true, symEffect: "Write"},             // store arg1 to arg0 + auxInt + aux.  arg2=mem.
+		{name: "ZSELB", argLength: 3, reg: fp2predfp, asm: "ZSEL", typ: "Vec256"},                                                         // arg0=x, arg1=y, arg2=predicate; per-element select, constructive.
+		{name: "ZSELH", argLength: 3, reg: fp2predfp, asm: "ZSEL", typ: "Vec256"},                                                         // arg0=x, arg1=y, arg2=predicate; per-element select, constructive.
+		{name: "ZSELS", argLength: 3, reg: fp2predfp, asm: "ZSEL", typ: "Vec256"},                                                         // arg0=x, arg1=y, arg2=predicate; per-element select, constructive.
+		{name: "ZSELD", argLength: 3, reg: fp2predfp, asm: "ZSEL", typ: "Vec256"},                                                         // arg0=x, arg1=y, arg2=predicate; per-element select, constructive.
 		{name: "PLDRload", argLength: 2, reg: predload, aux: "SymOff", asm: "PLDR", typ: "Mask", faultOnNilArg0: true, symEffect: "Read"}, // load a predicate from arg0 + auxInt + aux.  arg1=mem.
 		{name: "PSTRstore", argLength: 3, reg: predstore, aux: "SymOff", asm: "PSTR", faultOnNilArg0: true, symEffect: "Write"},           // store predicate arg1 to arg0 + auxInt + aux.  arg2=mem.
 		// PPFALSEB sets every bit of a predicate false, it's the zero value of a predicate.
@@ -896,7 +903,7 @@ func init() {
 		pkg:                "cmd/internal/obj/arm64",
 		genfile:            "../../arm64/ssa.go",
 		genSIMDfile:        "../../arm64/simdssa.go ../../arm64/simdssa_sve.go",
-		ops:                append(append(ops, simdARM64Ops(fp11, fp21, fp31, fpgp, fpgpfp, fp21)...), simdARM64SVEOps(fp11, fp21, fp2predpred)...),
+		ops:                append(append(ops, simdARM64Ops(fp11, fp21, fp31, fpgp, fpgpfp, fp21)...), simdARM64SVEOps(fp11, fp21, fp1predfp, fp2predpred, fp2predfp, fp2predfp, fp3predfp)...),
 		blocks:             blocks,
 		regnames:           regNamesARM64,
 		ParamIntRegNames:   "R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15",

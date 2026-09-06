@@ -155,9 +155,115 @@ func loToHiUint16Vec(x, lo archsimd.Uint16x8) archsimd.Uint16x8 {
 	return x.ReshapeToUint64s().BitsToFloat64().SetElem(1, lo.ReshapeToUint64s().BitsToFloat64().GetElem(0)).ToBits().ReshapeToUint16s()
 }
 
+// --- SVE predication peepholes ---
+//
+// IfElse over an unpredicated operation folds into that operation's
+// merging-predicated form. Merging keeps the destination, and an SVE predicated
+// instruction is destructive, so an "else" operand that is already one of the
+// sources folds into a bare predicated instruction; any other one first needs a
+// merging MOVPRFX to put it in the destination.
+
+func sveIfElseFoldsFirstOperand(x, y archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// arm64:`ZADD.*P[0-9]+\.M` -`ZSEL` -`ZMOVPRFX`
+	return x.Add(y).IfElse(m, x)
+}
+
+func sveIfElseFoldsSecondOperand(x, y archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// Commutative, so the mirrored form folds too.
+	// arm64:`ZADD.*P[0-9]+\.M` -`ZSEL` -`ZMOVPRFX`
+	return x.Add(y).IfElse(m, y)
+}
+
+func sveIfElseArbitraryElse(x, y, z archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// The else operand is neither source, so a merging MOVPRFX puts it in the
+	// destination and the destructive add merges over it.
+	// arm64:`ZMOVPRFX.*P[0-9]+\.M` `ZADD.*P[0-9]+\.M` -`ZSEL`
+	return x.Add(y).IfElse(m, z)
+}
+
+func sveMaskedFoldsIntoMerging(x, y archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// Masked is a select against zero. ADD has no zeroing-predicated form, so it
+	// folds into the merging one with the zero vector as the else operand.
+	// arm64:`ZMOVPRFX.*P[0-9]+\.M` `ZADD.*P[0-9]+\.M` -`ZSEL`
+	return x.Add(y).Masked(m)
+}
+
+//go:noinline
+func sinkInt8s(archsimd.Int8s) {}
+
+func sveIfElseMovprfx(x, y archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// The else operand is a source, but x stays live so the destructive add
+	// cannot write it. The whole register is copied, not just the active lanes,
+	// so this prefix is the unpredicated MOVPRFX.
+	// arm64:`ZMOVPRFX` `ZADD.*P[0-9]+\.M` -`ZMOVPRFX.*P[0-9]+`
+	r := x.Add(y).IfElse(m, x)
+	sinkInt8s(x)
+	return r
+}
+
+// A non-commutative operation is more restricted. Its destructive operand is
+// fixed, so only an "else" operand that is already that one folds, and there is
+// no prefixed form to place any other.
+
+func sveIfElseFoldsSubMinuend(x, y archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// arm64:`ZSUB.*P[0-9]+\.M` -`ZSEL`
+	return x.Sub(y).IfElse(m, x)
+}
+
+func sveIfElseKeepsSelectSubSubtrahend(x, y archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// Folding here would compute y-x.
+	// arm64:`ZSEL` -`ZSUB.*P[0-9]+\.M`
+	return x.Sub(y).IfElse(m, y)
+}
+
+func sveIfElseKeepsSelectSubArbitrary(x, y, z archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// arm64:`ZSEL` -`ZMOVPRFX` -`ZSUB.*P[0-9]+\.M`
+	return x.Sub(y).IfElse(m, z)
+}
+
+// An operation that only comes predicated reaches its unpredicated API through
+// an all-true predicate. A select over it replaces that predicate instead of
+// adding an instruction.
+
+func sveAbsSynthesizesAllTrue(x archsimd.Int8s) archsimd.Int8s {
+	// arm64:`PWHILELT` `ZABS.*P[0-9]+\.M`
+	return x.Abs()
+}
+
+func sveAbsIfElseFoldsToMerging(x, z archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// ABS names its destination apart from its source, so the else operand is an
+	// operand of the instruction: no select, no MOVPRFX, and the all-true
+	// predicate is gone because the select's mask took its place.
+	// arm64:`ZABS.*P[0-9]+\.M` -`ZSEL` -`PWHILELT` -`ZMOVPRFX`
+	return x.Abs().IfElse(m, z)
+}
+
+func sveAbsMaskedFoldsToMerging(x archsimd.Int8s, m archsimd.Mask8s) archsimd.Int8s {
+	// Masked folds through the same rule, with the zero vector as the else
+	// operand. Zeroing predication would save the ZDUP, but ABS only has a
+	// zeroing encoding from Armv9.6-A on.
+	// arm64:`ZABS.*P[0-9]+\.M` -`ZSEL` -`PWHILELT`
+	return x.Abs().Masked(m)
+}
+
+func sveIfElseFloat(x, y archsimd.Float64s, m archsimd.Mask64s) archsimd.Float64s {
+	// arm64:`ZFADD.*P[0-9]+\.M` -`ZSEL`
+	return x.Add(y).IfElse(m, x)
+}
+
 // The zero value of a mask is an all-false predicate.
 func sveZeroMask() archsimd.Mask8s {
 	// arm64:`PPFALSE` -`ZDUP`
 	var m archsimd.Mask8s
 	return m
+}
+
+// An operation whose unpredicated encoding needs SVE2 lowers to it only in
+// blocks where the cpufeatures analysis proves SVE2; elsewhere it lowers to
+// its baseline-SVE merging-predicated sibling under an all-true predicate.
+func sveMulSVE2Gate(x, y archsimd.Int8s) archsimd.Int8s {
+	if archsimd.ARM64.SVE2() {
+		return x.Mul(y) // arm64:`ZMUL\s+Z[0-9]+\.B, Z[0-9]+\.B, Z[0-9]+\.B`
+	}
+	return x.Mul(y) // arm64:`PWHILELT` `ZMUL.*P[0-9]+\.M`
 }
