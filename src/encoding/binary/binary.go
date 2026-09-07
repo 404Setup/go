@@ -27,7 +27,7 @@ import (
 	"math"
 	"reflect"
 	"slices"
-	"sync"
+	"sync/v2"
 )
 
 var errBufferTooSmall = errors.New("buffer too small")
@@ -689,7 +689,7 @@ func Size(v any) int {
 	return dataSize(reflect.Indirect(reflect.ValueOf(v)))
 }
 
-var structSize sync.Map // map[reflect.Type]int
+var structSize sync.Map[reflect.Type, int] // map[reflect.Type]int
 
 // dataSize returns the number of bytes the actual data represented by v occupies in memory.
 // For compound structures, it sums the sizes of the elements. Thus, for instance, for a slice
@@ -700,7 +700,7 @@ func dataSize(v reflect.Value) int {
 	case reflect.Slice, reflect.Array:
 		t := v.Type().Elem()
 		if size, ok := structSize.Load(t); ok {
-			return size.(int) * v.Len()
+			return size * v.Len()
 		}
 
 		size := sizeof(t)
@@ -714,7 +714,7 @@ func dataSize(v reflect.Value) int {
 	case reflect.Struct:
 		t := v.Type()
 		if size, ok := structSize.Load(t); ok {
-			return size.(int)
+			return size
 		}
 		size := sizeof(t)
 		structSize.Store(t, size)

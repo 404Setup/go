@@ -17,7 +17,7 @@ package json
 
 import (
 	"strconv"
-	"sync"
+	"sync/v2"
 )
 
 // Valid reports whether data is a valid JSON encoding.
@@ -86,14 +86,14 @@ type scanner struct {
 	bytes int64
 }
 
-var scannerPool = sync.Pool{
-	New: func() any {
+var scannerPool = sync.Pool[*scanner]{
+	New: func() *scanner {
 		return &scanner{}
 	},
 }
 
 func newScanner() *scanner {
-	scan := scannerPool.Get().(*scanner)
+	scan := scannerPool.Get()
 	// scan.reset by design doesn't set bytes to zero
 	scan.bytes = 0
 	scan.reset()

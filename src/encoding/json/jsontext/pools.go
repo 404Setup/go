@@ -10,7 +10,7 @@ import (
 	"bytes"
 	"io"
 	"math/bits"
-	"sync"
+	"sync/v2"
 )
 
 // TODO(https://go.dev/issue/47657): Use sync.PoolOf.
@@ -20,17 +20,17 @@ var (
 	// Since the buffer can get arbitrarily large in normal usage,
 	// there is statistical tracking logic to determine whether to recycle
 	// the internal buffer or not based on a history of utilization.
-	bufferedEncoderPool = &sync.Pool{New: func() any { return new(Encoder) }}
+	bufferedEncoderPool = &sync.Pool[*Encoder]{New: func() *Encoder { return new(Encoder) }}
 
 	// This owns the internal buffer, but it is only used to temporarily store
 	// buffered JSON before flushing it to the underlying io.Writer.
 	// In a sufficiently efficient streaming mode, we do not expect the buffer
 	// to grow arbitrarily large. Thus, we avoid recycling large buffers.
-	streamingEncoderPool = &sync.Pool{New: func() any { return new(Encoder) }}
+	streamingEncoderPool = &sync.Pool[*Encoder]{New: func() *Encoder { return new(Encoder) }}
 
 	// This does not own the internal buffer since
 	// it is taken directly from the provided bytes.Buffer.
-	bytesBufferEncoderPool = &sync.Pool{New: func() any { return new(Encoder) }}
+	bytesBufferEncoderPool = &sync.Pool[*Encoder]{New: func() *Encoder { return new(Encoder) }}
 )
 
 // bufferStatistics is statistics to track buffer utilization.
@@ -42,7 +42,7 @@ type bufferStatistics struct {
 }
 
 func getBufferedEncoder(opts ...Options) *Encoder {
-	e := bufferedEncoderPool.Get().(*Encoder)
+	e := bufferedEncoderPool.Get()
 	if e.s.Buf == nil {
 		// Round up to nearest 2ⁿ to make best use of malloc size classes.
 		// See runtime/sizeclasses.go on Go1.15.
@@ -89,11 +89,11 @@ func putBufferedEncoder(e *Encoder) {
 
 func getStreamingEncoder(w io.Writer, opts ...Options) *Encoder {
 	if _, ok := w.(*bytes.Buffer); ok {
-		e := bytesBufferEncoderPool.Get().(*Encoder)
+		e := bytesBufferEncoderPool.Get()
 		e.s.reset(nil, w, opts...) // buffer taken from bytes.Buffer
 		return e
 	} else {
-		e := streamingEncoderPool.Get().(*Encoder)
+		e := streamingEncoderPool.Get()
 		e.s.reset(e.s.Buf[:0], w, opts...) // preserve existing buffer
 		return e
 	}
@@ -116,13 +116,13 @@ func putStreamingEncoder(e *Encoder) {
 
 var (
 	// This does not own the internal buffer since it is externally provided.
-	bufferedDecoderPool = &sync.Pool{New: func() any { return new(Decoder) }}
+	bufferedDecoderPool = &sync.Pool[*Decoder]{New: func() *Decoder { return new(Decoder) }}
 
 	// This owns the internal buffer, but it is only used to temporarily store
 	// buffered JSON fetched from the underlying io.Reader.
 	// In a sufficiently efficient streaming mode, we do not expect the buffer
 	// to grow arbitrarily large. Thus, we avoid recycling large buffers.
-	streamingDecoderPool = &sync.Pool{New: func() any { return new(Decoder) }}
+	streamingDecoderPool = &sync.Pool[*Decoder]{New: func() *Decoder { return new(Decoder) }}
 
 	// This does not own the internal buffer since
 	// it is taken directly from the provided bytes.Buffer.
@@ -130,7 +130,7 @@ var (
 )
 
 func getBufferedDecoder(b []byte, opts ...Options) *Decoder {
-	d := bufferedDecoderPool.Get().(*Decoder)
+	d := bufferedDecoderPool.Get()
 	d.s.reset(b, nil, opts...)
 	return d
 }
@@ -141,11 +141,11 @@ func putBufferedDecoder(d *Decoder) {
 
 func getStreamingDecoder(r io.Reader, opts ...Options) *Decoder {
 	if _, ok := r.(*bytes.Buffer); ok {
-		d := bytesBufferDecoderPool.Get().(*Decoder)
+		d := bytesBufferDecoderPool.Get()
 		d.s.reset(nil, r, opts...) // buffer taken from bytes.Buffer
 		return d
 	} else {
-		d := streamingDecoderPool.Get().(*Decoder)
+		d := streamingDecoderPool.Get()
 		d.s.reset(d.s.buf[:0], r, opts...) // preserve existing buffer
 		return d
 	}

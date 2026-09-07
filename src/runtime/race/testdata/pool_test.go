@@ -6,6 +6,7 @@ package race_test
 
 import (
 	"sync"
+	syncv2 "sync/v2"
 	"testing"
 	"time"
 )
@@ -42,6 +43,43 @@ func TestNoRacePool(t *testing.T) {
 		}()
 		time.Sleep(100 * time.Millisecond)
 		x = p.Get().([]byte)
+		x[0] = 3
+	}
+}
+
+func TestRacePoolV2(t *testing.T) {
+	for range 10 {
+		c := make(chan bool)
+		p := &syncv2.Pool[[]byte]{New: func() []byte { return make([]byte, 10) }}
+		x := p.Get()
+		x[0] = 1
+		p.Put(x)
+		go func() {
+			y, ok := p.GetOK()
+			if !ok {
+				panic("GetOK with New returned false")
+			}
+			y[0] = 2
+			c <- true
+		}()
+		x[0] = 3 // Access after Put must still be reported as a race.
+		<-c
+	}
+}
+
+func TestNoRacePoolV2(t *testing.T) {
+	for range 10 {
+		p := &syncv2.Pool[[]byte]{New: func() []byte { return make([]byte, 10) }}
+		x := p.Get()
+		x[0] = 1
+		p.Put(x)
+		go func() {
+			y, _ := p.GetOK()
+			y[0] = 2
+			p.Put(y)
+		}()
+		time.Sleep(100 * time.Millisecond)
+		x = p.Get()
 		x[0] = 3
 	}
 }

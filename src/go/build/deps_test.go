@@ -124,7 +124,9 @@ var depsRules = `
 	< iter
 	< maps, slices;
 
-	internal/oserror, maps, slices
+	sync, iter < sync/v2;
+
+	internal/oserror, maps, slices, sync/v2
 	< RUNTIME;
 
 	RUNTIME
@@ -231,7 +233,7 @@ var depsRules = `
 	arena, strconv, unicode
 	< reflect;
 
-	reflect < sync/v2;
+	reflect, sync/v2 < sync/v2/container;
 
 	os, reflect
 	< internal/fmtsort

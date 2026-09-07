@@ -23,7 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -273,8 +273,8 @@ func newBufferedWriter(conn net.Conn, timeout time.Duration) *bufferedWriter {
 // not much thought went into it.
 const bufWriterPoolBufferSize = 4 << 10
 
-var bufWriterPool = sync.Pool{
-	New: func() any {
+var bufWriterPool = sync.Pool[*bufio.Writer]{
+	New: func() *bufio.Writer {
 		return bufio.NewWriterSize(nil, bufWriterPoolBufferSize)
 	},
 }
@@ -291,7 +291,7 @@ func (w *bufferedWriter) Write(p []byte) (n int, err error) {
 		return 0, w.werr
 	}
 	if w.bw == nil {
-		bw := bufWriterPool.Get().(*bufio.Writer)
+		bw := bufWriterPool.Get()
 		bw.Reset((*bufferedWriterTimeoutWriter)(w))
 		w.bw = bw
 	}
@@ -377,7 +377,7 @@ type connectionStater interface {
 	ConnectionState() tls.ConnectionState
 }
 
-var sorterPool = sync.Pool{New: func() any { return new(sorter) }}
+var sorterPool = sync.Pool[*sorter]{New: func() *sorter { return new(sorter) }}
 
 type sorter struct {
 	v []string // owned by sorter

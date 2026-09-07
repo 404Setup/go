@@ -24,7 +24,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"sync"
+	"sync/v2"
 	"testing"
 )
 
@@ -479,7 +479,7 @@ func BenchmarkTypeFieldsCache(b *testing.B) {
 
 	// clearClear clears the cache. Other JSON operations, must not be running.
 	clearCache := func() {
-		fieldCache = sync.Map{}
+		fieldCache = sync.Map[reflect.Type, structFields]{}
 	}
 
 	// MissTypes tests the performance of repeated cache misses.

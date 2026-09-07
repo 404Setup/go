@@ -17,8 +17,8 @@ import (
 	"hash"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
+	"sync/v2"
 	"time"
 )
 
@@ -836,7 +836,7 @@ func (c *Conn) retryReadRecord(expectChangeCipherSpec bool) error {
 // time, so that idle connections do not each pin a record-sized buffer.
 // Only buffers with capacity above maxIdleInputCap are pooled; smaller
 // buffers stay attached to their connection.
-var rawInputPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+var rawInputPool = sync.Pool[*bytes.Buffer]{New: func() *bytes.Buffer { return new(bytes.Buffer) }}
 
 // maxIdleInputCap is the largest rawInput capacity that a connection
 // keeps while waiting for a new record to arrive. It is large enough to
@@ -849,13 +849,13 @@ const maxIdleInputCap = 1024
 // returns its buffer to the pool once the handshake completes and after
 // buffered post-handshake messages have been consumed, so that
 // established connections do not pin it.
-var handPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+var handPool = sync.Pool[*bytes.Buffer]{New: func() *bytes.Buffer { return new(bytes.Buffer) }}
 
 // handBuf returns c.hand for writing, getting a buffer from handPool if
 // c.hand is nil.
 func (c *Conn) handBuf() *bytes.Buffer {
 	if c.hand == nil {
-		c.hand = handPool.Get().(*bytes.Buffer)
+		c.hand = handPool.Get()
 	}
 	return c.hand
 }
@@ -899,7 +899,7 @@ func (c *Conn) readFromUntil(r io.Reader, n int) error {
 		// Growing past maxIdleInputCap: switch to a pooled buffer so
 		// that record-sized buffers are recycled across connections
 		// rather than allocated for every record.
-		b := rawInputPool.Get().(*bytes.Buffer)
+		b := rawInputPool.Get()
 		b.Write(c.rawInput.Bytes())
 		if c.rawInput == c.smallInput {
 			c.smallInput.Reset()
@@ -1070,8 +1070,8 @@ func (c *Conn) flush() (int, error) {
 }
 
 // outBufPool pools the record-sized scratch buffers used by writeRecordLocked.
-var outBufPool = sync.Pool{
-	New: func() any {
+var outBufPool = sync.Pool[*[]byte]{
+	New: func() *[]byte {
 		return new([]byte)
 	},
 }
@@ -1092,7 +1092,7 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 		return len(data), nil
 	}
 
-	outBufPtr := outBufPool.Get().(*[]byte)
+	outBufPtr := outBufPool.Get()
 	outBuf := *outBufPtr
 	defer func() {
 		// You might be tempted to simplify this by just passing &outBuf to Put,

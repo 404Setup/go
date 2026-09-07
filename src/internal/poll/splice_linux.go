@@ -7,7 +7,7 @@ package poll
 import (
 	"internal/syscall/unix"
 	"runtime"
-	"sync"
+	"sync/v2"
 	"syscall"
 )
 
@@ -184,9 +184,9 @@ type splicePipe struct {
 // splicePipePool caches pipes to avoid high-frequency construction and destruction of pipe buffers.
 // The garbage collector will free all pipes in the sync.Pool periodically, thus we need to set up
 // a finalizer for each pipe to close its file descriptors before the actual GC.
-var splicePipePool = sync.Pool{New: newPoolPipe}
+var splicePipePool = sync.Pool[*splicePipe]{New: newPoolPipe}
 
-func newPoolPipe() any {
+func newPoolPipe() *splicePipe {
 	// Discard the error which occurred during the creation of pipe buffer,
 	// redirecting the data transmission to the conventional way utilizing read() + write() as a fallback.
 	p := newPipe()
@@ -206,7 +206,7 @@ func getPipe() (*splicePipe, error) {
 	if v == nil {
 		return nil, syscall.EINVAL
 	}
-	return v.(*splicePipe), nil
+	return v, nil
 }
 
 func putPipe(p *splicePipe) {

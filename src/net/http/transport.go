@@ -30,8 +30,8 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"sync/v2"
 	"time"
 	_ "unsafe"
 
@@ -3269,11 +3269,11 @@ type eofReader struct{}
 func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
 func (eofReader) ReadByte() (byte, error)  { return 0, io.EOF }
 
-var gzipPool = sync.Pool{New: func() any { return new(gzip.Reader) }}
+var gzipPool = sync.Pool[*gzip.Reader]{New: func() *gzip.Reader { return new(gzip.Reader) }}
 
 // gzipPoolGet gets a gzip.Reader from the pool and resets it to read from r.
 func gzipPoolGet(r io.Reader) (*gzip.Reader, error) {
-	zr := gzipPool.Get().(*gzip.Reader)
+	zr := gzipPool.Get()
 	if err := zr.Reset(r); err != nil {
 		gzipPoolPut(zr)
 		return nil, err

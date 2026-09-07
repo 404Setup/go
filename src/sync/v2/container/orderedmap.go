@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sync
+package container
 
 import (
 	isync "internal/sync"
@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync/atomic"
+	"sync/v2"
 )
 
 // OrderedMap is like a Go map[K]V but is safe for concurrent use and iterates
@@ -25,14 +26,14 @@ import (
 type OrderedMap[K comparable, V any] struct {
 	_ noCopy
 
-	shrinkMu RWMutex
+	shrinkMu sync.RWMutex
 	state    atomic.Pointer[orderedMapState[K, V]]
 }
 
 type orderedMapState[K comparable, V any] struct {
 	index isync.HashTrieMap[K, *orderedMapEntry[K, V]]
 
-	appendMu Mutex
+	appendMu sync.Mutex
 	head     atomic.Pointer[orderedMapEntry[K, V]]
 	tail     atomic.Pointer[orderedMapEntry[K, V]]
 }

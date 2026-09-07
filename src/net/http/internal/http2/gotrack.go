@@ -14,8 +14,8 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"sync"
 	"sync/atomic"
+	"sync/v2"
 )
 
 var DebugGoroutines = os.Getenv("DEBUG_HTTP2_GOROUTINES") == "1"
@@ -60,7 +60,7 @@ func (g goroutineLock) checkNotOn() {
 var goroutineSpace = []byte("goroutine ")
 
 func curGoroutineID() uint64 {
-	bp := littleBuf.Get().(*[]byte)
+	bp := littleBuf.Get()
 	defer littleBuf.Put(bp)
 	b := *bp
 	b = b[:runtime.Stack(b, false)]
@@ -78,8 +78,8 @@ func curGoroutineID() uint64 {
 	return n
 }
 
-var littleBuf = sync.Pool{
-	New: func() any {
+var littleBuf = sync.Pool[*[]byte]{
+	New: func() *[]byte {
 		buf := make([]byte, 64)
 		return &buf
 	},

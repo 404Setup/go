@@ -13,7 +13,7 @@ import (
 	"log"
 	"slices"
 	"strings"
-	"sync"
+	"sync/v2"
 
 	"net/http/internal/httpsfv"
 
@@ -228,8 +228,8 @@ func (h *FrameHeader) invalidate() { h.valid = false }
 
 // frame header bytes.
 // Used only by ReadFrameHeader.
-var fhBytes = sync.Pool{
-	New: func() any {
+var fhBytes = sync.Pool[*[]byte]{
+	New: func() *[]byte {
 		buf := make([]byte, frameHeaderLen)
 		return &buf
 	},
@@ -243,7 +243,7 @@ func invalidHTTP1LookingFrameHeader() FrameHeader {
 // ReadFrameHeader reads 9 bytes from r and returns a FrameHeader.
 // Most users should use Framer.ReadFrame instead.
 func ReadFrameHeader(r io.Reader) (FrameHeader, error) {
-	bufp := fhBytes.Get().(*[]byte)
+	bufp := fhBytes.Get()
 	defer fhBytes.Put(bufp)
 	return readFrameHeader(*bufp, r)
 }

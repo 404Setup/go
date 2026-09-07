@@ -9,7 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"runtime"
-	"sync"
+	"sync/v2"
 	"syscall"
 	"unsafe"
 )
@@ -38,8 +38,8 @@ const (
 	dirBufSize = 64 * 1024 // 64kB
 )
 
-var dirBufPool = sync.Pool{
-	New: func() any {
+var dirBufPool = sync.Pool[*[]byte]{
+	New: func() *[]byte {
 		// The buffer must be at least a block long.
 		buf := make([]byte, dirBufSize)
 		return &buf
@@ -112,7 +112,7 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.buf == nil {
-		d.buf = dirBufPool.Get().(*[]byte)
+		d.buf = dirBufPool.Get()
 	}
 
 	wantAll := n <= 0

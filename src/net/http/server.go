@@ -29,8 +29,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"sync/v2"
 	"time"
 	_ "unsafe" // for linkname
 
@@ -881,17 +881,17 @@ func (cr *connReader) Read(p []byte) (n int, err error) {
 }
 
 var (
-	bufioReaderPool   sync.Pool
-	bufioWriter2kPool sync.Pool
-	bufioWriter4kPool sync.Pool
+	bufioReaderPool   sync.Pool[*bufio.Reader]
+	bufioWriter2kPool sync.Pool[*bufio.Writer]
+	bufioWriter4kPool sync.Pool[*bufio.Writer]
 )
 
 const copyBufPoolSize = 32 * 1024
 
-var copyBufPool = sync.Pool{New: func() any { return new([copyBufPoolSize]byte) }}
+var copyBufPool = sync.Pool[*[copyBufPoolSize]byte]{New: func() *[copyBufPoolSize]byte { return new([copyBufPoolSize]byte) }}
 
 func getCopyBuf() []byte {
-	return copyBufPool.Get().(*[copyBufPoolSize]byte)[:]
+	return copyBufPool.Get()[:]
 }
 
 func putCopyBuf(b []byte) {
@@ -901,7 +901,7 @@ func putCopyBuf(b []byte) {
 	copyBufPool.Put((*[copyBufPoolSize]byte)(b))
 }
 
-func bufioWriterPool(size int) *sync.Pool {
+func bufioWriterPool(size int) *sync.Pool[*bufio.Writer] {
 	switch size {
 	case 2 << 10:
 		return &bufioWriter2kPool
@@ -913,7 +913,7 @@ func bufioWriterPool(size int) *sync.Pool {
 
 func newBufioReader(r io.Reader) *bufio.Reader {
 	if v := bufioReaderPool.Get(); v != nil {
-		br := v.(*bufio.Reader)
+		br := v
 		br.Reset(r)
 		return br
 	}
@@ -931,7 +931,7 @@ func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	pool := bufioWriterPool(size)
 	if pool != nil {
 		if v := pool.Get(); v != nil {
-			bw := v.(*bufio.Writer)
+			bw := v
 			bw.Reset(w)
 			return bw
 		}

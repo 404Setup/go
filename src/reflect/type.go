@@ -21,7 +21,7 @@ import (
 	"iter"
 	"runtime"
 	"strconv"
-	"sync"
+	"sync/v2"
 	"unicode"
 	"unicode/utf8"
 	"unsafe"
@@ -1380,7 +1380,7 @@ func rtypeOf(i any) *abi.Type {
 }
 
 // ptrMap is the cache for PointerTo.
-var ptrMap sync.Map // map[*rtype]*ptrType
+var ptrMap sync.Map[*rtype, *ptrType] // map[*rtype]*ptrType
 
 // PtrTo returns the pointer type with element t.
 // For example, if t represents type Foo, PtrTo(t) represents *Foo.
@@ -1407,7 +1407,7 @@ func (t *rtype) ptrTo() *abi.Type {
 
 	// Check the cache.
 	if pi, ok := ptrMap.Load(t); ok {
-		return &pi.(*ptrType).Type
+		return &pi.Type
 	}
 
 	// Look in known types.
@@ -1418,7 +1418,7 @@ func (t *rtype) ptrTo() *abi.Type {
 			continue
 		}
 		pi, _ := ptrMap.LoadOrStore(t, p)
-		return &pi.(*ptrType).Type
+		return &pi.Type
 	}
 
 	// Create a new ptrType starting with the description
@@ -1440,7 +1440,7 @@ func (t *rtype) ptrTo() *abi.Type {
 	pp.Elem = at
 
 	pi, _ := ptrMap.LoadOrStore(t, &pp)
-	return &pi.(*ptrType).Type
+	return &pi.Type
 }
 
 func ptrTo(t *abi.Type) *abi.Type {
@@ -1791,7 +1791,7 @@ func typesByString(s string) []*abi.Type {
 }
 
 // The lookupCache caches ArrayOf, ChanOf, MapOf and SliceOf lookups.
-var lookupCache sync.Map // map[cacheKey]*rtype
+var lookupCache sync.Map[cacheKey, *rtype] // map[cacheKey]*rtype
 
 // A cacheKey is the key for use in the lookupCache.
 // Four values describe any of the types we are looking for:
@@ -1811,7 +1811,7 @@ var funcLookupCache struct {
 
 	// m is a map[uint32][]*rtype keyed by the hash calculated in FuncOf.
 	// Elements of m are append-only and thus safe for concurrent reading.
-	m sync.Map
+	m sync.Map[uint32, []*abi.Type]
 }
 
 // ChanOf returns the channel type with the given direction and element type.
@@ -1826,7 +1826,7 @@ func ChanOf(dir ChanDir, t Type) Type {
 	// Look in cache.
 	ckey := cacheKey{Chan, typ, nil, uintptr(dir)}
 	if ch, ok := lookupCache.Load(ckey); ok {
-		return ch.(*rtype)
+		return ch
 	}
 
 	// This restriction is imposed by the gc compiler and the runtime.
@@ -1859,7 +1859,7 @@ func ChanOf(dir ChanDir, t Type) Type {
 		ch := (*chanType)(unsafe.Pointer(tt))
 		if ch.Elem == typ && ch.Dir == abi.ChanDir(dir) {
 			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
-			return ti.(Type)
+			return ti
 		}
 	}
 
@@ -1874,7 +1874,7 @@ func ChanOf(dir ChanDir, t Type) Type {
 	ch.Elem = typ
 
 	ti, _ := lookupCache.LoadOrStore(ckey, toRType(&ch.Type))
-	return ti.(Type)
+	return ti
 }
 
 var funcTypes []Type
@@ -1958,7 +1958,7 @@ func FuncOf(in, out []Type, variadic bool) Type {
 
 	// Look in cache.
 	if ts, ok := funcLookupCache.m.Load(hash); ok {
-		for _, t := range ts.([]*abi.Type) {
+		for _, t := range ts {
 			if haveIdenticalUnderlyingType(&ft.Type, t, true) {
 				return toRType(t)
 			}
@@ -1969,7 +1969,7 @@ func FuncOf(in, out []Type, variadic bool) Type {
 	funcLookupCache.Lock()
 	defer funcLookupCache.Unlock()
 	if ts, ok := funcLookupCache.m.Load(hash); ok {
-		for _, t := range ts.([]*abi.Type) {
+		for _, t := range ts {
 			if haveIdenticalUnderlyingType(&ft.Type, t, true) {
 				return toRType(t)
 			}
@@ -1979,7 +1979,7 @@ func FuncOf(in, out []Type, variadic bool) Type {
 	addToCache := func(tt *abi.Type) Type {
 		var rts []*abi.Type
 		if rti, ok := funcLookupCache.m.Load(hash); ok {
-			rts = rti.([]*abi.Type)
+			rts = rti
 		}
 		funcLookupCache.m.Store(hash, append(rts, tt))
 		return toType(tt)
@@ -2134,7 +2134,7 @@ func SliceOf(t Type) Type {
 	// Look in cache.
 	ckey := cacheKey{Slice, typ, nil, 0}
 	if slice, ok := lookupCache.Load(ckey); ok {
-		return slice.(Type)
+		return slice
 	}
 
 	// Look in known types.
@@ -2143,7 +2143,7 @@ func SliceOf(t Type) Type {
 		slice := (*sliceType)(unsafe.Pointer(tt))
 		if slice.Elem == typ {
 			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
-			return ti.(Type)
+			return ti
 		}
 	}
 
@@ -2158,7 +2158,7 @@ func SliceOf(t Type) Type {
 	slice.PtrToThis = 0
 
 	ti, _ := lookupCache.LoadOrStore(ckey, toRType(&slice.Type))
-	return ti.(Type)
+	return ti
 }
 
 // The structLookupCache caches StructOf lookups.
@@ -2169,7 +2169,7 @@ var structLookupCache struct {
 
 	// m is a map[uint32][]Type keyed by the hash calculated in StructOf.
 	// Elements in m are append-only and thus safe for concurrent reading.
-	m sync.Map
+	m sync.Map[uint32, []Type]
 }
 
 type structTypeUncommon struct {
@@ -2496,7 +2496,7 @@ func StructOf(fields []StructField) Type {
 
 	// Look in cache.
 	if ts, ok := structLookupCache.m.Load(hash); ok {
-		for _, st := range ts.([]Type) {
+		for _, st := range ts {
 			t := st.common()
 			if haveIdenticalUnderlyingType(&typ.Type, t, true) {
 				return toType(t)
@@ -2508,7 +2508,7 @@ func StructOf(fields []StructField) Type {
 	structLookupCache.Lock()
 	defer structLookupCache.Unlock()
 	if ts, ok := structLookupCache.m.Load(hash); ok {
-		for _, st := range ts.([]Type) {
+		for _, st := range ts {
 			t := st.common()
 			if haveIdenticalUnderlyingType(&typ.Type, t, true) {
 				return toType(t)
@@ -2519,7 +2519,7 @@ func StructOf(fields []StructField) Type {
 	addToCache := func(t Type) Type {
 		var ts []Type
 		if ti, ok := structLookupCache.m.Load(hash); ok {
-			ts = ti.([]Type)
+			ts = ti
 		}
 		structLookupCache.m.Store(hash, append(ts, t))
 		return t
@@ -2663,7 +2663,7 @@ func ArrayOf(length int, elem Type) Type {
 	// Look in cache.
 	ckey := cacheKey{Array, typ, nil, uintptr(length)}
 	if array, ok := lookupCache.Load(ckey); ok {
-		return array.(Type)
+		return array
 	}
 
 	// Look in known types.
@@ -2672,7 +2672,7 @@ func ArrayOf(length int, elem Type) Type {
 		array := (*arrayType)(unsafe.Pointer(tt))
 		if array.Elem == typ {
 			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
-			return ti.(Type)
+			return ti
 		}
 	}
 
@@ -2762,7 +2762,7 @@ func ArrayOf(length int, elem Type) Type {
 	}
 
 	ti, _ := lookupCache.LoadOrStore(ckey, toRType(&array.Type))
-	return ti.(Type)
+	return ti
 }
 
 // adjustAIXGCData adjusts the GCData field pointer for AIX.
@@ -2833,11 +2833,11 @@ type layoutKey struct {
 
 type layoutType struct {
 	t         *abi.Type
-	framePool *sync.Pool
+	framePool *sync.Pool[unsafe.Pointer]
 	abid      abiDesc
 }
 
-var layoutCache sync.Map // map[layoutKey]layoutType
+var layoutCache sync.Map[layoutKey, layoutType] // map[layoutKey]layoutType
 
 // funcLayout computes a struct type representing the layout of the
 // stack-assigned function arguments and return values for the function
@@ -2846,7 +2846,7 @@ var layoutCache sync.Map // map[layoutKey]layoutType
 // The returned type exists only for GC, so we only fill out GC relevant info.
 // Currently, that's just size and the GC program. We also fill in
 // the name for possible debugging use.
-func funcLayout(t *funcType, rcvr *abi.Type) (frametype *abi.Type, framePool *sync.Pool, abid abiDesc) {
+func funcLayout(t *funcType, rcvr *abi.Type) (frametype *abi.Type, framePool *sync.Pool[unsafe.Pointer], abid abiDesc) {
 	if t.Kind() != abi.Func {
 		panic("reflect: funcLayout of non-func type " + stringFor(&t.Type))
 	}
@@ -2855,7 +2855,7 @@ func funcLayout(t *funcType, rcvr *abi.Type) (frametype *abi.Type, framePool *sy
 	}
 	k := layoutKey{t, rcvr}
 	if lti, ok := layoutCache.Load(k); ok {
-		lt := lti.(layoutType)
+		lt := lti
 		return lt.t, lt.framePool, lt.abid
 	}
 
@@ -2885,7 +2885,7 @@ func funcLayout(t *funcType, rcvr *abi.Type) (frametype *abi.Type, framePool *sy
 	x.Str = resolveReflectName(newName(s, "", false, false))
 
 	// cache result for future callers
-	framePool = &sync.Pool{New: func() any {
+	framePool = &sync.Pool[unsafe.Pointer]{New: func() unsafe.Pointer {
 		return unsafe_New(x)
 	}}
 	lti, _ := layoutCache.LoadOrStore(k, layoutType{
@@ -2893,7 +2893,7 @@ func funcLayout(t *funcType, rcvr *abi.Type) (frametype *abi.Type, framePool *sy
 		framePool: framePool,
 		abid:      abid,
 	})
-	lt := lti.(layoutType)
+	lt := lti
 	return lt.t, lt.framePool, lt.abid
 }
 

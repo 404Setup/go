@@ -12,7 +12,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
-	"sync"
+	"sync/v2"
 	"time"
 
 	"encoding/json/internal"
@@ -523,11 +523,11 @@ type arshaler struct {
 	nonDefault bool
 }
 
-var lookupArshalerCache sync.Map // map[reflect.Type]*arshaler
+var lookupArshalerCache sync.Map[reflect.Type, *arshaler] // map[reflect.Type]*arshaler
 
 func lookupArshaler(t reflect.Type) *arshaler {
 	if v, ok := lookupArshalerCache.Load(t); ok {
-		return v.(*arshaler)
+		return v
 	}
 
 	fncs := makeDefaultArshaler(t)
@@ -536,16 +536,16 @@ func lookupArshaler(t reflect.Type) *arshaler {
 
 	// Use the last stored so that duplicate arshalers can be garbage collected.
 	v, _ := lookupArshalerCache.LoadOrStore(t, fncs)
-	return v.(*arshaler)
+	return v
 }
 
-var stringsPools = &sync.Pool{New: func() any { return new(stringSlice) }}
+var stringsPools = &sync.Pool[*stringSlice]{New: func() *stringSlice { return new(stringSlice) }}
 
 type stringSlice []string
 
 // getStrings returns a non-nil pointer to a slice with length n.
 func getStrings(n int) *stringSlice {
-	s := stringsPools.Get().(*stringSlice)
+	s := stringsPools.Get()
 	if cap(*s) < n {
 		*s = make([]string, n)
 	}

@@ -30,6 +30,11 @@ func isWindowsRetryable(err error) bool {
 	if err == windows.ERROR_SHARING_VIOLATION {
 		return true // Observed in https://go.dev/issue/51442.
 	}
+	if err == syscall.ERROR_DIR_NOT_EMPTY {
+		// A deleted child can remain visible while Windows finishes closing
+		// outstanding handles, even after RemoveAll has removed every entry.
+		return true
+	}
 	return false
 }
 

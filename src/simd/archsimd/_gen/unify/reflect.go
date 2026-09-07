@@ -9,7 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	"unicode"
 )
 
@@ -132,7 +132,7 @@ func (d Def) decode(rv reflect.Value) error {
 	return nil
 }
 
-var structFieldsCache sync.Map /*[reflect.Type, map[string]reflect.StructField]*/
+var structFieldsCache sync.Map[reflect.Type, map[string]reflect.StructField] /*[reflect.Type, map[string]reflect.StructField]*/
 
 // canonStructFields canonicalizes the name of all exported fields in rt to from
 // Go-style exported names to YAML-style lower-case names. If a name starts with
@@ -154,7 +154,7 @@ var structFieldsCache sync.Map /*[reflect.Type, map[string]reflect.StructField]*
 func canonStructFields(rt reflect.Type) map[string]reflect.StructField {
 	type fieldMap = map[string]reflect.StructField
 	if fields, ok := structFieldsCache.Load(rt); ok {
-		return fields.(fieldMap)
+		return fields
 	}
 
 	fm := make(fieldMap)
@@ -170,7 +170,7 @@ func canonStructFields(rt reflect.Type) map[string]reflect.StructField {
 	}
 
 	res, _ := structFieldsCache.LoadOrStore(rt, fm)
-	return res.(fieldMap)
+	return res
 }
 
 func lowerGoName(goName string) string {

@@ -8,7 +8,7 @@ import (
 	"compress/flate"
 	"errors"
 	"io"
-	"sync"
+	"sync/v2"
 )
 
 // A Compressor returns a new compressing writer, writing to w.
@@ -25,11 +25,11 @@ type Compressor func(w io.Writer) (io.WriteCloser, error)
 // one goroutine at a time.
 type Decompressor func(r io.Reader) io.ReadCloser
 
-var flateWriterPool sync.Pool
+var flateWriterPool sync.Pool[*flate.Writer]
 
 func newFlateWriter(w io.Writer) io.WriteCloser {
-	fw, ok := flateWriterPool.Get().(*flate.Writer)
-	if ok {
+	fw := flateWriterPool.Get()
+	if fw != nil {
 		fw.Reset(w)
 	} else {
 		fw, _ = flate.NewWriter(w, 5)
@@ -63,10 +63,10 @@ func (w *pooledFlateWriter) Close() error {
 	return err
 }
 
-var flateReaderPool sync.Pool
+var flateReaderPool sync.Pool[io.ReadCloser]
 
 func newFlateReader(r io.Reader) io.ReadCloser {
-	fr, ok := flateReaderPool.Get().(io.ReadCloser)
+	fr, ok := flateReaderPool.GetOK()
 	if ok {
 		fr.(flate.Resetter).Reset(r, nil)
 	} else {
@@ -102,8 +102,8 @@ func (r *pooledFlateReader) Close() error {
 }
 
 var (
-	compressors   sync.Map // map[uint16]Compressor
-	decompressors sync.Map // map[uint16]Decompressor
+	compressors   sync.Map[uint16, Compressor]   // map[uint16]Compressor
+	decompressors sync.Map[uint16, Decompressor] // map[uint16]Decompressor
 )
 
 func init() {
@@ -135,7 +135,7 @@ func compressor(method uint16) Compressor {
 	if !ok {
 		return nil
 	}
-	return ci.(Compressor)
+	return ci
 }
 
 func decompressor(method uint16) Decompressor {
@@ -143,5 +143,5 @@ func decompressor(method uint16) Decompressor {
 	if !ok {
 		return nil
 	}
-	return di.(Decompressor)
+	return di
 }

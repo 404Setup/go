@@ -5,7 +5,7 @@
 // Package buffer provides a pool-allocated byte buffer.
 package buffer
 
-import "sync"
+import "sync/v2"
 
 // Buffer is a byte buffer.
 //
@@ -14,15 +14,15 @@ import "sync"
 type Buffer []byte
 
 // Having an initial size gives a dramatic speedup.
-var bufPool = sync.Pool{
-	New: func() any {
+var bufPool = sync.Pool[*Buffer]{
+	New: func() *Buffer {
 		b := make([]byte, 0, 1024)
 		return (*Buffer)(&b)
 	},
 }
 
 func New() *Buffer {
-	return bufPool.Get().(*Buffer)
+	return bufPool.Get()
 }
 
 func (b *Buffer) Free() {

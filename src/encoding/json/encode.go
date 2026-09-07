@@ -55,7 +55,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	"unicode"
 	"unicode/utf8"
 )
@@ -304,11 +304,11 @@ type encodeState struct {
 
 const startDetectingCyclesAfter = 1000
 
-var encodeStatePool sync.Pool
+var encodeStatePool sync.Pool[*encodeState]
 
 func newEncodeState() *encodeState {
 	if v := encodeStatePool.Get(); v != nil {
-		e := v.(*encodeState)
+		e := v
 		e.Reset()
 		if len(e.ptrSeen) > 0 {
 			panic("ptrEncoder.encode should have emptied ptrSeen via defers")
@@ -370,7 +370,7 @@ type encOpts struct {
 
 type encoderFunc func(e *encodeState, v reflect.Value, opts encOpts)
 
-var encoderCache sync.Map // map[reflect.Type]encoderFunc
+var encoderCache sync.Map[reflect.Type, encoderFunc] // map[reflect.Type]encoderFunc
 
 func valueEncoder(v reflect.Value) encoderFunc {
 	if !v.IsValid() {
@@ -381,7 +381,7 @@ func valueEncoder(v reflect.Value) encoderFunc {
 
 func typeEncoder(t reflect.Type) encoderFunc {
 	if fi, ok := encoderCache.Load(t); ok {
-		return fi.(encoderFunc)
+		return fi
 	}
 
 	// To deal with recursive types, populate the map with an
@@ -397,7 +397,7 @@ func typeEncoder(t reflect.Type) encoderFunc {
 		indirect()(e, v, opts)
 	}))
 	if loaded {
-		return fi.(encoderFunc)
+		return fi
 	}
 
 	f := indirect()
@@ -1320,15 +1320,15 @@ func dominantField(fields []field) (field, bool) {
 	return fields[0], true
 }
 
-var fieldCache sync.Map // map[reflect.Type]structFields
+var fieldCache sync.Map[reflect.Type, structFields] // map[reflect.Type]structFields
 
 // cachedTypeFields is like typeFields but uses a cache to avoid repeated work.
 func cachedTypeFields(t reflect.Type) structFields {
 	if f, ok := fieldCache.Load(t); ok {
-		return f.(structFields)
+		return f
 	}
 	f, _ := fieldCache.LoadOrStore(t, typeFields(t))
-	return f.(structFields)
+	return f
 }
 
 func mayAppendQuote(b []byte, quoted bool) []byte {

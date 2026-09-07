@@ -10,7 +10,7 @@ import (
 	"internal/syscall/windows"
 	"io"
 	"runtime"
-	"sync"
+	"sync/v2"
 	"syscall"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -101,15 +101,15 @@ func newWsaBuf(b []byte) *syscall.WSABuf {
 	return &syscall.WSABuf{Buf: unsafe.SliceData(b), Len: uint32(len(b))}
 }
 
-var wsaBufsPool = sync.Pool{
-	New: func() any {
+var wsaBufsPool = sync.Pool[*[]syscall.WSABuf]{
+	New: func() *[]syscall.WSABuf {
 		buf := make([]syscall.WSABuf, 0, 16)
 		return &buf
 	},
 }
 
 func newWSABufs(buf *[][]byte) *[]syscall.WSABuf {
-	bufsPtr := wsaBufsPool.Get().(*[]syscall.WSABuf)
+	bufsPtr := wsaBufsPool.Get()
 	*bufsPtr = (*bufsPtr)[:0]
 	for _, b := range *buf {
 		if len(b) == 0 {
@@ -146,8 +146,8 @@ func freeWSABufs(bufsPtr *[]syscall.WSABuf) {
 }
 
 // wsaMsgPool is a pool of WSAMsg structures that can only hold a single WSABuf.
-var wsaMsgPool = sync.Pool{
-	New: func() any {
+var wsaMsgPool = sync.Pool[*windows.WSAMsg]{
+	New: func() *windows.WSAMsg {
 		return &windows.WSAMsg{
 			Buffers:     &syscall.WSABuf{},
 			BufferCount: 1,
@@ -163,7 +163,7 @@ func newWSAMsg(p []byte, oob []byte, flags int, rsa *wsaRsa) *windows.WSAMsg {
 	// then Windows may access invalid memory.
 
 	// Use a pool to reuse allocations.
-	msg := wsaMsgPool.Get().(*windows.WSAMsg)
+	msg := wsaMsgPool.Get()
 	msg.Buffers.Len = uint32(len(p))
 	msg.Buffers.Buf = unsafe.SliceData(p)
 	if len(oob) > 0 {
@@ -200,21 +200,21 @@ type wsaRsa struct {
 	namelen int32
 }
 
-var wsaRsaPool = sync.Pool{
-	New: func() any {
+var wsaRsaPool = sync.Pool[*wsaRsa]{
+	New: func() *wsaRsa {
 		return new(wsaRsa)
 	},
 }
 
 func newWSARsa() *wsaRsa {
-	rsa := wsaRsaPool.Get().(*wsaRsa)
+	rsa := wsaRsaPool.Get()
 	rsa.name = syscall.RawSockaddrAny{}
 	rsa.namelen = int32(unsafe.Sizeof(syscall.RawSockaddrAny{}))
 	return rsa
 }
 
-var operationPool = sync.Pool{
-	New: func() any {
+var operationPool = sync.Pool[*operation]{
+	New: func() *operation {
 		return new(operation)
 	},
 }
@@ -264,7 +264,7 @@ func (fd *FD) execIO(
 	if err != nil {
 		return 0, err
 	}
-	o := operationPool.Get().(*operation)
+	o := operationPool.Get()
 	defer operationPool.Put(o)
 	*o = operation{
 		runtimeCtx: fd.pd.runtimeCtx,

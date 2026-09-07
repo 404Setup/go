@@ -48,7 +48,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -74,8 +74,8 @@ var (
 	errStreamClosed       = errors.New("http2: stream closed")
 )
 
-var responseWriterStatePool = sync.Pool{
-	New: func() any {
+var responseWriterStatePool = sync.Pool[*responseWriterState]{
+	New: func() *responseWriterState {
 		return &responseWriterState{}
 	},
 }
@@ -87,8 +87,8 @@ var responseWriterStatePool = sync.Pool{
 // write and, notably, are returned to it by Flush when empty, so that a
 // handler that's parked mid-response for a long time (e.g. streaming a
 // long poll) doesn't pin a buffer per stream.
-var handlerWriterPool = sync.Pool{
-	New: func() any {
+var handlerWriterPool = sync.Pool[*bufio.Writer]{
+	New: func() *bufio.Writer {
 		return bufio.NewWriterSize(nil, handlerChunkWriteSize)
 	},
 }
@@ -141,8 +141,8 @@ func (s *Server) startGracefulShutdown() {
 // The pool is not used inside synctest bubbles, since a channel created
 // in one bubble can't be used from another bubble or from outside a
 // bubble, and sync.Pool is not bubble-aware.
-var errChanPool = sync.Pool{
-	New: func() any { return make(chan error, 1) },
+var errChanPool = sync.Pool[chan error]{
+	New: func() chan error { return make(chan error, 1) },
 }
 
 func getErrChan() chan error {
@@ -151,7 +151,7 @@ func getErrChan() chan error {
 		// Skip the pool; allocation cost is irrelevant in tests.
 		return make(chan error, 1)
 	}
-	return errChanPool.Get().(chan error)
+	return errChanPool.Get()
 }
 
 func putErrChan(ch chan error) {
@@ -1015,15 +1015,15 @@ func (sc *serverConn) readPreface() error {
 	}
 }
 
-var writeDataPool = sync.Pool{
-	New: func() any { return new(writeData) },
+var writeDataPool = sync.Pool[*writeData]{
+	New: func() *writeData { return new(writeData) },
 }
 
 // writeDataFromHandler writes DATA response frames from a handler on
 // the given stream.
 func (sc *serverConn) writeDataFromHandler(stream *stream, data []byte, endStream bool) error {
 	ch := getErrChan()
-	writeArg := writeDataPool.Get().(*writeData)
+	writeArg := writeDataPool.Get()
 	*writeArg = writeData{stream.id, data, endStream}
 	err := sc.writeFrameFromHandler(FrameWriteRequest{
 		write:  writeArg,
@@ -2270,7 +2270,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 }
 
 func (sc *serverConn) newResponseWriter(st *stream) *responseWriter {
-	rws := responseWriterStatePool.Get().(*responseWriterState)
+	rws := responseWriterStatePool.Get()
 	*rws = responseWriterState{} // zero all the fields
 	rws.conn = sc
 	rws.stream = st
@@ -2975,7 +2975,7 @@ func (w *responseWriter) write(lenData int, dataB []byte, dataS string) (n int, 
 	}
 
 	if rws.bw == nil {
-		rws.bw = handlerWriterPool.Get().(*bufio.Writer)
+		rws.bw = handlerWriterPool.Get()
 		rws.bw.Reset(chunkWriter{rws})
 	}
 	if dataB != nil {

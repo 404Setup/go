@@ -1639,7 +1639,7 @@ func (c *common) makeTempDir() (string, error) {
 	return dir, nil
 }
 
-// removeAll is like os.RemoveAll, but retries Windows "Access is denied."
+// removeAll is like os.RemoveAll, but retries transient Windows filesystem
 // errors up to an arbitrary timeout.
 //
 // Those errors have been known to occur spuriously on at least the

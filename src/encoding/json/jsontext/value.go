@@ -11,7 +11,7 @@ import (
 	"errors"
 	"io"
 	"slices"
-	"sync"
+	"sync/v2"
 
 	"encoding/json/internal/jsonflags"
 	"encoding/json/internal/jsonwire"
@@ -281,10 +281,10 @@ func (x objectMember) Compare(y objectMember) int {
 		bytes.TrimLeft(y.buffer, commaAndWhitespace))
 }
 
-var objectMemberPool = sync.Pool{New: func() any { return new([]objectMember) }}
+var objectMemberPool = sync.Pool[*[]objectMember]{New: func() *[]objectMember { return new([]objectMember) }}
 
 func getObjectMembers() *[]objectMember {
-	ns := objectMemberPool.Get().(*[]objectMember)
+	ns := objectMemberPool.Get()
 	*ns = (*ns)[:0]
 	return ns
 }

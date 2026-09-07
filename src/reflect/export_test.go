@@ -7,7 +7,7 @@ package reflect
 import (
 	"internal/abi"
 	"internal/goarch"
-	"sync"
+	"sync/v2"
 	"unsafe"
 )
 
@@ -139,7 +139,7 @@ type Buffer struct {
 }
 
 func clearLayoutCache() {
-	layoutCache = sync.Map{}
+	layoutCache = sync.Map[layoutKey, layoutType]{}
 }
 
 func SetArgRegs(ints, floats int, floatSize uintptr) (oldInts, oldFloats int, oldFloatSize uintptr) {

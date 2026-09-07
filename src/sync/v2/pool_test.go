@@ -5,6 +5,7 @@
 package sync_test
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	syncv2 "sync/v2"
@@ -35,12 +36,36 @@ func TestPool(t *testing.T) {
 	}
 }
 
+func TestPoolGetOKEmptyAndNew(t *testing.T) {
+	var p syncv2.Pool[[]byte]
+	if value, ok := p.GetOK(); value != nil || ok {
+		t.Fatalf("empty GetOK() = %v, %v; want nil, false", value, ok)
+	}
+	calls := 0
+	p.New = func() []byte {
+		calls++
+		return nil
+	}
+	if value, ok := p.GetOK(); value != nil || !ok || calls != 1 {
+		t.Fatalf("GetOK() = %v, %v; New calls = %d; want nil, true, 1", value, ok, calls)
+	}
+}
+
 func TestPoolConcurrent(t *testing.T) {
-	p := syncv2.Pool[[]byte]{New: func() []byte { return make([]byte, 32) }}
+	p := syncv2.Pool[[]byte]{New: func() []byte {
+		buf := make([]byte, 32)
+		buf[31] = 42
+		return buf
+	}}
 	const goroutines = 32
 	const iterations = 1000
 
 	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 10 {
+			runtime.GC()
+		}
+	})
 	for range goroutines {
 		wg.Go(func() {
 			for range iterations {
@@ -49,6 +74,11 @@ func TestPoolConcurrent(t *testing.T) {
 					t.Errorf("Get returned buffer with length %v", len(buf))
 					return
 				}
+				if buf[31] != 42 {
+					t.Errorf("pooled buffer corrupted: last byte = %d", buf[31])
+					return
+				}
+				buf[0]++ // Exercise synchronization of the pooled backing array.
 				p.Put(buf)
 			}
 		})

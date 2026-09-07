@@ -12,7 +12,7 @@ import (
 	"math"
 	"reflect"
 	"strings"
-	"sync"
+	"sync/v2"
 	"testing"
 	"unsafe"
 )
@@ -400,11 +400,11 @@ func TestBlankFields(t *testing.T) {
 
 func TestSizeStructCache(t *testing.T) {
 	// Reset the cache, otherwise multiple test runs fail.
-	structSize = sync.Map{}
+	structSize = sync.Map[reflect.Type, int]{}
 
 	count := func() int {
 		var i int
-		structSize.Range(func(_, _ any) bool {
+		structSize.Range(func(_ reflect.Type, _ int) bool {
 			i++
 			return true
 		})

@@ -28,9 +28,9 @@ func TimeProf() {
 	}
 
 	t0 := time.Now()
-	// We should get a profiling signal 100 times a second,
-	// so running for 1/10 second should be sufficient.
-	for time.Since(t0) < time.Second/10 {
+	// Collect enough samples for the time loop to dominate startup and
+	// profiler overhead, even when the system is busy.
+	for time.Since(t0) < time.Second {
 	}
 
 	pprof.StopCPUProfile()

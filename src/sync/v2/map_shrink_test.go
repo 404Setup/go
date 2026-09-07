@@ -2,9 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sync
+package sync_test
 
-import "testing"
+import (
+	. "sync/v2"
+	"testing"
+)
 
 func TestMapShrinkReplacesStorage(t *testing.T) {
 	var m Map[int, int]
@@ -14,20 +17,20 @@ func TestMapShrinkReplacesStorage(t *testing.T) {
 	for i := range 240 {
 		m.Delete(i)
 	}
-	before := m.current.Load()
+	before := MapStorage(&m)
 	if before == nil {
 		t.Fatal("Map has no storage after Store")
 	}
 
 	m.Shrink()
-	after := m.current.Load()
+	after := MapStorage(&m)
 	if after == nil || after == before {
 		t.Fatalf("Map storage after Shrink = %p; want a non-nil replacement for %p", after, before)
 	}
 
 	m.Clear()
 	m.Shrink()
-	if current := m.current.Load(); current != nil {
+	if current := MapStorage(&m); current != nil {
 		t.Fatalf("empty Map storage after Shrink = %p; want nil", current)
 	}
 }

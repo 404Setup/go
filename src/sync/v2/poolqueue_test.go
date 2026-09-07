@@ -2,28 +2,24 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sync
+package sync_test
 
 import (
 	"runtime"
 	"sync/atomic"
+	. "sync/v2"
 	"testing"
 )
 
 func TestPoolDequeue(t *testing.T) {
-	d := poolDequeue[int]{vals: make([]poolSlot[int], 16)}
-	testPoolQueue(t, d.pushHead, d.popHead, d.popTail)
+	testPoolQueue(t, NewPoolDequeue[int](16))
 }
 
 func TestPoolChain(t *testing.T) {
-	var c poolChain[int]
-	testPoolQueue(t, func(value poolItem[int]) bool {
-		c.pushHead(value)
-		return true
-	}, c.popHead, c.popTail)
+	testPoolQueue(t, NewPoolChain[int]())
 }
 
-func testPoolQueue(t *testing.T, push func(poolItem[int]) bool, popHead, popTail func() (poolItem[int], bool)) {
+func testPoolQueue(t *testing.T, d PoolDequeue[int]) {
 	const consumers = 8
 	n := 100_000
 	if testing.Short() {
@@ -47,9 +43,9 @@ func testPoolQueue(t *testing.T, push func(poolItem[int]) bool, popHead, popTail
 		wg.Go(func() {
 			failures := 0
 			for !stop.Load() {
-				if value, ok := popTail(); ok {
+				if value, ok := d.PopTail(); ok {
 					failures = 0
-					record(value.value)
+					record(value)
 				} else if failures++; failures%100 == 0 {
 					runtime.Gosched()
 				}
@@ -58,12 +54,12 @@ func testPoolQueue(t *testing.T, push func(poolItem[int]) bool, popHead, popTail
 	}
 
 	for value := 0; value < n; value++ {
-		for !push(poolItem[int]{value: value}) {
+		for !d.PushHead(value) {
 			runtime.Gosched()
 		}
 		if value%10 == 0 {
-			if item, ok := popHead(); ok {
-				record(item.value)
+			if item, ok := d.PopHead(); ok {
+				record(item)
 			}
 		}
 	}
@@ -83,6 +79,7 @@ func TestNilPool(t *testing.T) {
 		f    func()
 	}{
 		{"Get", func() { p.Get() }},
+		{"GetOK", func() { p.GetOK() }},
 		{"Put", func() { p.Put(1) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {

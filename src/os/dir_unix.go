@@ -11,7 +11,7 @@ import (
 	"internal/goarch"
 	"io"
 	"runtime"
-	"sync"
+	"sync/v2"
 	"syscall"
 	"unsafe"
 )
@@ -29,8 +29,8 @@ const (
 	blockSize = 8192
 )
 
-var dirBufPool = sync.Pool{
-	New: func() any {
+var dirBufPool = sync.Pool[*[]byte]{
+	New: func() *[]byte {
 		// The buffer must be at least a block long.
 		buf := make([]byte, blockSize)
 		return &buf
@@ -62,7 +62,7 @@ func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEn
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.buf == nil {
-		d.buf = dirBufPool.Get().(*[]byte)
+		d.buf = dirBufPool.Get()
 	}
 
 	// Change the meaning of n for the implementation below.

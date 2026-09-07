@@ -26,7 +26,7 @@ import (
 	urlpkg "net/url"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	_ "unsafe" // for linkname
 
 	"golang.org/x/net/http/httpguts"
@@ -1039,11 +1039,11 @@ func parseRequestLine(line string) (method, requestURI, proto string, ok bool) {
 	return method, requestURI, proto, true
 }
 
-var textprotoReaderPool sync.Pool
+var textprotoReaderPool sync.Pool[*textproto.Reader]
 
 func newTextprotoReader(br *bufio.Reader) *textproto.Reader {
 	if v := textprotoReaderPool.Get(); v != nil {
-		tr := v.(*textproto.Reader)
+		tr := v
 		tr.R = br
 		return tr
 	}

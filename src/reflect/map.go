@@ -40,7 +40,7 @@ func MapOf(key, elem Type) Type {
 	// Look in cache.
 	ckey := cacheKey{Map, ktyp, etyp, 0}
 	if mt, ok := lookupCache.Load(ckey); ok {
-		return mt.(Type)
+		return mt
 	}
 
 	// Look in known types.
@@ -49,7 +49,7 @@ func MapOf(key, elem Type) Type {
 		mt := (*abi.MapType)(unsafe.Pointer(tt))
 		if mt.Key == ktyp && mt.Elem == etyp {
 			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
-			return ti.(Type)
+			return ti
 		}
 	}
 
@@ -105,7 +105,7 @@ func MapOf(key, elem Type) Type {
 	mt.PtrToThis = 0
 
 	ti, _ := lookupCache.LoadOrStore(ckey, toRType(&mt.Type))
-	return ti.(Type)
+	return ti
 }
 
 func groupOf(ktyp, etyp Type) Type {

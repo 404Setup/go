@@ -29,6 +29,7 @@ import (
 // In the terminology of the Go memory model, a call to Put(x) synchronizes
 // before a call to Get returning that same value x. Similarly, a call to New
 // returning x synchronizes before a call to Get returning that same value x.
+// The same guarantees apply to GetOK.
 //
 // [the Go memory model]: https://go.dev/ref/mem
 type Pool[T any] struct {
@@ -42,7 +43,7 @@ type Pool[T any] struct {
 
 	// New optionally specifies a function to generate a value when Get would
 	// otherwise find the pool empty. It may not be changed concurrently with
-	// calls to Get.
+	// calls to Get or GetOK.
 	New func() T
 }
 
@@ -103,7 +104,17 @@ func (p *Pool[T]) Put(x T) {
 //
 // If the pool is empty and p.New is non-nil, Get returns the result of calling
 // p.New. Otherwise, Get returns the zero value of T.
+// Use GetOK to distinguish an empty pool from a stored zero value.
 func (p *Pool[T]) Get() T {
+	value, _ := p.GetOK()
+	return value
+}
+
+// GetOK is like Get but also reports whether a value was obtained.
+// It returns false only when the pool is empty and p.New is nil.
+// A value stored by Put or returned by p.New yields true, even if it is the
+// zero value of T (including nil).
+func (p *Pool[T]) GetOK() (value T, ok bool) {
 	if p == nil {
 		panic("nil Pool")
 	}
@@ -124,13 +135,12 @@ func (p *Pool[T]) Get() T {
 	runtime_procUnpin()
 	poolRaceGetDone(&item, ok)
 	if ok {
-		return item.value
+		return item.value, true
 	}
 	if p.New != nil {
-		return p.New()
+		return p.New(), true
 	}
-	var zero T
-	return zero
+	return value, false
 }
 
 func (p *Pool[T]) getSlow(pid int) (poolItem[T], bool) {

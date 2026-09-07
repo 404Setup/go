@@ -31,8 +31,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"sync/v2"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -1755,7 +1755,7 @@ func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
 // In practice, the maximum scratch buffer size should not exceed 512 KB due to
 // frameScratchBufferLen(maxFrameSize), thus the "infinity pool" should never be used.
 // It exists mainly as a safety measure, for potential future increases in max buffer size.
-var bufPools [7]sync.Pool // of *[]byte
+var bufPools [7]sync.Pool[*[]byte] // of *[]byte
 func bufPoolIndex(size int) int {
 	if size <= 16384 {
 		return 0
@@ -1786,7 +1786,7 @@ func (cs *clientStream) writeRequestBody(req *ClientRequest) (err error) {
 	scratchLen := cs.frameScratchBufferLen(maxFrameSize)
 	var buf []byte
 	index := bufPoolIndex(scratchLen)
-	if bp, ok := bufPools[index].Get().(*[]byte); ok && len(*bp) >= scratchLen {
+	if bp, ok := bufPools[index].GetOK(); ok && len(*bp) >= scratchLen {
 		defer bufPools[index].Put(bp)
 		buf = *bp
 	} else {
@@ -3112,11 +3112,11 @@ type eofReader struct{}
 func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
 func (eofReader) ReadByte() (byte, error)  { return 0, io.EOF }
 
-var gzipPool = sync.Pool{New: func() any { return new(gzip.Reader) }}
+var gzipPool = sync.Pool[*gzip.Reader]{New: func() *gzip.Reader { return new(gzip.Reader) }}
 
 // gzipPoolGet gets a gzip.Reader from the pool and resets it to read from r.
 func gzipPoolGet(r io.Reader) (*gzip.Reader, error) {
-	zr := gzipPool.Get().(*gzip.Reader)
+	zr := gzipPool.Get()
 	if err := zr.Reset(r); err != nil {
 		gzipPoolPut(zr)
 		return nil, err

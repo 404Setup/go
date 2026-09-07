@@ -2,17 +2,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sync_test
+package container_test
 
 import (
 	"reflect"
 	"sync"
-	syncv2 "sync/v2"
+	"sync/v2/container"
 	"testing"
 )
 
 func TestOrderedMap(t *testing.T) {
-	var m syncv2.OrderedMap[string, int]
+	var m container.OrderedMap[string, int]
 	if got, ok := m.Load("missing"); got != 0 || ok {
 		t.Fatalf("Load(missing) = %v, %v; want 0, false", got, ok)
 	}
@@ -77,7 +77,7 @@ func TestOrderedMap(t *testing.T) {
 }
 
 func TestOrderedMapIteratorSnapshot(t *testing.T) {
-	var m syncv2.OrderedMap[int, int]
+	var m container.OrderedMap[int, int]
 	for i := range 4 {
 		m.Store(i, i)
 	}
@@ -94,7 +94,7 @@ func TestOrderedMapIteratorSnapshot(t *testing.T) {
 }
 
 func TestOrderedMapShrink(t *testing.T) {
-	var m syncv2.OrderedMap[int, int]
+	var m container.OrderedMap[int, int]
 	for i := range 1024 {
 		m.Store(i, i)
 	}
@@ -126,7 +126,7 @@ func TestOrderedMapShrink(t *testing.T) {
 }
 
 func TestOrderedMapConcurrent(t *testing.T) {
-	var m syncv2.OrderedMap[int, int]
+	var m container.OrderedMap[int, int]
 	const writers = 8
 	const entriesPerWriter = 128
 	var wg sync.WaitGroup
@@ -168,7 +168,7 @@ func TestOrderedMapConcurrent(t *testing.T) {
 }
 
 func TestOrderedMapConcurrentSameKey(t *testing.T) {
-	var m syncv2.OrderedMap[int, int]
+	var m container.OrderedMap[int, int]
 	const goroutines = 8
 	const iterations = 2000
 	var wg sync.WaitGroup
@@ -219,17 +219,17 @@ func TestOrderedMapConcurrentSameKey(t *testing.T) {
 func TestOrderedMapComparePanicsForNonComparableValue(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		call func(*syncv2.OrderedMap[string, []int])
+		call func(*container.OrderedMap[string, []int])
 	}{
-		{"CompareAndSwap", func(m *syncv2.OrderedMap[string, []int]) {
+		{"CompareAndSwap", func(m *container.OrderedMap[string, []int]) {
 			m.CompareAndSwap("missing", nil, nil)
 		}},
-		{"CompareAndDelete", func(m *syncv2.OrderedMap[string, []int]) {
+		{"CompareAndDelete", func(m *container.OrderedMap[string, []int]) {
 			m.CompareAndDelete("missing", nil)
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var m syncv2.OrderedMap[string, []int]
+			var m container.OrderedMap[string, []int]
 			defer func() {
 				if recover() == nil {
 					t.Fatalf("%s did not panic for a non-comparable value type", test.name)
@@ -250,7 +250,7 @@ type orderedIntPair struct {
 	value int
 }
 
-func orderedMapPairs(m *syncv2.OrderedMap[string, int]) []orderedPair {
+func orderedMapPairs(m *container.OrderedMap[string, int]) []orderedPair {
 	var pairs []orderedPair
 	for key, value := range m.All() {
 		pairs = append(pairs, orderedPair{key, value})

@@ -11,7 +11,7 @@ import (
 	"net/textproto"
 	"slices"
 	"strings"
-	"sync"
+	"sync/v2"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -157,15 +157,15 @@ type headerSorter struct {
 	kvs []keyValues
 }
 
-var headerSorterPool = sync.Pool{
-	New: func() any { return new(headerSorter) },
+var headerSorterPool = sync.Pool[*headerSorter]{
+	New: func() *headerSorter { return new(headerSorter) },
 }
 
 // sortedKeyValues returns h's keys sorted in the returned kvs
 // slice. The headerSorter used to sort is also returned, for possible
 // return to headerSorterCache.
 func (h Header) sortedKeyValues(exclude map[string]bool) (kvs []keyValues, hs *headerSorter) {
-	hs = headerSorterPool.Get().(*headerSorter)
+	hs = headerSorterPool.Get()
 	if cap(hs.kvs) < len(h) {
 		hs.kvs = make([]keyValues, 0, len(h))
 	}

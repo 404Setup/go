@@ -14,7 +14,7 @@ package io
 
 import (
 	"errors"
-	"sync"
+	"sync/v2"
 )
 
 // Seek whence values.
@@ -652,15 +652,15 @@ func (discard) WriteString(s string) (int, error) {
 	return len(s), nil
 }
 
-var blackHolePool = sync.Pool{
-	New: func() any {
+var blackHolePool = sync.Pool[*[]byte]{
+	New: func() *[]byte {
 		b := make([]byte, 8192)
 		return &b
 	},
 }
 
 func (discard) ReadFrom(r Reader) (n int64, err error) {
-	bufp := blackHolePool.Get().(*[]byte)
+	bufp := blackHolePool.Get()
 	readSize := 0
 	for {
 		readSize, err = r.Read(*bufp)
