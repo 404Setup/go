@@ -233,7 +233,7 @@ var depsRules = `
 	arena, strconv, unicode
 	< reflect;
 
-	reflect, sync/v2 < sync/v2/container;
+	container/list, math/rand/v2, reflect, sync/v2 < sync/v2/container;
 
 	os, reflect
 	< internal/fmtsort
