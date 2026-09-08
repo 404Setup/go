@@ -439,6 +439,7 @@ var passes = [...]ssa.Pass{
 	{Name: "dead auto elim", Fn: elimDeadAutosGeneric},
 	{Name: "sccp", Fn: sccp},
 	{Name: "generic deadcode", Fn: deadcode, Required: true}, // remove dead stores, which otherwise mess up store chain
+	{Name: "o2 deadcode", Fn: o2Deadcode},
 	{Name: "late fuse", Fn: fuseLate},
 	{Name: "check bce", Fn: checkbce},
 	{Name: "dse", Fn: dse},
@@ -517,6 +518,9 @@ var passOrder = [...]constraint{
 	{"generic cse", "tighten"},
 	// checkbce needs the values removed
 	{"generic deadcode", "check bce"},
+	// Run the extra proof and cleanup after SCCP, before merging the remaining blocks.
+	{"generic deadcode", "o2 deadcode"},
+	{"o2 deadcode", "late fuse"},
 	// decompose builtin now also cleans up after expand calls
 	{"expand calls", "decompose builtin"},
 	// don't run optimization pass until we've decomposed builtin objects

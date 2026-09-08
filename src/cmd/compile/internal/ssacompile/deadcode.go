@@ -5,10 +5,24 @@
 package ssacompile
 
 import (
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/ssa/block"
 	"cmd/internal/src"
 )
+
+// o2Deadcode uses facts exposed by late constant propagation to eliminate
+// branches that the earlier prove pass could not resolve. Reuse the existing
+// optimizations so calls, panics, and other observable effects stay live.
+func o2Deadcode(f *ssa.Func) {
+	if !base.Flag.O2 {
+		return
+	}
+	cse(f)
+	prove(f)
+	opt(f)
+	deadcode(f)
+}
 
 // deadcode removes dead code from f.
 func deadcode(f *ssa.Func) {

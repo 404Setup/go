@@ -115,6 +115,10 @@
 //		force rebuilding of packages that are already up-to-date.
 //	-n
 //		print the commands but do not run them.
+//	-o2
+//		enable extra dead code elimination in all packages, including dependencies.
+//		This may increase compilation time. Supported only by the gc compiler.
+//		The compiler's -N flag disables this optimization.
 //	-p n
 //		the number of programs, such as build commands or
 //		test binaries, that can be run in parallel.

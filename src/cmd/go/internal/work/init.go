@@ -58,6 +58,12 @@ func BuildInit(ld *modload.Loader) {
 	base.AtExit(closeBuilders)
 
 	modload.Init(ld)
+	if cfg.BuildO2 {
+		if cfg.BuildContext.Compiler != "gc" {
+			base.Fatalf("go: -o2 is only supported by the gc compiler")
+		}
+		forcedGcflags = append(forcedGcflags, "-o2")
+	}
 	instrumentInit()
 	buildModeInit()
 	initCompilerConcurrencyPool()

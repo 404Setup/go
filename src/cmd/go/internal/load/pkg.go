@@ -2481,6 +2481,9 @@ func (p *Package) setBuildInfo(ctx context.Context, f *modfetch.Fetcher, autoVCS
 	if cfg.BuildMSan {
 		appendSetting("-msan", "true")
 	}
+	if cfg.BuildO2 {
+		appendSetting("-o2", "true")
+	}
 	// N.B. -pgo added later by setPGOProfilePath.
 	if cfg.BuildRace {
 		appendSetting("-race", "true")

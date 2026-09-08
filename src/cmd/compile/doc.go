@@ -101,6 +101,10 @@ Flags:
 		Disallow local (relative) imports.
 	-o file
 		Write object to file (default file.o or, with -pack, file.a).
+	-o2
+		Enable extra dead code elimination using conditions exposed by late
+		constant propagation. This may increase compilation time.
+		The -N flag disables this optimization along with other optimizations.
 	-p path
 		Set expected package import path for the code being compiled,
 		and diagnose imports that would cause a circular dependency.

@@ -71,6 +71,10 @@ and test commands:
 		force rebuilding of packages that are already up-to-date.
 	-n
 		print the commands but do not run them.
+	-o2
+		enable extra dead code elimination in all packages, including dependencies.
+		This may increase compilation time. Supported only by the gc compiler.
+		The compiler's -N flag disables this optimization.
 	-p n
 		the number of programs, such as build commands or
 		test binaries, that can be run in parallel.
@@ -349,6 +353,7 @@ func AddBuildFlags(cmd *base.Command, mask BuildFlagMask) {
 	cmd.Flag.Var(&load.BuildLdflags, "ldflags", "`arguments` to pass on each go tool link invocation")
 	cmd.Flag.BoolVar(&cfg.BuildLinkshared, "linkshared", false, "build code that will be linked against shared libraries previously created with -buildmode=shared")
 	cmd.Flag.BoolVar(&cfg.BuildMSan, "msan", false, "enable interoperation with memory sanitizer")
+	cmd.Flag.BoolVar(&cfg.BuildO2, "o2", false, "enable extra dead code elimination")
 	cmd.Flag.StringVar(&cfg.BuildPGO, "pgo", "auto", "specify the `file` path of a profile for profile-guided optimization (PGO); special name \"auto\" selects default.pgo, \"off\" turns off PGO")
 	cmd.Flag.StringVar(&cfg.BuildPkgdir, "pkgdir", "", "install and load all packages from `dir` instead of the usual locations")
 	cmd.Flag.BoolVar(&cfg.BuildRace, "race", false, "enable data race detection")

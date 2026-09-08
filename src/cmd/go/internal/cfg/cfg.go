@@ -84,6 +84,7 @@ var (
 	BuildJSON              bool                    // -json flag
 	BuildN                 bool                    // -n flag
 	BuildO                 string                  // -o flag
+	BuildO2                bool                    // -o2 flag
 	BuildP                 = runtime.GOMAXPROCS(0) // -p flag
 	BuildPGO               string                  // -pgo flag
 	BuildPkgdir            string                  // -pkgdir flag
