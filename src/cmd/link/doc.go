@@ -128,9 +128,9 @@ Flags:
 	-o file
 		Write output to file (default a.out, or a.out.exe on Windows).
 	-o2
-		With go build -ldflags=-o2, enable extra dead code elimination in matching
-		packages during compilation. Accepted but has no effect when linking
-		already compiled objects directly. The compiler's -N disables compile-time
+		With go build -ldflags=-o2, enable extra dead code elimination and loop
+		unrolling in matching packages during compilation. Accepted but has no effect
+		when linking already compiled objects directly. The compiler's -N disables compile-time
 		optimizations, including -fmth, but does not disable the linker's flush
 		mode. Use -ldflags='all=-o2 -fmth' to include dependencies.
 	-pluginpath path

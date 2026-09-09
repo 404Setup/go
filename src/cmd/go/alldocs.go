@@ -191,7 +191,7 @@
 //		See 'go help buildjson' for the encoding details.
 //	-ldflags '[pattern=]arg list'
 //		arguments to pass on each go tool link invocation.
-//		With the gc compiler, -o2 enables extra dead code elimination and
+//		With the gc compiler, -o2 enables extra dead code elimination and loop unrolling;
 //		-fmth enables aggressive floating-point optimizations during compilation
 //		of matching packages. Use 'all=-o2 -fmth' to include dependencies.
 //		The compiler's -N flag disables these compile-time optimizations;

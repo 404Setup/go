@@ -112,8 +112,11 @@ Flags:
 		The runtime package itself retains IEEE optimizations for its NaN checks.
 	-o2
 		Enable extra dead code elimination using conditions exposed by late
-		constant propagation. This may increase compilation time.
-		The -N flag disables this optimization along with other optimizations.
+		constant propagation, and unroll small, straight-line loops with known
+		iteration counts. Small loops are fully unrolled; larger loops may be
+		unrolled by a factor of 2 or 4 when their iteration count is divisible
+		by that factor. A code size budget limits expansion. This may increase
+		compilation time and binary size. The -N flag disables these optimizations.
 	-p path
 		Set expected package import path for the code being compiled,
 		and diagnose imports that would cause a circular dependency.

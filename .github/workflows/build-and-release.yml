@@ -1,9 +1,15 @@
-name: Build and release Go
+name: Build and release Illium
 
 on:
   push:
     branches:
       - master
+
+
+concurrency:
+  group: illium-actions
+  queue: max
+  cancel-in-progress: false
 
 permissions:
   contents: read
