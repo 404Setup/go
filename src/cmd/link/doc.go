@@ -135,7 +135,8 @@ Flags:
 		mode. Use -ldflags='all=-o2 -fmth' to include dependencies.
 	-o3
 		With go build -ldflags=-o3, enable all -o2 optimizations and remove provably
-		finite loops with no observable effects in matching packages. Use
+		finite loops with no observable effects in matching packages. Also enable
+		additional loop bounds analysis and method wrapper tail calls. Use
 		-ldflags=all=-o3 to include dependencies. The compiler's -N disables these
 		optimizations. Accepted but has no effect when linking already compiled objects.
 	-pluginpath path

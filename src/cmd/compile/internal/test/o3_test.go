@@ -16,7 +16,7 @@ func TestO3DeadCode(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "main.go")
-	if err := os.WriteFile(src, []byte(o3Source), 0o666); err != nil {
+	if err := os.WriteFile(src, []byte(o3Source+o3ScanSource), 0o666); err != nil {
 		t.Fatal(err)
 	}
 	for _, tt := range []struct {
@@ -47,6 +47,44 @@ func TestO3DeadCode(t *testing.T) {
 		})
 	}
 }
+
+func TestO3LoopBounds(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "scan.go")
+	if err := os.WriteFile(src, []byte("package p\n"+o3ScanSource), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	for _, arch := range []string{"amd64", "386", "arm64"} {
+		for _, level := range []string{"-o2", "-o3"} {
+			t.Run(arch+"/"+level, func(t *testing.T) {
+				cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "compile", level, "-d=ssa/check/on", "-S", "-o", filepath.Join(dir, "scan.o"), src)
+				cmd.Env = append(cmd.Environ(), "GOARCH="+arch)
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("compile failed: %v\n%s", err, out)
+				}
+				if got, want := bytes.Contains(out, []byte("runtime.panicBounds")), level == "-o2"; got != want {
+					t.Fatalf("bounds checks present = %v; want %v\n%s", got, want, out)
+				}
+			})
+		}
+	}
+}
+
+const o3ScanSource = `
+//go:noinline
+func scan(s string) int {
+	i, count := 0, 0
+	for i < len(s) {
+		for i < len(s) && s[i] == ' ' { i++ }
+		start := i
+		for i < len(s) && s[i] != ' ' { i++ }
+		count += i - start
+	}
+	return count
+}
+`
 
 const o3Source = `package main
 
@@ -118,12 +156,37 @@ func changing(n int) int {
 	return n
 }
 
+//go:noinline
+func scanFrom(s string, i int) int {
+	count := 0
+	for i < len(s) {
+		for i < len(s) && s[i] == ' ' { i++ }
+		start := i
+		for i < len(s) && s[i] != ' ' { i++ }
+		count += i - start
+	}
+	return count
+}
+
+//go:noinline
+func overflowingCounter() bool {
+	for i := int8(120); i < 127; i += 3 {
+		if i < 0 { return true }
+	}
+	return false
+}
+
 func mustPanic(f func()) {
 	defer func() { if recover() == nil { panic("missing panic") } }()
 	f()
 }
 
 func main() {
+	for _, s := range []string{"", " ", "abc", " a bcd  e ", "\x00 \xff"} {
+		want := 0
+		for i := range len(s) { if s[i] != ' ' { want++ } }
+		if scan(s) != want { panic("nested loop bounds") }
+	}
 	for _, n := range []int{-1, 0, 1, 2, 17, 100} {
 		if dead(n, 7) != n || branches(n, 7) != n || nested(n, 7) != n || down(n, 7) != n {
 			panic("dead loop result")
@@ -145,6 +208,8 @@ func main() {
 	mustPanic(func() { read(1, nil) })
 	mustPanic(func() { divide(1, 0) })
 	mustPanic(func() { index(1, nil) })
+	mustPanic(func() { scanFrom("x", -1) })
+	if scanFrom("  xy z", 1) != 3 || !overflowingCounter() { panic("invalid sign assumption") }
 	println("ok")
 }
 `

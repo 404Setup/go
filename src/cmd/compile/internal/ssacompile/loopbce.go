@@ -37,6 +37,76 @@ type indVar struct {
 	//	min <  ind <= max    [if flags == indVarMinExc|indVarMaxInc]
 }
 
+// nonNegativeIndVars proves non-negativity across cycles of phis, copies, and
+// increasing induction variables. Considering one loop at a time misses values
+// carried between an outer loop and successive inner loops.
+func nonNegativeIndVars(f *ssa.Func, ivs []indVar) []*ssa.Value {
+	// findIndVar proved these increments cannot overflow. An unchecked add,
+	// including an increment unrelated to an induction variable, is not safe.
+	increments := make(map[*ssa.Value]*ssa.Value)
+	for _, iv := range ivs {
+		if iv.flags&indVarDownward != 0 {
+			continue
+		}
+		// prove may have converted an unused counter to a downward loop
+		// since these induction variables were collected.
+		switch iv.nxt.Op {
+		case ssaop.OpAdd64, ssaop.OpAdd32, ssaop.OpAdd16, ssaop.OpAdd8:
+			increments[iv.nxt] = iv.ind
+		}
+	}
+	if len(increments) == 0 {
+		return nil
+	}
+
+	nonnegative := make([]bool, f.NumValues())
+	users := make([][]*ssa.Value, f.NumValues())
+	var work, candidates []*ssa.Value
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			if !v.Type.IsInteger() {
+				work = append(work, v)
+				continue
+			}
+			if ssa.InitLimit(v).Min >= 0 {
+				nonnegative[v.ID] = true
+				continue
+			}
+			var args []*ssa.Value
+			if ind := increments[v]; ind != nil {
+				args = []*ssa.Value{ind}
+			} else if v.Op == ssaop.OpPhi || v.Op == ssaop.OpCopy {
+				args = v.Args
+			} else {
+				work = append(work, v)
+				continue
+			}
+			nonnegative[v.ID] = true
+			candidates = append(candidates, v)
+			for _, a := range args {
+				users[a.ID] = append(users[a.ID], v)
+			}
+		}
+	}
+	for len(work) != 0 {
+		v := work[len(work)-1]
+		work = work[:len(work)-1]
+		for _, u := range users[v.ID] {
+			if nonnegative[u.ID] {
+				nonnegative[u.ID] = false
+				work = append(work, u)
+			}
+		}
+	}
+	result := candidates[:0]
+	for _, v := range candidates {
+		if nonnegative[v.ID] {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
 // parseIndVar checks whether the SSA value passed as argument is a valid induction
 // variable, and, if so, extracts:
 //   - the minimum bound

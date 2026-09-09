@@ -4286,7 +4286,9 @@ func addTailCall(pos src.XPos, fn *ir.Func, recv ir.Node, method *types.Field) {
 	dot := typecheck.XDotMethod(pos, recv, method.Sym, true)
 	call := typecheck.Call(pos, dot, args, method.Type.IsVariadic()).(*ir.CallExpr)
 
-	if recv.Type() != nil && recv.Type().IsPtr() && method.Type.Recv().Type.IsPtr() &&
+	tailReceiver := method.Type.Recv().Type.IsPtr() ||
+		base.Flag.O3 && base.Flag.N == 0 && sig.Recv() != nil && method.Type.Recv().Type.IsPtrShaped()
+	if recv.Type() != nil && recv.Type().IsPtr() && tailReceiver &&
 		method.Embedded != 0 &&
 		(types.IsInterfaceMethod(method.Type) && base.Ctxt.Arch.Name != "wasm" ||
 			!types.IsInterfaceMethod(method.Type) && !unifiedHaveInlineBody(ir.MethodExprName(dot).Func)) &&

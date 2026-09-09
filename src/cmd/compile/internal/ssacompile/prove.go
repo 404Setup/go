@@ -10,6 +10,7 @@ import (
 	"math/bits"
 	"strings"
 
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/ssa/block"
 	"cmd/compile/internal/ssa/ssaop"
@@ -1236,9 +1237,10 @@ func getSliceInfo(vp *ssa.Value) (inf sliceInfo) {
 // successor.
 func prove(f *ssa.Func) {
 	// Find induction variables.
+	ivs := findIndVar(f)
 	var indVars map[*ssa.Block][]indVar
 	var headerIndVars map[*ssa.Block][]indVar
-	for _, v := range findIndVar(f) {
+	for _, v := range ivs {
 		ind := v.ind
 		if len(ind.Args) != 2 {
 			// the rewrite code assumes there is only ever two parents to loops
@@ -1266,6 +1268,11 @@ func prove(f *ssa.Func) {
 
 	ft := newFactsTable(f)
 	ft.checkpoint()
+	if base.Flag.O3 {
+		for _, v := range nonNegativeIndVars(f, ivs) {
+			ft.setNonNegative(v)
+		}
+	}
 
 	// Find length and capacity ops.
 	for _, b := range f.Blocks {

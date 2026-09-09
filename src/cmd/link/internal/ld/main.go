@@ -56,7 +56,7 @@ var (
 
 func init() {
 	flag.Bool("o2", false, "enable extra dead code elimination and loop unrolling during compilation by cmd/go")
-	flag.Bool("o3", false, "enable O2 optimizations and dead loop elimination during compilation by cmd/go")
+	flag.Bool("o3", false, "enable O2 and additional loop and method wrapper optimizations during compilation by cmd/go")
 	flag.Var(&flagExtld, "extld", "use `linker` when linking in external mode")
 	flag.Var(&flagExtldflags, "extldflags", "pass `flags` to external linker")
 	flag.Var(&macOS, "macos", "mac OS version to write in build info (only used in internal linking)")

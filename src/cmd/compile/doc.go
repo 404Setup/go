@@ -122,7 +122,10 @@ Flags:
 		or externally used results when termination can be proved. This includes
 		branching loop bodies and runtime bounds; nested dead loops are removed
 		within an analysis budget. Calls, panics, and potentially nonterminating
-		loops are preserved. The -N flag disables these optimizations.
+		loops are preserved. Propagate non-negative induction variables across
+		nested loops to remove redundant bounds checks, and use tail calls for
+		eligible method wrappers with pointer-shaped value receivers.
+		The -N flag disables these optimizations.
 	-p path
 		Set expected package import path for the code being compiled,
 		and diagnose imports that would cause a circular dependency.
