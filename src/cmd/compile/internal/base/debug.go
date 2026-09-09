@@ -52,6 +52,7 @@ type DebugFlags struct {
 	InterfaceCycles       int    `help:"allow anonymous interface cycles" concurrent:"ok"`
 	Libfuzzer             int    `help:"enable coverage instrumentation for libfuzzer"`
 	LiteralAllocHash      string `help:"hash value for use in debugging literal allocation optimizations" concurrent:"ok"`
+	LoopReorder           int    `help:"print loop interchange and tiling decisions" concurrent:"ok"`
 	LoopVar               int    `help:"shared (0), 1 (private loop variables, default), 2, private + log" concurrent:"ok"`
 	LoopVarHash           string `help:"for debugging changes in loop behavior. Overrides experiment and loopvar flag." concurrent:"ok"`
 	LocationLists         int    `help:"print information about DWARF location list creation"`

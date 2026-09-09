@@ -127,6 +127,11 @@ Flags:
 		eligible method wrappers with pointer-shaped value receivers.
 		Resolve statically known MethodByName arguments through immutable local
 		aliases so the linker can discard unrelated methods.
+		Interchange rectangular loops over private fixed-size two-dimensional
+		arrays for contiguous access, or tile mixed row/column accesses in 32 by 32
+		blocks. This requires numeric elements, int indices, constant bounds, unit
+		increments, and independent, non-panicking iterations; uncertain
+		dependencies retain their original order.
 		The -N flag disables these optimizations.
 	-p path
 		Set expected package import path for the code being compiled,

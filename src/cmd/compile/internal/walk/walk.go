@@ -26,6 +26,9 @@ const (
 
 func Walk(fn *ir.Func) {
 	ir.CurFunc = fn
+	if base.Flag.O3 && base.Flag.N == 0 {
+		reorderLoops(fn)
+	}
 
 	// Build pre-walk analysis caches with a single AST traversal.
 	// (At some point, it might be worthwhile to have a walkState structure
