@@ -20,6 +20,9 @@ func TestCompilerOptimizationFlags(t *testing.T) {
 		want  []string
 	}{
 		{"-o2 -fmth", []string{"-o2", "-fmth"}},
+		{"-o3 -o2=false --o3=true", []string{"-o3", "-o2=false", "--o3=true"}},
+		{"-o3 -o3=false", []string{"-o3", "-o3=false"}},
+		{"-extldflags '-o3' -X main.value=-o3 -o3", []string{"-o3"}},
 		{"-o2 -o2=false --fmth=true", []string{"-o2", "-o2=false", "--fmth=true"}},
 		{"-s -w -fmth=0 -o2=1", []string{"-fmth=0", "-o2=1"}},
 		{"-extldflags '-fmth' -X main.value=-o2 -o2", []string{"-o2"}},

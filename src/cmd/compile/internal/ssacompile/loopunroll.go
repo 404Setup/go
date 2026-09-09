@@ -29,8 +29,6 @@ func o2LoopUnroll(f *ssa.Func) {
 
 func unrollLoop(f *ssa.Func, iv indVar) bool {
 	header, body := iv.ind.Block, iv.entry
-	// ponytail: only straight-line, constant-trip loops; add remainder loops
-	// and branching loop bodies when benchmarks justify their code size cost.
 	if header.Kind != block.BlockIf || len(header.Preds) != 2 ||
 		len(body.Preds) != 1 || body.Preds[0].B != header {
 		return false

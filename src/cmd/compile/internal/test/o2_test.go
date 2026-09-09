@@ -35,6 +35,11 @@ func TestO2DeadCode(t *testing.T) {
 		{"compiler-enabled", "", "-o2", false},
 		{"no-inline", "-o2", "-l", false},
 		{"combined", "-o2 -fmth", "", false},
+		{"o3-inherits", "-o3", "", false},
+		{"o3-inherits-disabled-o2", "-o3 -o2=false", "", false},
+		{"o3-compiler-enabled", "", "-o3", false},
+		{"o3-disabled-keeps-o2", "-o2 -o3=false", "", false},
+		{"o3-no-opt", "-o3", "-N", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dst := filepath.Join(dir, tt.name+".exe")

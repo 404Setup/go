@@ -3269,7 +3269,7 @@ func setToolFlags(ld *modload.Loader, pkgs ...*Package) {
 		p.Internal.Ldflags = BuildLdflags.For(ld, p)
 		if flags := compilerOptimizationFlags(p.Internal.Ldflags); len(flags) != 0 {
 			if cfg.BuildContext.Compiler != "gc" {
-				base.Fatalf("go: -ldflags=-o2 and -ldflags=-fmth are only supported by the gc compiler")
+				base.Fatalf("go: -ldflags=-o2, -ldflags=-o3 and -ldflags=-fmth are only supported by the gc compiler")
 			}
 			// Include these in Gcflags so compilation and its cache key agree.
 			p.Internal.Gcflags = append(flags, p.Internal.Gcflags...)

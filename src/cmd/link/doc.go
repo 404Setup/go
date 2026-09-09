@@ -133,6 +133,11 @@ Flags:
 		when linking already compiled objects directly. The compiler's -N disables compile-time
 		optimizations, including -fmth, but does not disable the linker's flush
 		mode. Use -ldflags='all=-o2 -fmth' to include dependencies.
+	-o3
+		With go build -ldflags=-o3, enable all -o2 optimizations and remove provably
+		finite loops with no observable effects in matching packages. Use
+		-ldflags=all=-o3 to include dependencies. The compiler's -N disables these
+		optimizations. Accepted but has no effect when linking already compiled objects.
 	-pluginpath path
 		The path name used to prefix exported plugin symbols.
 	-r dir1:dir2:...

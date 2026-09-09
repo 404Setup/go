@@ -112,7 +112,7 @@ func compilerOptimizationFlags(flags []string) []string {
 		}
 		name, value, hasValue := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-"), "=")
 		switch name {
-		case "o2", "fmth":
+		case "o2", "o3", "fmth":
 			if hasValue {
 				if _, err := strconv.ParseBool(value); err != nil {
 					base.Fatalf("go: invalid boolean value %q for -ldflags=-%s", value, name)

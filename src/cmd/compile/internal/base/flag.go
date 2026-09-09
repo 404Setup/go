@@ -117,6 +117,7 @@ type CmdFlags struct {
 	MutexProfile       string       "help:\"write mutex profile to `file`\""
 	NoLocalImports     bool         "help:\"reject local (relative) imports\""
 	O2                 bool         "help:\"enable extra dead code elimination and loop unrolling (disabled by -N)\""
+	O3                 bool         "help:\"enable O2 optimizations and dead loop elimination (disabled by -N)\""
 	CoverageCfg        func(string) "help:\"read coverage configuration from `file`\""
 	Pack               bool         "help:\"write to file.a instead of file.o\""
 	Race               bool         "help:\"enable race detector\""
@@ -203,6 +204,7 @@ func ParseFlags() {
 	registerFlags()
 	objabi.Flagparse(usage)
 	counter.CountFlags("compile/flag:", *flag.CommandLine)
+	Flag.O2 = Flag.O2 || Flag.O3
 
 	if gcd := os.Getenv("GOCOMPILEDEBUG"); gcd != "" {
 		// This will only override the flags set in gcd;

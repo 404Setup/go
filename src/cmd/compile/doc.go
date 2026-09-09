@@ -117,6 +117,12 @@ Flags:
 		unrolled by a factor of 2 or 4 when their iteration count is divisible
 		by that factor. A code size budget limits expansion. This may increase
 		compilation time and binary size. The -N flag disables these optimizations.
+	-o3
+		Enable all -o2 optimizations and eliminate loops with no observable effects
+		or externally used results when termination can be proved. This includes
+		branching loop bodies and runtime bounds; nested dead loops are removed
+		within an analysis budget. Calls, panics, and potentially nonterminating
+		loops are preserved. The -N flag disables these optimizations.
 	-p path
 		Set expected package import path for the code being compiled,
 		and diagnose imports that would cause a circular dependency.

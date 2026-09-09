@@ -442,6 +442,7 @@ var passes = [...]ssa.Pass{
 	{Name: "generic deadcode", Fn: deadcode, Required: true}, // remove dead stores, which otherwise mess up store chain
 	{Name: "o2 loop unroll", Fn: o2LoopUnroll},
 	{Name: "o2 deadcode", Fn: o2Deadcode},
+	{Name: "o3 deadcode", Fn: o3Deadcode},
 	{Name: "late fuse", Fn: fuseLate},
 	{Name: "check bce", Fn: checkbce},
 	{Name: "dse", Fn: dse},
@@ -527,6 +528,8 @@ var passOrder = [...]constraint{
 	{"generic deadcode", "o2 loop unroll"},
 	{"o2 loop unroll", "o2 deadcode"},
 	{"o2 deadcode", "late fuse"},
+	{"o2 deadcode", "o3 deadcode"},
+	{"o3 deadcode", "late fuse"},
 	// decompose builtin now also cleans up after expand calls
 	{"expand calls", "decompose builtin"},
 	// don't run optimization pass until we've decomposed builtin objects

@@ -1,6 +1,10 @@
 # Compile-time optimization options are exposed through -ldflags.
 ! go build -o2 .
 stderr 'flag provided but not defined: -o2'
+! go build -o3 .
+stderr 'flag provided but not defined: -o3'
+! go build -ldflags=-o3=invalid .
+stderr 'invalid boolean value "invalid"'
 ! go build -ldflags=-fmth=invalid .
 stderr 'invalid boolean value "invalid"'
 
@@ -8,6 +12,11 @@ stderr 'invalid boolean value "invalid"'
 go build -a -n '-ldflags=-o2 -fmth' .
 stderr 'compile.* -p main .* -o2 -fmth '
 ! stderr 'compile.* -p example.com/flags/dep .* -fmth '
+
+# O3 follows the same package matching and compiler-override rules as O2.
+go build -a -n '-ldflags=all=-o3' '-gcflags=example.com/flags/dep=-o3=false' .
+stderr 'compile.* -p main .* -o3 '
+stderr 'compile.* -p example.com/flags/dep .* -o3 -o3=false '
 
 # Patterns cover dependencies and later matching flags take precedence.
 go build -a -n '-ldflags=all=-o2 -fmth' '-ldflags=example.com/flags/dep=-fmth=false' .
