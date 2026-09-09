@@ -1137,6 +1137,11 @@ func usemethod(n *ir.CallExpr) {
 		base.FatalfAt(dot.Pos(), "usemethod: unexpected dot.Op() %s", dot.Op())
 	}
 
+	if base.Flag.O3 && base.Flag.N == 0 {
+		if value := staticValue(targetName); value != nil {
+			targetName = value
+		}
+	}
 	if ir.IsConst(targetName, constant.String) {
 		name := constant.StringVal(targetName.Val())
 		ir.CurFunc.LSym.AddRel(base.Ctxt, obj.Reloc{

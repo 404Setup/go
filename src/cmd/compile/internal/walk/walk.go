@@ -6,6 +6,7 @@ package walk
 
 import (
 	"fmt"
+	"go/constant"
 	"internal/abi"
 
 	"cmd/compile/internal/base"
@@ -447,8 +448,8 @@ func ifaceData(pos src.XPos, n ir.Node, t *types.Type) ir.Node {
 // including its closures, and uses a cache to reduce duplicative work.
 // It can return n or nil if it does not find an earlier expression.
 //
-// The current use case is reducing OCONVIFACE allocations, and hence
-// staticValue is currently only useful when given an *ir.ConvExpr.X as n.
+// Results are cached for OCONVIFACE operands and, under O3, statically known
+// MethodByName arguments that can narrow reflective method lookups.
 func staticValue(n ir.Node) ir.Node {
 	if staticValues == nil {
 		base.Fatalf("staticValues is nil. staticValue called outside of walk.Walk?")
@@ -483,6 +484,17 @@ func analyzePreWalk(fn *ir.Func) {
 			v := ro.StaticValue(x)
 			if v != nil && v != x {
 				sv[x] = v
+			}
+		case ir.OCALLFUNC, ir.OCALLINTER:
+			if !base.Flag.O3 || base.Flag.N != 0 {
+				return
+			}
+			call := n.(*ir.CallExpr)
+			if dot, ok := call.Fun.(*ir.SelectorExpr); ok && dot.Sel.Name == "MethodByName" && len(call.Args) != 0 {
+				x := call.Args[len(call.Args)-1]
+				if val := ro.StaticValue(x); ir.IsConst(val, constant.String) {
+					sv[x] = val
+				}
 			}
 		case ir.ONAME:
 			name := n.(*ir.Name).Canonical()

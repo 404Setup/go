@@ -125,6 +125,8 @@ Flags:
 		loops are preserved. Propagate non-negative induction variables across
 		nested loops to remove redundant bounds checks, and use tail calls for
 		eligible method wrappers with pointer-shaped value receivers.
+		Resolve statically known MethodByName arguments through immutable local
+		aliases so the linker can discard unrelated methods.
 		The -N flag disables these optimizations.
 	-p path
 		Set expected package import path for the code being compiled,
