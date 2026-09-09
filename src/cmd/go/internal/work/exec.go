@@ -99,6 +99,10 @@ func (b *Builder) Do(ctx context.Context, root *Action) {
 	// to do what it would have done first in a simple depth-first
 	// dependency order traversal.
 	all := actionList(root)
+	progress := b.startProgress(all)
+	if progress != nil {
+		defer func() { progress.finish(root.Failed != nil || base.GetExitStatus() != 0) }()
+	}
 	for i, a := range all {
 		a.priority = i
 	}
@@ -164,6 +168,11 @@ func (b *Builder) Do(ctx context.Context, root *Action) {
 		// shared work state are serialized through b.exec.
 		b.exec.Lock()
 		defer b.exec.Unlock()
+		if progress != nil && a.Actor != nil {
+			progress.sh.printLock.Lock()
+			progress.done++
+			progress.sh.printLock.Unlock()
+		}
 
 		if err != nil {
 			if b.AllowErrors && a.Package != nil {

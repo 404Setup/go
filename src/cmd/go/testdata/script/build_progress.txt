@@ -1,0 +1,40 @@
+# Captured CLI output must stay suitable for scripts and editors.
+go build -o app$GOEXE .
+! stdout .
+! stderr .
+
+# Cached builds must stay quiet too.
+go build -o app$GOEXE .
+! stdout .
+! stderr .
+
+env GOBIN=$WORK/bin
+go install .
+! stdout .
+! stderr .
+
+go build -json -o app$GOEXE .
+! stdout .
+! stderr .
+
+go list -export -f '{{.ImportPath}}' .
+stdout '^example.com/progress$'
+! stderr .
+
+# The Windows terminal implementation must not pull net into go_bootstrap.
+env GOOS=windows
+env GOARCH=amd64
+go list -tags=cmd_go_bootstrap -deps cmd/go
+! stdout '^net$'
+! stdout '^os/user$'
+! stdout '^crypto/x509$'
+! stdout '^cmd/vendor/golang.org/x/term$'
+
+-- go.mod --
+module example.com/progress
+
+go 1.26
+-- main.go --
+package main
+
+func main() {}

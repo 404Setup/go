@@ -43,7 +43,8 @@ type shellShared struct {
 
 	printLock sync.Mutex
 	printer   load.Printer
-	scriptDir string // current directory in printed script
+	progress  *buildProgress // protected by printLock
+	scriptDir string         // current directory in printed script
 
 	mkdirCache par.Cache[string, error] // a cache of created directories
 }
@@ -75,10 +76,11 @@ func (sh *Shell) pkg() *load.Package {
 func (sh *Shell) Printf(format string, a ...any) {
 	sh.printLock.Lock()
 	defer sh.printLock.Unlock()
-	sh.printer.Printf(sh.pkg(), format, a...)
+	sh.printfLocked(format, a...)
 }
 
 func (sh *Shell) printfLocked(format string, a ...any) {
+	sh.progress.clear()
 	sh.printer.Printf(sh.pkg(), format, a...)
 }
 
@@ -86,6 +88,7 @@ func (sh *Shell) printfLocked(format string, a ...any) {
 func (sh *Shell) Errorf(format string, a ...any) {
 	sh.printLock.Lock()
 	defer sh.printLock.Unlock()
+	sh.progress.clear()
 	sh.printer.Errorf(sh.pkg(), format, a...)
 }
 
