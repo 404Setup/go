@@ -28,6 +28,11 @@ import (
 // Use V4 for generic methods.
 const uirVersion = pkgbits.V4
 
+// inlinePropertiesFlag tags the inline cost in a compiler-private function
+// extension. A per-record marker survives verbatim relocation of imported
+// extensions, including re-exports through packages built without O3.
+const inlinePropertiesFlag = 1 << 30
+
 // localPkgReader holds the package reader used for reading the local
 // package. It exists so the unified IR linker can refer back to it
 // later.

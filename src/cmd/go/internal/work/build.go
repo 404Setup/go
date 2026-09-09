@@ -148,7 +148,7 @@ and test commands:
 	-ldflags '[pattern=]arg list'
 		arguments to pass on each go tool link invocation.
 		With the gc compiler, -o2 enables extra dead code elimination and loop unrolling;
-		-o3 includes -o2 and adds loop, bounds, method wrapper, and reflection optimizations;
+		-o3 includes -o2 and adds inlining, loop, bounds, method wrapper, and reflection optimizations;
 		-fmth enables aggressive floating-point optimizations during compilation
 		of matching packages. Use 'all=-o2 -fmth' to include dependencies.
 		The compiler's -N flag disables these compile-time optimizations;

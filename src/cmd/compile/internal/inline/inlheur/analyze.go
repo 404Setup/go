@@ -215,7 +215,14 @@ func fnFileLine(fn *ir.Func) (string, uint) {
 }
 
 func Enabled() bool {
-	return buildcfg.Experiment.NewInliner || UnitTesting()
+	return buildcfg.Experiment.NewInliner || O3Enabled() || UnitTesting()
+}
+
+// O3Enabled reports whether to use the additional O3 inlining policy.
+// Runtime write-barrier checks rely on keeping some lowering-generated panic
+// calls out of its nowritebarrierrec call graph. Keep its established policy.
+func O3Enabled() bool {
+	return base.Flag.O3 && base.Flag.N == 0 && !base.Flag.CompilingRuntime
 }
 
 func UnitTesting() bool {

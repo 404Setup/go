@@ -29,7 +29,6 @@ package inline
 import (
 	"fmt"
 	"go/constant"
-	"internal/buildcfg"
 	"strconv"
 	"strings"
 
@@ -48,6 +47,7 @@ import (
 // Inlining budget parameters, gathered in one place
 const (
 	inlineMaxBudget       = 80
+	inlineO3MaxBudget     = 120
 	inlineExtraAppendCost = 0
 	// default is to inline if there's at most one call. -l=4 overrides this by using 1 instead.
 	inlineExtraCallCost  = 57              // 57 was benchmarked to provided most benefit with no bad surprises; see https://github.com/golang/go/issues/19348#issuecomment-439370742
@@ -59,6 +59,15 @@ const (
 	inlineBigFunctionMaxCost    = 20                   // Max cost of inlinee when inlining into a "big" function.
 	inlineClosureCalledOnceCost = 10 * inlineMaxBudget // if a closure is just called once, inline it.
 )
+
+// inlineBaseBudget keeps candidate admission and callsite decisions in the
+// same cost units. O3 buys more code growth without changing exported costs.
+func inlineBaseBudget() int32 {
+	if inlheur.O3Enabled() {
+		return inlineO3MaxBudget
+	}
+	return inlineMaxBudget
+}
 
 var (
 	// List of all hot callee nodes.
@@ -222,7 +231,7 @@ func isAtomicV2InlineCandidate(fn *ir.Func) bool {
 // happen; changes here merely make inlines possible.
 func inlineBudget(fn *ir.Func, profile *pgoir.Profile, relaxed bool, verbose bool) int32 {
 	// Update the budget for profile-guided inlining.
-	budget := int32(inlineMaxBudget)
+	budget := inlineBaseBudget()
 
 	budget *= simdCreditMultiplier(fn)
 	if isAtomicV2InlineCandidate(fn) {
@@ -249,7 +258,7 @@ func inlineBudget(fn *ir.Func, profile *pgoir.Profile, relaxed bool, verbose boo
 		}
 	}
 	if relaxed {
-		budget += inlheur.BudgetExpansion(inlineMaxBudget)
+		budget += inlheur.BudgetExpansion(inlineBaseBudget())
 	}
 	if fn.ClosureParent != nil {
 		// be very liberal here, if the closure is only called once, the budget is large
@@ -1002,7 +1011,12 @@ var InlineCall = func(callerfn *ir.Func, call *ir.CallExpr, fn *ir.Func, inlInde
 //   - the score assigned to this specific callsite
 //   - whether the inlined function is "hot" according to PGO.
 func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller, closureCalledOnce bool) (bool, int32, int32, bool) {
-	maxCost := int32(inlineMaxBudget)
+	maxCost := inlineBaseBudget()
+	if inlheur.O3Enabled() && bigCaller && callee.Inl.Cost > inlineBigFunctionMaxCost {
+		// Once growth is limited, specialization bonuses must not admit a
+		// large body. Tiny helpers can still remove more code than they add.
+		return false, inlineBigFunctionMaxCost, callee.Inl.Cost, false
+	}
 
 	if strings.HasPrefix(ir.FuncName(caller), "runtime_mapaccess1") && caller.Sym().Pkg.Path == "internal/runtime/maps" &&
 		strings.HasPrefix(ir.FuncName(callee), "runtime_mapaccess2") && callee.Sym().Pkg.Path == "internal/runtime/maps" {
@@ -1265,7 +1279,7 @@ func mkinlcall(callerfn *ir.Func, n *ir.CallExpr, fn *ir.Func, bigCaller, closur
 	}
 
 	if base.Flag.LowerM != 0 {
-		if buildcfg.Experiment.NewInliner {
+		if inlheur.Enabled() {
 			fmt.Printf("%v: inlining call to %v with score %d\n",
 				ir.Line(n), fn.Nname.DiagName(), score)
 		} else {
@@ -1400,5 +1414,5 @@ func analyzeFuncProps(fn *ir.Func, p *pgoir.Profile) {
 	budgetForFunc := func(fn *ir.Func) int32 {
 		return inlineBudget(fn, p, true, false)
 	}
-	inlheur.AnalyzeFunc(fn, canInline, budgetForFunc, inlineMaxBudget)
+	inlheur.AnalyzeFunc(fn, canInline, budgetForFunc, int(inlineBaseBudget()))
 }

@@ -1250,11 +1250,12 @@ func (r *reader) funcExt(name *ir.Name, method *types.Sym) {
 		}
 
 		if r.Bool() {
+			cost := r.Len()
 			fn.Inl = &ir.Inline{
-				Cost:            int32(r.Len()),
+				Cost:            int32(cost &^ inlinePropertiesFlag),
 				CanDelayResults: r.Bool(),
 			}
-			if buildcfg.Experiment.NewInliner {
+			if cost&inlinePropertiesFlag != 0 || buildcfg.Experiment.NewInliner {
 				fn.Inl.Properties = r.String()
 			}
 		}

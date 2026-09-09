@@ -97,6 +97,14 @@ var adjValues = map[scoreAdjustTyp]int{
 // a series of "/"-separated clauses of the form adj1:value1. Example:
 // -d=inlscoreadj=inLoopAdj=0/passConstToIfAdj=-99
 func SetupScoreAdjustments() {
+	if O3Enabled() {
+		// Spend more on specialization and devirtualization, while also
+		// increasing the penalty for code duplicated on cold paths.
+		for adj, value := range adjValues {
+			adjValues[adj] = 2 * value
+		}
+		adjValues[inLoopAdj] = -30
+	}
 	if base.Debug.InlScoreAdj == "" {
 		return
 	}
@@ -197,6 +205,7 @@ func (cs *CallSite) computeCallSiteScore(csa *callSiteAnalyzer, calleeProps *Fun
 
 	// Start with the size-based score for the callee.
 	score := int(callee.Inl.Cost)
+	score -= callOverhead(callee)
 	var tmask scoreAdjustTyp
 
 	if debugTrace&debugTraceScoring != 0 {
@@ -379,7 +388,7 @@ func LargestNegativeScoreAdjustment(fn *ir.Func, props *FuncProps) int {
 		setupFlagToAdjMaps()
 	}
 	var tmask scoreAdjustTyp
-	score := adjValues[inLoopAdj] // any call can be in a loop
+	score := adjValues[inLoopAdj] - callOverhead(fn) // any call can be in a loop
 	for _, pf := range props.ParamFlags {
 		if adj, ok := paramFlagToPositiveAdj[pf]; ok {
 			score, tmask = adjustScore(adj, score, tmask)
@@ -397,6 +406,16 @@ func LargestNegativeScoreAdjustment(fn *ir.Func, props *FuncProps) int {
 	}
 
 	return score
+}
+
+// callOverhead estimates the call/return and argument/result setup eliminated
+// by inlining, in the same IR cost units as the body. Bound the credit: a large
+// signature alone is not a reason to duplicate a large function.
+func callOverhead(fn *ir.Func) int {
+	if !O3Enabled() {
+		return 0
+	}
+	return 5 + 2*min(8, len(fn.Type().RecvParamsResults()))
 }
 
 // callSiteTab contains entries for each call in the function

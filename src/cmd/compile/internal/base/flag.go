@@ -117,7 +117,7 @@ type CmdFlags struct {
 	MutexProfile       string       "help:\"write mutex profile to `file`\""
 	NoLocalImports     bool         "help:\"reject local (relative) imports\""
 	O2                 bool         "help:\"enable extra dead code elimination and loop unrolling (disabled by -N)\""
-	O3                 bool         "help:\"enable O2 and additional loop, wrapper, and reflection optimizations (disabled by -N)\""
+	O3                 bool         "help:\"enable O2 and additional inlining, loop, wrapper, and reflection optimizations (disabled by -N)\""
 	CoverageCfg        func(string) "help:\"read coverage configuration from `file`\""
 	Pack               bool         "help:\"write to file.a instead of file.o\""
 	Race               bool         "help:\"enable race detector\""

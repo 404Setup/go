@@ -118,6 +118,12 @@ Flags:
 		by that factor. A code size budget limits expansion. This may increase
 		compilation time and binary size. The -N flag disables these optimizations.
 	-o3
+		Use a larger inlining budget and a callsite cost model that credits
+		removed call overhead, loop execution, constant specialization, and
+		devirtualization. Penalize panic and init paths and restrict cumulative
+		caller growth to avoid excessive expansion. The -l flag disables inlining;
+		-N disables the additional O3 inlining policy.
+		The runtime retains its existing inlining policy for write-barrier safety.
 		Enable all -o2 optimizations and eliminate loops with no observable effects
 		or externally used results when termination can be proved. This includes
 		branching loop bodies and runtime bounds; nested dead loops are removed

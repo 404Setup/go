@@ -299,11 +299,10 @@ func (l *linker) relocFuncExt(w *pkgbits.Encoder, name *ir.Name) {
 	}
 
 	if inl := name.Func.Inl; w.Bool(inl != nil) {
-		w.Len(int(inl.Cost))
+		assert(inl.Cost >= 0 && inl.Cost < inlinePropertiesFlag)
+		w.Len(int(inl.Cost) | inlinePropertiesFlag)
 		w.Bool(inl.CanDelayResults)
-		if buildcfg.Experiment.NewInliner {
-			w.String(inl.Properties)
-		}
+		w.String(inl.Properties)
 	}
 
 	w.Sync(pkgbits.SyncEOF)

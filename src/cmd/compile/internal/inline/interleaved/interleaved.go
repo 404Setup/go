@@ -186,13 +186,14 @@ type callSite struct {
 }
 
 type inlClosureState struct {
-	fn        *ir.Func
-	profile   *pgoir.Profile
-	callSites map[*ir.ParenExpr]bool // callSites[p] == "p appears in parens" (do not append again)
-	resolved  []*ir.Func             // for each call in parens, the resolved target of the call
-	useCounts map[*ir.Func]int       // shared among all InlClosureStates
-	parens    []*ir.ParenExpr
-	bigCaller bool
+	fn          *ir.Func
+	profile     *pgoir.Profile
+	callSites   map[*ir.ParenExpr]bool // callSites[p] == "p appears in parens" (do not append again)
+	resolved    []*ir.Func             // for each call in parens, the resolved target of the call
+	useCounts   map[*ir.Func]int       // shared among all InlClosureStates
+	parens      []*ir.ParenExpr
+	bigCaller   bool
+	inlinedCost int32 // cumulative body cost, before specialization discounts
 }
 
 // resolve attempts to resolve a call to a potentially inlineable callee
@@ -236,7 +237,17 @@ func (s *inlClosureState) edit(state *devirtualize.State, i int) (*ir.CallExpr, 
 	if count <= 0 {
 		return nil, nil
 	}
-	if inlCall := inline.TryInlineCall(s.fn, call, s.bigCaller, s.profile, count == 1 && callee.ClosureParent != nil); inlCall != nil {
+	bigCaller := s.bigCaller
+	if inlheur.O3Enabled() && callee.Inl != nil {
+		// Bound cumulative expansion, including newly exposed calls. Counting
+		// unsimplified bodies is conservative but avoids rescanning the caller
+		// after every inline. Above this limit only tiny helpers are admitted.
+		bigCaller = bigCaller || s.inlinedCost+callee.Inl.Cost > 2000
+	}
+	if inlCall := inline.TryInlineCall(s.fn, call, bigCaller, s.profile, count == 1 && callee.ClosureParent != nil); inlCall != nil {
+		if inlheur.O3Enabled() {
+			s.inlinedCost = min(2000, s.inlinedCost+callee.Inl.Cost)
+		}
 		return call, inlCall
 	}
 	return nil, nil
