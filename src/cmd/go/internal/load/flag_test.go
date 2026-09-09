@@ -6,11 +6,39 @@ package load
 
 import (
 	"cmd/go/internal/modload"
+	"cmd/internal/quoted"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 )
+
+func TestCompilerOptimizationFlags(t *testing.T) {
+	for _, tt := range []struct {
+		flags string
+		want  []string
+	}{
+		{"-o2 -fmth", []string{"-o2", "-fmth"}},
+		{"-o2 -o2=false --fmth=true", []string{"-o2", "-o2=false", "--fmth=true"}},
+		{"-s -w -fmth=0 -o2=1", []string{"-fmth=0", "-o2=1"}},
+		{"-extldflags '-fmth' -X main.value=-o2 -o2", []string{"-o2"}},
+		{"-extldflags=-fmth -o -o2 -fmth", []string{"-fmth"}},
+		{"-buildid -fmth -o2", []string{"-o2"}},
+		{"-- -fmth", nil},
+		{"main.a -fmth", nil},
+	} {
+		t.Run(tt.flags, func(t *testing.T) {
+			flags, err := quoted.Split(tt.flags)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := compilerOptimizationFlags(flags); !slices.Equal(got, tt.want) {
+				t.Fatalf("got %q; want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 type ppfTestPackage struct {
 	path    string

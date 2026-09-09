@@ -9,6 +9,7 @@ import (
 	"cmd/go/internal/modload"
 	"cmd/internal/quoted"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -97,4 +98,37 @@ func (f *PerPackageFlag) For(s *modload.Loader, p *Package) []string {
 		}
 	}
 	return flags
+}
+
+// compilerOptimizationFlags extracts compile-time options exposed through
+// -ldflags. Keep operands of other linker flags (including quoted flags for an
+// external linker) intact. The linker still receives and validates all flags.
+func compilerOptimizationFlags(flags []string) []string {
+	var result []string
+	for i := 0; i < len(flags); i++ {
+		arg := flags[i]
+		if arg == "--" || !strings.HasPrefix(arg, "-") {
+			break
+		}
+		name, value, hasValue := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-"), "=")
+		switch name {
+		case "o2", "fmth":
+			if hasValue {
+				if _, err := strconv.ParseBool(value); err != nil {
+					base.Fatalf("go: invalid boolean value %q for -ldflags=-%s", value, name)
+				}
+			}
+			result = append(result, arg)
+		case "B", "D", "E", "H", "I", "L", "R", "T", "X",
+			"benchmark", "benchmarkprofile", "buildid", "buildmode", "capturehostobjs",
+			"cpuprofile", "debugtextsize", "debugtramp", "extar", "extld", "extldflags",
+			"fipso", "funcalign", "importcfg", "installsuffix", "k", "libgcc", "linkmode",
+			"macos", "macsdk", "memprofile", "memprofilerate", "o", "pluginpath",
+			"r", "randlayout", "strictdups", "tmpdir":
+			if !hasValue {
+				i++
+			}
+		}
+	}
+	return result
 }

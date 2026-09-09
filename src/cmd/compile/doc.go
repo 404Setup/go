@@ -101,6 +101,15 @@ Flags:
 		Disallow local (relative) imports.
 	-o file
 		Write object to file (default file.o or, with -pack, file.a).
+	-fmth
+		Enable aggressive floating-point optimizations (disabled by -N).
+		Assume finite operands/results and ignore signed zero. Permit
+		reassociation, reciprocal multiplication, and fused operations across
+		explicit rounding. Rounding, NaN, infinity, and signed-zero behavior may
+		change. Direct calls to math.Exp, Exp2, Log, Log2, Log10, Pow, Sin, Cos,
+		and Tan use approximate implementations with shorter polynomials.
+		Use go build -ldflags=-fmth to also enable runtime flush-to-zero mode.
+		The runtime package itself retains IEEE optimizations for its NaN checks.
 	-o2
 		Enable extra dead code elimination using conditions exposed by late
 		constant propagation. This may increase compilation time.

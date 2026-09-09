@@ -889,7 +889,8 @@ func schedinit() {
 	randinit() // must run before mallocinit, AlgInit, mcommoninit
 	mallocinit()
 	cpuinit(godebug) // must run before AlgInit
-	maps.AlgInit()   // maps, hash, rand must not be used before this call
+	initFastMath()
+	maps.AlgInit() // maps, hash, rand must not be used before this call
 	mcommoninit(gp.m, -1)
 	modulesinit()   // provides activeModules
 	typelinksinit() // uses maps, activeModules
@@ -1934,6 +1935,9 @@ func mstart1() {
 
 	asminit()
 	minit()
+	if fastMathMask != 0 {
+		enableFastMath()
+	}
 
 	// Install signal handlers; after minit so that minit can
 	// prepare the thread to be able to handle the signals.

@@ -422,6 +422,7 @@ var passes = [...]ssa.Pass{
 	{Name: "zero arg cse", Fn: zcse, Required: true},     // required to merge OpSB values
 	{Name: "opt deadcode", Fn: deadcode, Required: true}, // remove any blocks orphaned during opt
 	{Name: "generic cse", Fn: cse},
+	{Name: "fast math", Fn: fastmath},
 	{Name: "phiopt", Fn: phiopt},
 	{Name: "gcse deadcode", Fn: deadcode, Required: true}, // clean out after cse and phiopt
 	{Name: "nilcheckelim", Fn: nilcheckelim},
@@ -494,6 +495,8 @@ var passOrder = [...]constraint{
 
 	// prove relies on common-subexpression elimination for maximum benefits.
 	{"generic cse", "prove"},
+	{"generic cse", "fast math"},
+	{"fast math", "prove"},
 	// deadcode after prove to eliminate all new dead blocks.
 	{"prove", "generic deadcode"},
 	// divisible after prove to let prove analyze div and mod

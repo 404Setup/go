@@ -17,6 +17,7 @@ import (
 	"cmd/compile/internal/ssa/ssaop"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 	"cmd/internal/sys"
 )
 
@@ -2509,12 +2510,6 @@ func findIntrinsic(sym *types.Sym) intrinsicBuilder {
 		// We can't intrinsify them.
 		return nil
 	}
-	// Skip intrinsifying math functions (which may contain hard-float
-	// instructions) when soft-float
-	if Arch.SoftFloat && pkg == "math" {
-		return nil
-	}
-
 	fn := sym.Name
 	if ssaconfig.IntrinsicsDisable {
 		if pkg == "internal/runtime/sys" && (fn == "GetCallerPC" || fn == "GetCallerSP" || fn == "GetClosurePtr") ||
@@ -2523,6 +2518,20 @@ func findIntrinsic(sym *types.Sym) intrinsicBuilder {
 		} else {
 			return nil
 		}
+	}
+	if pkg == "math" && base.Flag.Fmth && base.Flag.N == 0 {
+		switch fn {
+		case "Exp", "Exp2", "Log", "Log2", "Log10", "Pow", "Sin", "Cos", "Tan":
+			return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+				target := base.PkgLinksym("math", "fast"+fn, obj.ABIInternal)
+				return s.rtcall(target, true, []*types.Type{types.Types[types.TFLOAT64]}, args...)[0]
+			}
+		}
+	}
+	// The fast-math replacements above are ordinary Go functions and work
+	// with soft float too. Hardware math intrinsics require hard float.
+	if Arch.SoftFloat && pkg == "math" {
+		return nil
 	}
 	return intrinsics.lookup(Arch.LinkArch.Arch, pkg, fn)
 }

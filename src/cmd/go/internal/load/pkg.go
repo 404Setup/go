@@ -2481,9 +2481,6 @@ func (p *Package) setBuildInfo(ctx context.Context, f *modfetch.Fetcher, autoVCS
 	if cfg.BuildMSan {
 		appendSetting("-msan", "true")
 	}
-	if cfg.BuildO2 {
-		appendSetting("-o2", "true")
-	}
 	// N.B. -pgo added later by setPGOProfilePath.
 	if cfg.BuildRace {
 		appendSetting("-race", "true")
@@ -3270,6 +3267,13 @@ func setToolFlags(ld *modload.Loader, pkgs ...*Package) {
 		p.Internal.Asmflags = BuildAsmflags.For(ld, p)
 		p.Internal.Gcflags = BuildGcflags.For(ld, p)
 		p.Internal.Ldflags = BuildLdflags.For(ld, p)
+		if flags := compilerOptimizationFlags(p.Internal.Ldflags); len(flags) != 0 {
+			if cfg.BuildContext.Compiler != "gc" {
+				base.Fatalf("go: -ldflags=-o2 and -ldflags=-fmth are only supported by the gc compiler")
+			}
+			// Include these in Gcflags so compilation and its cache key agree.
+			p.Internal.Gcflags = append(flags, p.Internal.Gcflags...)
+		}
 		p.Internal.Gccgoflags = BuildGccgoflags.For(ld, p)
 	}
 }

@@ -182,7 +182,15 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 	// trace event in entersyscall above.
 	mp.ncgo++
 
+	var fpControl uint32
+	if fastMathMask != 0 {
+		fpControl = getFPControl()
+	}
 	errno := asmcgocall(fn, arg)
+	if fastMathMask != 0 {
+		// Restore before exitsyscall can move us to a different M.
+		setFPControl(fpControl)
+	}
 
 	// Update accounting before exitsyscall because exitsyscall may
 	// reschedule us on to a different M.
@@ -446,6 +454,11 @@ func cgocallbackg1(fn, frame unsafe.Pointer, ctxt uintptr) {
 	// Add entry to defer stack in case of panic.
 	restore := true
 	defer unwindm(&restore)
+	if fastMathMask != 0 {
+		// The callback is locked to its M. Restore the foreign caller's
+		// environment before unwindm can unlock it, including on panic.
+		defer setFPControl(enableFastMath())
+	}
 
 	var ditStateM, ditStateG bool
 	if debug.dataindependenttiming == 1 && gp.m.isextra {

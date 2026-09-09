@@ -55,6 +55,7 @@ var (
 )
 
 func init() {
+	flag.Bool("o2", false, "enable extra dead code elimination during compilation by cmd/go")
 	flag.Var(&flagExtld, "extld", "use `linker` when linking in external mode")
 	flag.Var(&flagExtldflags, "extldflags", "pass `flags` to external linker")
 	flag.Var(&macOS, "macos", "mac OS version to write in build info (only used in internal linking)")
@@ -65,8 +66,9 @@ func init() {
 
 // Flags used by the linker. The exported flags are used by the architecture-specific packages.
 var (
-	flagBuildid = flag.String("buildid", "", "record `id` as Go toolchain build id")
-	flagBindNow = flag.Bool("bindnow", false, "mark a dynamically linked ELF object for immediate function binding")
+	flagFastMath = flag.Bool("fmth", false, "enable fast math compilation and runtime flush-to-zero mode")
+	flagBuildid  = flag.String("buildid", "", "record `id` as Go toolchain build id")
+	flagBindNow  = flag.Bool("bindnow", false, "mark a dynamically linked ELF object for immediate function binding")
 
 	flagOutfile    = flag.String("o", "", "write output to `file`")
 	flagPluginPath = flag.String("pluginpath", "", "full path name for plugin")
@@ -214,6 +216,9 @@ func Main(arch *sys.Arch, theArch Arch) {
 	objabi.Flagfn1("importcfg", "read import configuration from `file`", ctxt.readImportCfg)
 
 	objabi.Flagparse(usage)
+	if *flagFastMath {
+		addstrdata1(ctxt, "runtime.fastMath=1")
+	}
 	counter.CountFlags("link/flag:", *flag.CommandLine)
 
 	if ctxt.Debugvlog > 0 {

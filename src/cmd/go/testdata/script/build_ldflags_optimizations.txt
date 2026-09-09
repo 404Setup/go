@@ -1,0 +1,54 @@
+# Compile-time optimization options are exposed through -ldflags.
+! go build -o2 .
+stderr 'flag provided but not defined: -o2'
+! go build -ldflags=-fmth=invalid .
+stderr 'invalid boolean value "invalid"'
+
+# By default, only command-line packages are affected.
+go build -a -n '-ldflags=-o2 -fmth' .
+stderr 'compile.* -p main .* -o2 -fmth '
+! stderr 'compile.* -p example.com/flags/dep .* -fmth '
+
+# Patterns cover dependencies and later matching flags take precedence.
+go build -a -n '-ldflags=all=-o2 -fmth' '-ldflags=example.com/flags/dep=-fmth=false' .
+stderr 'compile.* -p main .* -o2 -fmth '
+stderr 'compile.* -p example.com/flags/dep .* -fmth=false '
+! stderr 'compile.* -p example.com/flags/dep .* -o2 '
+
+# Explicit compiler flags can override the linker-facing defaults.
+go build -a -n '-ldflags=-fmth' '-gcflags=-fmth=false' .
+stderr 'compile.* -p main .* -fmth -fmth=false '
+
+# Toggling the flags also invalidates dependency compilation caches and works
+# through go test's generated test packages.
+env FMTH=false
+go test ./dep
+env FMTH=true
+go test -ldflags=-fmth ./dep
+env FMTH=false
+go test -ldflags=-fmth=false ./dep
+
+-- go.mod --
+module example.com/flags
+
+go 1.28
+-- main.go --
+package main
+import "example.com/flags/dep"
+func main() { println(dep.F(2)) }
+-- dep/dep.go --
+package dep
+//go:noinline
+func F(x float64) float64 { return x / x }
+-- dep/dep_test.go --
+package dep_test
+import (
+	"example.com/flags/dep"
+	"os"
+	"testing"
+)
+func TestOptimization(t *testing.T) {
+	if got, want := dep.F(0) == 1, os.Getenv("FMTH") == "true"; got != want {
+		t.Fatalf("optimized = %v; want %v", got, want)
+	}
+}

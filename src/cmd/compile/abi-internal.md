@@ -502,6 +502,12 @@ At calls, the MXCSR control bits are always set as follows:
 
 The MXCSR status bits are callee-save.
 
+Executables linked with `-fmth` instead enable FZ and, where supported, DAZ
+on every runtime thread. Go-to-C calls preserve this environment on return;
+callbacks from C enable it for Go execution and restore the caller's control
+register before returning. This mode also affects packages compiled without
+`-fmth` and is independent of the compiler's `-N` flag.
+
 *Rationale*: Having a fixed MXCSR control configuration allows Go
 functions to use SSE operations without modifying or saving the MXCSR.
 Functions are allowed to modify it between calls (as long as they
@@ -626,6 +632,9 @@ set as follows:
 | NEP | 2 | 0 | Scalar operations do not affect higher elements in vector registers |
 | AH  | 1 | 0 | No alternate handling of de-normal inputs |
 | FIZ | 0 | 0 | Do not zero de-normals |
+
+When linked with `-fmth`, runtime threads instead use FZ=1 and AH=0.
+Foreign callbacks save and restore FPCR as described for MXCSR above.
 
 *Rationale*: Having a fixed FPCR control configuration allows Go
 functions to use floating-point and vector (SIMD) operations without

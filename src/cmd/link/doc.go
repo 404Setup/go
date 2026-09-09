@@ -83,6 +83,19 @@ Flags:
 		Set space-separated flags to pass to the external linker.
 	-f
 		Ignore version mismatch in the linked archives.
+	-fmth
+		With go build -ldflags=-fmth, enable aggressive floating-point
+		optimizations in matching packages during compilation. Assume finite
+		operands/results and ignore signed zero; allow reassociation, reciprocal
+		multiplication, and contraction. Results may differ from strict IEEE 754.
+		Replace direct calls to math.Exp, Exp2, Log, Log2, Log10, Pow, Sin, Cos,
+		and Tan with approximate implementations during compilation.
+		At link time, enable FTZ and supported DAZ bits on amd64 and 386 SSE2,
+		and FPCR.FZ on arm64. This affects all code running on the runtime's
+		threads, including dependencies. Foreign callbacks restore their caller's
+		floating-point environment. Other targets retain their hardware defaults.
+		Direct linking enables this runtime mode but cannot reoptimize objects.
+		The runtime package itself retains IEEE NaN checks during compilation.
 	-funcalign N
 		Set function alignment to N bytes
 	-g
@@ -114,6 +127,12 @@ Flags:
 		Link with C/C++ memory sanitizer support.
 	-o file
 		Write output to file (default a.out, or a.out.exe on Windows).
+	-o2
+		With go build -ldflags=-o2, enable extra dead code elimination in matching
+		packages during compilation. Accepted but has no effect when linking
+		already compiled objects directly. The compiler's -N disables compile-time
+		optimizations, including -fmth, but does not disable the linker's flush
+		mode. Use -ldflags='all=-o2 -fmth' to include dependencies.
 	-pluginpath path
 		The path name used to prefix exported plugin symbols.
 	-r dir1:dir2:...

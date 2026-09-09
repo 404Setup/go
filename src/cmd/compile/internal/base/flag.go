@@ -101,6 +101,7 @@ type CmdFlags struct {
 	Dynlink            *bool        "help:\"support references to Go symbols defined in other shared libraries\"" // &Ctxt.Flag_dynlink, set below
 	EmbedCfg           func(string) "help:\"read go:embed configuration from `file`\""
 	Env                func(string) "help:\"add `definition` of the form key=value to environment\""
+	Fmth               bool         "help:\"enable aggressive floating-point optimizations (disabled by -N)\""
 	GenDwarfInl        int          "help:\"generate DWARF inline info records\"" // 0=disabled, 1=funcs, 2=funcs+formals/locals
 	GoVersion          string       "help:\"required version of the runtime\""
 	ImportCfg          func(string) "help:\"read import configuration from `file`\""
@@ -366,6 +367,9 @@ func ParseFlags() {
 	}
 
 	if Flag.CompilingRuntime {
+		// Startup checks and runtime data structures depend on IEEE NaN
+		// semantics, even when the application uses fast math.
+		Flag.Fmth = false
 		// It is not possible to build the runtime with no optimizations,
 		// because the compiler cannot eliminate enough write barriers.
 		Flag.N = 0

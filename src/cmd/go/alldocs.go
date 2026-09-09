@@ -115,10 +115,6 @@
 //		force rebuilding of packages that are already up-to-date.
 //	-n
 //		print the commands but do not run them.
-//	-o2
-//		enable extra dead code elimination in all packages, including dependencies.
-//		This may increase compilation time. Supported only by the gc compiler.
-//		The compiler's -N flag disables this optimization.
 //	-p n
 //		the number of programs, such as build commands or
 //		test binaries, that can be run in parallel.
@@ -195,6 +191,17 @@
 //		See 'go help buildjson' for the encoding details.
 //	-ldflags '[pattern=]arg list'
 //		arguments to pass on each go tool link invocation.
+//		With the gc compiler, -o2 enables extra dead code elimination and
+//		-fmth enables aggressive floating-point optimizations during compilation
+//		of matching packages. Use 'all=-o2 -fmth' to include dependencies.
+//		The compiler's -N flag disables these compile-time optimizations;
+//		explicit -gcflags take precedence during compilation. -fmth also selects
+//		approximate math library calls and, at the final link, enables FTZ/DAZ
+//		on amd64/386 SSE2 or FZ on arm64 for all runtime threads. The runtime
+//		mode is independent of -gcflags and affects dependencies too.
+//		-fmth may change rounding, NaN, infinity, signed-zero, and subnormal
+//		behavior. Use -fmth=false to disable both parts.
+//		The runtime package retains its required IEEE NaN checks when compiling.
 //	-linkshared
 //		build code that will be linked against shared libraries previously
 //		created with -buildmode=shared.

@@ -11,4 +11,14 @@ var HypotGo = hypot
 var SqrtGo = sqrt
 var TrigReduce = trigReduce
 
+var FastExp = fastExp
+var FastExp2 = fastExp2
+var FastLog = fastLog
+var FastLog2 = fastLog2
+var FastLog10 = fastLog10
+var FastPow = fastPow
+var FastSin = fastSin
+var FastCos = fastCos
+var FastTan = fastTan
+
 const ReduceThreshold = reduceThreshold

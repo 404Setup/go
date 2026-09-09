@@ -22,20 +22,24 @@ func TestO2DeadCode(t *testing.T) {
 	goTool := testenv.GoToolPath(t)
 	for _, tt := range []struct {
 		name       string
-		flags      string
+		ldflags    string
+		gcflags    string
 		wantSymbol bool
 	}{
-		{"default", "", true},
-		{"enabled", "-o2", false},
-		{"disabled", "-o2=false", true},
-		{"no-opt-first", "-N -o2", true},
-		{"no-opt-last", "-o2 -N", true},
-		{"no-inline", "-o2 -l", false},
+		{"default", "", "", true},
+		{"enabled", "-o2", "", false},
+		{"disabled", "-o2=false", "", true},
+		{"last-wins", "-o2 -o2=false", "", true},
+		{"no-opt", "-o2", "-N", true},
+		{"compiler-override", "-o2", "-o2=false", true},
+		{"compiler-enabled", "", "-o2", false},
+		{"no-inline", "-o2", "-l", false},
+		{"combined", "-o2 -fmth", "", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dst := filepath.Join(dir, tt.name+".exe")
-			flags := "-d=ssa/check/on " + tt.flags
-			cmd := testenv.Command(t, goTool, "build", "-o2=false", "-gcflags="+flags, "-o", dst, src)
+			flags := "-d=ssa/check/on " + tt.gcflags
+			cmd := testenv.Command(t, goTool, "build", "-ldflags="+tt.ldflags, "-gcflags="+flags, "-o", dst, src)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("build failed: %v\n%s", err, out)
 			}
