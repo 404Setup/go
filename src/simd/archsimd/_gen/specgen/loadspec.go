@@ -7,12 +7,14 @@ package specgen
 import (
 	"fmt"
 	"go/ast"
+	"go/build"
+	"go/importer"
+	"go/parser"
 	"go/token"
 	"go/types"
+	"path/filepath"
 	"simd/archsimd/_gen/specgen/specexpr"
 	"strings"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // specPackage represents the parsed _gen/spec package.
@@ -54,39 +56,83 @@ type specTemplate struct {
 	fields [][2]int // start:end ranges of fields, including '{}'s, in ascending order
 }
 
+// specGoVersion is the oldest Go toolchain version that must be able to parse
+// and type-check the spec package.
+const specGoVersion = "go1.26"
+
+// loadAndTypeCheck imports and parses the spec package in dir, ensuring it is
+// target-independent, and type-checks it.
+func loadAndTypeCheck(ctx context, dir string) (*types.Package, *types.Info, []*ast.File) {
+	bp, err := build.ImportDir(dir, 0)
+	if err != nil {
+		ctx.errorf("failed to import spec directory %s: %s", dir, err)
+		return nil, nil, nil
+	}
+	if len(bp.AllTags) > 0 {
+		ctx.errorf("internal/spec must be target-independent, but found build tags: %v", bp.AllTags)
+		return nil, nil, nil
+	}
+
+	var astFiles []*ast.File
+	for _, name := range bp.GoFiles {
+		filePath := filepath.Join(bp.Dir, name)
+		file, err := parser.ParseFile(&ctx.root.fset, filePath, nil, parser.ParseComments)
+		if err != nil {
+			ctx.errorf("failed to parse %s: %s", filePath, err)
+			continue
+		}
+		astFiles = append(astFiles, file)
+	}
+
+	if len(astFiles) == 0 {
+		ctx.errorf("no Go source files found in directory %s", dir)
+		return nil, nil, nil
+	}
+
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Implicits:  make(map[ast.Node]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+		Scopes:     make(map[ast.Node]*types.Scope),
+		Instances:  make(map[*ast.Ident]types.Instance),
+	}
+
+	// Note: Imported packages resolve against the running toolchain's standard
+	// library, not the dev tree's. For math and math/bits that is immaterial.
+	// Constraint: internal/spec may import only long-stable standard library packages.
+	conf := types.Config{
+		GoVersion: specGoVersion,
+		Importer:  importer.ForCompiler(&ctx.root.fset, "source", nil),
+		Error: func(err error) {
+			ctx.errorf("%s", err)
+		},
+	}
+
+	typesPkg, err := conf.Check("simd/internal/spec", &ctx.root.fset, astFiles, info)
+	if err != nil && typesPkg == nil {
+		return nil, nil, nil
+	}
+	if len(ctx.root.errors) > 0 {
+		return nil, nil, nil
+	}
+
+	return typesPkg, info, astFiles
+}
+
 // loadSpecPackage parses the spec package in the given directory path.
 func loadSpecPackage(ctx context, dir string, opts *LoadOptions) *specPackage {
-	cfg := &packages.Config{
-		Mode: packages.LoadSyntax,
-		Dir:  dir,
-		Fset: &ctx.root.fset,
-	}
-
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		ctx.errorf("failed to load package: %s", err)
+	typesPkg, info, astFiles := loadAndTypeCheck(ctx, dir)
+	if typesPkg == nil {
 		return nil
 	}
-	if len(pkgs) == 0 {
-		ctx.errorf("no package found in directory %s", dir)
-		return nil
-	}
-	if len(pkgs[0].Errors) > 0 {
-		for _, err := range pkgs[0].Errors {
-			ctx.errorf("%s", err)
-		}
-		return nil
-	}
-
-	srcPkg := pkgs[0]
-	fset := srcPkg.Fset
-	info := srcPkg.TypesInfo
 
 	var pkg specPackage
 
 	// Gather exported functions
 	var funcs []*specFunc
-	for _, file := range srcPkg.Syntax {
+	for _, file := range astFiles {
 		for _, decl := range file.Decls {
 			d, ok := decl.(*ast.FuncDecl)
 			if !ok || !d.Name.IsExported() {
@@ -96,7 +142,7 @@ func loadSpecPackage(ctx context, dir string, opts *LoadOptions) *specPackage {
 				continue
 			}
 
-			obj := srcPkg.Types.Scope().Lookup(d.Name.Name)
+			obj := typesPkg.Scope().Lookup(d.Name.Name)
 			if obj == nil {
 				continue
 			}
@@ -136,6 +182,7 @@ func loadSpecPackage(ctx context, dir string, opts *LoadOptions) *specPackage {
 			}
 			f.NameTmpl = specTemplate{tmpl: f.Name}
 			if d.Doc != nil {
+				var err error
 				f.Doc, err = newSpecTemplate(d.Doc.Text())
 				if err != nil {
 					ctx.at(d.Doc.Pos()).errorf("malformed doc comment: %s", err)
@@ -174,9 +221,9 @@ func loadSpecPackage(ctx context, dir string, opts *LoadOptions) *specPackage {
 	}
 
 	lookupType := func(name string) types.Type {
-		obj := srcPkg.Types.Scope().Lookup(name)
+		obj := typesPkg.Scope().Lookup(name)
 		if obj == nil {
-			ctx.errorf("type %q missing from package %s", name, srcPkg.PkgPath)
+			ctx.errorf("type %q missing from package %s", name, typesPkg.Path())
 			return nil
 		}
 		tn, ok := obj.(*types.TypeName)
@@ -213,8 +260,8 @@ func loadSpecPackage(ctx context, dir string, opts *LoadOptions) *specPackage {
 	uintNType := lookupType("UintN")
 
 	pkg = specPackage{
-		Fset:       fset,
-		Pkg:        srcPkg.Types,
+		Fset:       &ctx.root.fset,
+		Pkg:        typesPkg,
 		TypesInfo:  info,
 		Funcs:      funcs,
 		TypeElems:  typeElems,
