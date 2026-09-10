@@ -31,7 +31,7 @@ func TestGoFileFormatting(t *testing.T) {
 	}
 
 	outStr := outBuf.String()
-	expected := "-- src/test.go --\npackage test\n\nfunc Foo() int { return 42 }\n"
+	expected := "-- " + filepath.Join("src", "test.go") + " --\npackage test\n\nfunc Foo() int { return 42 }\n"
 	if outStr != expected {
 		t.Errorf("got txtar output:\n%q\nwant:\n%q", outStr, expected)
 	}
