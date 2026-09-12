@@ -39,6 +39,7 @@ import (
 	"math"
 	"net"
 	"net/http/internal"
+	"net/http/internal/ascii"
 	"net/http/internal/httpcommon"
 	"net/textproto"
 	"net/url"
@@ -107,32 +108,23 @@ type Server struct {
 }
 
 func (s *Server) registerConn(sc *serverConn) {
-	if s == nil {
-		return // if the Server was used without calling ConfigureServer
-	}
 	s.mu.Lock()
 	s.activeConns[sc] = struct{}{}
 	s.mu.Unlock()
 }
 
 func (s *Server) unregisterConn(sc *serverConn) {
-	if s == nil {
-		return // if the Server was used without calling ConfigureServer
-	}
 	s.mu.Lock()
 	delete(s.activeConns, sc)
 	s.mu.Unlock()
 }
 
-func (s *Server) startGracefulShutdown() {
-	if s == nil {
-		return // if the Server was used without calling ConfigureServer
-	}
+func (s *Server) GracefulShutdown() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for sc := range s.activeConns {
 		sc.startGracefulShutdown()
 	}
-	s.mu.Unlock()
 }
 
 // errChanPool is a pool of reusable channels for reporting the result
@@ -192,23 +184,17 @@ func (s *Server) Configure(conf ServerConfig, tcfg *tls.Config) error {
 	return nil
 }
 
-func (s *Server) GracefulShutdown() {
-	s.startGracefulShutdown()
-}
-
 // ServeConnOpts are options for the Server.ServeConn method.
 type ServeConnOpts struct {
 	// Context is the base context to use.
 	// If nil, context.Background is used.
 	Context context.Context
 
-	// BaseConfig optionally sets the base configuration
-	// for values. If nil, defaults are used.
+	// BaseConfig is the configuration of the net/http.Server
+	// which is serving this connection.
 	BaseConfig ServerConfig
 
-	// Handler specifies which handler to use for processing
-	// requests. If nil, BaseConfig.Handler is used. If BaseConfig
-	// or BaseConfig.Handler is nil, http.DefaultServeMux is used.
+	// Handler specifies which handler to use for processing requests.
 	Handler Handler
 
 	// Settings is the decoded contents of the HTTP2-Settings header
@@ -223,7 +209,7 @@ type ServeConnOpts struct {
 }
 
 func (o *ServeConnOpts) context() context.Context {
-	if o != nil && o.Context != nil {
+	if o.Context != nil {
 		return o.Context
 	}
 	return context.Background()
@@ -270,7 +256,6 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 
 	conf := configFromServer(opts.BaseConfig)
 	sc := &serverConn{
-		srv:                         s,
 		hs:                          opts.BaseConfig,
 		conn:                        c,
 		baseCtx:                     baseCtx,
@@ -428,7 +413,6 @@ func (sc *serverConn) rejectConn(err ErrCode, debug string) {
 
 type serverConn struct {
 	// Immutable:
-	srv              *Server
 	hs               ServerConfig
 	conn             net.Conn
 	bw               *bufferedWriter // writing to conn
@@ -3057,12 +3041,12 @@ func (w *responseWriter) Push(target, method string, header Header) error {
 		// but PUSH_PROMISE requests cannot have a body.
 		// http://tools.ietf.org/html/rfc7540#section-8.2
 		// Also disallow Host, since the promised URL must be absolute.
-		if asciiEqualFold(k, "content-length") ||
-			asciiEqualFold(k, "content-encoding") ||
-			asciiEqualFold(k, "trailer") ||
-			asciiEqualFold(k, "te") ||
-			asciiEqualFold(k, "expect") ||
-			asciiEqualFold(k, "host") {
+		if ascii.EqualFold(k, "content-length") ||
+			ascii.EqualFold(k, "content-encoding") ||
+			ascii.EqualFold(k, "trailer") ||
+			ascii.EqualFold(k, "te") ||
+			ascii.EqualFold(k, "expect") ||
+			ascii.EqualFold(k, "host") {
 			return fmt.Errorf("promised request headers cannot include %q", k)
 		}
 	}
@@ -3253,16 +3237,12 @@ func (handler serve400Handler) ServeHTTP(w *ResponseWriter, r *ServerRequest) {
 }
 
 // h1ServerKeepAlivesDisabled reports whether hs has its keep-alives
-// disabled. See comments on h1ServerShutdownChan above for why
-// the code is written this way.
+// disabled.
 func h1ServerKeepAlivesDisabled(hs ServerConfig) bool {
 	return !hs.DoKeepAlives()
 }
 
 func (sc *serverConn) countError(name string, err error) error {
-	if sc == nil || sc.srv == nil {
-		return err
-	}
 	f := sc.countErrorFunc
 	if f == nil {
 		return err

@@ -198,11 +198,8 @@ func setPinned(ptr unsafe.Pointer, pin bool) bool {
 			// multiple pins on same object, set multipin bit
 			pinState.setMultiPinned(true)
 			// and increase the pin counter
-			// TODO(mknyszek): investigate if systemstack is necessary here
-			systemstack(func() {
-				offset := objIndex * span.elemsize
-				span.incPinCounter(offset)
-			})
+			offset := objIndex * span.elemsize
+			span.incPinCounter(offset)
 		} else {
 			// set pin bit
 			pinState.setPinned(true)
@@ -211,13 +208,8 @@ func setPinned(ptr unsafe.Pointer, pin bool) bool {
 		// unpin
 		if pinState.isPinned() {
 			if pinState.isMultiPinned() {
-				var exists bool
-				// TODO(mknyszek): investigate if systemstack is necessary here
-				systemstack(func() {
-					offset := objIndex * span.elemsize
-					exists = span.decPinCounter(offset)
-				})
-				if !exists {
+				offset := objIndex * span.elemsize
+				if !span.decPinCounter(offset) {
 					// counter is 0, clear multipin bit
 					pinState.setMultiPinned(false)
 				}
@@ -262,16 +254,23 @@ func (v *pinState) setMultiPinned(val bool) {
 
 // set sets the pin bit of the pinState to val. If multipin is true, it
 // sets/unsets the multipin bit instead.
+//
+// The caller must hold the span's speciallock from the call to ofObject
+// through the call to set, since set updates the whole byte.
 func (v *pinState) set(val bool, multipin bool) {
 	mask := v.mask
 	if multipin {
 		mask <<= 1
 	}
-	if val {
-		atomic.Or8(v.bytep, mask)
-	} else {
-		atomic.And8(v.bytep, ^mask)
+	if (v.byteVal&mask != 0) == val {
+		return
 	}
+	if val {
+		v.byteVal |= mask
+	} else {
+		v.byteVal &^= mask
+	}
+	atomic.Store8(v.bytep, v.byteVal)
 }
 
 // pinnerBits is the same type as gcBits but has different methods.
@@ -343,6 +342,9 @@ func (s *mspan) refreshPinnerBits() {
 
 // incPinCounter is only called for multiple pins of the same object and records
 // the _additional_ pins.
+//
+// The caller must ensure span is swept and hold span.speciallock with
+// preemption disabled.
 func (span *mspan) incPinCounter(offset uintptr) {
 	var rec *specialPinCounter
 	ref, exists := span.specialFindSplicePoint(offset, _KindSpecialPinCounter)
@@ -364,6 +366,9 @@ func (span *mspan) incPinCounter(offset uintptr) {
 
 // decPinCounter decreases the counter. If the counter reaches 0, the counter
 // special is deleted and false is returned. Otherwise true is returned.
+//
+// The caller must ensure span is swept and hold span.speciallock with
+// preemption disabled.
 func (span *mspan) decPinCounter(offset uintptr) bool {
 	ref, exists := span.specialFindSplicePoint(offset, _KindSpecialPinCounter)
 	if !exists {

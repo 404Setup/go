@@ -589,9 +589,9 @@ func (b *Builder) runCover(ctx context.Context, a *Action) error {
 	return nil
 }
 
-// build is the action for building a single package.
+// buildExport is the action for building the export data of a single package.
 // Note that any new influence on this logic must be reported in b.buildActionID above as well.
-func (b *Builder) build(ctx context.Context, a *Action) (err error) {
+func (b *Builder) buildExport(ctx context.Context, a *Action) (err error) {
 	p := a.Package
 	sh := b.Shell(a)
 
@@ -613,7 +613,8 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 		bit(needVet, a.needVet) |
 		bit(needCompiledGoFiles, b.NeedCompiledGoFiles)
 
-	if b.useCache(a, b.buildActionID(a), p.Target, need&needBuild != 0) {
+	actionID := b.buildActionID(a)
+	if b.useCache(a, actionID, p.Target, need&needBuild != 0) {
 		// We found the main output in the cache.
 		// If we don't need any other outputs, we can stop.
 		// Otherwise, we need to write files to a.Objdir (needVet).
@@ -871,20 +872,100 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 	}
 
 	// Compile Go.
-	objpkg := objdir + "_pkg_.a"
-	ofile, out, err := BuildToolchain.gc(b, a, objpkg, icfg.Bytes(), embedcfg, symabis, len(sfiles) > 0, pgoProfile, coverageConfig, gofiles)
-	if len(out) > 0 && (p.UsesCgo() || p.UsesSwig()) && !cfg.BuildX {
-		// Fix up output referring to cgo-generated code to be more readable.
-		// Replace *[100]_Ctype_foo with *[100]C.foo.
-		// If we're using -x, assume we're debugging and want the full dump, so disable the rewrite.
-		out = cgoTypeSigRe.ReplaceAll(out, []byte("C."))
+	// Save the export file so that it's safe to remove the rest of the object directory using
+	// clean after the compile action completes.
+	exportFile := objdir + "_pkg_.a"
+	if cfg.BuildToolchainName == "gc" {
+		exportFile = filepath.Join(b.WorkDir, "export", filepath.Base(filepath.Clean(objdir))+".a")
+		if err := sh.Mkdir(filepath.Dir(exportFile)); err != nil {
+			return err
+		}
 	}
-	if err := sh.reportCmd("", "", out, err); err != nil {
+	ofile, out, compile, err := BuildToolchain.gc(b, a, exportFile, icfg.Bytes(), embedcfg, symabis, len(sfiles) > 0, pgoProfile, coverageConfig, gofiles)
+	if err := b.reportCompile(a, out, err); err != nil {
 		return err
 	}
-	if ofile != objpkg {
+	if ofile != exportFile {
 		objects = append(objects, ofile)
 	}
+
+	a.built = exportFile
+	if cfg.BuildToolchainName == "gc" {
+		if err := b.updateExportBuildID(a, exportFile); err != nil {
+			if compile != nil {
+				_, werr := compile.wait()
+				err = errors.Join(err, werr)
+			}
+			return err
+		}
+	}
+
+	ep := &exportProvider{
+		exportFile: exportFile,
+		objects:    objects,
+		cgoObjects: cgoObjects,
+		cfiles:     cfiles,
+		sfiles:     sfiles,
+		output:     a.output,
+		compile:    compile,
+	}
+	a.output = nil
+	a.Provider = ep
+	return nil
+}
+
+func (b *Builder) buildObject(ctx context.Context, a *Action) error {
+	p := a.Package
+	sh := b.Shell(a)
+
+	exportAction := a.Deps[0]
+	a.actionID = exportAction.actionID
+	a.buildID = exportAction.buildID
+
+	ep, _ := exportAction.Provider.(*exportProvider)
+	if a.Failed != nil {
+		if ep != nil && ep.compile != nil {
+			_, err := ep.compile.wait()
+			return err
+		}
+		return nil
+	}
+	if ep == nil {
+		a.built = exportAction.built
+		if b.NeedExport {
+			p.Export = a.built
+			p.BuildID = a.buildID
+		}
+		return nil
+	}
+
+	a.output = ep.output
+	defer b.flushOutput(a)
+
+	if ep.compile != nil {
+		out, err := ep.compile.wait()
+		if err := b.reportCompile(a, out, err); err != nil {
+			return err
+		}
+	}
+
+	if b.IsCmdList && !b.NeedExport {
+		return nil
+	}
+	if p.Error != nil {
+		return p.Error
+	}
+
+	if err := sh.Mkdir(a.Objdir); err != nil {
+		return err
+	}
+
+	objdir := a.Objdir
+	objpkg := objdir + "_pkg_.a"
+	objects := ep.objects
+
+	cfiles := ep.cfiles
+	sfiles := ep.sfiles
 
 	// Copy .h files named for goos or goarch or goos_goarch
 	// to names using GOOS and GOARCH.
@@ -958,7 +1039,7 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 	// gcc-compiled objects (cgoObjects) be listed after the ordinary
 	// objects in the archive. I do not know why this is.
 	// https://golang.org/issue/2601
-	objects = append(objects, cgoObjects...)
+	objects = append(objects, ep.cgoObjects...)
 
 	// Add system object files.
 	for _, syso := range p.SysoFiles {
@@ -970,6 +1051,11 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 	// object files for non-Go sources to the archive.
 	// If the Go compiler wrote an archive and the package is entirely
 	// Go sources, there is no pack to execute at all.
+	if ep.exportFile != objpkg {
+		if err := sh.CopyFile(objpkg, ep.exportFile, 0666, true); err != nil {
+			return err
+		}
+	}
 	if len(objects) > 0 {
 		if err := BuildToolchain.pack(b, a, objpkg, objects); err != nil {
 			return err
@@ -982,6 +1068,17 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 
 	a.built = objpkg
 	return nil
+}
+
+func (b *Builder) reportCompile(a *Action, out []byte, err error) error {
+	p := a.Package
+	if len(out) > 0 && (p.UsesCgo() || p.UsesSwig()) && !cfg.BuildX {
+		// Fix up output referring to cgo-generated code to be more readable.
+		// Replace *[100]_Ctype_foo with *[100]C.foo.
+		// If we're using -x, assume we're debugging and want the full dump, so disable the rewrite.
+		out = cgoTypeSigRe.ReplaceAll(out, []byte("C."))
+	}
+	return b.Shell(a).reportCmd("", "", out, err)
 }
 
 var cgoTypeSigRe = lazyregexp.New(`\b_C2?(type|func|var|macro)_\B`)
@@ -2588,7 +2685,7 @@ func mkAbs(dir, f string) string {
 type toolchain interface {
 	// gc runs the compiler in a specific directory on a set of files
 	// and returns the name of the generated output file.
-	gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, pgoProfile, coverCfg string, gofiles []string) (ofile string, out []byte, err error)
+	gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, pgoProfile, coverCfg string, gofiles []string) (ofile string, out []byte, compile *shellCmd, err error)
 	// cc runs the toolchain's C compiler in a directory on a C file
 	// to produce an output file.
 	cc(b *Builder, a *Action, ofile, cfile string) error
@@ -2628,8 +2725,8 @@ func (noToolchain) linker() string {
 	return ""
 }
 
-func (noToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, pgoProfile, coverCfg string, gofiles []string) (ofile string, out []byte, err error) {
-	return "", nil, noCompiler()
+func (noToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, pgoProfile, coverCfg string, gofiles []string) (ofile string, out []byte, compile *shellCmd, err error) {
+	return "", nil, nil, noCompiler()
 }
 
 func (noToolchain) asm(b *Builder, a *Action, sfiles []string) ([]string, error) {
@@ -3870,7 +3967,7 @@ func (b *Builder) swigDoIntSize(objdir string) (intsize string, err error) {
 
 	p := load.GoFilesPackage(modload.NewLoader(), context.TODO(), load.PackageOpts{}, srcs)
 
-	if _, _, e := BuildToolchain.gc(b, &Action{Mode: "swigDoIntSize", Package: p, Objdir: objdir}, "", nil, nil, "", false, "", "", srcs); e != nil {
+	if _, _, _, e := BuildToolchain.gc(b, &Action{Mode: "swigDoIntSize", Package: p, Objdir: objdir}, "", nil, nil, "", false, "", "", srcs); e != nil {
 		return "32", nil
 	}
 	return "64", nil

@@ -6,6 +6,7 @@ package runtime_test
 
 import (
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 	"unsafe"
@@ -156,6 +157,42 @@ func TestPinnerTwoPinner(t *testing.T) {
 	if runtime.GetPinCounter(addr) != nil {
 		t.Fatal("pin counter was not deleted")
 	}
+}
+
+func TestPinnerConcurrent(t *testing.T) {
+	// Small, non-tiny objects exercise updates to different bits in the same
+	// pin-state byte when allocated in the same span.
+	var objects [64]*obj
+	for i := range objects {
+		objects[i] = new(obj)
+	}
+	done := make(chan struct{}, len(objects))
+	for _, p := range objects {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			var pinner runtime.Pinner
+			defer pinner.Unpin()
+			for range 100 {
+				for range 3 {
+					pinner.Pin(p)
+				}
+				if !runtime.IsPinned(unsafe.Pointer(p)) {
+					t.Error("not marked as pinned")
+					return
+				}
+				pinner.Unpin()
+				if runtime.IsPinned(unsafe.Pointer(p)) {
+					t.Error("still marked as pinned")
+					return
+				}
+			}
+		}()
+	}
+	runtime.GC()
+	for range objects {
+		<-done
+	}
+	runtime.KeepAlive(objects)
 }
 
 func TestPinnerPinZerosizeObj(t *testing.T) {
@@ -428,6 +465,17 @@ func BenchmarkPinnerPinUnpin(b *testing.B) {
 	}
 }
 
+func BenchmarkPinnerPinUnpinWithGC(b *testing.B) {
+	stop := applyGCLoad(b)
+	defer stop()
+	p := new(obj)
+	for b.Loop() {
+		var pinner runtime.Pinner
+		pinner.Pin(p)
+		pinner.Unpin()
+	}
+}
+
 func BenchmarkPinnerPinUnpinTiny(b *testing.B) {
 	p := new(bool)
 	for n := 0; n < b.N; n++ {
@@ -442,6 +490,35 @@ func BenchmarkPinnerPinUnpinDouble(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		var pinner runtime.Pinner
 		pinner.Pin(p)
+		pinner.Pin(p)
+		pinner.Unpin()
+	}
+}
+
+func BenchmarkPinnerPinUnpinMultiple(b *testing.B) {
+	for _, pins := range []int{3, 10, 100} {
+		b.Run(strconv.Itoa(pins), func(b *testing.B) {
+			p := new(obj)
+			for b.Loop() {
+				var pinner runtime.Pinner
+				for range pins {
+					pinner.Pin(p)
+				}
+				pinner.Unpin()
+			}
+		})
+	}
+}
+
+func BenchmarkPinnerPinUnpinAlreadyMultiPinned(b *testing.B) {
+	p := new(obj)
+	var pinned runtime.Pinner
+	pinned.Pin(p)
+	pinned.Pin(p)
+	defer pinned.Unpin()
+
+	for b.Loop() {
+		var pinner runtime.Pinner
 		pinner.Pin(p)
 		pinner.Unpin()
 	}
