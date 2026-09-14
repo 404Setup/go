@@ -56,7 +56,6 @@ var (
 
 func init() {
 	flag.Bool("o2", false, "enable extra dead code elimination and loop unrolling during compilation by cmd/go")
-	flag.Bool("o3", false, "enable O2 and additional loop, wrapper, and reflection optimizations during compilation by cmd/go")
 	flag.Var(&flagExtld, "extld", "use `linker` when linking in external mode")
 	flag.Var(&flagExtldflags, "extldflags", "pass `flags` to external linker")
 	flag.Var(&macOS, "macos", "mac OS version to write in build info (only used in internal linking)")
@@ -67,6 +66,7 @@ func init() {
 
 // Flags used by the linker. The exported flags are used by the architecture-specific packages.
 var (
+	flagO3       = flag.Bool("o3", false, "enable O2, additional compiler optimizations, and precise interface method elimination")
 	flagFastMath = flag.Bool("fmth", false, "enable fast math compilation and runtime flush-to-zero mode")
 	flagBuildid  = flag.String("buildid", "", "record `id` as Go toolchain build id")
 	flagBindNow  = flag.Bool("bindnow", false, "mark a dynamically linked ELF object for immediate function binding")

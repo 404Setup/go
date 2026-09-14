@@ -12,7 +12,17 @@ This fork is a personal Go branch maintained by 404Setup.
 - std: sync/v2 - It implements generic versions of `sync.Pool` and `sync.Map`, as well as an atomic ordered map.
 - std: sync/atomic/v2 - Implemented a generic version of `atomic.Value`
 - gc: Slightly optimized some parts of sync.Pool (I'm not sure if it works because its commits are mixed up with other commits, so I can't test it)
+- compiler: Implements aggressive floating-point optimization. Requires the `-fmth` compiler flag.
+- compiler: Implements cost-based inlining
+- compiler: Implements loop interchange and tiling
+- compiler: Implementation of bounded loop unrolling and elimination of useless infinite loops
+- compiler: Two levels of dead code elimination were implemented, reducing binary size by up to 27.1% in codebases of the 300,000-line scale.
 - compiler: To resolve a passive, malicious memory leak bug from Kaspersky, GOFIPS140 was actually removed from the binary when it was disabled. Previously, it would always be compiled instead of being eliminated by the dead code eliminater.
+
+The compiler-related optimizations mentioned above require the `-ldflags` parameter to be enabled:
+- `-o2`
+- `-o3`
+- ``-fmth` -- This may violate IEEE 754 floating-point semantics; please use with caution
 
 None of the commits will be merged upstream because I cannot guarantee the quality of my code and I do not have time 
 to wait for the pr queue.

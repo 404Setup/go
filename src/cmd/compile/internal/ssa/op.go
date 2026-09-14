@@ -43,9 +43,10 @@ type Arm64ConditionalParams struct {
 }
 
 type AuxCall struct {
-	Fn       *obj.LSym
-	RegCache *ssaop.RegInfo // regInfo for this call
-	AbiInfo  *abi.ABIParamResultInfo
+	Fn         *obj.LSym
+	RegCache   *ssaop.RegInfo // regInfo for this call
+	AbiInfo    *abi.ABIParamResultInfo
+	MethodUses *ir.MethodUses // emitted only for surviving calls
 }
 
 type AuxNameOffset struct {

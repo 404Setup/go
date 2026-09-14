@@ -1144,12 +1144,12 @@ func usemethod(walkstate *walkState, n *ir.CallExpr) {
 	}
 	if ir.IsConst(targetName, constant.String) {
 		name := constant.StringVal(targetName.Val())
-		walkstate.curfunc.LSym.AddRel(base.Ctxt, obj.Reloc{
+		reflectdata.MarkMethodUse(n, walkstate.curfunc.LSym, obj.Reloc{
 			Type: objabi.R_USENAMEDMETHOD,
 			Sym:  staticdata.StringSymNoCommon(name),
 		})
 	} else {
-		walkstate.curfunc.LSym.Set(obj.AttrReflectMethod, true)
+		reflectdata.MarkReflectMethod(n, walkstate.curfunc.LSym)
 	}
 }
 

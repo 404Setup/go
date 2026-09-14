@@ -1456,7 +1456,7 @@ func MarkUsedIfaceMethod(n *ir.CallExpr) {
 		// type, and the linker could do more complicated matching using
 		// some sort of fuzzy shape matching. For now, only use the name
 		// of the method for matching.
-		ir.CurFunc.LSym.AddRel(base.Ctxt, obj.Reloc{
+		MarkMethodUse(n, ir.CurFunc.LSym, obj.Reloc{
 			Type: objabi.R_USENAMEDMETHOD,
 			Sym:  staticdata.StringSymNoCommon(dot.Sel.Name),
 		})
@@ -1465,7 +1465,7 @@ func MarkUsedIfaceMethod(n *ir.CallExpr) {
 
 	// dot.Offset() is the method index * PtrSize (the offset of code pointer in itab).
 	midx := dot.Offset() / int64(types.PtrSize)
-	ir.CurFunc.LSym.AddRel(base.Ctxt, obj.Reloc{
+	MarkMethodUse(n, ir.CurFunc.LSym, obj.Reloc{
 		Type: objabi.R_USEIFACEMETHOD,
 		Sym:  TypeLinksym(ityp),
 		Add:  InterfaceMethodOffset(ityp, midx),

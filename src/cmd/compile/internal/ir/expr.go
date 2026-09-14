@@ -198,6 +198,15 @@ type CallExpr struct {
 	// keep a variable alive. See #73137.
 	IsCompilerVarLive bool
 	Reshape           bool
+	MethodUses        *MethodUses `mknode:"-"` // linker reachability attached during walk
+}
+
+// MethodUses records interface calls and reflective method lookups at a call
+// site. Under O3, these are emitted only if the call survives SSA optimization.
+// It is immutable after walk and may be shared by copies of a call.
+type MethodUses struct {
+	Relocs  []obj.Reloc
+	Reflect bool
 }
 
 func NewCallExpr(pos src.XPos, op Op, fun Node, args []Node) *CallExpr {

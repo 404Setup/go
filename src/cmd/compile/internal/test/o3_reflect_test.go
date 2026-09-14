@@ -32,6 +32,15 @@ func TestO3ReflectMethodName(t *testing.T) {
 		{"closure-write", "-o3", `name := "Keep"; f := func() { name = "Drop" }; f(); check(reflect.ValueOf(T{}).MethodByName(name).Call(nil), 2)`, true},
 		{"mixed-dynamic", "-o3", valueAlias + `; name2 := dynamicName; check(reflect.ValueOf(T{}).MethodByName(name2).Call(nil), 2)`, true},
 		{"index", "-o3", `check(reflect.ValueOf(T{}).Method(0).Call(nil), 2)`, true},
+		{"dead-dynamic", "-o3", valueAlias + `; n := int(dynamicCount); if n < 0 { reflect.ValueOf(T{}).MethodByName(dynamicName).Call(nil) }`, false},
+		{"dead-index", "-o3", valueAlias + `; n := int(dynamicCount); if n < 0 { reflect.ValueOf(T{}).Method(0).Call(nil) }`, false},
+		{"dead-named", "-o3", valueAlias + `; n := int(dynamicCount); if n < 0 { reflect.ValueOf(T{}).MethodByName("Drop").Call(nil) }`, false},
+		{"dead-type", "-o3", valueAlias + `; n := int(dynamicCount); if n < 0 { reflect.TypeOf(T{}).MethodByName(dynamicName) }`, false},
+		{"dead-o2", "-o2", `check(reflect.ValueOf(T{}).MethodByName("Keep").Call(nil), 1); n := int(dynamicCount); if n < 0 { reflect.ValueOf(T{}).MethodByName(dynamicName).Call(nil) }`, true},
+		{"dead-no-opt", "-o3 -N", valueAlias + `; n := int(dynamicCount); if n < 0 { reflect.ValueOf(T{}).MethodByName(dynamicName).Call(nil) }`, true},
+		{"lookup-escapes", "-o3", `lookup := reflect.ValueOf(T{}).MethodByName; check(lookup(dynamicName).Call(nil), 2)`, true},
+		{"defer", "-o3", `defer check(reflect.ValueOf(T{}).MethodByName(dynamicName).Call(nil), 2)`, true},
+		{"goroutine", "-o3", `done := make(chan bool); go func() { check(reflect.ValueOf(T{}).MethodByName(dynamicName).Call(nil), 2); done <- true }(); <-done`, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -70,6 +79,7 @@ func (T) Keep() int { return 1 }
 func (T) Drop() int { return 2 }
 
 var dynamicName = "Drop"
+var dynamicCount byte = 1
 
 //go:noinline
 func change(name *string) { *name = "Drop" }

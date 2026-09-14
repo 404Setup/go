@@ -29,6 +29,7 @@ type deadcodePass struct {
 	markableMethods    []methodref        // methods of reached types
 	reflectSeen        bool               // whether we have seen a reflect method call
 	dynlink            bool
+	o3Methods          *o3MethodAnalysis
 
 	methodsigstmp []methodsig // scratch buffer for decoding method signatures
 	pkginits      []loader.Sym
@@ -43,6 +44,9 @@ func (d *deadcodePass) init() {
 		d.ldr.Reachparent = make([]loader.Sym, d.ldr.NSym())
 	}
 	d.dynlink = d.ctxt.DynlinkingGo()
+	if *flagO3 && !d.dynlink {
+		d.o3Methods = newO3MethodAnalysis(d.ldr)
+	}
 
 	if d.ctxt.BuildMode == BuildModeShared {
 		// Mark all symbols defined in this library as reachable when
@@ -244,6 +248,9 @@ func (d *deadcodePass) flood() {
 					d.ctxt.Logf("reached iface method: %v\n", m)
 				}
 				d.ifaceMethod[m] = true
+				if d.o3Methods != nil {
+					d.o3Methods.recordCall(d, rs, m)
+				}
 				continue
 			case objabi.R_USENAMEDMETHOD:
 				name := d.decodeGenericIfaceMethod(d.ldr, r.Sym())
@@ -311,6 +318,9 @@ func (d *deadcodePass) flood() {
 			// to help work out which methods can be called
 			// dynamically via interfaces.
 			methodsigs := d.decodetypeMethods(d.ldr, d.ctxt.Arch, symIdx, &relocs)
+			if d.o3Methods != nil {
+				d.o3Methods.recordType(symIdx, methodsigs)
+			}
 			if len(methods) != len(methodsigs) {
 				panic(fmt.Sprintf("%q has %d method relocations for %d methods", d.ldr.SymName(symIdx), len(methods), len(methodsigs)))
 			}
@@ -423,6 +433,8 @@ func (d *deadcodePass) markMethod(m methodref) {
 // types into method signatures. Each encountered method is compared
 // against the interface method signatures, if it matches it is marked
 // as reachable. This is extremely conservative, but easy and correct.
+// With -o3, additionally require the receiver to implement the entire
+// interface at a reached call site (see o3MethodAnalysis).
 //
 // The third case is handled by looking for functions that compiler flagged
 // as REFLECTMETHOD. REFLECTMETHOD on a function F means that F does a method
@@ -459,7 +471,8 @@ func deadcode(ctxt *Link) {
 		// in the last pass.
 		rem := d.markableMethods[:0]
 		for _, m := range d.markableMethods {
-			if (d.reflectSeen && (m.isExported() || d.dynlink)) || d.ifaceMethod[m.m] || d.genericIfaceMethod[m.m.name] {
+			if (d.reflectSeen && (m.isExported() || d.dynlink)) || d.genericIfaceMethod[m.m.name] ||
+				(d.ifaceMethod[m.m] && (d.o3Methods == nil || d.o3Methods.reachable(&d, m))) {
 				d.markMethod(m)
 			} else {
 				rem = append(rem, m)

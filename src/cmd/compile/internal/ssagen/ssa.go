@@ -5173,6 +5173,7 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 		call.AddArgs(callArgs...)
 		call.AuxInt = stksize // Call operations carry the argsize of the callee along with them
 	}
+	call.Aux.(*ssa.AuxCall).MethodUses = n.MethodUses
 	s.prevCall = call
 	s.vars[memVar] = s.newValue1I(ssaop.OpSelectN, types.TypeMem, int64(len(ACResults)), call)
 	// Insert VarLive opcodes.
@@ -7128,6 +7129,15 @@ func genssa(htmlWriter ssa.HTMLWriter, f *ssa.Func, pp *objw.Progs) {
 		for _, v := range b.Values {
 			x := s.pp.Next
 			s.DebugFriendlySetPosFrom(v)
+
+			if aux, ok := v.Aux.(*ssa.AuxCall); ok && aux.MethodUses != nil {
+				for _, r := range aux.MethodUses.Relocs {
+					e.curfn.LSym.AddRel(base.Ctxt, r)
+				}
+				if aux.MethodUses.Reflect {
+					e.curfn.LSym.Set(obj.AttrReflectMethod, true)
+				}
+			}
 
 			if v.Op.ResultInArg0() && v.ResultReg() != v.Args[0].Reg() {
 				v.Fatalf("input[0] and output not in same register %s", v.LongString())
