@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"cmd/internal/cov/covcmd"
 	"cmd/internal/pathcache"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -362,7 +363,7 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	// Input files.
 	// TODO(matloob): once the build action depends on the cgo actions, we can
 	// use those actions' outputs instead of the file names and hashes.
-	inputFiles := str.StringList(
+	inputFiles := slices.Concat(
 		p.GoFiles,
 		p.CgoFiles,
 		p.CFiles,
@@ -525,7 +526,7 @@ func (b *Builder) runCover(ctx context.Context, a *Action) error {
 
 	outfiles := []string{}
 	infiles := []string{}
-	for i, file := range str.StringList(gofiles, cgofiles) {
+	for i, file := range slices.Concat(gofiles, cgofiles) {
 		if base.IsTestFile(file) {
 			continue // Not covering this file.
 		}
@@ -724,9 +725,9 @@ func (b *Builder) buildExport(ctx context.Context, a *Action) (err error) {
 		}
 	}
 
-	gofiles := str.StringList(p.GoFiles)
-	cfiles := str.StringList(p.CFiles)
-	sfiles := str.StringList(p.SFiles)
+	gofiles := p.GoFiles
+	cfiles := p.CFiles
+	sfiles := p.SFiles
 	var objects, cgoObjects []string
 
 	// If we're doing coverage, preprocess the .go files and put them in the work directory
@@ -837,7 +838,7 @@ func (b *Builder) buildExport(ctx context.Context, a *Action) (err error) {
 		for _, file := range p.EmbedFiles {
 			embed.Files[file] = fsys.Actual(filepath.Join(p.Dir, file))
 		}
-		js, err := json.MarshalIndent(&embed, "", "\t")
+		js, err := json.Marshal(&embed)
 		if err != nil {
 			return fmt.Errorf("marshal embedcfg: %v", err)
 		}
@@ -1181,7 +1182,7 @@ func (b *Builder) cacheCoverOutputs(a *Action, pr *coverProvider) error {
 		return "./" + file
 	}
 
-	b.cacheSrcFiles(a, str.StringList(pr.goSources, pr.cgoSources))
+	b.cacheSrcFiles(a, slices.Concat(pr.goSources, pr.cgoSources))
 	var cached coverProviderCached
 	if pr.covMetaFileName != "" {
 		cached.CovMetaFile = strings.TrimPrefix(pr.covMetaFileName, a.Objdir)
@@ -1278,7 +1279,7 @@ func (b *Builder) coverActionID(a *Action, covMetaFileName string) cache.ActionI
 	if err := json.NewEncoder(h).Encode(coverConfig(p, filepath.Base(covMetaFileName), "")); err != nil {
 		base.Fatal(err)
 	}
-	for _, file := range str.StringList(p.GoFiles, p.CgoFiles) {
+	for _, file := range slices.Concat(p.GoFiles, p.CgoFiles) {
 		fmt.Fprintf(h, "file %s %s\n", file, b.fileHash(filepath.Join(p.Dir, file)))
 	}
 
@@ -1362,7 +1363,7 @@ func (b *Builder) cgoRunActionID(a *Action) cache.ActionID {
 			fmt.Fprintf(h, "file %s %s\n", file, b.fileHash(filepath.Join(p.Dir, file)))
 		}
 	}
-	for _, file := range str.StringList(p.SwigFiles, p.SwigCXXFiles) {
+	for _, file := range slices.Concat(p.SwigFiles, p.SwigCXXFiles) {
 		fmt.Fprintf(h, "file %s %s\n", file, b.fileHash(filepath.Join(p.Dir, file)))
 	}
 
@@ -1409,7 +1410,7 @@ func (b *Builder) cacheRunCgoOutputs(a *Action, pr *runCgoProvider) error {
 	}
 
 	_, outC, outCXX := b.swigOutputs(a.Package, a.Objdir)
-	files := str.StringList(
+	files := slices.Concat(
 		[]string{"_cgo_export.c", "_cgo_export.h", "_cgo_main.c"},
 		trimObjdirPrefix(pr.goFiles),
 		trimObjdirPrefix(cgo2Files(pr.goFiles)),
@@ -1605,7 +1606,7 @@ func buildVetConfig(a *Action, srcfiles []string, vetDeps []*Action) {
 		}
 	}
 
-	ignored := str.StringList(a.Package.IgnoredGoFiles, a.Package.IgnoredOtherFiles)
+	ignored := slices.Concat(a.Package.IgnoredGoFiles, a.Package.IgnoredOtherFiles)
 
 	// Pass list of absolute paths to vet,
 	// so that vet's error messages will use absolute paths,
@@ -1623,15 +1624,13 @@ func buildVetConfig(a *Action, srcfiles []string, vetDeps []*Action) {
 		PackageFile:  make(map[string]string),
 		Standard:     make(map[string]bool),
 	}
-	vcfg.GoVersion = "go" + gover.Local()
+	v := gover.Local()
 	if a.Package.Module != nil {
-		v := a.Package.Module.GoVersion
-		if v == "" {
-			v = gover.DefaultGoModVersion
-		}
-		vcfg.GoVersion = "go" + v
+		v = cmp.Or(a.Package.Module.GoVersion, gover.DefaultGoModVersion)
 		vcfg.Module = analysisModuleFromModulePublic(a.Package.Module)
 	}
+	vcfg.GoVersion = "go" + v
+
 	a.vetCfg = vcfg
 	for i, raw := range a.Package.Internal.RawImports {
 		final := a.Package.Imports[i]
@@ -1830,11 +1829,10 @@ func (b *Builder) vet(ctx context.Context, a *Action) error {
 	}
 cachemiss:
 
-	js, err := json.MarshalIndent(vcfg, "", "\t")
+	js, err := json.Marshal(vcfg)
 	if err != nil {
 		return fmt.Errorf("internal error marshaling vet config: %v", err)
 	}
-	js = append(js, '\n')
 	if err := sh.writeFile(a.Objdir+"vet.cfg", js); err != nil {
 		return err
 	}
@@ -1922,11 +1920,10 @@ func (b *Builder) doExport(a *Action) error {
 		return err
 	}
 	// Serialize input, call tool, and update build ID.
-	js, err := json.MarshalIndent(ecfg, "", "\t")
+	js, err := json.Marshal(ecfg)
 	if err != nil {
 		return err
 	}
-	js = append(js, '\n')
 	in := a.Objdir + "export.cfg"
 	if err := sh.writeFile(in, js); err != nil {
 		return err
@@ -1945,13 +1942,10 @@ func (b *Builder) doExport(a *Action) error {
 func (b *Builder) buildExportConfig(a *Action) *exportConfig {
 	v := gover.Local()
 	if a.Package.Module != nil {
-		v = a.Package.Module.GoVersion
-		if v == "" {
-			v = gover.DefaultGoModVersion
-		}
+		v = cmp.Or(a.Package.Module.GoVersion, gover.DefaultGoModVersion)
 	}
 
-	srcs := str.StringList(a.Package.GoFiles, a.Package.CgoFiles)
+	srcs := slices.Concat(a.Package.GoFiles, a.Package.CgoFiles)
 	ecfg := &exportConfig{
 		ImportPath:  a.Package.ImportPath,
 		Compiler:    cfg.BuildToolchainName,
@@ -2614,7 +2608,6 @@ func (b *Builder) writeCoverPkgInputs(a *Action, pconfigfile, covMetaFileName, c
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	if err := sh.writeFile(pconfigfile, data); err != nil {
 		return err
 	}
@@ -3339,7 +3332,7 @@ func buildFlags(name, defaults string, fromPackage []string, check func(string, 
 	if err := check(name, "#cgo "+name, fromPackage); err != nil {
 		return nil, err
 	}
-	return str.StringList(envList("CGO_"+name, defaults), fromPackage), nil
+	return slices.Concat(envList("CGO_"+name, defaults), fromPackage), nil
 }
 
 var cgoRe = lazyregexp.New(`[/\\:]`)
@@ -3573,9 +3566,9 @@ func (b *Builder) runCgo(_ context.Context, a *Action) error {
 	}
 
 	a.Provider = &runCgoProvider{
-		CFLAGS:                          str.StringList(cgoCPPFLAGS, cgoCFLAGS),
-		CXXFLAGS:                        str.StringList(cgoCPPFLAGS, cgoCXXFLAGS),
-		FFLAGS:                          str.StringList(cgoCPPFLAGS, cgoFFLAGS),
+		CFLAGS:                          slices.Concat(cgoCPPFLAGS, cgoCFLAGS),
+		CXXFLAGS:                        slices.Concat(cgoCPPFLAGS, cgoCXXFLAGS),
+		FFLAGS:                          slices.Concat(cgoCPPFLAGS, cgoFFLAGS),
 		LDFLAGS:                         cgoLDFLAGS,
 		notCompatibleForInternalLinking: notCompatibleWithInternalLinking,
 		nonGoOverlay:                    a.nonGoOverlay,
@@ -3998,9 +3991,9 @@ func (b *Builder) swigOne(a *Action, file, objdir string, pcCFLAGS []string, cxx
 
 	var cflags []string
 	if cxx {
-		cflags = str.StringList(cgoCPPFLAGS, pcCFLAGS, cgoCXXFLAGS)
+		cflags = slices.Concat(cgoCPPFLAGS, pcCFLAGS, cgoCXXFLAGS)
 	} else {
-		cflags = str.StringList(cgoCPPFLAGS, pcCFLAGS, cgoCFLAGS)
+		cflags = slices.Concat(cgoCPPFLAGS, pcCFLAGS, cgoCFLAGS)
 	}
 
 	base := swigBase(file, cxx)

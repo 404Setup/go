@@ -1092,13 +1092,17 @@ func (t *Transport) maxIdleConnsPerHost() int {
 	return DefaultMaxIdleConnsPerHost
 }
 
+func (t *Transport) keepAlivesDisabled() bool {
+	return t.DisableKeepAlives || t.MaxIdleConnsPerHost < 0
+}
+
 // tryPutIdleConn adds pconn to the list of idle persistent connections awaiting
 // a new request.
 // If pconn is no longer needed or not in a good state, tryPutIdleConn returns
 // an error explaining why it wasn't registered.
 // tryPutIdleConn does not close pconn. Use putOrCloseIdleConn instead for that.
 func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
-	if t.DisableKeepAlives || t.MaxIdleConnsPerHost < 0 {
+	if t.keepAlivesDisabled() {
 		return errKeepAlivesDisabled
 	}
 	if pconn.isBroken() {
@@ -2404,10 +2408,16 @@ const maxPostCloseReadBytes = 256 << 10
 // has been closed.
 const maxPostCloseReadTime = 50 * time.Millisecond
 
-func maybeDrainBody(body io.Reader) bool {
+func maybeDrainBody(r io.Reader) bool {
 	drainedCh := make(chan bool, 1)
 	go func() {
-		if _, err := io.CopyN(io.Discard, body, maxPostCloseReadBytes+1); err == io.EOF {
+		// When we drain the body and (hopefully) reach EOF, we might
+		// potentially need to deal with trailers. Make sure they are discarded
+		// so the connection can actually be reused.
+		if b, ok := r.(*body); ok {
+			b.discardTrailer()
+		}
+		if _, err := io.CopyN(io.Discard, r, maxPostCloseReadBytes+1); err == io.EOF {
 			drainedCh <- true
 		} else {
 			drainedCh <- false
@@ -2595,8 +2605,11 @@ func (pc *persistConn) readLoop() {
 				tryPutIdle()
 				eofc <- struct{}{}
 			case errClosedEarly:
+				// Read resp before signaling eofc: the send lets the caller's
+				// Close return, and resp belongs to the caller after that.
+				tryDrain := alive && !pc.t.keepAlivesDisabled() && resp.ContentLength <= maxPostCloseReadBytes
 				eofc <- struct{}{}
-				if alive && resp.ContentLength <= maxPostCloseReadBytes && maybeDrainBody(body.body) {
+				if tryDrain && maybeDrainBody(body.body) {
 					tryPutIdle()
 				} else {
 					alive = false
