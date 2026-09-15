@@ -12,7 +12,7 @@ import (
 	"math"
 	"math/bits"
 	"reflect"
-	"sync"
+	"sync/v2"
 )
 
 const uint64Size = 8
@@ -39,8 +39,8 @@ type encBuffer struct {
 	scratch [64]byte
 }
 
-var encBufferPool = sync.Pool{
-	New: func() any {
+var encBufferPool = sync.Pool[*encBuffer]{
+	New: func() *encBuffer {
 		e := new(encBuffer)
 		e.data = e.scratch[0:0]
 		return e
@@ -415,7 +415,7 @@ func (enc *Encoder) encodeInterface(b *encBuffer, iv reflect.Value) {
 	// Encode the value into a new buffer. Any nested type definitions
 	// should be written to b, before the encoded value.
 	enc.pushWriter(b)
-	data := encBufferPool.Get().(*encBuffer)
+	data := encBufferPool.Get()
 	data.Write(spaceForLength)
 	enc.encode(data, elem, ut)
 	if enc.err != nil {

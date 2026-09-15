@@ -10,7 +10,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
-	"sync"
+	"sync/v2"
 	"unicode/utf8"
 )
 
@@ -137,13 +137,13 @@ type pp struct {
 	wrappedErrs []int
 }
 
-var ppFree = sync.Pool{
-	New: func() any { return new(pp) },
+var ppFree = sync.Pool[*pp]{
+	New: func() *pp { return new(pp) },
 }
 
 // newPrinter allocates a new pp struct or grabs a cached one.
 func newPrinter() *pp {
-	p := ppFree.Get().(*pp)
+	p := ppFree.Get()
 	p.panicking = false
 	p.erroring = false
 	p.wrapErrs = false

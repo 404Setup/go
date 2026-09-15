@@ -22,7 +22,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	"testing"
 	"time"
 )
@@ -2322,8 +2322,8 @@ func parseEKUs(ekuStrs []string) (ekus []ExtKeyUsage, unknowns []asn1.ObjectIden
 }
 
 func TestConstraintCases(t *testing.T) {
-	privateKeys := sync.Pool{
-		New: func() any {
+	privateKeys := sync.Pool[*ecdsa.PrivateKey]{
+		New: func() *ecdsa.PrivateKey {
 			priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			if err != nil {
 				panic(err)
@@ -2335,7 +2335,7 @@ func TestConstraintCases(t *testing.T) {
 	for i, test := range nameConstraintsTests {
 		t.Run(test.name, func(t *testing.T) {
 			rootPool := NewCertPool()
-			rootKey := privateKeys.Get().(*ecdsa.PrivateKey)
+			rootKey := privateKeys.Get()
 			rootName := "Root " + strconv.Itoa(i)
 
 			// keys keeps track of all the private keys used in a given
@@ -2364,7 +2364,7 @@ func TestConstraintCases(t *testing.T) {
 			intermediatePool := NewCertPool()
 
 			for level, intermediates := range test.intermediates {
-				levelKey := privateKeys.Get().(*ecdsa.PrivateKey)
+				levelKey := privateKeys.Get()
 				keys = append(keys, levelKey)
 				levelName := "Intermediate level " + strconv.Itoa(level)
 				var last *Certificate
@@ -2383,7 +2383,7 @@ func TestConstraintCases(t *testing.T) {
 				parentKey = levelKey
 			}
 
-			leafKey := privateKeys.Get().(*ecdsa.PrivateKey)
+			leafKey := privateKeys.Get()
 			keys = append(keys, leafKey)
 
 			leafCert, err := makeConstraintsLeafCert(test.leaf, leafKey, parent, parentKey)

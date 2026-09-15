@@ -12,7 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
-	"sync"
+	"sync/v2"
 	"time"
 )
 
@@ -387,7 +387,7 @@ type handleState struct {
 	groups  *[]string      // pool-allocated slice of active groups, for ReplaceAttr
 }
 
-var groupPool = sync.Pool{New: func() any {
+var groupPool = sync.Pool[*[]string]{New: func() *[]string {
 	s := make([]string, 0, 10)
 	return &s
 }}
@@ -401,7 +401,7 @@ func (h *commonHandler) newHandleState(buf *buffer.Buffer, freeBuf bool, sep str
 		prefix:  buffer.New(),
 	}
 	if h.opts.ReplaceAttr != nil {
-		s.groups = groupPool.Get().(*[]string)
+		s.groups = groupPool.Get()
 		*s.groups = append(*s.groups, h.groups[:h.nOpenGroups]...)
 	}
 	return s

@@ -20,8 +20,8 @@ import (
 	"log/internal"
 	"os"
 	"runtime"
-	"sync"
 	"sync/atomic"
+	"sync/v2"
 	"time"
 )
 
@@ -163,10 +163,10 @@ func formatHeader(buf *[]byte, t time.Time, prefix string, flag int, file string
 	}
 }
 
-var bufferPool = sync.Pool{New: func() any { return new([]byte) }}
+var bufferPool = sync.Pool[*[]byte]{New: func() *[]byte { return new([]byte) }}
 
 func getBuffer() *[]byte {
-	p := bufferPool.Get().(*[]byte)
+	p := bufferPool.Get()
 	*p = (*p)[:0]
 	return p
 }

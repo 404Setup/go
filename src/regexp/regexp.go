@@ -68,7 +68,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	"unicode"
 	"unicode/utf8"
 )
@@ -222,14 +222,14 @@ func compile(expr string, mode syntax.Flags, longest bool) (*Regexp, error) {
 // The final matchPool is a catch-all for very large queues.
 var (
 	matchSize = [...]int{128, 512, 2048, 16384, 0}
-	matchPool [len(matchSize)]sync.Pool
+	matchPool [len(matchSize)]sync.Pool[*machine]
 )
 
 // get returns a machine to use for matching re.
 // It uses the re's machine cache if possible, to avoid
 // unnecessary allocation.
 func (re *Regexp) get() *machine {
-	m, ok := matchPool[re.mpool].Get().(*machine)
+	m, ok := matchPool[re.mpool].GetOK()
 	if !ok {
 		m = new(machine)
 	}

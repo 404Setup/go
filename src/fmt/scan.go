@@ -11,7 +11,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
-	"sync"
+	"sync/v2"
 	"unicode/utf8"
 )
 
@@ -375,13 +375,13 @@ func (r *readRune) UnreadRune() error {
 	return nil
 }
 
-var ssFree = sync.Pool{
-	New: func() any { return new(ss) },
+var ssFree = sync.Pool[*ss]{
+	New: func() *ss { return new(ss) },
 }
 
 // newScanState allocates a new ss struct or grab a cached one.
 func newScanState(r io.Reader, nlIsSpace, nlIsEnd bool) (s *ss, old ssave) {
-	s = ssFree.Get().(*ss)
+	s = ssFree.Get()
 	if rs, ok := r.(io.RuneScanner); ok {
 		s.rs = rs
 	} else {

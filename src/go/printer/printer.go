@@ -13,7 +13,7 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
+	"sync/v2"
 	"text/tabwriter"
 	"unicode"
 )
@@ -1322,8 +1322,8 @@ type Config struct {
 	Indent   int  // default: 0 (all code is indented at least by this much)
 }
 
-var printerPool = sync.Pool{
-	New: func() any {
+var printerPool = sync.Pool[*printer]{
+	New: func() *printer {
 		return &printer{
 			// Whitespace sequences are short.
 			wsbuf: make([]whiteSpace, 0, 16),
@@ -1335,7 +1335,7 @@ var printerPool = sync.Pool{
 }
 
 func newPrinter(cfg *Config, fset *token.FileSet, nodeSizes map[ast.Node]int) *printer {
-	p := printerPool.Get().(*printer)
+	p := printerPool.Get()
 	*p = printer{
 		Config:    *cfg,
 		fset:      fset,

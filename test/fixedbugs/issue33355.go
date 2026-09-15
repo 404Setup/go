@@ -11,7 +11,7 @@ package server
 
 import (
 	"bytes"
-	"sync"
+	"sync/v2"
 )
 
 type client struct {
@@ -24,7 +24,7 @@ type client struct {
 
 type gateway struct {
 	cfg    *gatewayCfg
-	outsim *sync.Map
+	outsim *sync.Map[string, *outsie]
 }
 
 type gatewayCfg struct {
@@ -40,12 +40,12 @@ type Server struct {
 }
 
 type srvGateway struct {
-	outo     []*client
+	outo []*client
 }
 
 type subscription struct {
-	queue   []byte
-	client  *client
+	queue  []byte
+	client *client
 }
 
 type outsie struct {
@@ -62,7 +62,7 @@ type SublistResult struct {
 	qsubs [][]*subscription
 }
 
-var subPool = &sync.Pool{}
+var subPool = &sync.Pool[*subscription]{}
 
 func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgroups [][]byte) {
 	var gws []*client
@@ -79,7 +79,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 		checkReply = len(reply) > 0
 	)
 
-	sub := subPool.Get().(*subscription)
+	sub := subPool.Get()
 
 	if subjectStartsWithGatewayReplyPrefix(subject) {
 		dstPfx = subject[:8]
@@ -136,12 +136,10 @@ func subjectStartsWithGatewayReplyPrefix(subj []byte) bool {
 func (c *client) gatewayInterest(acc, subj string) *SublistResult {
 	ei, _ := c.gw.outsim.Load(acc)
 	var r *SublistResult
-	e := ei.(*outsie)
-	r = e.sl.Match(subj)
+	r = ei.sl.Match(subj)
 	return r
 }
 
 func (s *Sublist) Match(subject string) *SublistResult {
 	return nil
 }
-

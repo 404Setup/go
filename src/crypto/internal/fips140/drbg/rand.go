@@ -12,8 +12,8 @@ import (
 	"crypto/internal/fips140"
 	"crypto/internal/sysrand"
 	"io"
-	"sync"
 	"sync/atomic"
+	"sync/v2"
 )
 
 // getEntropy is very slow (~500µs), so we don't want it on the hot path.
@@ -21,8 +21,8 @@ import (
 // Occasional uses will use drbgInstance, even if the pool was emptied since the
 // last use. Frequent concurrent uses will fill the pool and use it.
 var drbgInstance atomic.Pointer[Counter]
-var drbgPool = sync.Pool{
-	New: func() any {
+var drbgPool = sync.Pool[*Counter]{
+	New: func() *Counter {
 		return NewCounter(getEntropy())
 	},
 }
@@ -55,7 +55,7 @@ func Read(b []byte) {
 
 	drbg := drbgInstance.Swap(nil)
 	if drbg == nil {
-		drbg = drbgPool.Get().(*Counter)
+		drbg = drbgPool.Get()
 	}
 	defer func() {
 		if !drbgInstance.CompareAndSwap(nil, drbg) {

@@ -16,7 +16,7 @@ package regexp
 
 import (
 	"regexp/syntax"
-	"sync"
+	"sync/v2"
 )
 
 // A job is an entry on the backtracker's job stack. It holds
@@ -44,10 +44,10 @@ type bitState struct {
 	inputs inputs
 }
 
-var bitStatePool sync.Pool
+var bitStatePool sync.Pool[*bitState]
 
 func newBitState() *bitState {
-	b, ok := bitStatePool.Get().(*bitState)
+	b, ok := bitStatePool.GetOK()
 	if !ok {
 		b = new(bitState)
 	}

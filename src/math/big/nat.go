@@ -18,7 +18,7 @@ import (
 	"math/bits"
 	"math/rand"
 	"slices"
-	"sync"
+	"sync/v2"
 )
 
 // An unsigned integer x of the form
@@ -272,13 +272,13 @@ type stackInner struct {
 	w []Word
 }
 
-var stackPool sync.Pool // pool of *stackInner
+var stackPool sync.Pool[*stackInner] // pool of *stackInner
 
 // getStack returns a temporary stack.
 // The caller must call [stack.free] to give up use of the stack when finished.
 func getStackInner() *stackInner {
-	s, _ := stackPool.Get().(*stackInner)
-	if s == nil {
+	s, ok := stackPool.GetOK()
+	if !ok {
 		s = new(stackInner)
 	}
 	return s
@@ -369,8 +369,9 @@ func (s *stack) nat(n int) nat {
 			}
 			return r
 		}
-		si, _ = stackPool.Get().(*stackInner)
-		if si == nil {
+		var ok = false
+		si, ok = stackPool.GetOK()
+		if !ok {
 			si = new(stackInner)
 		}
 		s.si = si

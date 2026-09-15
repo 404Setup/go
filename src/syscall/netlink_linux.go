@@ -7,7 +7,7 @@
 package syscall
 
 import (
-	"sync"
+	"sync/v2"
 	"unsafe"
 )
 
@@ -50,7 +50,7 @@ func newNetlinkRouteRequest(proto, seq, family int) []byte {
 	return rr.toWireFormat()
 }
 
-var pageBufPool = &sync.Pool{New: func() any {
+var pageBufPool = &sync.Pool[*[]byte]{New: func() *[]byte {
 	b := make([]byte, Getpagesize())
 	return &b
 }}
@@ -81,7 +81,7 @@ func NetlinkRIB(proto, family int) ([]byte, error) {
 	}
 	var tab []byte
 
-	rbNew := pageBufPool.Get().(*[]byte)
+	rbNew := pageBufPool.Get()
 	defer pageBufPool.Put(rbNew)
 done:
 	for {

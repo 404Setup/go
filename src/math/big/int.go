@@ -11,7 +11,7 @@ import (
 	"io"
 	"math/rand"
 	"strings"
-	"sync"
+	"sync/v2"
 )
 
 // An Int represents a signed multi-precision integer.
@@ -833,7 +833,7 @@ func euclidUpdate(A, B, Ua, Ub, q, r *Int, extended bool) (nA, nB, nr, nUa, nUb 
 // sixIntPool is used to reduce allocation of limbs used in temporary integers
 // used to calculate lehmerGCD.
 type sixIntPool struct {
-	pool sync.Pool
+	pool sync.Pool[*[6]Int]
 }
 
 func (t *sixIntPool) put(data *[6]Int) {
@@ -847,12 +847,12 @@ func (t *sixIntPool) put(data *[6]Int) {
 }
 
 func (t *sixIntPool) get() *[6]Int {
-	return t.pool.Get().(*[6]Int)
+	return t.pool.Get()
 }
 
 var sixIntP = sixIntPool{
-	sync.Pool{
-		New: func() any {
+	sync.Pool[*[6]Int]{
+		New: func() *[6]Int {
 			return &[6]Int{}
 		},
 	},
@@ -1001,7 +1001,7 @@ func (z *Int) Rand(rnd *rand.Rand, n *Int) *Int {
 // twoIntPool is used to reduce allocation of limbs used in temporary integers
 // used to calculate ModInverse.
 type twoIntPool struct {
-	pool sync.Pool
+	pool sync.Pool[*[2]Int]
 }
 
 func (t *twoIntPool) put(data *[2]Int) {
@@ -1011,12 +1011,12 @@ func (t *twoIntPool) put(data *[2]Int) {
 }
 
 func (t *twoIntPool) get() *[2]Int {
-	return t.pool.Get().(*[2]Int)
+	return t.pool.Get()
 }
 
 var twoIntP = twoIntPool{
-	sync.Pool{
-		New: func() any {
+	sync.Pool[*[2]Int]{
+		New: func() *[2]Int {
 			return &[2]Int{}
 		},
 	},

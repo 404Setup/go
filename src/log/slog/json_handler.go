@@ -14,7 +14,7 @@ import (
 	"io"
 	"log/slog/internal/buffer"
 	"strconv"
-	"sync"
+	"sync/v2"
 	"time"
 	"unicode/utf8"
 )
@@ -145,8 +145,8 @@ type jsonEncoder struct {
 	json *json.Encoder
 }
 
-var jsonEncoderPool = &sync.Pool{
-	New: func() any {
+var jsonEncoderPool = &sync.Pool[*jsonEncoder]{
+	New: func() *jsonEncoder {
 		enc := &jsonEncoder{
 			buf: new(bytes.Buffer),
 		}
@@ -157,7 +157,7 @@ var jsonEncoderPool = &sync.Pool{
 }
 
 func appendJSONMarshal(buf *buffer.Buffer, v any) error {
-	j := jsonEncoderPool.Get().(*jsonEncoder)
+	j := jsonEncoderPool.Get()
 	defer func() {
 		// To reduce peak allocation, return only smaller buffers to the pool.
 		const maxBufferSize = 16 << 10

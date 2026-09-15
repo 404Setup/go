@@ -7,7 +7,7 @@ package regexp
 import (
 	"io"
 	"regexp/syntax"
-	"sync"
+	"sync/v2"
 )
 
 // A queue is a 'sparse array' holding pending threads of execution.
@@ -378,10 +378,10 @@ type onePassMachine struct {
 	matchcap []int
 }
 
-var onePassPool sync.Pool
+var onePassPool sync.Pool[*onePassMachine]
 
 func newOnePassMachine() *onePassMachine {
-	m, ok := onePassPool.Get().(*onePassMachine)
+	m, ok := onePassPool.GetOK()
 	if !ok {
 		m = new(onePassMachine)
 	}

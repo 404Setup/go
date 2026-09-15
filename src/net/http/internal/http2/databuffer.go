@@ -7,7 +7,7 @@ package http2
 import (
 	"errors"
 	"fmt"
-	"sync"
+	"sync/v2"
 )
 
 // Buffer chunks are allocated from a pool to reduce pressure on GC.
@@ -20,41 +20,41 @@ import (
 // TODO: Benchmark to determine if the pools are necessary. The GC may have
 // improved enough that we can instead allocate chunks like this:
 // make([]byte, max(16<<10, expectedBytesRemaining))
-var dataChunkPools = [...]sync.Pool{
-	{New: func() any { return new([1 << 10]byte) }},
-	{New: func() any { return new([2 << 10]byte) }},
-	{New: func() any { return new([4 << 10]byte) }},
-	{New: func() any { return new([8 << 10]byte) }},
-	{New: func() any { return new([16 << 10]byte) }},
-}
+var (
+	dataChunkPool1K  = sync.Pool[*[1 << 10]byte]{New: func() *[1 << 10]byte { return new([1 << 10]byte) }}
+	dataChunkPool2K  = sync.Pool[*[2 << 10]byte]{New: func() *[2 << 10]byte { return new([2 << 10]byte) }}
+	dataChunkPool4K  = sync.Pool[*[4 << 10]byte]{New: func() *[4 << 10]byte { return new([4 << 10]byte) }}
+	dataChunkPool8K  = sync.Pool[*[8 << 10]byte]{New: func() *[8 << 10]byte { return new([8 << 10]byte) }}
+	dataChunkPool16K = sync.Pool[*[16 << 10]byte]{New: func() *[16 << 10]byte { return new([16 << 10]byte) }}
+)
 
 func getDataBufferChunk(size int64) []byte {
 	switch {
 	case size <= 1<<10:
-		return dataChunkPools[0].Get().(*[1 << 10]byte)[:]
+		return dataChunkPool1K.Get()[:]
 	case size <= 2<<10:
-		return dataChunkPools[1].Get().(*[2 << 10]byte)[:]
+		return dataChunkPool2K.Get()[:]
 	case size <= 4<<10:
-		return dataChunkPools[2].Get().(*[4 << 10]byte)[:]
+		return dataChunkPool4K.Get()[:]
 	case size <= 8<<10:
-		return dataChunkPools[3].Get().(*[8 << 10]byte)[:]
+		return dataChunkPool8K.Get()[:]
 	default:
-		return dataChunkPools[4].Get().(*[16 << 10]byte)[:]
+		return dataChunkPool16K.Get()[:]
 	}
 }
 
 func putDataBufferChunk(p []byte) {
 	switch len(p) {
 	case 1 << 10:
-		dataChunkPools[0].Put((*[1 << 10]byte)(p))
+		dataChunkPool1K.Put((*[1 << 10]byte)(p))
 	case 2 << 10:
-		dataChunkPools[1].Put((*[2 << 10]byte)(p))
+		dataChunkPool2K.Put((*[2 << 10]byte)(p))
 	case 4 << 10:
-		dataChunkPools[2].Put((*[4 << 10]byte)(p))
+		dataChunkPool4K.Put((*[4 << 10]byte)(p))
 	case 8 << 10:
-		dataChunkPools[3].Put((*[8 << 10]byte)(p))
+		dataChunkPool8K.Put((*[8 << 10]byte)(p))
 	case 16 << 10:
-		dataChunkPools[4].Put((*[16 << 10]byte)(p))
+		dataChunkPool16K.Put((*[16 << 10]byte)(p))
 	default:
 		panic(fmt.Sprintf("unexpected buffer len=%v", len(p)))
 	}
