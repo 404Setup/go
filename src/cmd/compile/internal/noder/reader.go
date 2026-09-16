@@ -4117,6 +4117,9 @@ func wrapType(typ *types.Type, target *ir.Package, seen map[string]*types.Type, 
 		if !types.Identical(typ, prev) {
 			base.Fatalf("collision: types %v and %v have link string %q", typ, prev, key)
 		}
+		// Wrapper generation is shared by structurally identical types.
+		// Share the cached TFlag too, without computing duplicate method sets.
+		typ.CopyTFlagFrom(prev)
 		return
 	}
 	seen[key] = typ
@@ -4128,6 +4131,9 @@ func wrapType(typ *types.Type, target *ir.Package, seen map[string]*types.Type, 
 
 	if !typ.IsInterface() {
 		typecheck.CalcMethods(typ)
+	}
+	if !typ.IsUntyped() {
+		typ.TFlag()
 	}
 	for _, meth := range typ.AllMethods() {
 		if meth.Sym.IsBlank() || !meth.IsMethod() {
