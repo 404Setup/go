@@ -1138,7 +1138,7 @@ func (w *walkState) usemethod(n *ir.CallExpr) {
 	}
 
 	if base.Flag.O3 && base.Flag.N == 0 {
-		if value := staticValue(targetName); value != nil {
+		if value := w.staticValue(targetName); value != nil {
 			targetName = value
 		}
 	}
