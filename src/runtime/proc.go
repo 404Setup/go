@@ -6032,6 +6032,12 @@ func (pp *p) destroy() {
 	clear(pp.sudogbuf[:])
 	pp.sudogcache = pp.sudogbuf[:0]
 	pp.pinnerCache = nil
+	if pp.pinCounterCache != nil {
+		lock(&mheap_.speciallock)
+		mheap_.specialPinCounterAlloc.free(unsafe.Pointer(pp.pinCounterCache))
+		unlock(&mheap_.speciallock)
+		pp.pinCounterCache = nil
+	}
 	clear(pp.deferpoolbuf[:])
 	pp.deferpool = pp.deferpoolbuf[:0]
 	systemstack(func() {
