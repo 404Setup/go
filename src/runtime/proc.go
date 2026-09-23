@@ -6950,7 +6950,15 @@ func preemptone(pp *p) bool {
 	// Request an async preemption of this P.
 	if preemptMSupported && debug.asyncpreemptoff == 0 {
 		pp.preempt = true
-		preemptM(mp)
+		// Claim the G's status and check that it is still running on mp.
+		// preemptM releases the _Gscan bit.
+		if castogscanstatus(gp, _Grunning, _Gscanrunning) {
+			if gp.m == mp {
+				preemptM(gp)
+			} else {
+				casfrom_Gscanstatus(gp, _Gscanrunning, _Grunning)
+			}
+		}
 	}
 
 	return true
