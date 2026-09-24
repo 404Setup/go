@@ -107,7 +107,7 @@ func TestValuesInfo(t *testing.T) {
 		{`package c5a; var _ = string("foo")`, `"foo"`, `string`, `"foo"`},
 		{`package c5b; var _ = string("foo")`, `string("foo")`, `string`, `"foo"`},
 		{`package c5c; type T string; var _ = T("foo")`, `T("foo")`, `c5c.T`, `"foo"`},
-		{`package c5d; var _ = string(65)`, `65`, `untyped int`, `65`},
+		// {`package c5d; var _ = string(65)`, `65`, `untyped int`, `65`},  // not valid with Go 1.28 - go.dev/issue/3939
 		{`package c5e; var _ = string('A')`, `'A'`, `untyped rune`, `65`},
 		{`package c5f; type T string; var _ = T('A')`, `'A'`, `untyped rune`, `65`},
 
@@ -1991,7 +1991,9 @@ func TestConvertibleTo(t *testing.T) {
 	}{
 		{Typ[Int], Typ[Int], true},
 		{Typ[Int], Typ[Float32], true},
-		{Typ[Int], Typ[String], true},
+		{Typ[Byte], Typ[String], true},
+		{Typ[Rune], Typ[String], true},
+		{Typ[Int], Typ[String], false},
 		{newDefined(Typ[Int]), Typ[Int], true},
 		{newDefined(new(Struct)), new(Struct), true},
 		{newDefined(Typ[Int]), new(Struct), false},
@@ -2164,6 +2166,75 @@ func TestNewAlias_Issue65455(t *testing.T) {
 	obj := NewTypeName(nopos, nil, "A", nil)
 	alias := NewAlias(obj, Typ[Int])
 	alias.Underlying() // must not panic
+}
+
+func shouldPanic(t *testing.T, msg string, f func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Errorf("%s: expected panic, but did not panic", msg)
+		}
+	}()
+	f()
+}
+
+func TestIncompleteAlias(t *testing.T) {
+	obj := NewTypeName(nopos, nil, "A", nil)
+	alias := NewAlias(obj, nil)
+
+	// An incomplete alias has no defined underlying or RHS type;
+	// accessing it must panic rather than return a misleading type.
+	shouldPanic(t, "alias.Underlying()", func() { alias.Underlying() })
+	shouldPanic(t, "alias.Rhs()", func() { alias.Rhs() })
+
+	// Unalias on an incomplete alias returns nil per its contract.
+	if got := Unalias(alias); got != nil {
+		t.Errorf("Unalias(alias) = %v, want nil", got)
+	}
+}
+
+func TestIncompleteTypeParam(t *testing.T) {
+	tname := NewTypeName(nopos, nil, "P", nil)
+	tparam := NewTypeParam(tname, nil)
+
+	// An incomplete TypeParam has no defined constraint or underlying type;
+	// accessing it must panic.
+	shouldPanic(t, "tparam.Constraint()", func() { tparam.Constraint() })
+	shouldPanic(t, "tparam.Underlying()", func() { tparam.Underlying() })
+}
+
+func TestIncompletePackageObjects(t *testing.T) {
+	const src = `package p
+type A = undeclared
+type B undeclared
+var C = undeclared
+const D = undeclared
+func F(undeclared)
+`
+	pkg, _ := typecheck(src, nil, nil)
+
+	for _, name := range pkg.Scope().Names() {
+		obj := pkg.Scope().Lookup(name)
+		if obj.Type() == nil {
+			t.Errorf("object %s has nil Type", obj.Name())
+		}
+	}
+
+	// Check that an incomplete alias from package checking has Typ[Invalid]
+	// as its Underlying and Rhs (errors occurred), and does not panic.
+	a := pkg.Scope().Lookup("A").Type().(*Alias)
+	if got, want := a.Underlying(), Typ[Invalid]; got != want {
+		t.Errorf("A.Underlying() = %v, want %v", got, want)
+	}
+	if got, want := a.Rhs(), Typ[Invalid]; got != want {
+		t.Errorf("A.Rhs() = %v, want %v", got, want)
+	}
+
+	// Verify that the broken func has an empty *Signature type, not Typ[Invalid] or nil.
+	fn := pkg.Scope().Lookup("F").(*Func)
+	if _, ok := fn.Type().(*Signature); !ok {
+		t.Errorf("F has type %T, want *Signature", fn.Type())
+	}
 }
 
 func TestIssue15305(t *testing.T) {

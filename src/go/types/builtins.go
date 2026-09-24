@@ -54,13 +54,16 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 	default:
 		// check all arguments
 		args = check.exprList(argList)
-		nargs = len(args)
-		for _, a := range args {
-			if !a.isValid() {
-				return
+		// never bail out early for assert and trace
+		if id != _Assert && id != _Trace {
+			for _, a := range args {
+				if !a.isValid() {
+					return
+				}
 			}
 		}
 		// first argument is always in x
+		nargs = len(args)
 		if nargs > 0 {
 			*x = *args[0]
 		}
@@ -947,7 +950,7 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 			return
 		}
 		if x.val.Kind() != constant.Bool {
-			check.errorf(x, Test, "internal error: value of %s should be a boolean constant", x)
+			check.internalErrorf(x, "value of %s should be a boolean constant", x)
 			return
 		}
 		if !constant.BoolVal(x.val) {
