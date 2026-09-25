@@ -145,3 +145,74 @@ func simdMemoryOperandMerge() archsimd.Uint32x4 {
 	a = a.Add(archsimd.LoadUint32x4(globalSlice[4:8]))
 	return a
 }
+
+func simdZeroingUsesVEX(x archsimd.Uint64x8) uint64 {
+	// The SIMD-typed value in this function implies AVX is present,
+	// so the zeroing of t must not use legacy-SSE encodings, which
+	// would incur AVX-SSE transition penalties (issue 80835).
+	// amd64:`VMOVUPS X15` -`\bMOVUPS`
+	var t [8]uint64
+	acc := archsimd.LoadUint64x8(t[:])
+	acc = acc.Add(x)
+	acc.Store(t[:])
+	var n uint64
+	for _, v := range t {
+		n += v
+	}
+	return n
+}
+
+func simdShiftScalarUsesVEX(x archsimd.Uint64x2, n uint64) archsimd.Uint64x2 {
+	// The scalar shift count must be moved to a vector register with
+	// a VEX encoding, not a legacy-SSE MOVQ (issue 80835).
+	// amd64:`VMOVQ` -`\bMOVQ [A-Z]+, X`
+	return x.ShiftAllLeft(n)
+}
+
+func simdMoveUsesVEX(x archsimd.Uint64x8, p *[8]uint64) uint64 {
+	// The 64-byte array copy is a lowered Move; its 16-byte chunks
+	// must use VEX encodings here (issue 80835).
+	var t [8]uint64
+	acc := archsimd.LoadUint64x8(t[:])
+	acc = acc.Add(x)
+	acc.Store(t[:])
+	// amd64:`VMOVUPS \([A-Z0-9]+\), X14` -`\bMOVUPS`
+	*p = t
+	return p[0]
+}
+
+func simdMove16UsesVEX(x archsimd.Uint64x2, d, s *[16]byte) uint64 {
+	// The 16-byte block copy is lowered to MOVOload/MOVOstore, which
+	// must use VEX encodings here (issue 80835).
+	// amd64:`VMOVUPS \([A-Z0-9]+\), X` -`\bMOVUPS`
+	*d = *s
+	t := x.Add(x)
+	var out [2]uint64
+	t.Store(out[:])
+	return out[0]
+}
+
+//go:noinline
+func simdOpaque() {}
+
+func simdSpillUsesVEX(a, b archsimd.Uint64x2) archsimd.Uint64x2 {
+	// x is live across the call, so it is spilled and reloaded; both
+	// must use VEX encodings here (issue 80835).
+	// amd64:`VMOVUPS [^,]*\(SP\), X` -`\bMOVUPS`
+	x := a.Add(b)
+	simdOpaque()
+	return x.Add(x)
+}
+
+func simdShuffleCopyUsesVEX(a, b archsimd.Uint64x2, n int) archsimd.Uint64x2 {
+	// The swap makes regalloc place shuffle copies in the block
+	// splitting the loop back edge; they must use VEX encodings here.
+	// This also relies on split-edge blocks inheriting the CPU
+	// features of their edge (issue 80835).
+	x, y := a, b
+	// amd64:`VMOVUPS X[0-9]+, X[0-9]+` -`\bMOVUPS`
+	for i := 0; i < n; i++ {
+		x, y = y, x
+	}
+	return x.Add(y)
+}
