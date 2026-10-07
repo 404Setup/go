@@ -183,7 +183,7 @@ func reorderLoop(fn *ir.Func, outer *ir.ForStmt) ir.Node {
 		end := typecheck.TempAt(pos, fn, index.Type())
 		add := ir.NewBinaryExpr(pos, ir.OADD, start, ir.NewInt(pos, tileSize))
 		limit := ir.NewCallExpr(pos, ir.OMIN, nil, []ir.Node{add, loop.Cond.(*ir.BinaryExpr).Y})
-		endInit := typecheck.Stmt(ir.NewAssignStmt(pos, end, limit))
+		endInit := typecheck.Stmt(fn, ir.NewAssignStmt(pos, end, limit))
 		init.Y = start
 		loop.Cond.(*ir.BinaryExpr).Y = end
 		tiled := ir.NewForStmt(pos,
@@ -200,5 +200,5 @@ func reorderLoop(fn *ir.Func, outer *ir.ForStmt) ir.Node {
 	if base.Debug.LoopReorder != 0 {
 		base.WarnfAt(outer.Pos(), "Tiled loops (32x32)")
 	}
-	return typecheck.Stmt(itile)
+	return typecheck.Stmt(fn, itile)
 }
