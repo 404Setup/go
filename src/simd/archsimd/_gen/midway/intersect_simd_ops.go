@@ -107,10 +107,7 @@ func main() {
 	}
 	specIdx := specgen.NewIndex(specFuncs)
 	files.AddPostProcessor(specdoc.Filler(specIdx, specdoc.Options{
-		AllowDocRewrite:     true,
-		AllowNameMismatches: true,
-		NoFillDoc:           true,
-		NoFillNames:         true,
+		AllowDocRewrite: true,
 	}))
 
 	defer files.FlushOrExit()

@@ -3452,6 +3452,24 @@ func testRequestHeaderValueCountLimit(t *testing.T, mode testMode) {
 			},
 			wantStatus: 431,
 		},
+		{
+			// Comma separated Trailer values are counted as multiple, because
+			// each value becomes its own field / a key in Request.Trailer.
+			// This is different from TestRequestTrailerHeaderValueCountLimit
+			// which tests the actual sending of the trailer, this just tests
+			// the Trailer header declaration.
+			name:  "comma separated trailer values count as multiple",
+			limit: 15,
+			setup: func(req *Request) {
+				req.Body = NoBody
+				req.TransferEncoding = []string{"chunked"}
+				req.Trailer = make(Header)
+				for i := range 16 {
+					req.Trailer[fmt.Sprintf("X-Trailer-%d", i)] = nil
+				}
+			},
+			wantStatus: 431,
+		},
 	}
 	for _, tt := range tests {
 		synctest.Subtest(t, tt.name, func(t *testing.T) {
@@ -8408,5 +8426,75 @@ func TestServerIdleKeepAliveNonstandardTimeoutError(t *testing.T) {
 		testServerIdleKeepAlive(t, func(li net.Listener) net.Listener {
 			return bespokeTimeoutListener{li}
 		})
+	})
+}
+
+func TestServerCONNECTSuccess(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		handler := newTestHandler(t)
+		st := newHTTP1ServerTest(t, handler.ServeHTTP)
+		defer handler.Close() // return from handlers before server shutdown
+		conn := st.dial()
+		conn.writeMessage(
+			"CONNECT backend.example.tld:80 HTTP/1.1",
+			"Host: example.tld",
+			"",
+		)
+		call := handler.nextCall()
+		const code = 200
+		call.w.WriteHeader(code)
+		body := []byte("body")
+		call.w.Write(body)
+		NewResponseController(call.w).Flush()
+		call.exit()
+
+		resp := conn.readResponse()
+		if resp.StatusCode != code {
+			t.Errorf("response status = %v, want %v", resp.StatusCode, code)
+		}
+		if resp.ContentLength != -1 {
+			t.Errorf("Content-Length: %v; want absent", resp.ContentLength)
+		}
+		if len(resp.TransferEncoding) > 0 {
+			t.Errorf("Transfer-Encoding: %q; want absent", resp.TransferEncoding)
+		}
+		for _, h := range []string{"Content-Length", "Transfer-Encoding"} {
+			if got, ok := resp.Header[h]; ok {
+				t.Errorf("response header %q = %q; want absent", h, got)
+			}
+		}
+		conn.wantBytes(body)
+		conn.wantClosed()
+	})
+}
+
+func TestServerCONNECTFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		handler := newTestHandler(t)
+		st := newHTTP1ServerTest(t, handler.ServeHTTP)
+		defer handler.Close() // return from handlers before server shutdown
+		conn := st.dial()
+		conn.writeMessage(
+			"CONNECT backend.example.tld:80 HTTP/1.1",
+			"Host: example.tld",
+			"",
+		)
+		call := handler.nextCall()
+		const code = 409
+		body := []byte("body")
+		call.w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		call.w.WriteHeader(code)
+		call.w.Write(body)
+		call.exit()
+
+		resp := conn.readResponse()
+		if resp.StatusCode != code {
+			t.Errorf("response status = %v, want %v", resp.StatusCode, code)
+		}
+		if !resp.Close {
+			t.Errorf("Connection: close not set; want it to be")
+		}
+		conn.wantBytes(body)
+		conn.wantClosed()
 	})
 }
