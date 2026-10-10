@@ -81,17 +81,21 @@ func (x Float32s) StorePart(s []float32) (n int) {
 //go:noescape
 func (x Float32s) storePart(s []float32)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Float32s) IfElse(mask Mask32s, y Float32s) Float32s
+func (x Float32s) IfElse(mask Mask32s, y Float32s) (z Float32s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Float32s) Masked(mask Mask32s) Float32s {
+func (x Float32s) Masked(mask Mask32s) (z Float32s) {
 	var zero Float32s
 	return x.IfElse(mask, zero)
 }
@@ -176,17 +180,21 @@ func (x Float64s) StorePart(s []float64) (n int) {
 //go:noescape
 func (x Float64s) storePart(s []float64)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Float64s) IfElse(mask Mask64s, y Float64s) Float64s
+func (x Float64s) IfElse(mask Mask64s, y Float64s) (z Float64s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Float64s) Masked(mask Mask64s) Float64s {
+func (x Float64s) Masked(mask Mask64s) (z Float64s) {
 	var zero Float64s
 	return x.IfElse(mask, zero)
 }
@@ -271,17 +279,21 @@ func (x Int8s) StorePart(s []int8) (n int) {
 //go:noescape
 func (x Int8s) storePart(s []int8)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Int8s) IfElse(mask Mask8s, y Int8s) Int8s
+func (x Int8s) IfElse(mask Mask8s, y Int8s) (z Int8s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Int8s) Masked(mask Mask8s) Int8s {
+func (x Int8s) Masked(mask Mask8s) (z Int8s) {
 	var zero Int8s
 	return x.IfElse(mask, zero)
 }
@@ -366,17 +378,21 @@ func (x Int16s) StorePart(s []int16) (n int) {
 //go:noescape
 func (x Int16s) storePart(s []int16)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Int16s) IfElse(mask Mask16s, y Int16s) Int16s
+func (x Int16s) IfElse(mask Mask16s, y Int16s) (z Int16s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Int16s) Masked(mask Mask16s) Int16s {
+func (x Int16s) Masked(mask Mask16s) (z Int16s) {
 	var zero Int16s
 	return x.IfElse(mask, zero)
 }
@@ -461,17 +477,21 @@ func (x Int32s) StorePart(s []int32) (n int) {
 //go:noescape
 func (x Int32s) storePart(s []int32)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Int32s) IfElse(mask Mask32s, y Int32s) Int32s
+func (x Int32s) IfElse(mask Mask32s, y Int32s) (z Int32s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Int32s) Masked(mask Mask32s) Int32s {
+func (x Int32s) Masked(mask Mask32s) (z Int32s) {
 	var zero Int32s
 	return x.IfElse(mask, zero)
 }
@@ -556,17 +576,21 @@ func (x Int64s) StorePart(s []int64) (n int) {
 //go:noescape
 func (x Int64s) storePart(s []int64)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Int64s) IfElse(mask Mask64s, y Int64s) Int64s
+func (x Int64s) IfElse(mask Mask64s, y Int64s) (z Int64s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Int64s) Masked(mask Mask64s) Int64s {
+func (x Int64s) Masked(mask Mask64s) (z Int64s) {
 	var zero Int64s
 	return x.IfElse(mask, zero)
 }
@@ -651,17 +675,21 @@ func (x Uint8s) StorePart(s []uint8) (n int) {
 //go:noescape
 func (x Uint8s) storePart(s []uint8)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Uint8s) IfElse(mask Mask8s, y Uint8s) Uint8s
+func (x Uint8s) IfElse(mask Mask8s, y Uint8s) (z Uint8s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Uint8s) Masked(mask Mask8s) Uint8s {
+func (x Uint8s) Masked(mask Mask8s) (z Uint8s) {
 	var zero Uint8s
 	return x.IfElse(mask, zero)
 }
@@ -746,17 +774,21 @@ func (x Uint16s) StorePart(s []uint16) (n int) {
 //go:noescape
 func (x Uint16s) storePart(s []uint16)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Uint16s) IfElse(mask Mask16s, y Uint16s) Uint16s
+func (x Uint16s) IfElse(mask Mask16s, y Uint16s) (z Uint16s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Uint16s) Masked(mask Mask16s) Uint16s {
+func (x Uint16s) Masked(mask Mask16s) (z Uint16s) {
 	var zero Uint16s
 	return x.IfElse(mask, zero)
 }
@@ -841,17 +873,21 @@ func (x Uint32s) StorePart(s []uint32) (n int) {
 //go:noescape
 func (x Uint32s) storePart(s []uint32)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Uint32s) IfElse(mask Mask32s, y Uint32s) Uint32s
+func (x Uint32s) IfElse(mask Mask32s, y Uint32s) (z Uint32s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Uint32s) Masked(mask Mask32s) Uint32s {
+func (x Uint32s) Masked(mask Mask32s) (z Uint32s) {
 	var zero Uint32s
 	return x.IfElse(mask, zero)
 }
@@ -936,17 +972,21 @@ func (x Uint64s) StorePart(s []uint64) (n int) {
 //go:noescape
 func (x Uint64s) storePart(s []uint64)
 
-// IfElse returns the elements of x where the corresponding element of mask is
-// true, and the elements of y where it is false.
+// IfElse returns a vector with elements from x where mask is true, and y where
+// mask is false.
+//
+//	z[i] = if mask[i] { x[i] } else { y[i] }
 //
 // Asm: ZSEL
-func (x Uint64s) IfElse(mask Mask64s, y Uint64s) Uint64s
+func (x Uint64s) IfElse(mask Mask64s, y Uint64s) (z Uint64s)
 
-// Masked returns the elements of x where the corresponding element of mask is
-// true, and zero where it is false.
+// Masked returns a vector with elements from x where mask is true, and zero
+// elsewhere.
+//
+//	z[i] = if mask[i] { x[i] } else { 0 }
 //
 // Asm: Emulated
-func (x Uint64s) Masked(mask Mask64s) Uint64s {
+func (x Uint64s) Masked(mask Mask64s) (z Uint64s) {
 	var zero Uint64s
 	return x.IfElse(mask, zero)
 }
@@ -985,39 +1025,39 @@ type Mask8s struct {
 // Asm: PWHILELT, CPU Feature: SVE
 func Mask8sAllTrue() Mask8s
 
-// First returns a mask with only the first active lane of m active, or no
-// lanes active if m has none.
+// First returns a mask with only the first active lane of x active, or no
+// lanes active if x has none.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask8s) First() Mask8s
+func (x Mask8s) First() Mask8s
 
-// Next returns a mask with only the lane after the last active lane of m
-// active. If m has no active lanes, lane 0 is active; if its last active lane
+// Next returns a mask with only the lane after the last active lane of x
+// active. If x has no active lanes, lane 0 is active; if its last active lane
 // is the last lane, no lanes are active.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask8s) Next() Mask8s
+func (x Mask8s) Next() Mask8s
 
-// All reports whether every lane of m is active.
+// All returns true when all positions in mask x are true.
 //
 // Asm: BICS (predicate), CPU Feature: SVE
-func (m Mask8s) All() bool
+func (x Mask8s) All() bool
 
-// None reports whether no lane of m is active.
+// None returns true when no positions in mask x are set.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask8s) None() bool
+func (x Mask8s) None() bool
 
-// Any reports whether some lane of m is active.
+// Any returns true when any position in mask x is true.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask8s) Any() bool
+func (x Mask8s) Any() bool
 
-// String returns a string representation of SIMD mask m: 1 for an active lane,
+// String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() lanes that exist at the runtime
 // vector length are shown.
-func (m Mask8s) String() string {
-	bits := *(*uint64)(unsafe.Pointer(&m))
+func (x Mask8s) String() string {
+	bits := *(*uint64)(unsafe.Pointer(&x))
 	var s [32]int8
 	n := vl()
 	for i := range n {
@@ -1047,39 +1087,39 @@ type Mask16s struct {
 // Asm: PWHILELT, CPU Feature: SVE
 func Mask16sAllTrue() Mask16s
 
-// First returns a mask with only the first active lane of m active, or no
-// lanes active if m has none.
+// First returns a mask with only the first active lane of x active, or no
+// lanes active if x has none.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask16s) First() Mask16s
+func (x Mask16s) First() Mask16s
 
-// Next returns a mask with only the lane after the last active lane of m
-// active. If m has no active lanes, lane 0 is active; if its last active lane
+// Next returns a mask with only the lane after the last active lane of x
+// active. If x has no active lanes, lane 0 is active; if its last active lane
 // is the last lane, no lanes are active.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask16s) Next() Mask16s
+func (x Mask16s) Next() Mask16s
 
-// All reports whether every lane of m is active.
+// All returns true when all positions in mask x are true.
 //
 // Asm: BICS (predicate), CPU Feature: SVE
-func (m Mask16s) All() bool
+func (x Mask16s) All() bool
 
-// None reports whether no lane of m is active.
+// None returns true when no positions in mask x are set.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask16s) None() bool
+func (x Mask16s) None() bool
 
-// Any reports whether some lane of m is active.
+// Any returns true when any position in mask x is true.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask16s) Any() bool
+func (x Mask16s) Any() bool
 
-// String returns a string representation of SIMD mask m: 1 for an active lane,
+// String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() / 2 lanes that exist at the runtime
 // vector length are shown.
-func (m Mask16s) String() string {
-	bits := *(*uint64)(unsafe.Pointer(&m))
+func (x Mask16s) String() string {
+	bits := *(*uint64)(unsafe.Pointer(&x))
 	var s [16]int16
 	n := vl() / 2
 	for i := range n {
@@ -1109,39 +1149,39 @@ type Mask32s struct {
 // Asm: PWHILELT, CPU Feature: SVE
 func Mask32sAllTrue() Mask32s
 
-// First returns a mask with only the first active lane of m active, or no
-// lanes active if m has none.
+// First returns a mask with only the first active lane of x active, or no
+// lanes active if x has none.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask32s) First() Mask32s
+func (x Mask32s) First() Mask32s
 
-// Next returns a mask with only the lane after the last active lane of m
-// active. If m has no active lanes, lane 0 is active; if its last active lane
+// Next returns a mask with only the lane after the last active lane of x
+// active. If x has no active lanes, lane 0 is active; if its last active lane
 // is the last lane, no lanes are active.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask32s) Next() Mask32s
+func (x Mask32s) Next() Mask32s
 
-// All reports whether every lane of m is active.
+// All returns true when all positions in mask x are true.
 //
 // Asm: BICS (predicate), CPU Feature: SVE
-func (m Mask32s) All() bool
+func (x Mask32s) All() bool
 
-// None reports whether no lane of m is active.
+// None returns true when no positions in mask x are set.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask32s) None() bool
+func (x Mask32s) None() bool
 
-// Any reports whether some lane of m is active.
+// Any returns true when any position in mask x is true.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask32s) Any() bool
+func (x Mask32s) Any() bool
 
-// String returns a string representation of SIMD mask m: 1 for an active lane,
+// String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() / 4 lanes that exist at the runtime
 // vector length are shown.
-func (m Mask32s) String() string {
-	bits := *(*uint64)(unsafe.Pointer(&m))
+func (x Mask32s) String() string {
+	bits := *(*uint64)(unsafe.Pointer(&x))
 	var s [8]int32
 	n := vl() / 4
 	for i := range n {
@@ -1171,39 +1211,39 @@ type Mask64s struct {
 // Asm: PWHILELT, CPU Feature: SVE
 func Mask64sAllTrue() Mask64s
 
-// First returns a mask with only the first active lane of m active, or no
-// lanes active if m has none.
+// First returns a mask with only the first active lane of x active, or no
+// lanes active if x has none.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask64s) First() Mask64s
+func (x Mask64s) First() Mask64s
 
-// Next returns a mask with only the lane after the last active lane of m
-// active. If m has no active lanes, lane 0 is active; if its last active lane
+// Next returns a mask with only the lane after the last active lane of x
+// active. If x has no active lanes, lane 0 is active; if its last active lane
 // is the last lane, no lanes are active.
 //
 // Asm: PNEXT, CPU Feature: SVE
-func (m Mask64s) Next() Mask64s
+func (x Mask64s) Next() Mask64s
 
-// All reports whether every lane of m is active.
+// All returns true when all positions in mask x are true.
 //
 // Asm: BICS (predicate), CPU Feature: SVE
-func (m Mask64s) All() bool
+func (x Mask64s) All() bool
 
-// None reports whether no lane of m is active.
+// None returns true when no positions in mask x are set.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask64s) None() bool
+func (x Mask64s) None() bool
 
-// Any reports whether some lane of m is active.
+// Any returns true when any position in mask x is true.
 //
 // Asm: PTEST, CPU Feature: SVE
-func (m Mask64s) Any() bool
+func (x Mask64s) Any() bool
 
-// String returns a string representation of SIMD mask m: 1 for an active lane,
+// String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() / 8 lanes that exist at the runtime
 // vector length are shown.
-func (m Mask64s) String() string {
-	bits := *(*uint64)(unsafe.Pointer(&m))
+func (x Mask64s) String() string {
+	bits := *(*uint64)(unsafe.Pointer(&x))
 	var s [4]int64
 	n := vl() / 8
 	for i := range n {
