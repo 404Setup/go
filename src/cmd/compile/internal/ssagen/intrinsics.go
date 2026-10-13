@@ -2011,30 +2011,38 @@ func se(x uint8) int64 {
 	return int64(int8(x))
 }
 
+// The following functions are marked noinline because the process of trying to
+// inline them significantly increases compilation time for the ssagen package.
+
+//go:noinline
 func opLen0(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue0(op, t)
 	}
 }
 
+//go:noinline
 func opLen1(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue1(op, t, args[0])
 	}
 }
 
+//go:noinline
 func opLen2(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue2(op, t, args[0], args[1])
 	}
 }
 
+//go:noinline
 func opLen2_21(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue2(op, t, args[1], args[0])
 	}
 }
 
+//go:noinline
 func opLen3(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue3(op, t, args[0], args[1], args[2])
@@ -2047,6 +2055,7 @@ var ssaVecBySize = map[int64]*types.Type{
 	64: types.TypeVec512,
 }
 
+//go:noinline
 func opLen3_31Zero3(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if t, ok := ssaVecBySize[args[1].Type.Size()]; !ok {
@@ -2057,30 +2066,35 @@ func opLen3_31Zero3(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, a
 	}
 }
 
+//go:noinline
 func opLen3_21(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue3(op, t, args[1], args[0], args[2])
 	}
 }
 
+//go:noinline
 func opLen3_231(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue3(op, t, args[2], args[0], args[1])
 	}
 }
 
+//go:noinline
 func opLen4(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue4(op, t, args[0], args[1], args[2], args[3])
 	}
 }
 
+//go:noinline
 func opLen4_231(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue4(op, t, args[2], args[0], args[1], args[3])
 	}
 }
 
+//go:noinline
 func opLen4_31(op ssaop.Op, t *types.Type) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue4(op, t, args[2], args[1], args[0], args[3])
@@ -2275,6 +2289,7 @@ func immJumpTableN(s *state, idx *ssa.Value, intrinsicCall *ir.CallExpr, immLimi
 	return ret
 }
 
+//go:noinline
 func opLen1Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64 {
@@ -2287,6 +2302,7 @@ func opLen1Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.Cal
 	}
 }
 
+//go:noinline
 func opLen2Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64 {
@@ -2299,6 +2315,7 @@ func opLen2Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.Cal
 	}
 }
 
+//go:noinline
 func opLen3Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64 {
@@ -2311,6 +2328,7 @@ func opLen3Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.Cal
 	}
 }
 
+//go:noinline
 func opLen2Imm8_2I(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if args[2].Op == ssaop.OpConst8 || args[2].Op == ssaop.OpConst64 {
@@ -2324,6 +2342,8 @@ func opLen2Imm8_2I(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.
 }
 
 // Two immediates instead of just 1.  Offset is ignored, so it is a _ parameter instead.
+//
+//go:noinline
 func opLen2Imm8_II(op ssaop.Op, t *types.Type, _ int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if (args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64) && (args[2].Op == ssaop.OpConst8 || args[2].Op == ssaop.OpConst64) && args[1].AuxInt & ^3 == 0 && args[2].AuxInt & ^3 == 0 {
@@ -2346,6 +2366,8 @@ func opLen2Imm8_II(op ssaop.Op, t *types.Type, _ int) func(s *state, n *ir.CallE
 }
 
 // The assembler requires the imm value of a SHA1RNDS4 instruction to be one of 0,1,2,3...
+//
+//go:noinline
 func opLen2Imm8_SHA1RNDS4(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64 {
@@ -2358,6 +2380,7 @@ func opLen2Imm8_SHA1RNDS4(op ssaop.Op, t *types.Type, offset int) func(s *state,
 	}
 }
 
+//go:noinline
 func opLen1Imm(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if (args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64) && uint64(args[1].AuxInt) <= immMax {
@@ -2370,6 +2393,7 @@ func opLen1Imm(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s *st
 	}
 }
 
+//go:noinline
 func opLen2Imm(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if (args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64) && uint64(args[1].AuxInt) <= immMax {
@@ -2382,6 +2406,7 @@ func opLen2Imm(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s *st
 	}
 }
 
+//go:noinline
 func opLen3Imm(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if (args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64) && uint64(args[1].AuxInt) <= immMax {
@@ -2394,6 +2419,7 @@ func opLen3Imm(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s *st
 	}
 }
 
+//go:noinline
 func opLen2Imm_2I(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if (args[2].Op == ssaop.OpConst8 || args[2].Op == ssaop.OpConst64) && uint64(args[2].AuxInt) <= immMax {
@@ -2406,6 +2432,7 @@ func opLen2Imm_2I(op ssaop.Op, t *types.Type, offset int, immMax uint64) func(s 
 	}
 }
 
+//go:noinline
 func opLen3Imm8_2I(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if args[2].Op == ssaop.OpConst8 || args[2].Op == ssaop.OpConst64 {
@@ -2418,6 +2445,7 @@ func opLen3Imm8_2I(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.
 	}
 }
 
+//go:noinline
 func opLen4Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		if args[1].Op == ssaop.OpConst8 || args[1].Op == ssaop.OpConst64 {
@@ -2430,12 +2458,14 @@ func opLen4Imm8(op ssaop.Op, t *types.Type, offset int) func(s *state, n *ir.Cal
 	}
 }
 
+//go:noinline
 func simdBroadcast(op ssaop.Op) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue2(op, n.Type(), args[0], s.mem())
 	}
 }
 
+//go:noinline
 func simdLoad() func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		ptr := s.nilCheck(args[0])
@@ -2443,6 +2473,7 @@ func simdLoad() func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	}
 }
 
+//go:noinline
 func simdStore() func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		ptr := s.nilCheck(args[1])
@@ -2465,6 +2496,7 @@ var cvtMaskToVOpcodes = map[int]map[int]ssaop.Op{
 	64: {2: ssaop.OpCvtMask64x2to8, 4: ssaop.OpCvtMask64x4to8, 8: ssaop.OpCvtMask64x8to8},
 }
 
+//go:noinline
 func simdCvtVToMask(elemBits, lanes int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		op := cvtVToMaskOpcodes[elemBits][lanes]
@@ -2475,6 +2507,7 @@ func simdCvtVToMask(elemBits, lanes int) func(s *state, n *ir.CallExpr, args []*
 	}
 }
 
+//go:noinline
 func simdCvtMaskToV(elemBits, lanes int) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		op := cvtMaskToVOpcodes[elemBits][lanes]
@@ -2485,12 +2518,14 @@ func simdCvtMaskToV(elemBits, lanes int) func(s *state, n *ir.CallExpr, args []*
 	}
 }
 
+//go:noinline
 func simdMaskedLoad(op ssaop.Op) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		return s.newValue3(op, n.Type(), args[0], args[1], s.mem())
 	}
 }
 
+//go:noinline
 func simdMaskedStore(op ssaop.Op) func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 		s.vars[memVar] = s.newValue4A(op, types.TypeMem, args[0].Type, args[1], args[2], args[0], s.mem())
