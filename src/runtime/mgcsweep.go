@@ -233,15 +233,23 @@ func finishsweep_m() {
 
 	// Sweeping must be complete before marking commences.
 	//
-	// For concurrent GC, gcStart picks up any remaining unswept spans
-	// prior to stopping the world.
+	// gcStart picks up any unswept spans prior to commencing, which
+	// ensures there are no unswept spans in the presence of a single GC.
+	// However, in the case of gcStart racing with another GC, there are
+	// edge cases that allow finishsweep_m to observe unswept spans. For
+	// example,
 	//
-	// For GODEBUG=gcstoptheworld=2 (work.mode == gcForceBlockMode), mark
-	// termination does all sweeping synchronously.
+	// - gcStart sweeps remaining spans prior to taking work.startSema.
+	//   While blocked waiting, another goroutine could take the lock and
+	//   complete an entire GC cycle. When the original goroutine finally
+	//   unblocks there are now unswept spans from the subsequent GC cycle.
 	//
-	// Either way, all spans should be swept, so throw if anything is left.
-	if sweepone() != ^uintptr(0) {
-		throw("unswept spans found at start of mark phase")
+	// - Mark termination makes most sweep work prior to startTheWorld, but
+	//   it calls prepareForSweep after restarting the world, which adds more
+	//   work. A concurrent gcStart call could finish all of the initial work
+	//   before prepareForSweep adds more, and thus gcStart doesn't see it
+	//   until after taking work.startSema.
+	for sweepone() != ^uintptr(0) {
 	}
 
 	// Make sure there aren't any outstanding sweepers left.
