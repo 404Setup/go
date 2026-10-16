@@ -17,6 +17,8 @@ type v256 struct {
 }
 
 // Float32s is a scalable SIMD vector of float32s.
+//
+// CPU Feature: SVE
 type Float32s struct {
 	float32x8 v256
 	vals      [8]float32
@@ -116,6 +118,8 @@ func (x Float32s) String() string {
 }
 
 // Float64s is a scalable SIMD vector of float64s.
+//
+// CPU Feature: SVE
 type Float64s struct {
 	float64x4 v256
 	vals      [4]float64
@@ -215,6 +219,8 @@ func (x Float64s) String() string {
 }
 
 // Int8s is a scalable SIMD vector of int8s.
+//
+// CPU Feature: SVE
 type Int8s struct {
 	int8x32 v256
 	vals    [32]int8
@@ -304,6 +310,15 @@ func (x Int8s) Masked(mask Mask8s) (z Int8s) {
 // Asm: ZDUP, CPU Feature: SVE
 func BroadcastInt8s(x int8) (z Int8s)
 
+// ToMask returns a mask indicating which elements of x are non-zero.
+//
+//	z[i] = x[i] != 0
+//
+// Asm: ZCMPNE, CPU Feature: SVE
+func (x Int8s) ToMask() (z Mask8s) {
+	return x.NotEqual(Int8s{})
+}
+
 // String returns a string representation of SIMD vector x. Only the x.Len()
 // elements that exist at the runtime vector length are shown.
 func (x Int8s) String() string {
@@ -314,6 +329,8 @@ func (x Int8s) String() string {
 }
 
 // Int16s is a scalable SIMD vector of int16s.
+//
+// CPU Feature: SVE
 type Int16s struct {
 	int16x16 v256
 	vals     [16]int16
@@ -403,6 +420,15 @@ func (x Int16s) Masked(mask Mask16s) (z Int16s) {
 // Asm: ZDUP, CPU Feature: SVE
 func BroadcastInt16s(x int16) (z Int16s)
 
+// ToMask returns a mask indicating which elements of x are non-zero.
+//
+//	z[i] = x[i] != 0
+//
+// Asm: ZCMPNE, CPU Feature: SVE
+func (x Int16s) ToMask() (z Mask16s) {
+	return x.NotEqual(Int16s{})
+}
+
 // String returns a string representation of SIMD vector x. Only the x.Len()
 // elements that exist at the runtime vector length are shown.
 func (x Int16s) String() string {
@@ -413,6 +439,8 @@ func (x Int16s) String() string {
 }
 
 // Int32s is a scalable SIMD vector of int32s.
+//
+// CPU Feature: SVE
 type Int32s struct {
 	int32x8 v256
 	vals    [8]int32
@@ -502,6 +530,15 @@ func (x Int32s) Masked(mask Mask32s) (z Int32s) {
 // Asm: ZDUP, CPU Feature: SVE
 func BroadcastInt32s(x int32) (z Int32s)
 
+// ToMask returns a mask indicating which elements of x are non-zero.
+//
+//	z[i] = x[i] != 0
+//
+// Asm: ZCMPNE, CPU Feature: SVE
+func (x Int32s) ToMask() (z Mask32s) {
+	return x.NotEqual(Int32s{})
+}
+
 // String returns a string representation of SIMD vector x. Only the x.Len()
 // elements that exist at the runtime vector length are shown.
 func (x Int32s) String() string {
@@ -512,6 +549,8 @@ func (x Int32s) String() string {
 }
 
 // Int64s is a scalable SIMD vector of int64s.
+//
+// CPU Feature: SVE
 type Int64s struct {
 	int64x4 v256
 	vals    [4]int64
@@ -601,6 +640,15 @@ func (x Int64s) Masked(mask Mask64s) (z Int64s) {
 // Asm: ZDUP, CPU Feature: SVE
 func BroadcastInt64s(x int64) (z Int64s)
 
+// ToMask returns a mask indicating which elements of x are non-zero.
+//
+//	z[i] = x[i] != 0
+//
+// Asm: ZCMPNE, CPU Feature: SVE
+func (x Int64s) ToMask() (z Mask64s) {
+	return x.NotEqual(Int64s{})
+}
+
 // String returns a string representation of SIMD vector x. Only the x.Len()
 // elements that exist at the runtime vector length are shown.
 func (x Int64s) String() string {
@@ -611,6 +659,8 @@ func (x Int64s) String() string {
 }
 
 // Uint8s is a scalable SIMD vector of uint8s.
+//
+// CPU Feature: SVE
 type Uint8s struct {
 	uint8x32 v256
 	vals     [32]uint8
@@ -710,6 +760,8 @@ func (x Uint8s) String() string {
 }
 
 // Uint16s is a scalable SIMD vector of uint16s.
+//
+// CPU Feature: SVE
 type Uint16s struct {
 	uint16x16 v256
 	vals      [16]uint16
@@ -809,6 +861,8 @@ func (x Uint16s) String() string {
 }
 
 // Uint32s is a scalable SIMD vector of uint32s.
+//
+// CPU Feature: SVE
 type Uint32s struct {
 	uint32x8 v256
 	vals     [8]uint32
@@ -908,6 +962,8 @@ func (x Uint32s) String() string {
 }
 
 // Uint64s is a scalable SIMD vector of uint64s.
+//
+// CPU Feature: SVE
 type Uint64s struct {
 	uint64x4 v256
 	vals     [4]uint64
@@ -1015,6 +1071,8 @@ func (x Uint64s) String() string {
 // In memory a Mask8s is a uint64 holding those bits, bit 0 first; the bits
 // beyond the runtime vector length are zero. So the bits of m can be read with
 // *(*uint64)(unsafe.Pointer(&m)).
+//
+// CPU Feature: SVE
 type Mask8s struct {
 	mask8s psve
 	vals   uint64
@@ -1053,6 +1111,14 @@ func (x Mask8s) None() bool
 // Asm: PTEST, CPU Feature: SVE
 func (x Mask8s) Any() bool
 
+// ToInt8s converts the mask to a vector, where element i is set to ^0 (all bits
+// set, e.g., -1) if mask element i is "true", and 0 otherwise.
+//
+// Asm: ZCPY, CPU Feature: SVE
+func (x Mask8s) ToInt8s() (z Int8s) {
+	return BroadcastInt8s(-1).Masked(x)
+}
+
 // String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() lanes that exist at the runtime
 // vector length are shown.
@@ -1077,6 +1143,8 @@ func (x Mask8s) String() string {
 // In memory a Mask16s is a uint64 holding those bits, bit 0 first; the bits
 // beyond the runtime vector length are zero. So the bits of m can be read with
 // *(*uint64)(unsafe.Pointer(&m)).
+//
+// CPU Feature: SVE
 type Mask16s struct {
 	mask16s psve
 	vals    uint64
@@ -1115,6 +1183,14 @@ func (x Mask16s) None() bool
 // Asm: PTEST, CPU Feature: SVE
 func (x Mask16s) Any() bool
 
+// ToInt16s converts the mask to a vector, where element i is set to ^0 (all bits
+// set, e.g., -1) if mask element i is "true", and 0 otherwise.
+//
+// Asm: ZCPY, CPU Feature: SVE
+func (x Mask16s) ToInt16s() (z Int16s) {
+	return BroadcastInt16s(-1).Masked(x)
+}
+
 // String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() / 2 lanes that exist at the runtime
 // vector length are shown.
@@ -1139,6 +1215,8 @@ func (x Mask16s) String() string {
 // In memory a Mask32s is a uint64 holding those bits, bit 0 first; the bits
 // beyond the runtime vector length are zero. So the bits of m can be read with
 // *(*uint64)(unsafe.Pointer(&m)).
+//
+// CPU Feature: SVE
 type Mask32s struct {
 	mask32s psve
 	vals    uint64
@@ -1177,6 +1255,14 @@ func (x Mask32s) None() bool
 // Asm: PTEST, CPU Feature: SVE
 func (x Mask32s) Any() bool
 
+// ToInt32s converts the mask to a vector, where element i is set to ^0 (all bits
+// set, e.g., -1) if mask element i is "true", and 0 otherwise.
+//
+// Asm: ZCPY, CPU Feature: SVE
+func (x Mask32s) ToInt32s() (z Int32s) {
+	return BroadcastInt32s(-1).Masked(x)
+}
+
 // String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() / 4 lanes that exist at the runtime
 // vector length are shown.
@@ -1201,6 +1287,8 @@ func (x Mask32s) String() string {
 // In memory a Mask64s is a uint64 holding those bits, bit 0 first; the bits
 // beyond the runtime vector length are zero. So the bits of m can be read with
 // *(*uint64)(unsafe.Pointer(&m)).
+//
+// CPU Feature: SVE
 type Mask64s struct {
 	mask64s psve
 	vals    uint64
@@ -1238,6 +1326,14 @@ func (x Mask64s) None() bool
 //
 // Asm: PTEST, CPU Feature: SVE
 func (x Mask64s) Any() bool
+
+// ToInt64s converts the mask to a vector, where element i is set to ^0 (all bits
+// set, e.g., -1) if mask element i is "true", and 0 otherwise.
+//
+// Asm: ZCPY, CPU Feature: SVE
+func (x Mask64s) ToInt64s() (z Int64s) {
+	return BroadcastInt64s(-1).Masked(x)
+}
 
 // String returns a string representation of SIMD mask x: 1 for an active lane,
 // 0 for an inactive one. Only the vl() / 8 lanes that exist at the runtime
