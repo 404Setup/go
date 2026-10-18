@@ -294,6 +294,17 @@ func (x Float32s) Ceil() Float32s
 // Asm: ZFRINTP, CPU Feature: SVE
 func (x Float64s) Ceil() Float64s
 
+/* ConvertToInt32 */
+
+// ConvertToInt32 converts each element of x to int32.
+//
+// When a conversion is inexact, this truncates the result (rounds toward zero).
+// If the converted result would be outside the representable range, the result
+// is architecture-dependent.
+//
+// Asm: ZFCVTZS, CPU Feature: SVE
+func (x Float32s) ConvertToInt32() (z Int32s)
+
 /* Div */
 
 // Div divides x by y elementwise.
@@ -1070,6 +1081,38 @@ func (x Uint32s) Or(y Uint32s) (z Uint32s)
 // Asm: ZORR, CPU Feature: SVE
 func (x Uint64s) Or(y Uint64s) (z Uint64s)
 
+/* ReduceMax */
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+//
+// Asm: ZFMAXVS, CPU Feature: SVE
+func (x Float32s) ReduceMax() (z float32)
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+//
+// Asm: ZFMAXVD, CPU Feature: SVE
+func (x Float64s) ReduceMax() (z float64)
+
+/* ReduceSum */
+
+// ReduceSum returns the scalar sum of the elements of x.
+//
+//	z = x[0] + x[1] + ...
+//
+// Asm: ZFADDVS, CPU Feature: SVE
+func (x Float32s) ReduceSum() (z float32)
+
+// ReduceSum returns the scalar sum of the elements of x.
+//
+//	z = x[0] + x[1] + ...
+//
+// Asm: ZFADDVD, CPU Feature: SVE
+func (x Float64s) ReduceSum() (z float64)
+
 /* Round */
 
 // Round rounds elements to the nearest integer, rounding ties to even.
@@ -1081,6 +1124,72 @@ func (x Float32s) Round() Float32s
 //
 // Asm: ZFRINTN, CPU Feature: SVE
 func (x Float64s) Round() Float64s
+
+/* ShiftAllLeft */
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Int8s) ShiftAllLeft(shift uint64) (z Int8s)
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Int16s) ShiftAllLeft(shift uint64) (z Int16s)
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Int32s) ShiftAllLeft(shift uint64) (z Int32s)
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Int64s) ShiftAllLeft(shift uint64) (z Int64s)
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Uint8s) ShiftAllLeft(shift uint64) (z Uint8s)
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Uint16s) ShiftAllLeft(shift uint64) (z Uint16s)
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Uint32s) ShiftAllLeft(shift uint64) (z Uint32s)
+
+// ShiftAllLeft shifts each element of x left by shift bits.
+// If shift is greater than the element width, the result is 0.
+//
+//	z[i] = x[i] << shift
+//
+// Asm: ZLSL, CPU Feature: SVE
+func (x Uint64s) ShiftAllLeft(shift uint64) (z Uint64s)
 
 /* Sqrt */
 

@@ -376,6 +376,13 @@ type {{.Name}} struct {
 // Asm: PWHILELT, CPU Feature: SVE
 func {{.Name}}AllTrue() {{.Name}}
 
+// {{.Name}}FromCount returns a mask whose first count lanes are true and the
+// rest false. A count of 0 or less gives no true lanes, and a count of the
+// vector length or more gives all true lanes.
+//
+// Asm: PWHILELT, CPU Feature: SVE
+func {{.Name}}FromCount(count int) {{.Name}}
+
 // First returns a mask with only the first active lane of x active, or no
 // lanes active if x has none.
 //
@@ -885,8 +892,8 @@ func parseSIMDTypes(ops []Operation) simdTypeMap {
 	ret := map[specexpr.Num][]simdType{}
 	seen := map[string]struct{}{}
 	processArg := func(arg types.Operand) {
-		if arg.Class == "immediate" || arg.Class == "greg" {
-			// Immediates and general-purpose registers are not encoded as vector types.
+		if arg.Class == "immediate" || arg.Class == "greg" || arg.Class == "fpreg" {
+			// Immediates and scalar registers are not encoded as vector types.
 			return
 		}
 		if arg.Lanes != nil && *arg.Lanes <= 1 {
