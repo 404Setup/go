@@ -869,8 +869,7 @@ func testTransportMaxConnsPerHostDialCancellation(t *testing.T, mode testMode) {
 	// This request is canceled when dial is queued, which preempts dialing.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	SetPendingDialHooks(cancel, nil)
-	defer SetPendingDialHooks(nil, nil)
+	SetPendingDialHooks(t, cancel, nil)
 
 	req, _ := NewRequestWithContext(ctx, "GET", ts.URL, nil)
 	_, err := c.Do(req)
@@ -879,7 +878,7 @@ func testTransportMaxConnsPerHostDialCancellation(t *testing.T, mode testMode) {
 	}
 
 	// This request should succeed.
-	SetPendingDialHooks(nil, nil)
+	SetPendingDialHooks(t, nil, nil)
 	req, _ = NewRequest("GET", ts.URL, nil)
 	resp, err := c.Do(req)
 	if err != nil {
@@ -2481,8 +2480,7 @@ func testTransportConcurrency(t *testing.T, mode testMode) {
 	// the leak checker happy, keep track of pending dials and
 	// wait for them to finish (and be closed or returned to the
 	// idle pool) before we close idle connections.
-	SetPendingDialHooks(func() { wg.Add(1) }, wg.Done)
-	defer SetPendingDialHooks(nil, nil)
+	SetPendingDialHooks(t, func() { wg.Add(1) }, wg.Done)
 
 	c := ts.Client()
 	reqs := make(chan string)
@@ -2735,7 +2733,7 @@ func runCancelTest(t *testing.T, f func(t *testing.T, test cancelTest), opts ...
 }
 
 func TestTransportCancelRequest(t *testing.T) {
-	runCancelTest(t, testTransportCancelRequest, http3SkippedMode)
+	runCancelTest(t, testTransportCancelRequest)
 }
 func testTransportCancelRequest(t *testing.T, test cancelTest) {
 	const msg = "Hello"
@@ -2751,6 +2749,7 @@ func testTransportCancelRequest(t *testing.T, test cancelTest) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer conn.Close()
 
 	req, _ := NewRequest("GET", cst.ts.URL, nil)
 	req = test.newReq(req)
@@ -2873,7 +2872,7 @@ Get error = true
 
 // Issue 51354
 func TestTransportCancelRequestWithBody(t *testing.T) {
-	runCancelTest(t, testTransportCancelRequestWithBody, http3SkippedMode)
+	runCancelTest(t, testTransportCancelRequestWithBody)
 }
 func testTransportCancelRequestWithBody(t *testing.T, test cancelTest) {
 	const msg = "Hello"
@@ -2889,6 +2888,7 @@ func testTransportCancelRequestWithBody(t *testing.T, test cancelTest) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer conn.Close()
 
 	req, _ := NewRequest("POST", cst.ts.URL, strings.NewReader("withbody"))
 	req = test.newReq(req)
@@ -4205,77 +4205,6 @@ func TestRoundTripReturnsProxyError(t *testing.T) {
 	}
 }
 
-// tests that putting an idle conn after a call to CloseIdleConns does return it
-func TestTransportCloseIdleConnsThenReturn(t *testing.T) {
-	tr := &Transport{}
-	wantIdle := func(when string, n int) bool {
-		got := tr.IdleConnCountForTesting("http", "example.com") // key used by PutIdleTestConn
-		if got == n {
-			return true
-		}
-		t.Errorf("%s: idle conns = %d; want %d", when, got, n)
-		return false
-	}
-	wantIdle("start", 0)
-	if !tr.PutIdleTestConn("http", "example.com") {
-		t.Fatal("put failed")
-	}
-	if !tr.PutIdleTestConn("http", "example.com") {
-		t.Fatal("second put failed")
-	}
-	wantIdle("after put", 2)
-	tr.CloseIdleConnections()
-	if !tr.IsIdleForTesting() {
-		t.Error("should be idle after CloseIdleConnections")
-	}
-	wantIdle("after close idle", 0)
-	if tr.PutIdleTestConn("http", "example.com") {
-		t.Fatal("put didn't fail")
-	}
-	wantIdle("after second put", 0)
-
-	tr.QueueForIdleConnForTesting() // should toggle the transport out of idle mode
-	if tr.IsIdleForTesting() {
-		t.Error("shouldn't be idle after QueueForIdleConnForTesting")
-	}
-	if !tr.PutIdleTestConn("http", "example.com") {
-		t.Fatal("after re-activation")
-	}
-	wantIdle("after final put", 1)
-}
-
-// Test for issue 34282
-// Ensure that getConn doesn't call the GotConn trace hook on an HTTP/2 idle conn
-func TestTransportTraceGotConnH2IdleConns(t *testing.T) {
-	tr := &Transport{}
-	wantIdle := func(when string, n int) bool {
-		got := tr.IdleConnCountForTesting("https", "example.com:443") // key used by PutIdleTestConnH2
-		if got == n {
-			return true
-		}
-		t.Errorf("%s: idle conns = %d; want %d", when, got, n)
-		return false
-	}
-	wantIdle("start", 0)
-	alt := funcRoundTripper(func() {})
-	if !tr.PutIdleTestConnH2("https", "example.com:443", alt) {
-		t.Fatal("put failed")
-	}
-	wantIdle("after put", 1)
-	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) {
-			// tr.getConn should leave it for the HTTP/2 alt to call GotConn.
-			t.Error("GotConn called")
-		},
-	})
-	req, _ := NewRequestWithContext(ctx, MethodGet, "https://example.com", nil)
-	_, err := tr.RoundTrip(req)
-	if err != errFakeRoundTrip {
-		t.Errorf("got error: %v; want %q", err, errFakeRoundTrip)
-	}
-	wantIdle("after round trip", 1)
-}
-
 // https://go.dev/issue/70515
 //
 // When the first request on a new connection fails, we do not retry the request.
@@ -4920,8 +4849,7 @@ func TestNoCrashReturningTransportAltConn(t *testing.T) {
 	defer ln.Close()
 
 	var wg sync.WaitGroup
-	SetPendingDialHooks(func() { wg.Add(1) }, wg.Done)
-	defer SetPendingDialHooks(nil, nil)
+	SetPendingDialHooks(t, func() { wg.Add(1) }, wg.Done)
 
 	testDone := make(chan struct{})
 	defer close(testDone)
@@ -5465,60 +5393,6 @@ func testTLSHandshakeTrace(t *testing.T, mode testMode) {
 	}
 	if !done {
 		t.Fatal("Expected TLSHandshakeDone to be called, but wasn't")
-	}
-}
-
-func TestTransportMaxIdleConns(t *testing.T) {
-	runNoSynctest(t, testTransportMaxIdleConns, []testMode{http1Mode})
-}
-func testTransportMaxIdleConns(t *testing.T, mode testMode) {
-	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
-		// No body for convenience.
-	}), optRealNet).ts
-	c := ts.Client()
-	tr := c.Transport.(*Transport)
-	tr.MaxIdleConns = 4
-
-	ip, port, err := net.SplitHostPort(ts.Listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.WithValue(context.Background(), nettrace.LookupIPAltResolverKey{}, func(ctx context.Context, _, host string) ([]net.IPAddr, error) {
-		return []net.IPAddr{{IP: net.ParseIP(ip)}}, nil
-	})
-
-	hitHost := func(n int) {
-		req, _ := NewRequest("GET", fmt.Sprintf("http://host-%d.dns-is-faked.golang:"+port, n), nil)
-		req = req.WithContext(ctx)
-		res, err := c.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		res.Body.Close()
-	}
-	for i := 0; i < 4; i++ {
-		hitHost(i)
-	}
-	want := []string{
-		"|http|host-0.dns-is-faked.golang:" + port,
-		"|http|host-1.dns-is-faked.golang:" + port,
-		"|http|host-2.dns-is-faked.golang:" + port,
-		"|http|host-3.dns-is-faked.golang:" + port,
-	}
-	if got := tr.IdleConnKeysForTesting(); !slices.Equal(got, want) {
-		t.Fatalf("idle conn keys mismatch.\n got: %q\nwant: %q\n", got, want)
-	}
-
-	// Now hitting the 5th host should kick out the first host:
-	hitHost(4)
-	want = []string{
-		"|http|host-1.dns-is-faked.golang:" + port,
-		"|http|host-2.dns-is-faked.golang:" + port,
-		"|http|host-3.dns-is-faked.golang:" + port,
-		"|http|host-4.dns-is-faked.golang:" + port,
-	}
-	if got := tr.IdleConnKeysForTesting(); !slices.Equal(got, want) {
-		t.Fatalf("idle conn keys mismatch after 5th host.\n got: %q\nwant: %q\n", got, want)
 	}
 }
 

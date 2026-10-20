@@ -212,10 +212,11 @@ func (s *server) idleTimeout() time.Duration {
 }
 
 type serverConn struct {
-	qconn   *quic.Conn
-	srv     *server
-	baseCtx context.Context
-	handler http.Handler
+	qconn    *quic.Conn
+	srv      *server
+	baseCtx  context.Context
+	handler  http.Handler
+	tlsState *tls.ConnectionState
 
 	genericConn // for handleUnidirectionalStream
 	enc         qpackEncoder
@@ -234,11 +235,15 @@ type serverConn struct {
 // newServerConn handles a new connection.
 // The baseCtx parameter is the base context for request handlers on this connection.
 func (s *server) newServerConn(baseCtx context.Context, qconn *quic.Conn, h http.Handler) {
+	baseCtx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
+
 	sc := &serverConn{
 		qconn:               qconn,
 		srv:                 s,
 		baseCtx:             baseCtx,
 		handler:             h,
+		tlsState:            new(qconn.ConnectionState()),
 		maxHeaderBytes:      int64(s.srv1.MaxHeaderBytes),
 		maxHeaderValueCount: int64(s.srv1.MaxHeaderValueCount),
 	}
@@ -597,6 +602,11 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 		contentLength = int64(n)
 	}
 
+	// TODO: Similar to HTTP/2, we probably should also cancel the ctx when the
+	// peer cancels the request stream (STOP_SENDING). This is not yet possible
+	// with the current API of the quic package.
+	ctx, cancel := context.WithCancel(sc.baseCtx)
+	defer cancel()
 	req := (&http.Request{
 		Proto:         "HTTP/3.0",
 		Method:        pHeader.method,
@@ -608,7 +618,8 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 		RemoteAddr:    sc.qconn.RemoteAddr().String(),
 		Header:        header,
 		ContentLength: contentLength,
-	}).WithContext(sc.baseCtx)
+		TLS:           sc.tlsState,
+	}).WithContext(ctx)
 
 	rw := sc.newResponseWriter(st, req.Method != "HEAD")
 
