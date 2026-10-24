@@ -1235,7 +1235,7 @@ func TestStripPasswordFromError(t *testing.T) {
 	}
 }
 
-func TestClientTimeout(t *testing.T) { runSynctest(t, testClientTimeout, http3SkippedMode) }
+func TestClientTimeout(t *testing.T) { runSynctest(t, testClientTimeout) }
 func testClientTimeout(t *testing.T, mode testMode) {
 	sawSlow := false
 	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
@@ -1287,10 +1287,7 @@ func testClientTimeout(t *testing.T, mode testMode) {
 
 // Client.Timeout firing before getting to the body
 func TestClientTimeout_Headers(t *testing.T) {
-	// Leaves lingering goroutine that fails the test when tested with -race
-	// flag for HTTP/3. The lingering goroutine will eventually exit, which can
-	// make this test deceptively pass when ran together with many other tests.
-	runSynctest(t, testClientTimeout_Headers, http3SkippedMode)
+	runSynctest(t, testClientTimeout_Headers)
 }
 func testClientTimeout_Headers(t *testing.T, mode testMode) {
 	donec := make(chan bool, 1)
@@ -1690,6 +1687,15 @@ func testClientCopyHostOnRedirect(t *testing.T, mode testMode) {
 			}
 			w.Header().Set("Location", tsURL+"/final")
 			w.WriteHeader(302)
+		case "/scheme-relative":
+			// Scheme-relative redirect.
+			if r.Host != virtualHost {
+				t.Errorf("Serving /scheme-relative: Request.Host = %#v; want %#v", r.Host, virtualHost)
+				w.WriteHeader(404)
+				return
+			}
+			w.Header().Set("Location", "//"+tsHost+"/final")
+			w.WriteHeader(302)
 		case "/final":
 			if r.Host != tsHost {
 				t.Errorf("Serving /final: Request.Host = %#v; want %#v", r.Host, tsHost)
@@ -1709,18 +1715,20 @@ func testClientCopyHostOnRedirect(t *testing.T, mode testMode) {
 	t.Logf("Server host is %v", tsHost)
 
 	c := ts.Client()
-	req, _ := NewRequest("GET", ts.URL, nil)
-	req.Host = virtualHost
-	resp, err := c.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatal(resp.Status)
-	}
-	if got, err := io.ReadAll(resp.Body); err != nil || string(got) != wantBody {
-		t.Errorf("body = %q; want %q", got, wantBody)
+	for _, path := range []string{"/", "/scheme-relative"} {
+		req, _ := NewRequest("GET", ts.URL+path, nil)
+		req.Host = virtualHost
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatal(resp.Status)
+		}
+		if got, err := io.ReadAll(resp.Body); err != nil || string(got) != wantBody {
+			t.Errorf("body = %q; want %q", got, wantBody)
+		}
 	}
 }
 

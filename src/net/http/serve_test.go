@@ -3331,7 +3331,7 @@ func TestStripPrefixNotModifyRequest(t *testing.T) {
 	}
 }
 
-func TestRequestLimit(t *testing.T) { runSynctest(t, testRequestLimit, http3SkippedMode) }
+func TestRequestLimit(t *testing.T) { runSynctest(t, testRequestLimit) }
 func testRequestLimit(t *testing.T, mode testMode) {
 	bytesPerHeader := len("header12345: val12345\r\n")
 	numHeaders := ((DefaultMaxHeaderBytes + 4096) / bytesPerHeader) + 1
@@ -7890,6 +7890,35 @@ func TestServerRequestBodyLength(t *testing.T) {
 		wantContentLength: -1,
 		wantBodyLength:    5,
 		wantClose:         true, // RFC 9112 6.1
+	}, {
+		// RFC 9112 6.1
+		name: "HTTP/1.0 TE and CL with keep-alive",
+		message: joinCRLF(
+			"POST / HTTP/1.0",
+			"Host: example.tld",
+			"Connection: keep-alive",
+			"Transfer-Encoding: chunked",
+			"Content-Length: 5",
+			"",
+			"hello",
+		),
+		wantContentLength: 5,
+		wantBodyLength:    5,
+		wantClose:         true,
+	}, {
+		// RFC 9112 6.1
+		name: "HTTP/1.0 TE only with keep-alive",
+		message: joinCRLF(
+			"POST / HTTP/1.0",
+			"Host: example.tld",
+			"Connection: keep-alive",
+			"Transfer-Encoding: chunked",
+			"",
+			"",
+		),
+		wantContentLength: 0,
+		wantBodyLength:    0,
+		wantClose:         true,
 	}, {
 		// RFC 9112 6.3.4 paragraph 1
 		name: "TE only",
