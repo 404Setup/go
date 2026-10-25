@@ -58,6 +58,36 @@ func (ht *HashTrieMap[K, V]) initSlow() {
 type hashFunc func(unsafe.Pointer, uintptr) uintptr
 type equalFunc func(unsafe.Pointer, unsafe.Pointer) bool
 
+func loadPointer[T any](p *atomic.Pointer[T]) *T {
+	return (*atomic.Pointer[T])(abi.NoEscape(unsafe.Pointer(p))).Load()
+}
+
+// Storage returns an opaque pointer identifying the current root storage of the map.
+func (ht *HashTrieMap[K, V]) Storage() unsafe.Pointer {
+	return unsafe.Pointer(loadPointer(&ht.root))
+}
+
+// StoreUnique inserts a key and value with a known-unique key into an
+// unshared HashTrieMap without locking. The caller must have exclusive
+// access to ht.
+func (ht *HashTrieMap[K, V]) StoreUnique(key K, value V) {
+	ht.init()
+	ht.insertNew(ht.root.Load(), key, value)
+}
+
+//go:noinline
+func (ht *HashTrieMap[K, V]) ensureRoot() *indirect[K, V] {
+	ht.initMu.Lock()
+	defer ht.initMu.Unlock()
+
+	if i := ht.root.Load(); i != nil {
+		return i
+	}
+	i := newIndirectNode[K, V](nil)
+	ht.root.Store(i)
+	return i
+}
+
 // Load returns the value stored in the map for a key, or nil if no
 // value is present.
 // The ok result indicates whether value was found in the map.
@@ -65,9 +95,12 @@ func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 	if ht.inited.Load() == 0 {
 		return value, false
 	}
+	i := loadPointer(&ht.root)
+	if i == nil {
+		return value, false
+	}
 	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
 
-	i := ht.root.Load()
 	hashShift := 8 * goarch.PtrSize
 	for hashShift != 0 {
 		hashShift -= nChildrenLog2
@@ -96,7 +129,10 @@ func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool)
 	var n *node[K, V]
 	for {
 		// Find the key or a candidate location for insertion.
-		i = ht.root.Load()
+		i = loadPointer(&ht.root)
+		if i == nil {
+			i = ht.ensureRoot()
+		}
 		hashShift = 8 * goarch.PtrSize
 		haveInsertPoint := false
 		for hashShift != 0 {
@@ -213,7 +249,10 @@ func (ht *HashTrieMap[K, V]) Swap(key K, new V) (previous V, loaded bool) {
 	var n *node[K, V]
 	for {
 		// Find the key or a candidate location for insertion.
-		i = ht.root.Load()
+		i = loadPointer(&ht.root)
+		if i == nil {
+			i = ht.ensureRoot()
+		}
 		hashShift = 8 * goarch.PtrSize
 		haveInsertPoint := false
 		for hashShift != 0 {
@@ -431,7 +470,10 @@ func (ht *HashTrieMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 func (ht *HashTrieMap[K, V]) find(key K, hash uintptr, valEqual equalFunc, value V) (i *indirect[K, V], hashShift uint, slot *atomic.Pointer[node[K, V]], n *node[K, V]) {
 	for {
 		// Find the key or return if it's not there.
-		i = ht.root.Load()
+		i = loadPointer(&ht.root)
+		if i == nil {
+			return nil, 0, nil, nil
+		}
 		hashShift = 8 * goarch.PtrSize
 		found := false
 		for hashShift != 0 {
@@ -486,7 +528,9 @@ func (ht *HashTrieMap[K, V]) find(key K, hash uintptr, valEqual equalFunc, value
 func (ht *HashTrieMap[K, V]) All() func(yield func(K, V) bool) {
 	return func(yield func(key K, value V) bool) {
 		if ht.inited.Load() != 0 {
-			ht.iter(ht.root.Load(), yield)
+			if root := loadPointer(&ht.root); root != nil {
+				ht.iter(root, yield)
+			}
 		}
 	}
 }
@@ -498,7 +542,9 @@ func (ht *HashTrieMap[K, V]) All() func(yield func(K, V) bool) {
 // It provides the same guarantees as sync.Map, and All.
 func (ht *HashTrieMap[K, V]) Range(yield func(K, V) bool) {
 	if ht.inited.Load() != 0 {
-		ht.iter(ht.root.Load(), yield)
+		if root := loadPointer(&ht.root); root != nil {
+			ht.iter(root, yield)
+		}
 	}
 }
 
@@ -530,10 +576,138 @@ func (ht *HashTrieMap[K, V]) Clear() {
 	if ht.inited.Load() == 0 {
 		return
 	}
+	ht.clearSlow()
+}
 
-	// It's sufficient to just drop the root on the floor, but the root
-	// must always be non-nil.
+//go:noinline
+func (ht *HashTrieMap[K, V]) clearSlow() {
+	ht.initMu.Lock()
+	defer ht.initMu.Unlock()
+
+	var locked []*indirect[K, V]
+	for {
+		oldRoot := ht.root.Load()
+		if oldRoot == nil {
+			ht.root.Store(newIndirectNode[K, V](nil))
+			return
+		}
+		locked = locked[:0]
+		var conflict *indirect[K, V]
+		locked, conflict = freezeIndirect(oldRoot, locked)
+		if conflict == nil {
+			break
+		}
+		for _, n := range locked {
+			n.mu.Unlock()
+		}
+		conflict.mu.Lock()
+		conflict.mu.Unlock()
+	}
+	for _, n := range locked {
+		n.dead.Store(true)
+	}
 	ht.root.Store(newIndirectNode[K, V](nil))
+	for _, n := range locked {
+		n.mu.Unlock()
+	}
+}
+
+// Shrink rebuilds the HashTrieMap's underlying storage to fit its current entries.
+func (ht *HashTrieMap[K, V]) Shrink() {
+	if ht.inited.Load() == 0 {
+		return
+	}
+	ht.initMu.Lock()
+	defer ht.initMu.Unlock()
+
+	var locked []*indirect[K, V]
+	var oldRoot *indirect[K, V]
+	for {
+		oldRoot = ht.root.Load()
+		if oldRoot == nil {
+			return
+		}
+		locked = locked[:0]
+		var conflict *indirect[K, V]
+		locked, conflict = freezeIndirect(oldRoot, locked)
+		if conflict == nil {
+			break
+		}
+		for _, n := range locked {
+			n.mu.Unlock()
+		}
+		conflict.mu.Lock()
+		conflict.mu.Unlock()
+	}
+
+	var newRoot *indirect[K, V]
+	ht.rebuild(&newRoot, oldRoot)
+	for _, n := range locked {
+		n.dead.Store(true)
+	}
+	ht.root.Store(newRoot)
+	for _, n := range locked {
+		n.mu.Unlock()
+	}
+}
+
+func freezeIndirect[K comparable, V any](i *indirect[K, V], locked []*indirect[K, V]) ([]*indirect[K, V], *indirect[K, V]) {
+	if !i.mu.TryLock() {
+		return locked, i
+	}
+	locked = append(locked, i)
+	for j := range i.children {
+		n := i.children[j].Load()
+		if n != nil && !n.isEntry {
+			var conflict *indirect[K, V]
+			locked, conflict = freezeIndirect(n.indirect(), locked)
+			if conflict != nil {
+				return locked, conflict
+			}
+		}
+	}
+	return locked, nil
+}
+
+func (ht *HashTrieMap[K, V]) rebuild(newRoot **indirect[K, V], i *indirect[K, V]) {
+	for j := range i.children {
+		n := i.children[j].Load()
+		if n == nil {
+			continue
+		}
+		if !n.isEntry {
+			ht.rebuild(newRoot, n.indirect())
+			continue
+		}
+		for e := n.entry(); e != nil; e = e.overflow.Load() {
+			if *newRoot == nil {
+				*newRoot = newIndirectNode[K, V](nil)
+			}
+			ht.insertNew(*newRoot, e.key, e.value)
+		}
+	}
+}
+
+func (ht *HashTrieMap[K, V]) insertNew(i *indirect[K, V], key K, value V) {
+	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	hashShift := uint(8 * goarch.PtrSize)
+	for hashShift != 0 {
+		hashShift -= nChildrenLog2
+		slot := &i.children[(hash>>hashShift)&nChildrenMask]
+		n := slot.Load()
+		if n == nil {
+			newEntry := newEntryNode(key, value)
+			slot.Store(&newEntry.node)
+			return
+		}
+		if n.isEntry {
+			newEntry := newEntryNode(key, value)
+			slot.Store(ht.expand(n.entry(), newEntry, hash, hashShift, i))
+			return
+		}
+		i = n.indirect()
+	}
+	panic("internal/sync.HashTrieMap: ran out of hash bits while iterating")
 }
 
 const (

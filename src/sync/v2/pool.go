@@ -121,11 +121,13 @@ func (p *Pool[T]) GetOK() (value T, ok bool) {
 
 	poolRaceGet()
 	l, pid := p.pin()
-	item, ok := l.private, l.privateSet
-	if ok {
+	var item poolItem[T]
+	if l.privateSet {
+		item = l.private
 		var zero poolItem[T]
 		l.private = zero
 		l.privateSet = false
+		ok = true
 	} else {
 		item, ok = l.shared.popHead()
 		if !ok {

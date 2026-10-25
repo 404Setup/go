@@ -36,13 +36,17 @@ type ConcurrentSkipListMap[K, V any] struct {
 const skipListLevels = 32
 
 type skipListState[K, V any] struct {
-	head skipListNode[K, V]
+	head     skipListNode[K, V]
+	headNext [skipListLevels]atomic.Pointer[skipListNode[K, V]]
+	height   atomic.Int32
 }
 
 type skipListNode[K, V any] struct {
-	key   K                                // immutable after publication
-	value atomic.Pointer[skipListValue[V]] // nil marks a deleted entry
-	next  []atomic.Pointer[skipListNode[K, V]]
+	key     K                                // immutable after publication
+	value   atomic.Pointer[skipListValue[V]] // nil marks a deleted entry
+	next    []atomic.Pointer[skipListNode[K, V]]
+	initVal skipListValue[V]
+	tower   [2]atomic.Pointer[skipListNode[K, V]]
 }
 
 type skipListValue[V any] struct{ value V }
@@ -66,27 +70,63 @@ func (m *ConcurrentSkipListMap[K, V]) Len() int {
 	return m.length
 }
 
-// find returns the first node whose key is at least key. If predecessors is
-// non-nil, it also records the predecessor at every level for a writer.
-func (m *ConcurrentSkipListMap[K, V]) find(s *skipListState[K, V], key K, predecessors *[skipListLevels]*skipListNode[K, V]) *skipListNode[K, V] {
+// find returns the first node whose key is at least key, and whether its key
+// equals key. If predecessors is non-nil, it also records the predecessor at
+// levels [0, s.height) for a writer.
+func (m *ConcurrentSkipListMap[K, V]) find(s *skipListState[K, V], key K, predecessors *[skipListLevels]*skipListNode[K, V]) (*skipListNode[K, V], bool) {
 	n := &s.head
-	for level := skipListLevels - 1; level >= 0; level-- {
-		for next := n.next[level].Load(); next != nil && m.compare(next.key, key) < 0; next = n.next[level].Load() {
+	top := int(s.height.Load()) - 1
+	var right *skipListNode[K, V]
+	exact := false
+	for level := top; level >= 0; level-- {
+		next := n.next[level].Load()
+		for next != nil && next != right {
+			c := m.compare(next.key, key)
+			if c >= 0 {
+				right = next
+				if c == 0 {
+					exact = true
+					if predecessors == nil {
+						return next, true
+					}
+				}
+				break
+			}
 			n = next
+			next = n.next[level].Load()
 		}
 		if predecessors != nil {
 			predecessors[level] = n
 		}
 	}
-	return n.next[0].Load()
+	if right != nil {
+		return right, exact
+	}
+	return n.next[0].Load(), false
 }
 
 // Load returns the value for key and whether it was present.
 func (m *ConcurrentSkipListMap[K, V]) Load(key K) (value V, ok bool) {
 	if s := m.state.Load(); s != nil {
-		if n := m.find(s, key, nil); n != nil && m.compare(n.key, key) == 0 {
-			if current := n.value.Load(); current != nil {
-				return current.value, true
+		n := &s.head
+		var right *skipListNode[K, V]
+		for level := int(s.height.Load()) - 1; level >= 0; level-- {
+			next := n.next[level].Load()
+			for next != nil && next != right {
+				c := m.compare(next.key, key)
+				if c > 0 {
+					right = next
+					break
+				}
+				if c == 0 {
+					if current := next.value.Load(); current != nil {
+						return current.value, true
+					}
+					right = next
+					break
+				}
+				n = next
+				next = n.next[level].Load()
 			}
 		}
 	}
@@ -121,25 +161,53 @@ func (m *ConcurrentSkipListMap[K, V]) store(key K, value V, overwrite bool) (pre
 	}
 	s := m.state.Load()
 	if s == nil {
-		s = &skipListState[K, V]{head: skipListNode[K, V]{next: make([]atomic.Pointer[skipListNode[K, V]], skipListLevels)}}
+		s = new(skipListState[K, V])
+		s.head.next = s.headNext[:]
+		s.height.Store(1)
 		m.state.Store(s)
 	}
 	var predecessors [skipListLevels]*skipListNode[K, V]
-	n := m.find(s, key, &predecessors)
-	if n != nil && m.compare(n.key, key) == 0 {
-		previous = n.value.Load().value
-		if overwrite {
-			n.value.Store(&skipListValue[V]{value: value})
+	n := &s.head
+	top := int(s.height.Load()) - 1
+	var right *skipListNode[K, V]
+	for level := top; level >= 0; level-- {
+		next := n.next[level].Load()
+		for next != nil && next != right {
+			c := m.compare(next.key, key)
+			if c > 0 {
+				right = next
+				break
+			}
+			if c == 0 {
+				previous = next.value.Load().value
+				if overwrite {
+					next.value.Store(&skipListValue[V]{value: value})
+				}
+				return previous, true
+			}
+			n = next
+			next = n.next[level].Load()
 		}
-		return previous, true
+		predecessors[level] = n
 	}
 	// Each additional level is chosen with probability 1/4. The cap covers
 	// a 64-bit key space without allocating a full tower for every node.
 	height := min(1+bits.TrailingZeros64(rand.Uint64())/2, skipListLevels)
-	n = &skipListNode[K, V]{key: key, next: make([]atomic.Pointer[skipListNode[K, V]], height)}
-	n.value.Store(&skipListValue[V]{value: value})
+	for level := top + 1; level < height; level++ {
+		predecessors[level] = &s.head
+	}
+	n = &skipListNode[K, V]{key: key, initVal: skipListValue[V]{value: value}}
+	if height <= len(n.tower) {
+		n.next = n.tower[:height]
+	} else {
+		n.next = make([]atomic.Pointer[skipListNode[K, V]], height)
+	}
+	n.value.Store(&n.initVal)
 	for level := range height {
 		n.next[level].Store(predecessors[level].next[level].Load())
+	}
+	if int32(height) > s.height.Load() {
+		s.height.Store(int32(height))
 	}
 	// Publish the base link first; higher links only accelerate searches.
 	for level := range height {
@@ -164,8 +232,8 @@ func (m *ConcurrentSkipListMap[K, V]) remove(key K) (value V, loaded bool) {
 		return value, false
 	}
 	var predecessors [skipListLevels]*skipListNode[K, V]
-	n := m.find(s, key, &predecessors)
-	if n == nil || m.compare(n.key, key) != 0 {
+	n, exact := m.find(s, key, &predecessors)
+	if !exact {
 		return value, false
 	}
 	value = n.value.Load().value
@@ -173,6 +241,11 @@ func (m *ConcurrentSkipListMap[K, V]) remove(key K) (value V, loaded bool) {
 	for level := len(n.next) - 1; level >= 0; level-- {
 		predecessors[level].next[level].Store(n.next[level].Load())
 	}
+	h := int(s.height.Load())
+	for h > 1 && s.head.next[h-1].Load() == nil {
+		h--
+	}
+	s.height.Store(int32(h))
 	m.length--
 	return value, true
 }
@@ -188,7 +261,7 @@ func (m *ConcurrentSkipListMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s := m.state.Load(); s != nil {
-		if n := m.find(s, key, nil); n != nil && m.compare(n.key, key) == 0 && any(n.value.Load().value) == any(old) {
+		if n, exact := m.find(s, key, nil); exact && any(n.value.Load().value) == any(old) {
 			n.value.Store(&skipListValue[V]{value: new})
 			return true
 		}
@@ -202,11 +275,26 @@ func (m *ConcurrentSkipListMap[K, V]) CompareAndDelete(key K, old V) bool {
 	mapCheckComparable[V]("CompareAndDelete")
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if value, ok := m.Load(key); ok && any(value) == any(old) {
-		m.remove(key)
-		return true
+	s := m.state.Load()
+	if s == nil {
+		return false
 	}
-	return false
+	var predecessors [skipListLevels]*skipListNode[K, V]
+	n, exact := m.find(s, key, &predecessors)
+	if !exact || any(n.value.Load().value) != any(old) {
+		return false
+	}
+	n.value.Store(nil)
+	for level := len(n.next) - 1; level >= 0; level-- {
+		predecessors[level].next[level].Store(n.next[level].Load())
+	}
+	h := int(s.height.Load())
+	for h > 1 && s.head.next[h-1].Load() == nil {
+		h--
+	}
+	s.height.Store(int32(h))
+	m.length--
+	return true
 }
 
 // Clear atomically removes all entries. Readers already using the old list may
@@ -233,17 +321,34 @@ func (m *ConcurrentSkipListMap[K, V]) edge(last, remove bool) (key K, value V, o
 	if s == nil {
 		return key, value, false
 	}
-	n := s.head.next[0].Load()
-	if last {
-		n = &s.head
-		for level := skipListLevels - 1; level >= 0; level-- {
-			for next := n.next[level].Load(); next != nil; next = n.next[level].Load() {
-				n = next
+	if !last {
+		n := s.head.next[0].Load()
+		if n == nil {
+			return key, value, false
+		}
+		key, value, ok = n.key, n.value.Load().value, true
+		if remove {
+			n.value.Store(nil)
+			for level := len(n.next) - 1; level >= 0; level-- {
+				s.head.next[level].Store(n.next[level].Load())
 			}
+			h := int(s.height.Load())
+			for h > 1 && s.head.next[h-1].Load() == nil {
+				h--
+			}
+			s.height.Store(int32(h))
+			m.length--
 		}
-		if n == &s.head {
-			n = nil
+		return
+	}
+	n := &s.head
+	for level := int(s.height.Load()) - 1; level >= 0; level-- {
+		for next := n.next[level].Load(); next != nil; next = n.next[level].Load() {
+			n = next
 		}
+	}
+	if n == &s.head {
+		return key, value, false
 	}
 	key, value, ok = skipListPair(n)
 	if ok && remove {
@@ -286,10 +391,12 @@ func (m *ConcurrentSkipListMap[K, V]) bound(key K, upper, inclusive bool) (k K, 
 		return k, value, false
 	}
 	n := &s.head
-	for level := skipListLevels - 1; level >= 0; level-- {
-		for next := n.next[level].Load(); next != nil; next = n.next[level].Load() {
+	var right *skipListNode[K, V]
+	for level := int(s.height.Load()) - 1; level >= 0; level-- {
+		for next := n.next[level].Load(); next != nil && next != right; next = n.next[level].Load() {
 			c := m.compare(next.key, key)
 			if c > 0 || (c == 0 && upper == inclusive) {
+				right = next
 				break
 			}
 			n = next
@@ -307,27 +414,31 @@ func (m *ConcurrentSkipListMap[K, V]) bound(key K, upper, inclusive bool) (k K, 
 // O(n) time for n traversed nodes without locking or copying the whole map.
 // Concurrent inserts may be visited and concurrent deletes may be skipped.
 // Yield may call any method on m.
-func (m *ConcurrentSkipListMap[K, V]) All() iter.Seq2[K, V] { return m.iterate(nil, nil) }
-
-// RangeBetween returns an ascending iterator over keys in [lower, upper),
-// according to the comparator. It takes expected O(log n + k) time for k
-// traversed nodes and has the same concurrency guarantees as All.
-func (m *ConcurrentSkipListMap[K, V]) RangeBetween(lower, upper K) iter.Seq2[K, V] {
-	return m.iterate(&lower, &upper)
-}
-
-func (m *ConcurrentSkipListMap[K, V]) iterate(lower, upper *K) iter.Seq2[K, V] {
+func (m *ConcurrentSkipListMap[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		s := m.state.Load()
 		if s == nil {
 			return
 		}
-		n := s.head.next[0].Load()
-		if lower != nil {
-			n = m.find(s, *lower, nil)
+		for n := s.head.next[0].Load(); n != nil; n = n.next[0].Load() {
+			if current := n.value.Load(); current != nil && !yield(n.key, current.value) {
+				return
+			}
 		}
-		for ; n != nil; n = n.next[0].Load() {
-			if upper != nil && m.compare(n.key, *upper) >= 0 {
+	}
+}
+
+// RangeBetween returns an ascending iterator over keys in [lower, upper),
+// according to the comparator. It takes expected O(log n + k) time for k
+// traversed nodes and has the same concurrency guarantees as All.
+func (m *ConcurrentSkipListMap[K, V]) RangeBetween(lower, upper K) iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		s := m.state.Load()
+		if s == nil {
+			return
+		}
+		for n, _ := m.find(s, lower, nil); n != nil; n = n.next[0].Load() {
+			if m.compare(n.key, upper) >= 0 {
 				return
 			}
 			if current := n.value.Load(); current != nil && !yield(n.key, current.value) {

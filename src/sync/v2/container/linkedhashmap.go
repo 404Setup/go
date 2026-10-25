@@ -4,10 +4,7 @@
 
 package container
 
-import (
-	"container/list"
-	"iter"
-)
+import "iter"
 
 // LinkedHashMap is a hash map with a doubly linked iteration order. The zero
 // value is ready for use and iterates in insertion order. Updating a key keeps
@@ -21,15 +18,74 @@ import (
 // synchronization. Deleted entries are unlinked immediately.
 type LinkedHashMap[K comparable, V any] struct {
 	_           noCopy
-	index       map[K]*list.Element
-	order       list.List
+	index       map[K]*linkedHashMapNode[K, V]
+	order       linkedHashMapList[K, V]
+	free        *linkedHashMapNode[K, V]
 	accessOrder bool
 	version     uint64
 }
 
-type linkedHashMapEntry[K comparable, V any] struct {
-	key   K
-	value V
+type linkedHashMapNode[K comparable, V any] struct {
+	next, prev *linkedHashMapNode[K, V]
+	key        K
+	value      V
+}
+
+type linkedHashMapList[K comparable, V any] struct {
+	head, tail *linkedHashMapNode[K, V]
+	len        int
+}
+
+func (l *linkedHashMapList[K, V]) Len() int { return l.len }
+
+func (l *linkedHashMapList[K, V]) init() {
+	l.head = nil
+	l.tail = nil
+	l.len = 0
+}
+
+func (l *linkedHashMapList[K, V]) pushBack(e *linkedHashMapNode[K, V]) {
+	e.prev = l.tail
+	e.next = nil
+	if l.tail != nil {
+		l.tail.next = e
+	} else {
+		l.head = e
+	}
+	l.tail = e
+	l.len++
+}
+
+func (l *linkedHashMapList[K, V]) remove(e *linkedHashMapNode[K, V]) {
+	if e.prev != nil {
+		e.prev.next = e.next
+	} else {
+		l.head = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	} else {
+		l.tail = e.prev
+	}
+	e.next = nil
+	e.prev = nil
+	l.len--
+}
+
+func (l *linkedHashMapList[K, V]) moveToBack(e *linkedHashMapNode[K, V]) {
+	if l.tail == e {
+		return
+	}
+	if e.prev != nil {
+		e.prev.next = e.next
+	} else {
+		l.head = e.next
+	}
+	e.next.prev = e.prev
+	e.prev = l.tail
+	e.next = nil
+	l.tail.next = e
+	l.tail = e
 }
 
 // NewLinkedHashMap returns an empty map. If accessOrder is true, successful
@@ -45,7 +101,7 @@ func (m *LinkedHashMap[K, V]) Len() int { return len(m.index) }
 // Peek returns the value for key without changing its position.
 func (m *LinkedHashMap[K, V]) Peek(key K) (value V, ok bool) {
 	if e := m.index[key]; e != nil {
-		return e.Value.(*linkedHashMapEntry[K, V]).value, true
+		return e.value, true
 	}
 	return value, false
 }
@@ -53,15 +109,18 @@ func (m *LinkedHashMap[K, V]) Peek(key K) (value V, ok bool) {
 // Load returns the value for key. In access order it moves the entry to the end.
 func (m *LinkedHashMap[K, V]) Load(key K) (value V, ok bool) {
 	if e := m.index[key]; e != nil {
-		m.touch(e)
-		return e.Value.(*linkedHashMapEntry[K, V]).value, true
+		if m.accessOrder && e != m.order.tail {
+			m.order.moveToBack(e)
+			m.version++
+		}
+		return e.value, true
 	}
 	return value, false
 }
 
-func (m *LinkedHashMap[K, V]) touch(e *list.Element) {
-	if m.accessOrder && e != m.order.Back() {
-		m.order.MoveToBack(e)
+func (m *LinkedHashMap[K, V]) touch(e *linkedHashMapNode[K, V]) {
+	if m.accessOrder && e != m.order.tail {
+		m.order.moveToBack(e)
 		m.version++
 	}
 }
@@ -72,16 +131,23 @@ func (m *LinkedHashMap[K, V]) Store(key K, value V) { m.Swap(key, value) }
 // Swap sets the value for key and returns its previous value, if any.
 func (m *LinkedHashMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 	if e := m.index[key]; e != nil {
-		entry := e.Value.(*linkedHashMapEntry[K, V])
-		previous = entry.value
-		entry.value = value
+		previous = e.value
+		e.value = value
 		m.touch(e)
 		return previous, true
 	}
 	if m.index == nil {
-		m.index = make(map[K]*list.Element)
+		m.index = make(map[K]*linkedHashMapNode[K, V])
 	}
-	m.index[key] = m.order.PushBack(&linkedHashMapEntry[K, V]{key: key, value: value})
+	e := m.free
+	if e != nil {
+		m.free = nil
+		*e = linkedHashMapNode[K, V]{key: key, value: value}
+	} else {
+		e = &linkedHashMapNode[K, V]{key: key, value: value}
+	}
+	m.index[key] = e
+	m.order.pushBack(e)
 	m.version++
 	return previous, false
 }
@@ -113,9 +179,8 @@ func (m *LinkedHashMap[K, V]) Delete(key K) { m.LoadAndDelete(key) }
 func (m *LinkedHashMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 	mapCheckComparable[V]("CompareAndSwap")
 	if e := m.index[key]; e != nil {
-		entry := e.Value.(*linkedHashMapEntry[K, V])
-		if any(entry.value) == any(old) {
-			entry.value = new
+		if any(e.value) == any(old) {
+			e.value = new
 			m.touch(e)
 			return true
 		}
@@ -127,8 +192,8 @@ func (m *LinkedHashMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 // comparability requirements as CompareAndSwap.
 func (m *LinkedHashMap[K, V]) CompareAndDelete(key K, old V) bool {
 	mapCheckComparable[V]("CompareAndDelete")
-	if value, ok := m.Peek(key); ok && any(value) == any(old) {
-		m.Delete(key)
+	if e := m.index[key]; e != nil && any(e.value) == any(old) {
+		m.remove(e)
 		return true
 	}
 	return false
@@ -137,59 +202,66 @@ func (m *LinkedHashMap[K, V]) CompareAndDelete(key K, old V) bool {
 // Clear removes all entries and releases the hash index and list storage.
 func (m *LinkedHashMap[K, V]) Clear() {
 	m.index = nil
-	m.order.Init()
+	m.order.init()
+	m.free = nil
 	m.version++
 }
 
 // Shrink rebuilds the hash index to fit the current entries, preserving order.
 func (m *LinkedHashMap[K, V]) Shrink() {
-	m.index = make(map[K]*list.Element, m.order.Len())
-	for e := m.order.Front(); e != nil; e = e.Next() {
-		m.index[e.Value.(*linkedHashMapEntry[K, V]).key] = e
+	m.free = nil
+	m.index = make(map[K]*linkedHashMapNode[K, V], m.order.len)
+	for e := m.order.head; e != nil; e = e.next {
+		m.index[e.key] = e
 	}
 }
 
-func linkedHashMapPair[K comparable, V any](e *list.Element) (key K, value V, ok bool) {
+func linkedHashMapPair[K comparable, V any](e *linkedHashMapNode[K, V]) (key K, value V, ok bool) {
 	if e == nil {
 		return key, value, false
 	}
-	entry := e.Value.(*linkedHashMapEntry[K, V])
-	return entry.key, entry.value, true
+	return e.key, e.value, true
 }
 
 // First returns the first entry without changing its position.
 func (m *LinkedHashMap[K, V]) First() (key K, value V, ok bool) {
-	return linkedHashMapPair[K, V](m.order.Front())
+	return linkedHashMapPair[K, V](m.order.head)
 }
 
 // Last returns the last entry without changing its position.
 func (m *LinkedHashMap[K, V]) Last() (key K, value V, ok bool) {
-	return linkedHashMapPair[K, V](m.order.Back())
+	return linkedHashMapPair[K, V](m.order.tail)
 }
 
 // PollFirst removes and returns the first entry. In access order this is the
 // least recently accessed entry. It takes O(n) time for a key containing NaN,
 // which cannot be removed from a Go map by key; otherwise it takes O(1) time.
 func (m *LinkedHashMap[K, V]) PollFirst() (key K, value V, ok bool) {
-	return m.remove(m.order.Front())
+	return m.remove(m.order.head)
 }
 
 // PollLast removes and returns the last entry. Its complexity is as for PollFirst.
 func (m *LinkedHashMap[K, V]) PollLast() (key K, value V, ok bool) {
-	return m.remove(m.order.Back())
+	return m.remove(m.order.tail)
 }
 
-func (m *LinkedHashMap[K, V]) remove(e *list.Element) (key K, value V, ok bool) {
-	key, value, ok = linkedHashMapPair[K, V](e)
-	if ok {
-		m.order.Remove(e)
-		if key != key {
-			m.Shrink()
-		} else {
-			delete(m.index, key)
-		}
-		m.version++
+func (m *LinkedHashMap[K, V]) remove(e *linkedHashMapNode[K, V]) (key K, value V, ok bool) {
+	if e == nil {
+		return key, value, false
 	}
+	key, value, ok = e.key, e.value, true
+	m.order.remove(e)
+	if key != key {
+		m.Shrink()
+	} else {
+		delete(m.index, key)
+	}
+	var zero linkedHashMapNode[K, V]
+	*e = zero
+	if m.free == nil {
+		m.free = e
+	}
+	m.version++
 	return
 }
 
@@ -197,30 +269,30 @@ func (m *LinkedHashMap[K, V]) remove(e *list.Element) (key K, value V, ok bool) 
 // reordering entries during iteration panics if iteration continues afterward.
 // Values may be replaced without reordering entries. In access order, use Peek
 // to read values without reordering them.
-func (m *LinkedHashMap[K, V]) All() iter.Seq2[K, V] { return m.iterate(false) }
-
-// Backward returns an iterator in reverse order, with the same rules as All.
-func (m *LinkedHashMap[K, V]) Backward() iter.Seq2[K, V] { return m.iterate(true) }
-
-func (m *LinkedHashMap[K, V]) iterate(reverse bool) iter.Seq2[K, V] {
+func (m *LinkedHashMap[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		version := m.version
-		e := m.order.Front()
-		if reverse {
-			e = m.order.Back()
-		}
-		for e != nil {
-			entry := e.Value.(*linkedHashMapEntry[K, V])
-			if !yield(entry.key, entry.value) {
+		for e := m.order.head; e != nil; e = e.next {
+			if !yield(e.key, e.value) {
 				return
 			}
 			if m.version != version {
 				panic("sync/v2/container: LinkedHashMap modified during iteration")
 			}
-			if reverse {
-				e = e.Prev()
-			} else {
-				e = e.Next()
+		}
+	}
+}
+
+// Backward returns an iterator in reverse order, with the same rules as All.
+func (m *LinkedHashMap[K, V]) Backward() iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		version := m.version
+		for e := m.order.tail; e != nil; e = e.prev {
+			if !yield(e.key, e.value) {
+				return
+			}
+			if m.version != version {
+				panic("sync/v2/container: LinkedHashMap modified during iteration")
 			}
 		}
 	}

@@ -10,7 +10,7 @@ import "unsafe"
 type PoolItem[T any] = poolItem[T]
 
 func MapStorage[K comparable, V any](m *Map[K, V]) unsafe.Pointer {
-	return unsafe.Pointer(m.current.Load())
+	return m.m.Storage()
 }
 
 type PoolDequeue[T any] interface {

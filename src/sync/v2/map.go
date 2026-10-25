@@ -7,7 +7,6 @@ package sync
 import (
 	isync "internal/sync"
 	"iter"
-	"sync/atomic"
 )
 
 // Map is like a Go map[K]V but is safe for concurrent use by multiple
@@ -41,44 +40,23 @@ import (
 type Map[K comparable, V any] struct {
 	_ noCopy
 
-	shrinkMu RWMutex
-	current  atomic.Pointer[isync.HashTrieMap[K, V]]
-}
-
-func (m *Map[K, V]) trieForWrite() *isync.HashTrieMap[K, V] {
-	if current := m.current.Load(); current != nil {
-		return current
-	}
-	current := new(isync.HashTrieMap[K, V])
-	if m.current.CompareAndSwap(nil, current) {
-		return current
-	}
-	return m.current.Load()
+	m isync.HashTrieMap[K, V]
 }
 
 // Load returns the value stored in the map for a key. The ok result indicates
 // whether the value was found in the map.
 func (m *Map[K, V]) Load(key K) (value V, ok bool) {
-	if current := m.current.Load(); current != nil {
-		return current.Load(key)
-	}
-	return value, false
+	return m.m.Load(key)
 }
 
 // Store sets the value for a key.
 func (m *Map[K, V]) Store(key K, value V) {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	m.trieForWrite().Store(key, value)
+	m.m.Store(key, value)
 }
 
 // Clear deletes all the entries, resulting in an empty Map.
 func (m *Map[K, V]) Clear() {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	if current := m.current.Load(); current != nil {
-		current.Clear()
-	}
+	m.m.Clear()
 }
 
 // Shrink rebuilds the Map's underlying storage to fit its current entries.
@@ -88,68 +66,38 @@ func (m *Map[K, V]) Clear() {
 // Write operations block while Shrink runs. Loads and iterations may continue
 // concurrently and may use either the old or rebuilt storage.
 func (m *Map[K, V]) Shrink() {
-	m.shrinkMu.Lock()
-	defer m.shrinkMu.Unlock()
-
-	current := m.current.Load()
-	if current == nil {
-		return
-	}
-	var next *isync.HashTrieMap[K, V]
-	current.Range(func(key K, value V) bool {
-		if next == nil {
-			next = new(isync.HashTrieMap[K, V])
-		}
-		next.Store(key, value)
-		return true
-	})
-	m.current.Store(next)
+	m.m.Shrink()
 }
 
 // LoadOrStore returns the existing value for the key if present. Otherwise, it
 // stores and returns the given value. The loaded result is true if the value was
 // loaded, false if stored.
 func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	return m.trieForWrite().LoadOrStore(key, value)
+	return m.m.LoadOrStore(key, value)
 }
 
 // LoadAndDelete deletes the value for a key, returning the previous value if
 // any. The loaded result reports whether the key was present.
 func (m *Map[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	if current := m.current.Load(); current != nil {
-		return current.LoadAndDelete(key)
-	}
-	return value, false
+	return m.m.LoadAndDelete(key)
 }
 
 // Delete deletes the value for a key. If the key is not in the map, Delete does
 // nothing.
 func (m *Map[K, V]) Delete(key K) {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	if current := m.current.Load(); current != nil {
-		current.Delete(key)
-	}
+	m.m.Delete(key)
 }
 
 // Swap swaps the value for a key and returns the previous value if any. The
 // loaded result reports whether the key was present.
 func (m *Map[K, V]) Swap(key K, value V) (previous V, loaded bool) {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	return m.trieForWrite().Swap(key, value)
+	return m.m.Swap(key, value)
 }
 
 // CompareAndSwap swaps the old and new values for key if the value stored in
 // the map is equal to old. It panics if V is not a comparable type.
 func (m *Map[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	return m.trieForWrite().CompareAndSwap(key, old, new)
+	return m.m.CompareAndSwap(key, old, new)
 }
 
 // CompareAndDelete deletes the entry for key if its value is equal to old. It
@@ -157,9 +105,7 @@ func (m *Map[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 //
 // If there is no current value for key, CompareAndDelete returns false.
 func (m *Map[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-	return m.trieForWrite().CompareAndDelete(key, old)
+	return m.m.CompareAndDelete(key, old)
 }
 
 // All returns an iterator over each key and value present in the map.
@@ -170,11 +116,7 @@ func (m *Map[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 // that key from any point during iteration. The iterator does not block other
 // methods on the receiver; even yield itself may call any method on m.
 func (m *Map[K, V]) All() iter.Seq2[K, V] {
-	return func(yield func(K, V) bool) {
-		if current := m.current.Load(); current != nil {
-			current.Range(yield)
-		}
-	}
+	return m.m.All()
 }
 
 // Range calls f sequentially for each key and value present in the map. If f
@@ -189,7 +131,5 @@ func (m *Map[K, V]) All() iter.Seq2[K, V] {
 // Range may be O(N) with the number of elements in the map even if f returns
 // false after a constant number of calls.
 func (m *Map[K, V]) Range(f func(key K, value V) bool) {
-	if current := m.current.Load(); current != nil {
-		current.Range(f)
-	}
+	m.m.Range(f)
 }
