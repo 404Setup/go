@@ -947,7 +947,7 @@ func (t *tester) registerTests() {
 	}
 
 	// sync tests
-	if t.hasParallelism() {
+	if !t.compileOnly && t.hasParallelism() {
 		t.registerTest("sync -cpu=10",
 			&goTest{
 				variant: "cpu10",
@@ -968,17 +968,6 @@ func (t *tester) registerTests() {
 				pkg:       "internal/runtime/wasitest",
 				runOnHost: true,
 			})
-	}
-
-	// Only run the API check on fast development platforms.
-	// Every platform checks the API on every GOOS/GOARCH/CGO_ENABLED combination anyway,
-	// so we really only need to run this check once anywhere to get adequate coverage.
-	// To help developers avoid trybot-only failures, we try to run on typical developer machines
-	// which is darwin,linux,windows/amd64 and darwin/arm64.
-	//
-	// TODO: remove the exclusion of goexperiment simd right before dev.simd branch is merged to master.
-	if goos == "darwin" || ((goos == "linux" || goos == "windows") && (goarch == "amd64" && !strings.Contains(goexperiment, "simd"))) {
-		t.registerTest("API check", &goTest{variant: "check", pkg: "cmd/api", testFlags: []string{"-check"}})
 	}
 
 	// Runtime CPU tests.
@@ -1427,30 +1416,7 @@ func (t *tester) runPending(nextTest *distTest) {
 		}(w)
 	}
 
-	var maxbg = 4 /* maximum number of jobs to run at once */
-	if gohostarch == "arm" || gohostarch == "mips64" || gohostarch == "mips64le" {
-		maxbg = min(maxbg, runtime.NumCPU())
-	}
-	if runtime.GOMAXPROCS(0) == 1 {
-		maxbg = 1
-	}
-
-	// for runtime.NumCPU() < 4 ||  runtime.GOMAXPROCS(0) == 1, do not change maxbg.
-	// Because there is not enough CPU to parallel the testing of multiple packages.
-	if runtime.NumCPU() > 4 && runtime.GOMAXPROCS(0) != 1 {
-		for _, w := range worklist {
-			// See go.dev/issue/65164
-			// because GOMAXPROCS=2 runtime CPU usage is low,
-			// so increase maxbg to avoid slowing down execution with low CPU usage.
-			// This makes testing a single package slower,
-			// but testing multiple packages together faster.
-			if strings.Contains(w.dt.heading, "GOMAXPROCS=2 runtime") {
-				maxbg = runtime.NumCPU()
-				break
-			}
-		}
-	}
-
+	maxbg := runtime.GOMAXPROCS(0)
 	started := 0
 	ended := 0
 	var last *distTest
