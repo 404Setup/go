@@ -1786,6 +1786,9 @@ func (r *reader) stmt1(tag codeStmt, out *ir.Nodes) ir.Node {
 
 	case stmtAssign:
 		pos := r.pos()
+		lno := base.Pos
+		defer func() { base.Pos = lno }()
+		base.Pos = pos
 		names, lhs := r.assignList()
 		rhs := r.multiExpr()
 
@@ -1906,6 +1909,8 @@ func (r *reader) assign() (ir.Node, bool) {
 
 	case assignDef:
 		pos := r.pos()
+		lno := base.Pos
+		defer func() { base.Pos = lno }()
 		setBasePos(pos) // test/fixedbugs/issue49767.go depends on base.Pos being set for the r.typ() call here, ugh
 		name := r.curfn.NewLocal(pos, r.localIdent(), r.typ())
 		r.addLocal(name)
@@ -1929,8 +1934,13 @@ func (r *reader) forStmt(label *types.Sym) ir.Node {
 
 	r.openScope()
 
-	if r.Bool() {
-		pos := r.pos()
+	isRange := r.Bool()
+	pos := r.pos()
+	lno := base.Pos
+	defer func() { base.Pos = lno }()
+	base.Pos = pos
+
+	if isRange {
 		rang := ir.NewRangeStmt(pos, nil, nil, nil, nil, false)
 		rang.Label = label
 
@@ -1961,8 +1971,12 @@ func (r *reader) forStmt(label *types.Sym) ir.Node {
 		return rang
 	}
 
-	pos := r.pos()
 	init := r.stmt()
+	if init != nil && init.Pos().IsKnown() {
+		lno := base.Pos
+		defer func() { base.Pos = lno }()
+		base.Pos = init.Pos()
+	}
 	cond := r.optExpr()
 	post := r.stmt()
 	body := r.blockStmt()
@@ -1982,7 +1996,15 @@ func (r *reader) ifStmt() ir.Node {
 	r.Sync(pkgbits.SyncIfStmt)
 	r.openScope()
 	pos := r.pos()
+	lno := base.Pos
+	defer func() { base.Pos = lno }()
+	base.Pos = pos
 	init := r.stmts()
+	if len(init) > 0 && init[len(init)-1].Pos().IsKnown() {
+		lno := base.Pos
+		defer func() { base.Pos = lno }()
+		base.Pos = init[len(init)-1].Pos()
+	}
 	cond := r.expr()
 	staticCond := r.Int()
 	var then, els []ir.Node
@@ -2082,13 +2104,24 @@ func (r *reader) switchStmt(label *types.Sym) ir.Node {
 
 	r.openScope()
 	pos := r.pos()
+	lno := base.Pos
+	defer func() { base.Pos = lno }()
+	base.Pos = pos
 	init := r.stmt()
+	if init != nil && init.Pos().IsKnown() {
+		lno := base.Pos
+		defer func() { base.Pos = lno }()
+		base.Pos = init.Pos()
+	}
 
 	var tag ir.Node
 	var ident *ir.Ident
 	var iface *types.Type
 	if r.Bool() {
 		pos := r.pos()
+		lno := base.Pos
+		defer func() { base.Pos = lno }()
+		base.Pos = pos
 		if r.Bool() {
 			ident = ir.NewIdent(r.pos(), r.localIdent())
 		}
@@ -2107,6 +2140,8 @@ func (r *reader) switchStmt(label *types.Sym) ir.Node {
 		r.openScope()
 
 		pos := r.pos()
+		lno := base.Pos
+		base.Pos = pos
 		var cases, rtypes []ir.Node
 		if iface != nil {
 			cases = make([]ir.Node, r.Len())
@@ -2154,6 +2189,7 @@ func (r *reader) switchStmt(label *types.Sym) ir.Node {
 
 		clause.Body = r.stmts()
 		clauses[i] = clause
+		base.Pos = lno
 	}
 	if len(clauses) > 0 {
 		r.closeScope()
