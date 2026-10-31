@@ -46,8 +46,18 @@ func isASCIIPrint(s string) bool {
 // asciiToLower returns the lowercase version of s if s is ASCII and printable,
 // and whether or not it was.
 func asciiToLower(s string) (lower string, ok bool) {
-	if !isASCIIPrint(s) {
-		return "", false
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < ' ' || c > '~' {
+			return "", false
+		}
+		if 'A' <= c && c <= 'Z' {
+			hasUpper = true
+		}
+	}
+	if !hasUpper {
+		return s, true
 	}
 	return strings.ToLower(s), true
 }

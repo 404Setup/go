@@ -1009,7 +1009,14 @@ type httpRange struct {
 }
 
 func (r httpRange) contentRange(size int64) string {
-	return fmt.Sprintf("bytes %d-%d/%d", r.start, r.start+r.length-1, size)
+	var b [64]byte
+	buf := append(b[:0], "bytes "...)
+	buf = strconv.AppendInt(buf, r.start, 10)
+	buf = append(buf, '-')
+	buf = strconv.AppendInt(buf, r.start+r.length-1, 10)
+	buf = append(buf, '/')
+	buf = strconv.AppendInt(buf, size, 10)
+	return string(buf)
 }
 
 func (r httpRange) mimeHeader(contentType string, size int64) textproto.MIMEHeader {
@@ -1048,7 +1055,6 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 	if len(s) < len(b) || !ascii.EqualFold(s[:len(b)], b) {
 		return nil, errors.New("invalid range")
 	}
-	var ranges []httpRange
 	noOverlap := false
 	numRanges := strings.Count(s[len(b):], ",") + 1
 	maxRanges := maxContentRanges()
@@ -1058,10 +1064,14 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 	if numRanges > maxRanges {
 		return nil, nil // ignore header with too many ranges
 	}
+	var ranges []httpRange
 	for ra := range strings.SplitSeq(s[len(b):], ",") {
 		ra = textproto.TrimString(ra)
 		if ra == "" {
 			continue
+		}
+		if ranges == nil {
+			ranges = make([]httpRange, 0, min(numRanges, 16))
 		}
 		start, end, ok := strings.Cut(ra, "-")
 		if !ok {

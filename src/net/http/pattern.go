@@ -127,7 +127,9 @@ func parsePattern(s string) (_ *pattern, err error) {
 		return nil, errors.New("non-CONNECT pattern with unclean path can never match")
 	}
 
-	seenNames := map[string]bool{} // remember wildcard names to catch dups
+	p.segments = make([]segment, 0, strings.Count(rest, "/"))
+	var firstName string
+	var seenNames map[string]bool // remember wildcard names to catch dups
 	for len(rest) > 0 {
 		// Invariant: rest[0] == '/'.
 		rest = rest[1:]
@@ -173,10 +175,16 @@ func parsePattern(s string) (_ *pattern, err error) {
 			if !isValidWildcardName(name) {
 				return nil, fmt.Errorf("bad wildcard name %q", name)
 			}
-			if seenNames[name] {
+			if firstName == "" {
+				firstName = name
+			} else if name == firstName || seenNames[name] {
 				return nil, fmt.Errorf("duplicate wildcard name %q", name)
+			} else {
+				if seenNames == nil {
+					seenNames = map[string]bool{}
+				}
+				seenNames[name] = true
 			}
-			seenNames[name] = true
 			p.segments = append(p.segments, segment{s: name, wild: true, multi: multi})
 		}
 	}
@@ -197,6 +205,10 @@ func isValidWildcardName(s string) bool {
 }
 
 func pathUnescape(path string) string {
+	if strings.IndexByte(path, '%') < 0 {
+		// Fast path: nothing to unescape.
+		return path
+	}
 	u, err := url.PathUnescape(path)
 	if err != nil {
 		// Invalidly escaped path; use the original
@@ -206,15 +218,32 @@ func pathUnescape(path string) string {
 }
 
 // relationship is a relationship between two patterns, p1 and p2.
-type relationship string
+type relationship uint8
 
 const (
-	equivalent   relationship = "equivalent"   // both match the same requests
-	moreGeneral  relationship = "moreGeneral"  // p1 matches everything p2 does & more
-	moreSpecific relationship = "moreSpecific" // p2 matches everything p1 does & more
-	disjoint     relationship = "disjoint"     // there is no request that both match
-	overlaps     relationship = "overlaps"     // there is a request that both match, but neither is more specific
+	equivalent   relationship = 0                          // both match the same requests
+	moreGeneral  relationship = 1                          // p1 matches everything p2 does & more
+	moreSpecific relationship = 2                          // p2 matches everything p1 does & more
+	overlaps     relationship = moreGeneral | moreSpecific // there is a request that both match, but neither is more specific
+	disjoint     relationship = 4                          // there is no request that both match
 )
+
+func (r relationship) String() string {
+	switch r {
+	case equivalent:
+		return "equivalent"
+	case moreGeneral:
+		return "moreGeneral"
+	case moreSpecific:
+		return "moreSpecific"
+	case overlaps:
+		return "overlaps"
+	case disjoint:
+		return "disjoint"
+	default:
+		panic(fmt.Sprintf("unknown relationship %d", uint8(r)))
+	}
+}
 
 // conflictsWith reports whether p1 conflicts with p2, that is, whether
 // there is a request that both match but where neither is higher precedence
@@ -281,35 +310,39 @@ func (p1 *pattern) compareMethods(p2 *pattern) relationship {
 // comparePaths determines the relationship between the path
 // part of two patterns.
 func (p1 *pattern) comparePaths(p2 *pattern) relationship {
+	segs1, segs2 := p1.segments, p2.segments
+	n1, n2 := len(segs1), len(segs2)
 	// Optimization: if a path pattern doesn't end in a multi ("...") wildcard, then it
 	// can only match paths with the same number of segments.
-	if len(p1.segments) != len(p2.segments) && !p1.lastSegment().multi && !p2.lastSegment().multi {
+	if n1 != n2 && !segs1[n1-1].multi && !segs2[n2-1].multi {
 		return disjoint
 	}
 
 	// Consider corresponding segments in the two path patterns.
-	var segs1, segs2 []segment
+	// Iterate backwards because URL patterns frequently share a common prefix
+	// and differ near the end; combineRelationships is commutative and associative.
+	n := min(n1, n2)
 	rel := equivalent
-	for segs1, segs2 = p1.segments, p2.segments; len(segs1) > 0 && len(segs2) > 0; segs1, segs2 = segs1[1:], segs2[1:] {
-		rel = combineRelationships(rel, compareSegments(segs1[0], segs2[0]))
-		if rel == disjoint {
-			return rel
+	for i := n - 1; i >= 0; i-- {
+		rel |= compareSegments(segs1[i], segs2[i])
+		if rel >= disjoint {
+			return disjoint
 		}
 	}
 	// We've reached the end of the corresponding segments of the patterns.
 	// If they have the same number of segments, then we've already determined
 	// their relationship.
-	if len(segs1) == 0 && len(segs2) == 0 {
+	if n1 == n2 {
 		return rel
 	}
 	// Otherwise, the only way they could fail to be disjoint is if the shorter
 	// pattern ends in a multi. In that case, that multi is more general
 	// than the remainder of the longer pattern, so combine those two relationships.
-	if len(segs1) < len(segs2) && p1.lastSegment().multi {
-		return combineRelationships(rel, moreGeneral)
+	if n1 < n2 && segs1[n1-1].multi {
+		return rel | moreGeneral
 	}
-	if len(segs2) < len(segs1) && p2.lastSegment().multi {
-		return combineRelationships(rel, moreSpecific)
+	if n2 < n1 && segs2[n2-1].multi {
+		return rel | moreSpecific
 	}
 	return disjoint
 }
@@ -357,28 +390,10 @@ func compareSegments(s1, s2 segment) relationship {
 // Or if p1 is more general in one way and more specific in the other, then
 // they overlap.
 func combineRelationships(r1, r2 relationship) relationship {
-	switch r1 {
-	case equivalent:
-		return r2
-	case disjoint:
-		return disjoint
-	case overlaps:
-		if r2 == disjoint {
-			return disjoint
-		}
-		return overlaps
-	case moreGeneral, moreSpecific:
-		switch r2 {
-		case equivalent:
-			return r1
-		case inverseRelationship(r1):
-			return overlaps
-		default:
-			return r2
-		}
-	default:
-		panic(fmt.Sprintf("unknown relationship %q", r1))
+	if r := r1 | r2; r < disjoint {
+		return r
 	}
+	return disjoint
 }
 
 // If p1 has relationship `r` to p2, then

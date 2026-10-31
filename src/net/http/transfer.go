@@ -76,15 +76,13 @@ type transferWriter struct {
 	ByteReadCh   chan readResult // non-nil if probeRequestBody called
 }
 
-func newTransferWriter(r any) (t *transferWriter, err error) {
-	t = &transferWriter{}
-
+func newTransferWriter(r any) (t transferWriter, err error) {
 	// Extract relevant fields
 	atLeastHTTP11 := false
 	switch rr := r.(type) {
 	case *Request:
 		if rr.ContentLength != 0 && rr.Body == nil {
-			return nil, fmt.Errorf("http: Request.ContentLength=%d with nil Body", rr.ContentLength)
+			return t, fmt.Errorf("http: Request.ContentLength=%d with nil Body", rr.ContentLength)
 		}
 		t.Method = valueOrDefault(rr.Method, "GET")
 		t.Close = rr.Close
@@ -151,7 +149,7 @@ func newTransferWriter(r any) (t *transferWriter, err error) {
 	// unmodified on the "Trailer:" line of the header, so invalid bytes
 	// (in particular CR and LF) would permit header injection. (Issue 78775.)
 	if err := validateHeaders(t.Trailer); err != "" {
-		return nil, fmt.Errorf("net/http: invalid trailer %s", err)
+		return t, fmt.Errorf("net/http: invalid trailer %s", err)
 	}
 
 	return t, nil
@@ -214,17 +212,18 @@ func (t *transferWriter) shouldSendChunkedRequestBody() bool {
 // In other words, this delay will not normally affect anybody, and there
 // are workarounds if it does.
 func (t *transferWriter) probeRequestBody() {
-	t.ByteReadCh = make(chan readResult, 1)
-	go func(body io.Reader) {
+	ch := make(chan readResult, 1)
+	t.ByteReadCh = ch
+	go func(body io.Reader, ch chan<- readResult) {
 		var buf [1]byte
 		var rres readResult
 		rres.n, rres.err = body.Read(buf[:])
 		if rres.n == 1 {
 			rres.b = buf[0]
 		}
-		t.ByteReadCh <- rres
-		close(t.ByteReadCh)
-	}(t.Body)
+		ch <- rres
+		close(ch)
+	}(t.Body, ch)
 	timer := time.NewTimer(200 * time.Millisecond)
 	select {
 	case rres := <-t.ByteReadCh:
@@ -247,7 +246,7 @@ func (t *transferWriter) probeRequestBody() {
 		// assuming that this is ContentLength == -1
 		// (unknown), which means we'll send a
 		// "Transfer-Encoding: chunked" header.
-		t.Body = io.MultiReader(finishAsyncByteRead{t}, t.Body)
+		t.Body = io.MultiReader(finishAsyncByteRead{ch}, t.Body)
 		// Request that Request.Write flush the headers to the
 		// network before writing the body, since our body may not
 		// become readable until it's seen the response headers.
@@ -297,14 +296,15 @@ func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) 
 	// function of the sanitized field triple (Body, ContentLength,
 	// TransferEncoding)
 	if t.shouldSendContentLength() {
-		if _, err := io.WriteString(w, "Content-Length: "); err != nil {
-			return err
-		}
-		if _, err := io.WriteString(w, strconv.FormatInt(t.ContentLength, 10)+"\r\n"); err != nil {
+		var buf [len("Content-Length: ") + 20 + len("\r\n")]byte
+		b := append(buf[:0], "Content-Length: "...)
+		b = strconv.AppendInt(b, t.ContentLength, 10)
+		b = append(b, "\r\n"...)
+		if _, err := w.Write(b); err != nil {
 			return err
 		}
 		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField("Content-Length", []string{strconv.FormatInt(t.ContentLength, 10)})
+			trace.WroteHeaderField("Content-Length", []string{string(b[len("Content-Length: ") : len(b)-2])})
 		}
 	} else if chunked(t.TransferEncoding) {
 		if _, err := io.WriteString(w, "Transfer-Encoding: chunked\r\n"); err != nil {
@@ -498,7 +498,7 @@ func suppressedHeaders(status int) []string {
 
 // msg is *Request or *Response.
 func readTransfer(msg any, r *bufio.Reader, maxTrailerHeaders int64) (err error) {
-	t := &transferReader{RequestMethod: "GET"}
+	t := transferReader{RequestMethod: "GET"}
 
 	// Unify input
 	isResponse := false
@@ -554,7 +554,9 @@ func readTransfer(msg any, r *bufio.Reader, maxTrailerHeaders int64) (err error)
 	case t.RealBodyLength == 0:
 		t.Body = NoBody
 	case t.RealBodyLength > 0:
-		t.Body = &body{src: io.LimitReader(r, t.RealBodyLength), closing: t.Close}
+		b := &body{lr: io.LimitedReader{R: r, N: t.RealBodyLength}, closing: t.Close}
+		b.src = &b.lr
+		t.Body = b
 	case t.Close:
 		// Close semantics (no Transfer-Encoding or Content-Length).
 		t.Body = &body{src: r, closing: t.Close}
@@ -869,6 +871,7 @@ type body struct {
 	closing           bool          // is the connection to be closed after reading body?
 	doEarlyClose      bool          // whether Close should stop early
 	maxTrailerHeaders int64         // how many trailer header values are allowed
+	lr                io.LimitedReader
 
 	mu          sync.Mutex // guards following, and calls to Read and Close
 	sawEOF      bool
@@ -1202,14 +1205,14 @@ func parseContentLength(contentLength []string) (string, int64, error) {
 // finishAsyncByteRead finishes reading the 1-byte sniff
 // from the ContentLength==0, Body!=nil case.
 type finishAsyncByteRead struct {
-	tw *transferWriter
+	ch <-chan readResult
 }
 
 func (fr finishAsyncByteRead) Read(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return
 	}
-	rres := <-fr.tw.ByteReadCh
+	rres := <-fr.ch
 	n, err = rres.n, rres.err
 	if n == 1 {
 		p[0] = rres.b

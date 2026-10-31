@@ -413,6 +413,45 @@ func readCookies(h Header, filter string) []*Cookie {
 	return cookies
 }
 
+// readCookie returns the first valid cookie named name from the "Cookie"
+// values of h, or nil if there is none. It behaves like
+// readCookies(h, name)[0] without allocating the result slice.
+func readCookie(h Header, name string) *Cookie {
+	lines := h["Cookie"]
+	if len(lines) == 0 {
+		return nil
+	}
+	cookieCount := 0
+	for _, line := range lines {
+		cookieCount += strings.Count(line, ";") + 1
+	}
+	if !cookieNumWithinMax(cookieCount) {
+		return nil
+	}
+	for _, line := range lines {
+		line = textproto.TrimString(line)
+		var part string
+		for len(line) > 0 {
+			part, line, _ = strings.Cut(line, ";")
+			part = textproto.TrimString(part)
+			if part == "" {
+				continue
+			}
+			n, val, _ := strings.Cut(part, "=")
+			n = textproto.TrimString(n)
+			if n != name || !isToken(n) {
+				continue
+			}
+			val, quoted, ok := parseCookieValue(val, true)
+			if !ok {
+				continue
+			}
+			return &Cookie{Name: n, Value: val, Quoted: quoted}
+		}
+	}
+	return nil
+}
+
 // validCookieDomain reports whether v is a valid cookie domain-value.
 func validCookieDomain(v string) bool {
 	if isCookieDomainName(v) {

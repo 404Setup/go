@@ -309,6 +309,9 @@ func checkConnHeaders(h map[string][]string) error {
 }
 
 func commaSeparatedTrailers(trailer map[string][]string) (string, error) {
+	if len(trailer) == 0 {
+		return "", nil
+	}
 	keys := make([]string, 0, len(trailer))
 	for k := range trailer {
 		k = CanonicalHeader(k)
@@ -418,8 +421,8 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 	// Setup Trailers
 	var trailer map[string][]string
 	for _, v := range rp.Header["Trailer"] {
-		for _, key := range strings.Split(v, ",") {
-			key = textproto.CanonicalMIMEHeaderKey(textproto.TrimString(key))
+		for key := range strings.SplitSeq(v, ",") {
+			key = CanonicalHeader(textproto.TrimString(key))
 			switch key {
 			case "Transfer-Encoding", "Trailer", "Content-Length":
 				// Bogus. (copy of http1 rules)

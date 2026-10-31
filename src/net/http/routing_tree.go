@@ -119,8 +119,10 @@ func (root *routingNode) match(host, method, path string) (*routingNode, []strin
 		// There is a host. If there is a pattern that specifies that host and it
 		// matches, we are done. If the pattern doesn't match, fall through to
 		// try patterns with no host.
-		if l, m := root.findChild(host).matchMethodAndPath(method, path); l != nil {
-			return l, m
+		if c := root.findChild(host); c != nil {
+			if l, m := c.matchMethodAndPath(method, path); l != nil {
+				return l, m
+			}
 		}
 	}
 	return root.emptyChild.matchMethodAndPath(method, path)
@@ -133,17 +135,24 @@ func (n *routingNode) matchMethodAndPath(method, path string) (*routingNode, []s
 	if n == nil {
 		return nil, nil
 	}
-	if l, m := n.findChild(method).matchPath(path, nil); l != nil {
-		// Exact match of method name.
-		return l, m
-	}
-	if method == "HEAD" {
-		// GET matches HEAD too.
-		if l, m := n.findChild("GET").matchPath(path, nil); l != nil {
+	if c := n.findChild(method); c != nil {
+		if l, m := c.matchPath(path, nil); l != nil {
+			// Exact match of method name.
 			return l, m
 		}
 	}
+	if method == "HEAD" {
+		// GET matches HEAD too.
+		if c := n.findChild("GET"); c != nil {
+			if l, m := c.matchPath(path, nil); l != nil {
+				return l, m
+			}
+		}
+	}
 	// No exact match; try patterns with no method.
+	if n.emptyChild == nil {
+		return nil, nil
+	}
 	return n.emptyChild.matchPath(path, nil)
 }
 
@@ -165,24 +174,31 @@ func (n *routingNode) matchPath(path string, matches []string) (*routingNode, []
 		}
 		return n, matches
 	}
-	// Get the first segment of path.
-	seg, rest := firstSegment(path)
-	// First try matching against patterns that have a literal for this position.
-	// We know by construction that such patterns are more specific than those
-	// with a wildcard at this position (they are either more specific, equivalent,
-	// or overlap, and we ruled out the first two when the patterns were registered).
-	if n, m := n.findChild(seg).matchPath(rest, matches); n != nil {
-		return n, m
-	}
-	// If matching a literal fails, try again with patterns that have a single
-	// wildcard (represented by an empty string in the child mapping).
-	// Again, by construction, patterns with a single wildcard must be more specific than
-	// those with a multi wildcard.
-	// We skip this step if the segment is a trailing slash, because single wildcards
-	// don't match trailing slashes.
-	if seg != "/" {
-		if n, m := n.emptyChild.matchPath(rest, append(matches, seg)); n != nil {
-			return n, m
+	if n.children.s != nil || n.children.m != nil || n.emptyChild != nil {
+		// Get the first segment of path.
+		seg, rest := firstSegment(path)
+		// First try matching against patterns that have a literal for this position.
+		// We know by construction that such patterns are more specific than those
+		// with a wildcard at this position (they are either more specific, equivalent,
+		// or overlap, and we ruled out the first two when the patterns were registered).
+		if c := n.findChild(seg); c != nil {
+			if n, m := c.matchPath(rest, matches); n != nil {
+				return n, m
+			}
+		}
+		// If matching a literal fails, try again with patterns that have a single
+		// wildcard (represented by an empty string in the child mapping).
+		// Again, by construction, patterns with a single wildcard must be more specific than
+		// those with a multi wildcard.
+		// We skip this step if the segment is a trailing slash, because single wildcards
+		// don't match trailing slashes.
+		if seg != "/" && n.emptyChild != nil {
+			// Only build the extended matches slice when there is a single-wildcard
+			// child to try; otherwise append would allocate a slice that is
+			// immediately discarded.
+			if n, m := n.emptyChild.matchPath(rest, append(matches, seg)); n != nil {
+				return n, m
+			}
 		}
 	}
 	// Lastly, match the pattern (there can be at most one) that has a multi

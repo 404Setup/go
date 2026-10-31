@@ -6,7 +6,6 @@ package http
 
 import (
 	"io"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -143,22 +142,25 @@ func hexEscapeNonASCII(s string) string {
 	if newLen == len(s) {
 		return s
 	}
-	b := make([]byte, 0, newLen)
+	const hex = "0123456789abcdef"
+	var b strings.Builder
+	b.Grow(newLen)
 	var pos int
 	for i := 0; i < len(s); i++ {
 		if s[i] >= utf8.RuneSelf {
 			if pos < i {
-				b = append(b, s[pos:i]...)
+				b.WriteString(s[pos:i])
 			}
-			b = append(b, '%')
-			b = strconv.AppendInt(b, int64(s[i]), 16)
+			b.WriteByte('%')
+			b.WriteByte(hex[s[i]>>4])
+			b.WriteByte(hex[s[i]&0x0f])
 			pos = i + 1
 		}
 	}
 	if pos < len(s) {
-		b = append(b, s[pos:]...)
+		b.WriteString(s[pos:])
 	}
-	return string(b)
+	return b.String()
 }
 
 // NoBody is an [io.ReadCloser] with no bytes. Read always returns EOF

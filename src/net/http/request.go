@@ -454,7 +454,7 @@ func (r *Request) Cookie(name string) (*Cookie, error) {
 	if name == "" {
 		return nil, ErrNoCookie
 	}
-	for _, c := range readCookies(r.Header, name) {
+	if c := readCookie(r.Header, name); c != nil {
 		return c, nil
 	}
 	return nil, ErrNoCookie
@@ -467,7 +467,7 @@ func (r *Request) Cookie(name string) (*Cookie, error) {
 // AddCookie only sanitizes c's name and value, and does not sanitize
 // a Cookie header already present in the request.
 func (r *Request) AddCookie(c *Cookie) {
-	s := fmt.Sprintf("%s=%s", sanitizeCookieName(c.Name), sanitizeCookieValue(c.Value, c.Quoted))
+	s := sanitizeCookieName(c.Name) + "=" + sanitizeCookieValue(c.Value, c.Quoted)
 	if c := r.Header.Get("Cookie"); c != "" {
 		r.Header.Set("Cookie", c+"; "+s)
 	} else {
@@ -680,14 +680,26 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		w = bw
 	}
 
-	_, err = fmt.Fprintf(w, "%s %s HTTP/1.1\r\n", valueOrDefault(r.Method, "GET"), ruri)
-	if err != nil {
+	ws, ok := w.(io.StringWriter)
+	if !ok {
+		ws = stringWriter{w}
+	}
+
+	if _, err = ws.WriteString(valueOrDefault(r.Method, "GET")); err != nil {
+		return err
+	}
+	if _, err = ws.WriteString(" "); err != nil {
+		return err
+	}
+	if _, err = ws.WriteString(ruri); err != nil {
+		return err
+	}
+	if _, err = ws.WriteString(" HTTP/1.1\r\n"); err != nil {
 		return err
 	}
 
 	// Header lines
-	_, err = fmt.Fprintf(w, "Host: %s\r\n", host)
-	if err != nil {
+	if err = writeHeaderLine(ws, "Host", host); err != nil {
 		return err
 	}
 	if trace != nil && trace.WroteHeaderField != nil {
@@ -696,15 +708,19 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 
 	// Use the defaultUserAgent unless the Header contains one, which
 	// may be blank to not send the header.
-	userAgent := defaultUserAgent
-	if r.Header.has("User-Agent") {
-		userAgent = r.Header.Get("User-Agent")
-	}
-	if userAgent != "" {
-		userAgent = headerNewlineToSpace.Replace(userAgent)
+	if !r.Header.has("User-Agent") {
+		if _, err = ws.WriteString("User-Agent: " + defaultUserAgent + "\r\n"); err != nil {
+			return err
+		}
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("User-Agent", []string{defaultUserAgent})
+		}
+	} else if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
+		if strings.ContainsAny(userAgent, "\r\n") {
+			userAgent = headerNewlineToSpace.Replace(userAgent)
+		}
 		userAgent = textproto.TrimString(userAgent)
-		_, err = fmt.Fprintf(w, "User-Agent: %s\r\n", userAgent)
-		if err != nil {
+		if err = writeHeaderLine(ws, "User-Agent", userAgent); err != nil {
 			return err
 		}
 		if trace != nil && trace.WroteHeaderField != nil {
@@ -861,6 +877,10 @@ func validMethod(method string) bool {
 	   extension-method = token
 	     token          = 1*<any CHAR except CTLs or separators>
 	*/
+	switch method {
+	case "GET", "POST", "HEAD", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH":
+		return true
+	}
 	return isToken(method)
 }
 
@@ -1091,34 +1111,95 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	return readRequestLimit(b, math.MaxInt64)
 }
 
+func readLineBytes(b *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		l, more, err := b.ReadLine()
+		if err != nil {
+			return nil, err
+		}
+		if line == nil && !more {
+			return l, nil
+		}
+		line = append(line, l...)
+		if !more {
+			break
+		}
+	}
+	return line, nil
+}
+
 func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err error) {
-	tp := newTextprotoReader(b)
-	defer putTextprotoReader(tp)
-
-	req = new(Request)
-
 	// First line: GET /index.html HTTP/1.0
-	var s string
-	if s, err = tp.ReadLine(); err != nil {
+	line, err := readLineBytes(b)
+	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-	}()
 
-	var ok bool
-	req.Method, req.RequestURI, req.Proto, ok = parseRequestLine(s)
-	if !ok {
-		return nil, badStringError("malformed HTTP request", s)
+	i1 := bytes.IndexByte(line, ' ')
+	if i1 < 0 {
+		return nil, badStringError("malformed HTTP request", string(line))
 	}
-	if !validMethod(req.Method) {
-		return nil, badStringError("invalid method", req.Method)
+	methodBytes := line[:i1]
+	rest := line[i1+1:]
+	i2 := bytes.IndexByte(rest, ' ')
+	if i2 < 0 {
+		return nil, badStringError("malformed HTTP request", string(line))
 	}
-	rawurl := req.RequestURI
-	if req.ProtoMajor, req.ProtoMinor, ok = ParseHTTPVersion(req.Proto); !ok {
-		return nil, badStringError("malformed HTTP version", req.Proto)
+	uriBytes := rest[:i2]
+	protoBytes := rest[i2+1:]
+
+	var method string
+	switch string(methodBytes) {
+	case "GET":
+		method = "GET"
+	case "POST":
+		method = "POST"
+	case "HEAD":
+		method = "HEAD"
+	case "PUT":
+		method = "PUT"
+	case "DELETE":
+		method = "DELETE"
+	case "CONNECT":
+		method = "CONNECT"
+	case "OPTIONS":
+		method = "OPTIONS"
+	case "TRACE":
+		method = "TRACE"
+	case "PATCH":
+		method = "PATCH"
+	default:
+		method = string(methodBytes)
+		if !validMethod(method) {
+			return nil, badStringError("invalid method", method)
+		}
+	}
+
+	var proto string
+	var protoMajor, protoMinor int
+	switch string(protoBytes) {
+	case "HTTP/1.1":
+		proto = "HTTP/1.1"
+		protoMajor = 1
+		protoMinor = 1
+	case "HTTP/1.0":
+		proto = "HTTP/1.0"
+		protoMajor = 1
+		protoMinor = 0
+	default:
+		proto = string(protoBytes)
+		var ok bool
+		if protoMajor, protoMinor, ok = ParseHTTPVersion(proto); !ok {
+			return nil, badStringError("malformed HTTP version", proto)
+		}
+	}
+
+	req = &Request{
+		Method:     method,
+		Proto:      proto,
+		ProtoMajor: protoMajor,
+		ProtoMinor: protoMinor,
 	}
 
 	// CONNECT requests are used two different ways, and neither uses a full URL:
@@ -1130,23 +1211,35 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 	// that starts with a slash. It can be parsed with the regular URL parser,
 	// and the path will end up in req.URL.Path, where it needs to be in order for
 	// RPC to work.
-	justAuthority := req.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
-	if justAuthority {
-		rawurl = "http://" + rawurl
-	}
+	if len(uriBytes) == 1 && uriBytes[0] == '/' {
+		req.RequestURI = "/"
+		req.URL = &url.URL{Path: "/"}
+	} else {
+		req.RequestURI = string(uriBytes)
+		rawurl := req.RequestURI
+		justAuthority := req.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
+		if justAuthority {
+			rawurl = "http://" + rawurl
+		}
 
-	if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
-		return nil, err
-	}
+		if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
+			return nil, err
+		}
 
-	if justAuthority {
-		// Strip the bogus "http://" back off.
-		req.URL.Scheme = ""
+		if justAuthority {
+			// Strip the bogus "http://" back off.
+			req.URL.Scheme = ""
+		}
 	}
 
 	// Subsequent lines: Key: value.
+	tp := newTextprotoReader(b)
 	mimeHeader, err := readMIMEHeader(tp, math.MaxInt64, maxHeaders)
+	putTextprotoReader(tp)
 	if err != nil {
+		if err == io.EOF {
+			return nil, io.ErrUnexpectedEOF
+		}
 		// TODO: Add a distinguishable error to net/textproto.
 		if err.Error() == "message too large" {
 			return nil, errTooLarge
@@ -1176,6 +1269,9 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 
 	err = readTransfer(req, b, maxHeaders)
 	if err != nil {
+		if err == io.EOF {
+			return nil, io.ErrUnexpectedEOF
+		}
 		return nil, err
 	}
 
@@ -1274,7 +1370,25 @@ func (l *maxBytesReader) Close() error {
 }
 
 func copyValues(dst, src url.Values) {
+	// Count the values destined for keys not yet present in dst so they
+	// can share a single backing array instead of one allocation per key.
+	nv := 0
 	for k, vs := range src {
+		if dst[k] == nil {
+			nv += len(vs)
+		}
+	}
+	var sv []string
+	if nv > 0 {
+		sv = make([]string, nv)
+	}
+	for k, vs := range src {
+		if len(vs) > 0 && dst[k] == nil {
+			n := copy(sv, vs)
+			dst[k] = sv[:n:n]
+			sv = sv[n:]
+			continue
+		}
 		dst[k] = append(dst[k], vs...)
 	}
 }

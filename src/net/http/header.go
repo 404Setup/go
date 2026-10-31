@@ -176,7 +176,9 @@ func (h Header) sortedKeyValues(exclude map[string]bool) (kvs []keyValues, hs *h
 		}
 	}
 	hs.kvs = kvs
-	slices.SortFunc(hs.kvs, func(a, b keyValues) int { return strings.Compare(a.key, b.key) })
+	if len(kvs) > 1 {
+		slices.SortFunc(hs.kvs, func(a, b keyValues) int { return strings.Compare(a.key, b.key) })
+	}
 	return kvs, hs
 }
 
@@ -188,6 +190,9 @@ func (h Header) WriteSubset(w io.Writer, exclude map[string]bool) error {
 }
 
 func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptrace.ClientTrace) error {
+	if len(h) == 0 {
+		return nil
+	}
 	ws, ok := w.(io.StringWriter)
 	if !ok {
 		ws = stringWriter{w}
@@ -203,13 +208,13 @@ func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptra
 			continue
 		}
 		for _, v := range kv.values {
-			v = headerNewlineToSpace.Replace(v)
+			if strings.ContainsAny(v, "\r\n") {
+				v = headerNewlineToSpace.Replace(v)
+			}
 			v = textproto.TrimString(v)
-			for _, s := range []string{kv.key, ": ", v, "\r\n"} {
-				if _, err := ws.WriteString(s); err != nil {
-					headerSorterPool.Put(sorter)
-					return err
-				}
+			if err := writeHeaderLine(ws, kv.key, v); err != nil {
+				headerSorterPool.Put(sorter)
+				return err
 			}
 			if trace != nil && trace.WroteHeaderField != nil {
 				formattedVals = append(formattedVals, v)
@@ -222,6 +227,21 @@ func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptra
 	}
 	headerSorterPool.Put(sorter)
 	return nil
+}
+
+// writeHeaderLine writes "key: value\r\n" to ws.
+func writeHeaderLine(ws io.StringWriter, key, value string) error {
+	if _, err := ws.WriteString(key); err != nil {
+		return err
+	}
+	if _, err := ws.WriteString(": "); err != nil {
+		return err
+	}
+	if _, err := ws.WriteString(value); err != nil {
+		return err
+	}
+	_, err := ws.WriteString("\r\n")
+	return err
 }
 
 // CanonicalHeaderKey returns the canonical format of the

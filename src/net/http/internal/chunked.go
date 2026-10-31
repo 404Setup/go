@@ -12,8 +12,8 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
+	"strconv"
 )
 
 const maxLineLength = 4096 // assumed <= bufio.defaultBufSize
@@ -242,7 +242,7 @@ func (cw *chunkedWriter) Write(data []byte) (n int, err error) {
 		return 0, nil
 	}
 
-	if _, err = fmt.Fprintf(cw.Wire, "%x\r\n", len(data)); err != nil {
+	if err = writeChunkSize(cw.Wire, len(data)); err != nil {
 		return 0, err
 	}
 	if n, err = cw.Wire.Write(data); err != nil {
@@ -263,6 +263,29 @@ func (cw *chunkedWriter) Write(data []byte) (n int, err error) {
 
 func (cw *chunkedWriter) Close() error {
 	_, err := io.WriteString(cw.Wire, "0\r\n")
+	return err
+}
+
+// writeChunkSize writes the chunk-size line "<hex size>\r\n" to w.
+// When w is backed by a [bufio.Writer], the line is formatted directly into
+// its spare buffer capacity, avoiding any allocation.
+func writeChunkSize(w io.Writer, n int) error {
+	var bw *bufio.Writer
+	switch w := w.(type) {
+	case *bufio.Writer:
+		bw = w
+	case *FlushAfterChunkWriter:
+		bw = w.Writer
+	}
+	if bw != nil {
+		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(n), 16)
+		b = append(b, '\r', '\n')
+		_, err := bw.Write(b)
+		return err
+	}
+	b := strconv.AppendUint(make([]byte, 0, 18), uint64(n), 16)
+	b = append(b, '\r', '\n')
+	_, err := w.Write(b)
 	return err
 }
 

@@ -368,9 +368,11 @@ func rewriteRequestURL(req *http.Request, target *url.URL) {
 
 func copyHeader(dst, src http.Header) {
 	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
+		if len(vv) == 0 {
+			continue
 		}
+		k = http.CanonicalHeaderKey(k)
+		dst[k] = append(dst[k], vv...)
 	}
 }
 

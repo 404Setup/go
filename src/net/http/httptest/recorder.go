@@ -218,7 +218,13 @@ func (rw *ResponseRecorder) Result() *http.Response {
 	if res.StatusCode == 0 {
 		res.StatusCode = 200
 	}
-	res.Status = fmt.Sprintf("%03d %s", res.StatusCode, http.StatusText(res.StatusCode))
+	if res.StatusCode == 200 {
+		res.Status = "200 OK"
+	} else if res.StatusCode >= 100 && res.StatusCode <= 999 {
+		res.Status = strconv.Itoa(res.StatusCode) + " " + http.StatusText(res.StatusCode)
+	} else {
+		res.Status = fmt.Sprintf("%03d %s", res.StatusCode, http.StatusText(res.StatusCode))
+	}
 	if rw.Body != nil {
 		res.Body = io.NopCloser(bytes.NewReader(rw.Body.Bytes()))
 	} else {

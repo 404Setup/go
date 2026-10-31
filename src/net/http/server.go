@@ -389,7 +389,10 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 		return len(p), nil
 	}
 	if cw.chunking {
-		_, err = fmt.Fprintf(cw.res.conn.bufw, "%x\r\n", len(p))
+		bw := cw.res.conn.bufw
+		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(p)), 16)
+		b = append(b, '\r', '\n')
+		_, err = bw.Write(b)
 		if err != nil {
 			cw.res.conn.rwc.Close()
 			return
@@ -1120,10 +1123,9 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		return nil, ErrHijacked
 	}
 
-	t0 := time.Now()
 	var wholeReqDeadline time.Time // or zero if none
 	if d := c.server.ReadTimeout; d > 0 {
-		wholeReqDeadline = t0.Add(d)
+		wholeReqDeadline = time.Now().Add(d)
 	}
 	if d := c.server.WriteTimeout; d > 0 {
 		defer func() {
@@ -1193,7 +1195,6 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		cancelCtx:     cancelCtx,
 		req:           req,
 		reqBody:       reqBody,
-		handlerHeader: make(Header),
 		contentLength: -1,
 
 		// We populate these ahead of time so we're not
@@ -1228,6 +1229,9 @@ func http1ServerSupportsRequest(req *Request) bool {
 }
 
 func (w *response) Header() Header {
+	if w.handlerHeader == nil {
+		w.handlerHeader = make(Header)
+	}
 	if w.cw.header == nil && w.wroteHeader && !w.cw.wroteHeader {
 		// Accessing the header between logically writing it
 		// and physically writing it means we need to allocate
@@ -1371,22 +1375,29 @@ var (
 // smart enough to realize this function doesn't mutate h.
 func (h extraHeader) Write(w *bufio.Writer) {
 	if h.date != nil {
-		w.Write(headerDate)
+		w.WriteString("Date: ")
 		w.Write(h.date)
-		w.Write(crlf)
+		w.WriteString("\r\n")
 	}
 	if h.contentLength != nil {
-		w.Write(headerContentLength)
+		w.WriteString("Content-Length: ")
 		w.Write(h.contentLength)
-		w.Write(crlf)
+		w.WriteString("\r\n")
 	}
-	for i, v := range []string{h.contentType, h.connection, h.transferEncoding} {
-		if v != "" {
-			w.Write(extraHeaderKeys[i])
-			w.Write(colonSpace)
-			w.WriteString(v)
-			w.Write(crlf)
-		}
+	if h.contentType != "" {
+		w.WriteString("Content-Type: ")
+		w.WriteString(h.contentType)
+		w.WriteString("\r\n")
+	}
+	if h.connection != "" {
+		w.WriteString("Connection: ")
+		w.WriteString(h.connection)
+		w.WriteString("\r\n")
+	}
+	if h.transferEncoding != "" {
+		w.WriteString("Transfer-Encoding: ")
+		w.WriteString(h.transferEncoding)
+		w.WriteString("\r\n")
 	}
 }
 
@@ -1687,13 +1698,28 @@ func foreachHeaderElement(v string, fn func(string)) {
 // code is the response status code.
 // scratch is an optional scratch buffer. If it has at least capacity 3, it's used.
 func writeStatusLine(bw *bufio.Writer, is11 bool, code int, scratch []byte) {
+	if code == StatusOK {
+		if is11 {
+			bw.WriteString("HTTP/1.1 200 OK\r\n")
+		} else {
+			bw.WriteString("HTTP/1.0 200 OK\r\n")
+		}
+		return
+	}
 	if is11 {
 		bw.WriteString("HTTP/1.1 ")
 	} else {
 		bw.WriteString("HTTP/1.0 ")
 	}
 	if text := StatusText(code); text != "" {
-		bw.Write(strconv.AppendInt(scratch[:0], int64(code), 10))
+		if len(scratch) >= 3 && code >= 100 && code <= 999 {
+			scratch[0] = byte(code/100 + '0')
+			scratch[1] = byte((code/10)%10 + '0')
+			scratch[2] = byte(code%10 + '0')
+			bw.Write(scratch[:3])
+		} else {
+			bw.Write(strconv.AppendInt(scratch[:0], int64(code), 10))
+		}
 		bw.WriteByte(' ')
 		bw.WriteString(text)
 		bw.WriteString("\r\n")
@@ -2515,14 +2541,27 @@ func Error(w ResponseWriter, error string, code int) {
 	// We don't delete Content-Encoding, because some middleware sets
 	// Content-Encoding: gzip and wraps the ResponseWriter to compress on-the-fly.
 	// See https://go.dev/issue/66343.
-	h.Del("Content-Length")
+	delete(h, "Content-Length")
 
 	// There might be content type already set, but we reset it to
 	// text/plain for the error message.
-	h.Set("Content-Type", "text/plain; charset=utf-8")
-	h.Set("X-Content-Type-Options", "nosniff")
+	strs := []string{"text/plain; charset=utf-8", "nosniff"}
+	h["Content-Type"] = strs[:1:1]
+	h["X-Content-Type-Options"] = strs[1:2:2]
 	w.WriteHeader(code)
-	fmt.Fprintln(w, error)
+	if sw, ok := w.(io.StringWriter); ok {
+		sw.WriteString(error)
+		sw.WriteString("\n")
+	} else {
+		var buf [128]byte
+		if len(error)+1 <= len(buf) {
+			n := copy(buf[:], error)
+			buf[n] = '\n'
+			w.Write(buf[:n+1])
+		} else {
+			io.WriteString(w, error+"\n")
+		}
+	}
 }
 
 // NotFound replies to the request with an HTTP 404 not found error.
@@ -2621,8 +2660,8 @@ func Redirect(w ResponseWriter, r *Request, url string, code int) {
 
 	// Shouldn't send the body for POST or HEAD; that leaves GET.
 	if !hadCT && r.Method == "GET" {
-		body := "<a href=\"" + htmlEscape(url) + "\">" + StatusText(code) + "</a>.\n"
-		fmt.Fprintln(w, body)
+		body := "<a href=\"" + htmlEscape(url) + "\">" + StatusText(code) + "</a>.\n\n"
+		io.WriteString(w, body)
 	}
 }
 
@@ -2637,6 +2676,9 @@ var htmlReplacer = strings.NewReplacer(
 )
 
 func htmlEscape(s string) string {
+	if !strings.ContainsAny(s, "&<>'\"") {
+		return s
+	}
 	return htmlReplacer.Replace(s)
 }
 
@@ -2650,6 +2692,8 @@ func (rh *redirectHandler) ServeHTTP(w ResponseWriter, r *Request) {
 	Redirect(w, r, rh.url, rh.code)
 }
 
+var slashRedirectHandler Handler = &redirectHandler{"/", StatusTemporaryRedirect}
+
 // RedirectHandler returns a request handler that redirects
 // each request it receives to the given url using the given
 // status code.
@@ -2657,6 +2701,9 @@ func (rh *redirectHandler) ServeHTTP(w ResponseWriter, r *Request) {
 // The provided code should be in the 3xx range and is usually
 // [StatusMovedPermanently], [StatusFound] or [StatusSeeOther].
 func RedirectHandler(url string, code int) Handler {
+	if url == "/" && code == StatusTemporaryRedirect {
+		return slashRedirectHandler
+	}
 	return &redirectHandler{url, code}
 }
 
@@ -2803,6 +2850,14 @@ func cleanPath(p string) string {
 	}
 	if p[0] != '/' {
 		p = "/" + p
+	} else {
+		for len(p) > 1 && p[1] == '/' {
+			p = p[1:]
+		}
+		if isCleanPath(p) {
+			// Fast path: p is already canonical; avoid path.Clean.
+			return p
+		}
 	}
 	np := path.Clean(p)
 	// path.Clean removes trailing slash except for root;
@@ -2818,10 +2873,36 @@ func cleanPath(p string) string {
 	return np
 }
 
+// isCleanPath reports whether p, which must begin with '/', is already in
+// the form cleanPath would return: it contains no empty segments ("//")
+// and no "." or ".." segments. A trailing slash is permitted.
+func isCleanPath(p string) bool {
+	for i := 0; i < len(p); i++ {
+		if p[i] != '/' {
+			continue
+		}
+		if i+1 < len(p) {
+			switch p[i+1] {
+			case '/':
+				return false
+			case '.':
+				if i+2 == len(p) || p[i+2] == '/' {
+					return false
+				}
+				if p[i+2] == '.' && (i+3 == len(p) || p[i+3] == '/') {
+					return false
+				}
+			}
+			i++
+		}
+	}
+	return true
+}
+
 // stripHostPort returns h without any trailing ":<port>".
 func stripHostPort(h string) string {
 	// If no port on host, return unchanged
-	if !strings.Contains(h, ":") {
+	if strings.IndexByte(h, ':') < 0 {
 		return h
 	}
 	host, _, err := net.SplitHostPort(h)
@@ -2873,9 +2954,10 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 		// If r.URL.Path is /tree and its handler is not registered,
 		// the /tree -> /tree/ redirect applies to CONNECT requests
 		// but the path canonicalization does not.
-		_, _, u := mux.matchOrRedirect(host, r.Method, path, r.URL)
-		if u != nil {
-			return RedirectHandler(u.String(), StatusTemporaryRedirect), u.Path, nil, nil
+		_, _, redirPath := mux.matchOrRedirect(host, r.Method, path, r.URL)
+		if redirPath != "" {
+			urlStr, uPath := urlFromEscaped(redirPath, r.URL.RawQuery)
+			return RedirectHandler(urlStr, StatusTemporaryRedirect), uPath, nil, nil
 		}
 		// Redo the match, this time with r.Host instead of r.URL.Host.
 		// Pass a nil URL to skip the trailing-slash redirect logic.
@@ -2888,10 +2970,11 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 
 		// If the given path is /tree and its handler is not registered,
 		// redirect for /tree/.
-		var u *url.URL
-		n, matches, u = mux.matchOrRedirect(host, r.Method, path, r.URL)
-		if u != nil {
-			return RedirectHandler(u.String(), StatusTemporaryRedirect), n.pattern.String(), nil, nil
+		var redirPath string
+		n, matches, redirPath = mux.matchOrRedirect(host, r.Method, path, r.URL)
+		if redirPath != "" {
+			urlStr, _ := urlFromEscaped(redirPath, r.URL.RawQuery)
+			return RedirectHandler(urlStr, StatusTemporaryRedirect), n.pattern.String(), nil, nil
 		}
 		if path != escapedPath {
 			// Redirect to cleaned path.
@@ -2899,8 +2982,8 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 			if n != nil {
 				patStr = n.pattern.String()
 			}
-			u := urlFromEscaped(path, r.URL.RawQuery)
-			return RedirectHandler(u.String(), StatusTemporaryRedirect), patStr, nil, nil
+			urlStr, _ := urlFromEscaped(path, r.URL.RawQuery)
+			return RedirectHandler(urlStr, StatusTemporaryRedirect), patStr, nil, nil
 		}
 	}
 	if n == nil {
@@ -2924,8 +3007,8 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 // If the url argument is non-nil, handler also deals with trailing-slash
 // redirection: when a path doesn't match exactly, the match is tried again
 // after appending "/" to the path. If that second match succeeds, the last
-// return value is the URL to redirect to.
-func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *routingNode, matches []string, redirectTo *url.URL) {
+// return value is the escaped path to redirect to.
+func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *routingNode, matches []string, redirectPath string) {
 	mux.mu.RLock()
 	defer mux.mu.RUnlock()
 
@@ -2935,7 +3018,7 @@ func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *
 	// - We were asked not to try trailing slash redirection.
 	// - The URL already has a trailing slash.
 	// - The URL is an empty string.
-	if !exactMatch(n, path) && u != nil && !strings.HasSuffix(path, "/") && path != "" {
+	if u != nil && len(path) > 0 && path[len(path)-1] != '/' && !exactMatch(n, path) {
 		// If there is an exact match with a trailing slash, then redirect.
 		path += "/"
 		n2, _ := mux.tree.match(host, method, path)
@@ -2944,14 +3027,14 @@ func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *
 			// of findHandler, and that method returns before it does the "n == nil" check where
 			// the first return value matters. We return it here only to make the pattern available
 			// to findHandler.
-			return n2, nil, urlFromEscaped(path, u.RawQuery)
+			return n2, nil, path
 		}
 	}
-	return n, matches, nil
+	return n, matches, ""
 }
 
-// urlFromEscaped returns a url.URL constructed from an escaped path and a raw
-// query.
+// urlFromEscaped returns the redirect URL string and unescaped path constructed
+// from an escaped path and a raw query.
 //
 // It ensures that the Path and RawPath fields are in sync by unescaping the
 // escaped path. Populating only the Path field and leaving RawPath empty (or
@@ -2959,18 +3042,25 @@ func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *
 // either unexpected escaping (e.g., double-escaping "%" into "%25" in an
 // already escaped path) or a lack thereof (e.g., losing the escaping of "%2f"
 // and turning it into a literal path separator "/").
-func urlFromEscaped(escaped, rawQuery string) *url.URL {
+func urlFromEscaped(escaped, rawQuery string) (urlStr, unescapedPath string) {
+	if len(escaped) > 0 && escaped[0] == '/' && (len(escaped) == 1 || escaped[1] != '/') && strings.IndexByte(escaped, '%') < 0 {
+		if rawQuery == "" {
+			return escaped, escaped
+		}
+		return escaped + "?" + rawQuery, escaped
+	}
 	unescaped, err := url.PathUnescape(escaped)
 	// Should be impossible, since ServeMux will reject unparsable URLs way
 	// earlier.
 	if err != nil {
 		unescaped = escaped
 	}
-	return &url.URL{
+	u := url.URL{
 		Path:     unescaped,
 		RawPath:  escaped,
 		RawQuery: rawQuery,
 	}
+	return u.String(), unescaped
 }
 
 // exactMatch reports whether the node's pattern exactly matches the path.

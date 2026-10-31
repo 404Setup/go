@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -156,40 +155,71 @@ func (r *Response) Location() (*url.URL, error) {
 // After that call, clients can inspect resp.Trailer to find key/value
 // pairs included in the response trailer.
 func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
-	tp := textproto.NewReader(r)
-	resp := &Response{
-		Request: req,
-	}
-
 	// Parse the first line of the response.
-	line, err := tp.ReadLine()
+	lineBytes, err := readLineBytes(r)
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
 		return nil, err
 	}
-	proto, status, ok := strings.Cut(line, " ")
-	if !ok {
-		return nil, badStringError("malformed HTTP response", line)
+	resp := &Response{
+		Request: req,
 	}
-	resp.Proto = proto
-	resp.Status = strings.TrimLeft(status, " ")
-
-	statusCode, _, _ := strings.Cut(resp.Status, " ")
-	if len(statusCode) != 3 {
-		return nil, badStringError("malformed HTTP status code", statusCode)
-	}
-	resp.StatusCode, err = strconv.Atoi(statusCode)
-	if err != nil || resp.StatusCode < 0 {
-		return nil, badStringError("malformed HTTP status code", statusCode)
-	}
-	if resp.ProtoMajor, resp.ProtoMinor, ok = ParseHTTPVersion(resp.Proto); !ok {
-		return nil, badStringError("malformed HTTP version", resp.Proto)
+	if string(lineBytes) == "HTTP/1.1 200 OK" {
+		resp.Proto = "HTTP/1.1"
+		resp.Status = "200 OK"
+		resp.StatusCode = 200
+		resp.ProtoMajor = 1
+		resp.ProtoMinor = 1
+	} else {
+		before, after, ok := bytes.Cut(lineBytes, []byte{' '})
+		if !ok {
+			return nil, badStringError("malformed HTTP response", string(lineBytes))
+		}
+		protoBytes := before
+		statusBytes := bytes.TrimLeft(after, " ")
+		var protoOK bool
+		switch string(protoBytes) {
+		case "HTTP/1.1":
+			resp.Proto = "HTTP/1.1"
+			resp.ProtoMajor = 1
+			resp.ProtoMinor = 1
+			protoOK = true
+		case "HTTP/1.0":
+			resp.Proto = "HTTP/1.0"
+			resp.ProtoMajor = 1
+			resp.ProtoMinor = 0
+			protoOK = true
+		default:
+			resp.Proto = string(protoBytes)
+		}
+		if string(statusBytes) == "200 OK" {
+			resp.Status = "200 OK"
+			resp.StatusCode = 200
+		} else {
+			resp.Status = string(statusBytes)
+			statusCode, _, _ := strings.Cut(resp.Status, " ")
+			if len(statusCode) != 3 {
+				return nil, badStringError("malformed HTTP status code", statusCode)
+			}
+			resp.StatusCode, err = strconv.Atoi(statusCode)
+			if err != nil || resp.StatusCode < 0 {
+				return nil, badStringError("malformed HTTP status code", statusCode)
+			}
+		}
+		if !protoOK {
+			var ok bool
+			if resp.ProtoMajor, resp.ProtoMinor, ok = ParseHTTPVersion(resp.Proto); !ok {
+				return nil, badStringError("malformed HTTP version", resp.Proto)
+			}
+		}
 	}
 
 	// Parse the response headers.
+	tp := newTextprotoReader(r)
 	mimeHeader, err := tp.ReadMIMEHeader()
+	putTextprotoReader(tp)
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -254,19 +284,34 @@ func (r *Response) Write(w io.Writer) error {
 		if text == "" {
 			text = "status code " + strconv.Itoa(r.StatusCode)
 		}
+	} else if len(text) >= 4 &&
+		text[0] == byte('0'+r.StatusCode/100) &&
+		text[1] == byte('0'+(r.StatusCode/10)%10) &&
+		text[2] == byte('0'+r.StatusCode%10) &&
+		text[3] == ' ' {
+		text = text[4:]
 	} else {
 		// Just to reduce stutter, if user set r.Status to "200 OK" and StatusCode to 200.
 		// Not important.
 		text = strings.TrimPrefix(text, strconv.Itoa(r.StatusCode)+" ")
 	}
 
-	if _, err := fmt.Fprintf(w, "HTTP/%d.%d %03d %s\r\n", r.ProtoMajor, r.ProtoMinor, r.StatusCode, text); err != nil {
+	if r.ProtoMajor >= 0 && r.ProtoMajor <= 9 && r.ProtoMinor >= 0 && r.ProtoMinor <= 9 && r.StatusCode >= 100 && r.StatusCode <= 999 {
+		var buf [64]byte
+		b := append(buf[:0], "HTTP/"...)
+		b = append(b, byte('0'+r.ProtoMajor), '.', byte('0'+r.ProtoMinor), ' ')
+		b = append(b, byte('0'+r.StatusCode/100), byte('0'+(r.StatusCode/10)%10), byte('0'+r.StatusCode%10), ' ')
+		b = append(b, text...)
+		b = append(b, "\r\n"...)
+		if _, err := w.Write(b); err != nil {
+			return err
+		}
+	} else if _, err := fmt.Fprintf(w, "HTTP/%d.%d %03d %s\r\n", r.ProtoMajor, r.ProtoMinor, r.StatusCode, text); err != nil {
 		return err
 	}
 
 	// Clone it, so we can modify r1 as needed.
-	r1 := new(Response)
-	*r1 = *r
+	r1 := *r
 	if r1.ContentLength == 0 && r1.Body != nil {
 		// Is it actually 0 length? Or just unknown?
 		var buf [1]byte
@@ -298,7 +343,7 @@ func (r *Response) Write(w io.Writer) error {
 	}
 
 	// Process Body,ContentLength,Close,Trailer
-	tw, err := newTransferWriter(r1)
+	tw, err := newTransferWriter(&r1)
 	if err != nil {
 		return err
 	}
