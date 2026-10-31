@@ -680,26 +680,35 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		w = bw
 	}
 
-	ws, ok := w.(io.StringWriter)
-	if !ok {
-		ws = stringWriter{w}
+	writeLine := func(a, b, c, d string) error {
+		if bufw, ok := w.(*bufio.Writer); ok {
+			buf := bufw.AvailableBuffer()
+			buf = append(buf, a...)
+			buf = append(buf, b...)
+			buf = append(buf, c...)
+			buf = append(buf, d...)
+			_, err := bufw.Write(buf)
+			return err
+		}
+		var stack [256]byte
+		buf := stack[:0]
+		if len(a)+len(b)+len(c)+len(d) > len(stack) {
+			buf = make([]byte, 0, len(a)+len(b)+len(c)+len(d))
+		}
+		buf = append(buf, a...)
+		buf = append(buf, b...)
+		buf = append(buf, c...)
+		buf = append(buf, d...)
+		_, err := w.Write(buf)
+		return err
 	}
 
-	if _, err = ws.WriteString(valueOrDefault(r.Method, "GET")); err != nil {
-		return err
-	}
-	if _, err = ws.WriteString(" "); err != nil {
-		return err
-	}
-	if _, err = ws.WriteString(ruri); err != nil {
-		return err
-	}
-	if _, err = ws.WriteString(" HTTP/1.1\r\n"); err != nil {
+	if err = writeLine(valueOrDefault(r.Method, "GET"), " ", ruri, " HTTP/1.1\r\n"); err != nil {
 		return err
 	}
 
 	// Header lines
-	if err = writeHeaderLine(ws, "Host", host); err != nil {
+	if err = writeLine("Host: ", host, "\r\n", ""); err != nil {
 		return err
 	}
 	if trace != nil && trace.WroteHeaderField != nil {
@@ -709,7 +718,7 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	// Use the defaultUserAgent unless the Header contains one, which
 	// may be blank to not send the header.
 	if !r.Header.has("User-Agent") {
-		if _, err = ws.WriteString("User-Agent: " + defaultUserAgent + "\r\n"); err != nil {
+		if _, err = io.WriteString(w, "User-Agent: "+defaultUserAgent+"\r\n"); err != nil {
 			return err
 		}
 		if trace != nil && trace.WroteHeaderField != nil {
@@ -720,7 +729,7 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 			userAgent = headerNewlineToSpace.Replace(userAgent)
 		}
 		userAgent = textproto.TrimString(userAgent)
-		if err = writeHeaderLine(ws, "User-Agent", userAgent); err != nil {
+		if err = writeLine("User-Agent: ", userAgent, "\r\n", ""); err != nil {
 			return err
 		}
 		if trace != nil && trace.WroteHeaderField != nil {

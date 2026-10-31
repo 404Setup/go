@@ -284,12 +284,14 @@ func (r *Response) Write(w io.Writer) error {
 		if text == "" {
 			text = "status code " + strconv.Itoa(r.StatusCode)
 		}
-	} else if len(text) >= 4 &&
-		text[0] == byte('0'+r.StatusCode/100) &&
-		text[1] == byte('0'+(r.StatusCode/10)%10) &&
-		text[2] == byte('0'+r.StatusCode%10) &&
-		text[3] == ' ' {
-		text = text[4:]
+	} else if r.StatusCode >= 100 && r.StatusCode <= 999 {
+		if len(text) >= 4 &&
+			text[0] == byte('0'+r.StatusCode/100) &&
+			text[1] == byte('0'+(r.StatusCode/10)%10) &&
+			text[2] == byte('0'+r.StatusCode%10) &&
+			text[3] == ' ' {
+			text = text[4:]
+		}
 	} else {
 		// Just to reduce stutter, if user set r.Status to "200 OK" and StatusCode to 200.
 		// Not important.
