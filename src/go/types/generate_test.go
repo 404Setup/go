@@ -224,6 +224,7 @@ var filemap = map[string]action{
 	},
 	"slice.go":           nil,
 	"subst.go":           func(f *ast.File) { fixTokenPos(f); renameSelectors(f, "Trace->_Trace") },
+	"target.go":          fixSprintf,
 	"termlist.go":        nil,
 	"termlist_test.go":   nil,
 	"trie.go":            nil,
@@ -243,7 +244,11 @@ var filemap = map[string]action{
 		renameImportPath(f, `"cmd/compile/internal/syntax"->"go/ast"`)
 		renameSelectorExprs(f, "syntax.Expr->ast.Expr")
 	},
-	"universe.go":  fixGlobalTypVarDecl,
+	"universe.go": func(f *ast.File) {
+		renameImportPath(f, `"cmd/compile/internal/syntax"->"go/ast"`)
+		renameSelectorExprs(f, "syntax.CallExpr->ast.CallExpr")
+		fixGlobalTypVarDecl(f)
+	},
 	"util_test.go": fixTokenPos,
 	"validtype.go": func(f *ast.File) { fixTokenPos(f); renameSelectors(f, "Trace->_Trace") },
 	"version.go":   func(f *ast.File) { renameIdents(f, "poser->positioner") },

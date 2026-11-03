@@ -257,21 +257,14 @@ func DivFloats[E Floats, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 //	w[i] = x[i] * y[i]        // Double width
 //	z[j] = w[2*j] + w[2*j+1]
 //
+// While the products can never overflow, the sum wraps on overflow.
+// {{if eq .xB "int"}}
+// This happens in exactly one situation: if all four input elements are Min{{title .xE}}.
+// {{end}}
+//
 //specgen:commutative
 //specgen:require z={xB}{xN*2}x{xL/2}
-func DotProductPairs[E Nums, W Width, zE Nums](x, y Vec[E, W]) (z Vec[zE, W]) {
-	// TODO: How do we handle/specify overflow? x86 only supports this on signed
-	// types, and the only case that can overflow is if all four elements are
-	// MinInt16 (in which case the true result is MaxInt32+1, which wraps around
-	// to MinInt32). Unsigned types can overflow much more readily.
-	//
-	// Maybe we just leave overflow unspecified (or "architecture dependent").
-	// In which case, we probably need a way to communicate that in the spec
-	// (designated panic?).
-	//
-	// We might also need a way to constraint this to same-signed E and zE,
-	// which the constraint language doesn't currently have a way to say, but we
-	// could add as a built-in projection function in the syntax.
+func DotProductPairs[E Ints | Uints, W Width, zE Nums](x, y Vec[E, W]) (z Vec[zE, W]) {
 	z = makeVec[zE, W]()
 	for i := range z {
 		z[i] = zE(x[2*i])*zE(y[2*i]) + zE(x[2*i+1])*zE(y[2*i+1])
@@ -298,38 +291,116 @@ func DotProductPairsSaturated[xE Uints, xW Width, yE Ints, zE Ints](x Vec[xE, xW
 	return z
 }
 
-// Max returns the elementwise maximum of x and y.
+// MaxInts returns the elementwise maximum of x and y.
 //
 //	z[i] = max(x[i], y[i])
-func Max[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
-	// Note that this is NOT marked as commutative because its handling of NaN
-	// on AMD64 is non-commutative.
-
-	// TODO: Platforms do not agree on how to handle NaNs.
-	//
-	// AMD64 AVX (VMAXPS/VMINPS): If either input is NaN or if inputs are +0.0
-	// and −0.0, the instruction selects the second operand (making it
-	// non-commutative).
-	//
-	// ARM64 NEON (VFMAX/VFMIN): Follows IEEE 754-2008 maxNum/minNum (returns
-	// the numerical operand if one is NaN).
-	//
-	// WASM (F32x4Max/F32x4Min): Follows IEEE 754-2019 maximum/minimum.
-	//
-	// simd_emulated.go: Uses Go's built-in max/min (max(x, NaN) = NaN, and
-	// preserves +0.0 vs −0.0).
+//
+//specgen:name Max
+//specgen:commutative
+func MaxInts[E Ints | Uints, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 	return map2[E, W, E, W](x, y, func(x, y E) E {
 		return max(x, y)
 	})
 }
 
-// Min returns the elementwise minimum of x and y.
+// MaxFloats returns the elementwise maximum of x and y.
+//
+//	z[i] = max(x[i], y[i])
+//
+// The handling of NaN and signed zeroes is architecture-dependent. ARM64 and
+// WASM follow the IEEE 754-2019 maximum algorithm, which also agrees with Go's
+// max built-in. AMD64 handles these differently. Notably, AMD64 is
+// non-commutative.
+//
+//	x     y     IEEE  AMD64
+//	----- ----- ----- -----
+//	NaN   y     NaN   y
+//	x     NaN   NaN   NaN
+//	-Inf  y     y     y
+//	x     -Inf  x     x
+//	+Inf  y     +Inf  +Inf
+//	x     +Inf  +Inf  +Inf
+//	+0    -0    +0    -0
+//	-0    +0    +0    +0
+//
+//specgen:name Max
+func MaxFloats[E Floats, W Width](x, y Vec[E, W]) (z Vec[Variation[E], W]) {
+	// Note that this is NOT marked as commutative because its handling of NaN
+	// and signed zeroes on AMD64 is non-commutative.
+	//
+	// AMD64 AVX (VMAXPS/VMINPS): Computes `if x > y { x } else { y }`. If
+	// either input is NaN or if inputs are +0.0 and −0.0, the instruction
+	// selects the second operand y (making it non-commutative).
+	//
+	// ARM64 NEON/SVE (VFMAX/VFMIN, ZFMAX/ZFMIN) and WASM (F32x4Max/F32x4Min):
+	// Follow IEEE 754-2019 maximum/minimum (like Go's built-in max/min,
+	// propagating NaN and ordering −0.0 < +0.0).
+	return map2[E, W, Variation[E], W](x, y, func(x, y E) Variation[E] {
+		amd64 := y
+		if x > y {
+			amd64 = x
+		}
+		ieee := max(x, y)
+		if equalExact(amd64, ieee) {
+			return exact(ieee)
+		}
+		return perPlatform(map[Platform]E{
+			PlatformAMD64: amd64,
+			PlatformARM64: ieee,
+			PlatformWASM:  ieee,
+		})
+	})
+}
+
+// MinInts returns the elementwise minimum of x and y.
 //
 //	z[i] = min(x[i], y[i])
-func Min[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
-	// TODO: Same issue as Max.
+//
+//specgen:name Min
+//specgen:commutative
+func MinInts[E Ints | Uints, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 	return map2[E, W, E, W](x, y, func(x, y E) E {
 		return min(x, y)
+	})
+}
+
+// MinFloats returns the elementwise minimum of x and y.
+//
+//	z[i] = min(x[i], y[i])
+//
+// The handling of NaN and signed zeroes is architecture-dependent. ARM64 and
+// WASM follow the IEEE 754-2019 minimum algorithm, which also agrees with Go's
+// min built-in. AMD64 handles these differently. Notably, AMD64 is
+// non-commutative.
+//
+//	x     y     IEEE  AMD64
+//	----- ----- ----- -----
+//	NaN   y     NaN   y
+//	x     NaN   NaN   NaN
+//	-Inf  y     -Inf  -Inf
+//	x     -Inf  -Inf  -Inf
+//	+Inf  y     y     y
+//	x     +Inf  x     x
+//	+0    -0    -0    -0
+//	-0    +0    -0    +0
+//
+//specgen:name Min
+func MinFloats[E Floats, W Width](x, y Vec[E, W]) (z Vec[Variation[E], W]) {
+	// See MaxFloats for platform details.
+	return map2[E, W, Variation[E], W](x, y, func(x, y E) Variation[E] {
+		amd64 := y
+		if x < y {
+			amd64 = x
+		}
+		ieee := min(x, y)
+		if equalExact(amd64, ieee) {
+			return exact(ieee)
+		}
+		return perPlatform(map[Platform]E{
+			PlatformAMD64: amd64,
+			PlatformARM64: ieee,
+			PlatformWASM:  ieee,
+		})
 	})
 }
 
@@ -362,21 +433,39 @@ func MulAddInts[E Ints | Uints, W Width](x, y, z Vec[E, W]) (w Vec[E, W]) {
 //	w[i] = x[i] * y[i] + z[i]
 //
 // This performs a fused multiply-add, computing x[i]*y[i] + z[i] with a single
-// rounding rather than two and no intermediate overflow.
+// rounding rather than two and no intermediate overflow, except on wasm, where
+// it rounds x[i]*y[i] before adding z[i].
 //
 //specgen:name MulAdd
-func MulAddFloats[E Floats, W Width](x, y, z Vec[E, W]) (w Vec[E, W]) {
+func MulAddFloats[E Floats, W Width](x, y, z Vec[E, W]) (w Vec[Variation[E], W]) {
+	// Every platform that can reasonably implement SIMD has fused vector
+	// multiply-add instructions, except WASM: SIMD128 has none, so WASM
+	// implements MulAdd as a multiply followed by an add. (Relaxed SIMD's
+	// relaxed_madd may or may not fuse, depending on the host, and not all
+	// runtimes support it.)
+	//
 	// Go has the option of compiling x*y + z using FMA, but only does so if FMA
 	// support is guaranteed by the hardware version (e.g., GOAMD64>=3). To
 	// guarantee the right result, we have to do it ourself.
-	w = makeVec[E, W]()
+	w = makeVec[Variation[E], W]()
 	for i := range x {
+		var fused E
 		switch xi := any(x[i]).(type) {
 		case float32:
-			w[i] = E(fma32(xi, float32(y[i]), float32(z[i])))
+			fused = E(fma32(xi, float32(y[i]), float32(z[i])))
 		case float64:
-			w[i] = E(math.FMA(xi, float64(y[i]), float64(z[i])))
+			fused = E(math.FMA(xi, float64(y[i]), float64(z[i])))
 		}
+		// The explicit conversion prevents the Go compiler from fusing the
+		// multiply and add.
+		unfused := E(x[i]*y[i]) + z[i]
+		if equalExact(fused, unfused) {
+			w[i] = exact(fused)
+			continue
+		}
+		w[i] = perPlatformDefault(fused, map[Platform]E{
+			PlatformWASM: unfused,
+		})
 	}
 	return w
 }
@@ -390,23 +479,67 @@ func Neg[E Ints | Floats, W Width](x Vec[E, W]) (z Vec[E, W]) {
 	})
 }
 
-// ReduceSum returns the scalar sum of the elements of x.
+// ReduceSumInts returns the scalar sum of the elements of x.
 //
 //	z = x[0] + x[1] + ...
-func ReduceSum[E Elt, W Width](x Vec[E, W]) (z E) {
-	// TODO: Determine and document the precision of the result.
+//
+//specgen:name ReduceSum
+func ReduceSumInts[E Ints | Uints, W Width](x Vec[E, W]) (z E) {
+	// Integer addition wraps and is associative, so the order doesn't matter.
 	for _, xi := range x {
 		z += xi
 	}
 	return z
 }
 
+// ReduceSumFloats returns the scalar sum of the elements of x.
+//
+// {{if eq .xL 2}}
+//
+//	z = x[0] + x[1]
+//
+// {{else}}
+//
+// This uses repeated pairwise summation, which may affect the final precision
+// of the result.
+//
+// {{if eq .xL 4}}
+//
+//	z = (x[0] + x[1]) + (x[2] + x[3])
+//
+// {{else}}
+//
+//	z = ((x[0] + x[1]) + (x[2] + x[3])) + ...
+//
+// {{end}}
+//
+// {{end}}
+//
+//specgen:name ReduceSum
+func ReduceSumFloats[E Floats, W Width](x Vec[E, W]) (z E) {
+	// Vector lengths are powers of two, so every level pairs up evenly.
+	tmp := make([]E, x.len()/2, maxScalableWidth/elemBits[E]()/2)
+	for i := range tmp {
+		tmp[i] = x[2*i] + x[2*i+1]
+	}
+	for len(tmp) > 1 {
+		half := len(tmp) / 2
+		for i := range half {
+			tmp[i] = tmp[2*i] + tmp[2*i+1]
+		}
+		tmp = tmp[:half]
+	}
+	return tmp[0]
+}
+
 // ReduceMax returns the largest element of x.
 //
 //	z = max(x[0], x[1], ...)
 func ReduceMax[E Elt, W Width](x Vec[E, W]) (z E) {
-	// TODO: Platforms may not agree on NaN and on the sign of a zero result,
-	// as with Max.
+	// TODO: Do we need per-platform handling of non-finites? Since AMD64 is the
+	// only platform that's weird about non-finite values and it doesn't have
+	// ReduceMax, maybe we don't have to, but if we ever want to emulate this on
+	// AMD64, we'd have to decide whether to match AMD64's Max or Go/IEEE Max.
 	z = x[0]
 	for _, xi := range x[1:] {
 		z = max(z, xi)
@@ -417,10 +550,15 @@ func ReduceMax[E Elt, W Width](x Vec[E, W]) (z E) {
 // Sqrt returns the elementwise square root of x.
 //
 //	z[i] = sqrt(x[i])
+//
+// The result is correctly rounded. Sqrt(+Inf) = +Inf, Sqrt(±0) = ±0, and
+// Sqrt(x) is NaN if x < 0 or x is NaN. The sign and payload of a NaN result
+// are unspecified.
 func Sqrt[E Floats, W Width](x Vec[E, W]) (z Vec[E, W]) {
-	// TODO: Determine and document the precision of the result.
-	//
-	// TODO: Document behavior for special float values.
+	// For float32, computing the square root in float64 and rounding to
+	// float32 is still correctly rounded: double rounding is harmless for
+	// square root when the wider format has at least 2p+2 bits of precision,
+	// and 53 >= 2*24+2.
 	return map1[E, W, E, W](x, func(x E) E {
 		return E(math.Sqrt(float64(x)))
 	})

@@ -419,7 +419,7 @@ func (check *Checker) updateExprVal(x syntax.Expr, val constant.Value) {
 // If x is a constant operand, the returned constant.Value will be the
 // representation of x in this context.
 func (check *Checker) implicitTypeAndValue(x *operand, target Type) (Type, constant.Value, Code) {
-	if !x.isValid() || isTyped(x.typ()) || !isValid(target) {
+	if !x.isValid() || x.isTyped() || !isValid(target) {
 		return x.typ(), nil, 0
 	}
 	// x is untyped
@@ -433,9 +433,13 @@ func (check *Checker) implicitTypeAndValue(x *operand, target Type) (Type, const
 	}
 
 	if x.isNil() {
-		assert(isUntyped(x.typ()))
+		assert(x.isUntyped())
 		if hasNil(target) {
-			return target, nil, 0
+			if isTypes2 {
+				return target, nil, 0
+			}
+			// Preserve the type of nil as UntypedNil: see go.dev/issue/13061.
+			return Typ[UntypedNil], nil, 0
 		}
 		return nil, nil, InvalidUntypedConversion
 	}
@@ -643,7 +647,7 @@ func (check *Checker) shift(x, y *operand, e syntax.Expr, op syntax.Operator) {
 	}
 
 	if allInteger(x.typ()) ||
-		isUntyped(x.typ()) && (xval != nil && xval.Kind() == constant.Int || xval == nil && isNumeric(x.typ())) {
+		x.isUntyped() && (xval != nil && xval.Kind() == constant.Int || xval == nil && isNumeric(x.typ())) {
 		// The lhs is of integer type, or it is an untyped constant
 		// representable as an integer, or a non-constant untyped
 		// numeric value. Nothing to do.
@@ -669,7 +673,7 @@ func (check *Checker) shift(x, y *operand, e syntax.Expr, op syntax.Operator) {
 			return
 		}
 
-		if isUntyped(y.typ()) {
+		if y.isUntyped() {
 			// Caution: Check for representability here, rather than in the switch
 			// below, because isInteger includes untyped integers (was bug go.dev/issue/43697).
 			check.representable(y, Typ[Uint])
@@ -681,7 +685,7 @@ func (check *Checker) shift(x, y *operand, e syntax.Expr, op syntax.Operator) {
 	} else {
 		// Check that RHS is otherwise at least of integer type.
 		switch {
-		case isUntyped(y.typ()):
+		case y.isUntyped():
 			// Non-constant untyped shift counts are converted to uint
 			// (go.dev/issue/77117, go.dev/issue/79252, go.dev/issue/80983).
 			// Note: If we change our opinion on go.dev/issue/77177 and
@@ -740,7 +744,7 @@ func (check *Checker) shift(x, y *operand, e syntax.Expr, op syntax.Operator) {
 		}
 
 		// non-constant shift with constant lhs
-		if isUntyped(x.typ()) {
+		if x.isUntyped() {
 			// spec: "If the left operand of a non-constant shift
 			// expression is an untyped constant, the type of the
 			// constant is what it would be if the shift expression
@@ -871,7 +875,7 @@ checked:
 		// (otherwise we had an error reported elsewhere already)
 		if isValid(x.typ()) && isValid(y.typ()) {
 			if e != nil {
-				check.errorf(x, MismatchedTypes, invalidOp+"%s (mismatched types %s and %s)", e, x.typ(), y.typ())
+				check.errorf(e, MismatchedTypes, invalidOp+"%s (mismatched types %s and %s)", e, x.typ(), y.typ())
 			} else {
 				check.errorf(x, MismatchedTypes, invalidOp+"%s %s= %s (mismatched types %s and %s)", lhs, op, rhs, x.typ(), y.typ())
 			}
@@ -941,7 +945,7 @@ func (check *Checker) matchTypes(x, y *operand) {
 	// not compatible, we report a type mismatch error.
 	mayConvert := func(x, y *operand) bool {
 		// If both operands are typed, there's no need for an implicit conversion.
-		if isTyped(x.typ()) && isTyped(y.typ()) {
+		if x.isTyped() && y.isTyped() {
 			return false
 		}
 		// A numeric type can only convert to another numeric type.
@@ -1000,54 +1004,6 @@ const (
 	expression
 	statement
 )
-
-// target represents the target type in an assignment context.
-type target struct {
-	typ Type
-	// TODO(gri) desc is only used in Checker.funcInst - do we need it?
-	//           (setting/computing desc may be expensive for not being used)
-	//           Also, if we keep it, review consistency of description.
-	desc string
-	hint bool // if set, the target may be used as untyped composite literal hint before Go 1.28
-}
-
-// newTarget creates a new target for the given type and description.
-// The result is nil if typ is nil.
-func newTarget(typ Type, desc string) *target {
-	if typ != nil {
-		return &target{typ, desc, false}
-	}
-	return nil
-}
-
-// newHint is like newTarget but it marks the result as a hint.
-func newHint(typ Type, desc string) *target {
-	if typ != nil {
-		return &target{typ, desc, true}
-	}
-	return nil
-}
-
-// sig returns the target type T if it is a signature (the result may be its Named or Alias type, if any).
-// The result is nil if T is nil or T's type set has no common signature type.
-func (T *target) sig() Type {
-	if T != nil {
-		if u, _ := commonUnder(T.typ, nil); u != nil {
-			if _, ok := u.(*Signature); ok {
-				return T.typ
-			}
-		}
-	}
-	return nil
-}
-
-// String returns a string representation of T, for debugging.
-func (T *target) String() string {
-	if T != nil {
-		return sprintf(nil, true, "target{%s, %q}", T.typ, T.desc)
-	}
-	return "no target"
-}
 
 // rawExpr typechecks expression e and initializes x with the expression
 // value or type. If an error occurred, x.mode is set to invalid.
@@ -1328,48 +1284,6 @@ Error:
 	return statement // avoid follow-up errors
 }
 
-// keyVal maps a complex, float, integer, string or boolean constant value
-// to the corresponding complex128, float64, int64, uint64, string, or bool
-// Go value if possible; otherwise it returns x.
-// A complex constant that can be represented as a float (such as 1.2 + 0i)
-// is returned as a floating point value; if a floating point value can be
-// represented as an integer (such as 1.0) it is returned as an integer value.
-// This ensures that constants of different kind but equal value (such as
-// 1.0 + 0i, 1.0, 1) result in the same value.
-func keyVal(x constant.Value) any {
-	switch x.Kind() {
-	case constant.Complex:
-		f := constant.ToFloat(x)
-		if f.Kind() != constant.Float {
-			r, _ := constant.Float64Val(constant.Real(x))
-			i, _ := constant.Float64Val(constant.Imag(x))
-			return complex(r, i)
-		}
-		x = f
-		fallthrough
-	case constant.Float:
-		i := constant.ToInt(x)
-		if i.Kind() != constant.Int {
-			v, _ := constant.Float64Val(x)
-			return v
-		}
-		x = i
-		fallthrough
-	case constant.Int:
-		if v, ok := constant.Int64Val(x); ok {
-			return v
-		}
-		if v, ok := constant.Uint64Val(x); ok {
-			return v
-		}
-	case constant.String:
-		return constant.StringVal(x)
-	case constant.Bool:
-		return constant.BoolVal(x)
-	}
-	return x
-}
-
 // typeAssertion checks x.(T). The type of x must be an interface.
 func (check *Checker) typeAssertion(e syntax.Expr, x *operand, T Type, typeSwitch bool) {
 	var cause string
@@ -1421,7 +1335,7 @@ func (check *Checker) multiExpr(e syntax.Expr, allowCommaOk bool) (list []*opera
 		list = make([]*operand, t.Len())
 		for i, v := range t.vars {
 			// create a dummy expression (in place of e) for better error messages
-			dummy := syntax.NewName(syntax.StartPos(e), nth(i+1, "function result"))
+			dummy := newIdent(startPos(e), nth(i+1, "function result"))
 			list[i] = &operand{mode_: value, expr: dummy, typ_: v.typ}
 		}
 		return
@@ -1437,7 +1351,7 @@ func (check *Checker) multiExpr(e syntax.Expr, allowCommaOk bool) (list []*opera
 			typ = universeError
 		}
 		// create a dummy expression (in place of e) for better error messages
-		dummy := syntax.NewName(syntax.StartPos(e), what)
+		dummy := newIdent(startPos(e), what)
 		x2 := &operand{mode_: value, expr: dummy, typ_: typ}
 		list = append(list, x2)
 		commaOk = true
