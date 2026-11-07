@@ -4,7 +4,10 @@
 
 package ld
 
-import "cmd/link/internal/loader"
+import (
+	"cmd/link/internal/loader"
+	"internal/abi"
+)
 
 // o3MethodAnalysis refines interface reachability using complete method sets.
 // A common name such as Close or Get alone does not make a type implement the
@@ -49,7 +52,7 @@ func newO3MethodAnalysis(ldr *loader.Loader) *o3MethodAnalysis {
 func (a *o3MethodAnalysis) recordCall(d *deadcodePass, iface loader.Sym, called methodsig) {
 	if _, ok := a.interfaces[iface]; !ok {
 		p := d.ldr.Data(iface)
-		off := commonsize(d.ctxt.Arch) + 4*d.ctxt.Arch.PtrSize
+		off := abi.RTypeSize(abi.Interface, d.ctxt.Arch.PtrSize)
 		if decodetypeHasUncommon(d.ctxt.Arch, p) {
 			off += uncommonSize(d.ctxt.Arch)
 		}
