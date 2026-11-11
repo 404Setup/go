@@ -666,7 +666,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
 			s.vars[memVar] = p1
 			return p0
 		},
-		sys.AMD64, sys.Loong64, sys.RISCV64)
+		sys.AMD64, sys.Loong64, sys.MIPS64, sys.RISCV64)
 	addF("internal/runtime/atomic", "And32",
 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 			v := s.newValue3(ssaop.OpAtomicAnd32value, types.NewTuple(types.Types[types.TUINT32], types.TypeMem), args[0], args[1], s.mem())
@@ -674,7 +674,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
 			s.vars[memVar] = p1
 			return p0
 		},
-		sys.AMD64, sys.Loong64, sys.RISCV64)
+		sys.AMD64, sys.Loong64, sys.MIPS64, sys.RISCV64)
 	addF("internal/runtime/atomic", "Or64",
 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 			v := s.newValue3(ssaop.OpAtomicOr64value, types.NewTuple(types.Types[types.TUINT64], types.TypeMem), args[0], args[1], s.mem())
@@ -682,7 +682,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
 			s.vars[memVar] = p1
 			return p0
 		},
-		sys.AMD64, sys.Loong64, sys.RISCV64)
+		sys.AMD64, sys.Loong64, sys.MIPS64, sys.RISCV64)
 	addF("internal/runtime/atomic", "Or32",
 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 			v := s.newValue3(ssaop.OpAtomicOr32value, types.NewTuple(types.Types[types.TUINT32], types.TypeMem), args[0], args[1], s.mem())
@@ -690,7 +690,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
 			s.vars[memVar] = p1
 			return p0
 		},
-		sys.AMD64, sys.Loong64, sys.RISCV64)
+		sys.AMD64, sys.Loong64, sys.MIPS64, sys.RISCV64)
 
 	// Aliases for atomic load operations
 	alias("internal/runtime/atomic", "Loadint32", "internal/runtime/atomic", "Load", all...)

@@ -230,6 +230,24 @@ func (x Int8s) Len() int {
 	return 16
 }
 
+// LookupOrZero permutes x, returning 0 for out-of-range indices.
+//
+//	if indices[i] < x.Len() {
+//	    z[i] = x[indices[i]]
+//	} else {
+//	    z[i] = 0
+//	}
+func (x Int8s) LookupOrZero(indices Uint8s) (z Int8s) {
+	var res Int8s
+	for i := 0; i < 16; i++ {
+		idx := indices.get(i)
+		if idx < 16 {
+			res.set(i, x.get(int(idx)))
+		}
+	}
+	return res
+}
+
 // Masked returns a vector with elements from x where mask is true, and zero
 // elsewhere.
 //
@@ -402,6 +420,8 @@ func (x Int8s) Xor(y Int8s) (z Int8s) {
 }
 
 // ConvertToUint8 converts each element of x to uint8.
+//
+//	z[i] = uint8(x[i])
 //
 // This wraps unrepresentable values.
 func (x Int8s) ConvertToUint8() (z Uint8s) {
@@ -808,6 +828,8 @@ func (x Int16s) Xor(y Int16s) (z Int16s) {
 
 // ConvertToUint16 converts each element of x to uint16.
 //
+//	z[i] = uint16(x[i])
+//
 // This wraps unrepresentable values.
 func (x Int16s) ConvertToUint16() (z Uint16s) {
 	return Uint16s{a: x.a, b: x.b}
@@ -910,6 +932,8 @@ func (x Int32s) AndNot(y Int32s) (z Int32s) {
 }
 
 // ConvertToFloat32 converts each element of x to float32.
+//
+//	z[i] = float32(x[i])
 func (x Int32s) ConvertToFloat32() (z Float32s) {
 	var res Float32s
 	for i := 0; i < 4; i++ {
@@ -1186,6 +1210,8 @@ func (x Int32s) Xor(y Int32s) (z Int32s) {
 
 // ConvertToUint32 converts each element of x to uint32.
 //
+//	z[i] = uint32(x[i])
+//
 // This wraps unrepresentable values.
 func (x Int32s) ConvertToUint32() (z Uint32s) {
 	return Uint32s{a: x.a, b: x.b}
@@ -1232,6 +1258,20 @@ func (x *Int64s) set(i int, v int64) {
 	} else {
 		x.b = uint64(v)
 	}
+}
+
+// Abs returns the elementwise absolute value of x.
+func (x Int64s) Abs() (z Uint64s) {
+	var res Uint64s
+	for i := 0; i < 2; i++ {
+		v := x.get(i)
+		if v < 0 {
+			res.set(i, uint64(-v))
+		} else {
+			res.set(i, uint64(v))
+		}
+	}
+	return res
 }
 
 // Add adds x and y elementwise.
@@ -1398,6 +1438,18 @@ func (x Int64s) ShiftAllLeft(shift uint64) (z Int64s) {
 	return Int64s{a: x.a << shift, b: x.b << shift}
 }
 
+// ShiftAllRight arithmetically shifts each element of x right by shift bits.
+// If shift is greater than the element width, the result is 0 or -1.
+//
+//	z[i] = x[i] >> shift
+func (x Int64s) ShiftAllRight(shift uint64) (z Int64s) {
+	var res Int64s
+	for i := 0; i < 2; i++ {
+		res.set(i, x.get(i)>>shift)
+	}
+	return res
+}
+
 // Store stores the elements of x into a slice. If len(s) < x.Len(), it panics.
 func (x Int64s) Store(s []int64) {
 	if len(s) > 0 {
@@ -1448,6 +1500,8 @@ func (x Int64s) Xor(y Int64s) (z Int64s) {
 }
 
 // ConvertToUint64 converts each element of x to uint64.
+//
+//	z[i] = uint64(x[i])
 //
 // This wraps unrepresentable values.
 func (x Int64s) ConvertToUint64() (z Uint64s) {
@@ -1574,12 +1628,66 @@ func (x Uint8s) Equal(y Uint8s) (z Mask8s) {
 	return res
 }
 
+// Greater returns a mask indicating which elements of x are greater than y.
+//
+//	z[i] = x[i] > y[i]
+func (x Uint8s) Greater(y Uint8s) (z Mask8s) {
+	var res Mask8s
+	for i := 0; i < 16; i++ {
+		if x.get(i) > y.get(i) {
+			res.set(i, true)
+		}
+	}
+	return res
+}
+
+// GreaterEqual returns a mask indicating which elements of x are greater than
+// or equal to y.
+//
+//	z[i] = x[i] >= y[i]
+func (x Uint8s) GreaterEqual(y Uint8s) (z Mask8s) {
+	var res Mask8s
+	for i := 0; i < 16; i++ {
+		if x.get(i) >= y.get(i) {
+			res.set(i, true)
+		}
+	}
+	return res
+}
+
 // HiToLo returns a vector whose low half is the high half of x and whose high
 // half is zero.
 //
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Uint8s) HiToLo() (z Uint8s) {
 	return Uint8s{a: x.b}
+}
+
+// Less returns a mask indicating which elements of x are less than y.
+//
+//	z[i] = x[i] < y[i]
+func (x Uint8s) Less(y Uint8s) (z Mask8s) {
+	var res Mask8s
+	for i := 0; i < 16; i++ {
+		if x.get(i) < y.get(i) {
+			res.set(i, true)
+		}
+	}
+	return res
+}
+
+// LessEqual returns a mask indicating which elements of x are less than or
+// equal to y.
+//
+//	z[i] = x[i] <= y[i]
+func (x Uint8s) LessEqual(y Uint8s) (z Mask8s) {
+	var res Mask8s
+	for i := 0; i < 16; i++ {
+		if x.get(i) <= y.get(i) {
+			res.set(i, true)
+		}
+	}
+	return res
 }
 
 // NotEqual returns a mask indicating which elements of x and y are not equal.
@@ -1750,6 +1858,8 @@ func (x Uint8s) BitsToInt8() (z Int8s) {
 }
 
 // ConvertToInt8 converts each element of x to int8.
+//
+//	z[i] = int8(x[i])
 //
 // This wraps unrepresentable values.
 func (x Uint8s) ConvertToInt8() (z Int8s) {
@@ -2193,6 +2303,8 @@ func (x Uint16s) BitsToInt16() (z Int16s) {
 
 // ConvertToInt16 converts each element of x to int16.
 //
+//	z[i] = int16(x[i])
+//
 // This wraps unrepresentable values.
 func (x Uint16s) ConvertToInt16() (z Int16s) {
 	return Int16s{a: x.a, b: x.b}
@@ -2596,6 +2708,8 @@ func (x Uint32s) BitsToInt32() (z Int32s) {
 
 // ConvertToInt32 converts each element of x to int32.
 //
+//	z[i] = int32(x[i])
+//
 // This wraps unrepresentable values.
 func (x Uint32s) ConvertToInt32() (z Int32s) {
 	return Int32s{a: x.a, b: x.b}
@@ -2908,6 +3022,8 @@ func (x Uint64s) BitsToInt64() (z Int64s) {
 
 // ConvertToInt64 converts each element of x to int64.
 //
+//	z[i] = int64(x[i])
+//
 // This wraps unrepresentable values.
 func (x Uint64s) ConvertToInt64() (z Int64s) {
 	return Int64s{a: x.a, b: x.b}
@@ -3044,6 +3160,8 @@ func (x Float32s) Ceil() (z Float32s) {
 }
 
 // ConvertToInt32 converts each element of x to int32.
+//
+//	z[i] = int32(x[i])
 //
 // When a conversion is inexact, this truncates the result (rounds toward zero).
 // If the converted result would be outside the representable range, the result
@@ -4122,6 +4240,20 @@ func (x Uint64s) CarrylessMultiplyEven(y Uint64s) (z Uint64s) {
 	return x.clmul(y)
 }
 
+// CarrylessMultiplyEvenOdd computes the elementwise carryless multiplication of
+// even-indexed elements of x and odd-indexed elements of y. The result of each
+// carryless multiply is twice the width of the input elements. The high bits
+// are stored in elements z[2*i+1] and the low bits are stored in elements
+// z[2*i].
+//
+//	concat(z[2*i+1], z[2*i]) = clmul(x[2*i], y[2*i+1])
+//
+// See [CarrylessMultiplyEven] for details about carryless multiply.
+func (x Uint64s) CarrylessMultiplyEvenOdd(y Uint64s) (z Uint64s) {
+	y.a = y.b
+	return x.clmul(y)
+}
+
 // CarrylessMultiplyOdd computes the elementwise carryless multiplication of
 // odd-indexed elements of x and y. The result of each carryless multiply is
 // twice the width of the input elements. The high bits are stored in elements
@@ -4133,6 +4265,20 @@ func (x Uint64s) CarrylessMultiplyEven(y Uint64s) (z Uint64s) {
 func (x Uint64s) CarrylessMultiplyOdd(y Uint64s) (z Uint64s) {
 	x.a = x.b
 	y.a = y.b
+	return x.clmul(y)
+}
+
+// CarrylessMultiplyOddEven computes the elementwise carryless multiplication of
+// odd-indexed elements of x and even-indexed elements of y. The result of each
+// carryless multiply is twice the width of the input elements. The high bits
+// are stored in elements z[2*i+1] and the low bits are stored in elements
+// z[2*i].
+//
+//	concat(z[2*i+1], z[2*i]) = clmul(x[2*i+1], y[2*i])
+//
+// See [CarrylessMultiplyEven] for details about carryless multiply.
+func (x Uint64s) CarrylessMultiplyOddEven(y Uint64s) (z Uint64s) {
+	x.a = x.b
 	return x.clmul(y)
 }
 
@@ -4372,4 +4518,325 @@ func (x Mask64s) TrailingZeros() int {
 		return 1
 	}
 	return 2
+}
+
+// Width-changing conversions. These keep the vector width, so narrowing
+// conversions fill the low elements of the result and zero the rest, and
+// widening conversions convert only the low elements of x.
+
+// ExtendToInt16 sign-extends each element of x to int16.
+//
+//	z[i] = int16(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Int8s) ExtendToInt16() (z Int16s) {
+	for i := 0; i < 8; i++ {
+		z.set(i, int16(x.get(i)))
+	}
+	return z
+}
+
+// ExtendToInt32 sign-extends each element of x to int32.
+//
+//	z[i] = int32(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Int16s) ExtendToInt32() (z Int32s) {
+	for i := 0; i < 4; i++ {
+		z.set(i, int32(x.get(i)))
+	}
+	return z
+}
+
+// ExtendToInt64 sign-extends each element of x to int64.
+//
+//	z[i] = int64(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Int32s) ExtendToInt64() (z Int64s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, int64(x.get(i)))
+	}
+	return z
+}
+
+// ExtendToUint16 zero-extends each element of x to uint16.
+//
+//	z[i] = uint16(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Uint8s) ExtendToUint16() (z Uint16s) {
+	for i := 0; i < 8; i++ {
+		z.set(i, uint16(x.get(i)))
+	}
+	return z
+}
+
+// ExtendToUint32 zero-extends each element of x to uint32.
+//
+//	z[i] = uint32(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Uint16s) ExtendToUint32() (z Uint32s) {
+	for i := 0; i < 4; i++ {
+		z.set(i, uint32(x.get(i)))
+	}
+	return z
+}
+
+// ExtendToUint64 zero-extends each element of x to uint64.
+//
+//	z[i] = uint64(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Uint32s) ExtendToUint64() (z Uint64s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, uint64(x.get(i)))
+	}
+	return z
+}
+
+// TruncToInt8 converts each element of x to int8 by discarding its high
+// bits.
+//
+//	z[i] = int8(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int16s) TruncToInt8() (z Int8s) {
+	for i := 0; i < 8; i++ {
+		z.set(i, int8(x.get(i)))
+	}
+	return z
+}
+
+// TruncToInt16 converts each element of x to int16 by discarding its high
+// bits.
+//
+//	z[i] = int16(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int32s) TruncToInt16() (z Int16s) {
+	for i := 0; i < 4; i++ {
+		z.set(i, int16(x.get(i)))
+	}
+	return z
+}
+
+// TruncToInt32 converts each element of x to int32 by discarding its high
+// bits.
+//
+//	z[i] = int32(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int64s) TruncToInt32() (z Int32s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, int32(x.get(i)))
+	}
+	return z
+}
+
+// TruncToUint8 converts each element of x to uint8 by discarding its high
+// bits.
+//
+//	z[i] = uint8(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Uint16s) TruncToUint8() (z Uint8s) {
+	for i := 0; i < 8; i++ {
+		z.set(i, uint8(x.get(i)))
+	}
+	return z
+}
+
+// TruncToUint16 converts each element of x to uint16 by discarding its high
+// bits.
+//
+//	z[i] = uint16(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Uint32s) TruncToUint16() (z Uint16s) {
+	for i := 0; i < 4; i++ {
+		z.set(i, uint16(x.get(i)))
+	}
+	return z
+}
+
+// TruncToUint32 converts each element of x to uint32 by discarding its high
+// bits.
+//
+//	z[i] = uint32(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Uint64s) TruncToUint32() (z Uint32s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, uint32(x.get(i)))
+	}
+	return z
+}
+
+// SaturateToInt8 converts each element of x to int8, saturating values
+// that are outside the range of int8.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int16s) SaturateToInt8() (z Int8s) {
+	for i := 0; i < 8; i++ {
+		z.set(i, int8(min(max(x.get(i), math.MinInt8), math.MaxInt8)))
+	}
+	return z
+}
+
+// SaturateToUint8 converts each element of x to uint8, saturating values
+// that are outside the range of uint8. Negative values become 0.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int16s) SaturateToUint8() (z Uint8s) {
+	for i := 0; i < 8; i++ {
+		z.set(i, uint8(min(max(x.get(i), 0), math.MaxUint8)))
+	}
+	return z
+}
+
+// SaturateToUint8 converts each element of x to uint8, saturating values
+// that are outside the range of uint8.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Uint16s) SaturateToUint8() (z Uint8s) {
+	for i := 0; i < 8; i++ {
+		z.set(i, uint8(min(x.get(i), math.MaxUint8)))
+	}
+	return z
+}
+
+// SaturateToInt16 converts each element of x to int16, saturating values
+// that are outside the range of int16.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int32s) SaturateToInt16() (z Int16s) {
+	for i := 0; i < 4; i++ {
+		z.set(i, int16(min(max(x.get(i), math.MinInt16), math.MaxInt16)))
+	}
+	return z
+}
+
+// SaturateToUint16 converts each element of x to uint16, saturating values
+// that are outside the range of uint16. Negative values become 0.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int32s) SaturateToUint16() (z Uint16s) {
+	for i := 0; i < 4; i++ {
+		z.set(i, uint16(min(max(x.get(i), 0), math.MaxUint16)))
+	}
+	return z
+}
+
+// SaturateToUint16 converts each element of x to uint16, saturating values
+// that are outside the range of uint16.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Uint32s) SaturateToUint16() (z Uint16s) {
+	for i := 0; i < 4; i++ {
+		z.set(i, uint16(min(x.get(i), math.MaxUint16)))
+	}
+	return z
+}
+
+// SaturateToInt32 converts each element of x to int32, saturating values
+// that are outside the range of int32.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int64s) SaturateToInt32() (z Int32s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, int32(min(max(x.get(i), math.MinInt32), math.MaxInt32)))
+	}
+	return z
+}
+
+// SaturateToUint32 converts each element of x to uint32, saturating values
+// that are outside the range of uint32. Negative values become 0.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Int64s) SaturateToUint32() (z Uint32s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, uint32(min(max(x.get(i), 0), math.MaxUint32)))
+	}
+	return z
+}
+
+// SaturateToUint32 converts each element of x to uint32, saturating values
+// that are outside the range of uint32.
+//
+//	z[i] = sat(x[i])
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Uint64s) SaturateToUint32() (z Uint32s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, uint32(min(x.get(i), math.MaxUint32)))
+	}
+	return z
+}
+
+// ConvertToFloat64 converts each element of x to float64.
+//
+//	z[i] = float64(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Float32s) ConvertToFloat64() (z Float64s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, float64(x.get(i)))
+	}
+	return z
+}
+
+// ConvertToFloat32 converts each element of x to float32.
+//
+//	z[i] = float32(x[i])
+//
+// The results are rounded to the nearest representable value, or ±inf if they
+// cannot be represented.
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Float64s) ConvertToFloat32() (z Float32s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, float32(x.get(i)))
+	}
+	return z
 }

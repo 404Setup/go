@@ -9,19 +9,25 @@ package archsimd
 // broadcast1To2 copies the lowest element of its input to all 2 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTQ, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTQ, CPU Feature: AVX
 func (x Float64x2) broadcast1To2() Float64x2
 
 // broadcast1To2 copies the lowest element of its input to all 2 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTQ, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTQ, CPU Feature: AVX
 func (x Int64x2) broadcast1To2() Int64x2
 
 // broadcast1To2 copies the lowest element of its input to all 2 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTQ, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTQ, CPU Feature: AVX
 func (x Uint64x2) broadcast1To2() Uint64x2
 
 /* broadcast1To2Masked */
@@ -55,7 +61,9 @@ func (x Uint64x2) broadcast1To2Masked(mask Mask64x2) Uint64x2
 // broadcast1To4 copies the lowest element of its input to all 4 elements of
 // the output vector.
 //
-// Asm: VBROADCASTSS, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VBROADCASTSS, CPU Feature: AVX
 func (x Float32x4) broadcast1To4() Float32x4
 
 // broadcast1To4 copies the lowest element of its input to all 4 elements of
@@ -67,7 +75,9 @@ func (x Float64x2) broadcast1To4() Float64x4
 // broadcast1To4 copies the lowest element of its input to all 4 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTD, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTD, CPU Feature: AVX
 func (x Int32x4) broadcast1To4() Int32x4
 
 // broadcast1To4 copies the lowest element of its input to all 4 elements of
@@ -79,7 +89,9 @@ func (x Int64x2) broadcast1To4() Int64x4
 // broadcast1To4 copies the lowest element of its input to all 4 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTD, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTD, CPU Feature: AVX
 func (x Uint32x4) broadcast1To4() Uint32x4
 
 // broadcast1To4 copies the lowest element of its input to all 4 elements of
@@ -155,7 +167,9 @@ func (x Float64x2) broadcast1To8() Float64x8
 // broadcast1To8 copies the lowest element of its input to all 8 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTW, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTW, CPU Feature: AVX
 func (x Int16x8) broadcast1To8() Int16x8
 
 // broadcast1To8 copies the lowest element of its input to all 8 elements of
@@ -173,7 +187,9 @@ func (x Int64x2) broadcast1To8() Int64x8
 // broadcast1To8 copies the lowest element of its input to all 8 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTW, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTW, CPU Feature: AVX
 func (x Uint16x8) broadcast1To8() Uint16x8
 
 // broadcast1To8 copies the lowest element of its input to all 8 elements of
@@ -265,7 +281,9 @@ func (x Float32x4) broadcast1To16() Float32x16
 // broadcast1To16 copies the lowest element of its input to all 16 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTB, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTB, CPU Feature: AVX
 func (x Int8x16) broadcast1To16() Int8x16
 
 // broadcast1To16 copies the lowest element of its input to all 16 elements of
@@ -283,7 +301,9 @@ func (x Int32x4) broadcast1To16() Int32x16
 // broadcast1To16 copies the lowest element of its input to all 16 elements of
 // the output vector.
 //
-// Asm: VPBROADCASTB, CPU Feature: AVX2
+// Without AVX2, the compiler implements this with an AVX shuffle.
+//
+// Asm: VPBROADCASTB, CPU Feature: AVX
 func (x Uint8x16) broadcast1To16() Uint8x16
 
 // broadcast1To16 copies the lowest element of its input to all 16 elements of
@@ -485,6 +505,42 @@ func (x Uint64x4) carrylessMultiply(xyHiLo uint8, y Uint64x4) Uint64x4
 //
 // Asm: VPCLMULQDQ, CPU Feature: AVX512VPCLMULQDQ
 func (x Uint64x8) carrylessMultiply(xyHiLo uint8, y Uint64x8) Uint64x8
+
+/* concatSaturateToInt8 */
+
+// concatSaturateToInt8 converts the element values of x and y to int8 with signed
+// saturation and packs them into the low and high halves of the result
+// (of each 128-bit group, for Grouped).
+//
+// Asm: VPACKSSWB, CPU Feature: AVX
+func (x Int16x8) concatSaturateToInt8(y Int16x8) Int8x16
+
+/* concatSaturateToInt8Grouped */
+
+// concatSaturateToInt8Grouped converts the element values of x and y to int8 with signed
+// saturation and packs them into the low and high halves of the result
+// (of each 128-bit group, for Grouped).
+//
+// Asm: VPACKSSWB, CPU Feature: AVX2
+func (x Int16x16) concatSaturateToInt8Grouped(y Int16x16) Int8x32
+
+/* concatSaturateToUint8 */
+
+// concatSaturateToUint8 converts the signed element values of x and y to uint8 with
+// saturation and packs them into the low and high halves of the result
+// (of each 128-bit group, for Grouped).
+//
+// Asm: VPACKUSWB, CPU Feature: AVX
+func (x Int16x8) concatSaturateToUint8(y Int16x8) Uint8x16
+
+/* concatSaturateToUint8Grouped */
+
+// concatSaturateToUint8Grouped converts the signed element values of x and y to uint8 with
+// saturation and packs them into the low and high halves of the result
+// (of each 128-bit group, for Grouped).
+//
+// Asm: VPACKUSWB, CPU Feature: AVX2
+func (x Int16x16) concatSaturateToUint8Grouped(y Int16x16) Uint8x32
 
 /* concatSelectedConstant */
 
@@ -1041,6 +1097,198 @@ func (x Uint16x16) permuteScalarsLoGrouped(indices uint8) Uint16x16
 // Asm: VPSHUFLW, CPU Feature: AVX512
 func (x Uint16x32) permuteScalarsLoGrouped(indices uint8) Uint16x32
 
+/* saturateToInt8 */
+
+// saturateToInt8 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVSWB, CPU Feature: AVX512
+func (x Int16x8) saturateToInt8() Int8x16
+
+// saturateToInt8 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVSWB, CPU Feature: AVX512
+func (x Int16x16) saturateToInt8() Int8x32
+
+/* saturateToInt8Masked */
+
+// saturateToInt8Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVSWB, CPU Feature: AVX512
+func (x Int16x8) saturateToInt8Masked(mask Mask16x8) Int8x16
+
+// saturateToInt8Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVSWB, CPU Feature: AVX512
+func (x Int16x16) saturateToInt8Masked(mask Mask16x16) Int8x32
+
+/* saturateToInt16 */
+
+// saturateToInt16 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVSDW, CPU Feature: AVX512
+func (x Int32x4) saturateToInt16() Int16x8
+
+// saturateToInt16 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVSDW, CPU Feature: AVX512
+func (x Int32x8) saturateToInt16() Int16x16
+
+/* saturateToInt16Masked */
+
+// saturateToInt16Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVSDW, CPU Feature: AVX512
+func (x Int32x4) saturateToInt16Masked(mask Mask32x4) Int16x8
+
+// saturateToInt16Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVSDW, CPU Feature: AVX512
+func (x Int32x8) saturateToInt16Masked(mask Mask32x8) Int16x16
+
+/* saturateToInt32 */
+
+// saturateToInt32 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVSQD, CPU Feature: AVX512
+func (x Int64x2) saturateToInt32() Int32x4
+
+// saturateToInt32 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVSQD, CPU Feature: AVX512
+func (x Int64x4) saturateToInt32() Int32x8
+
+/* saturateToInt32Masked */
+
+// saturateToInt32Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVSQD, CPU Feature: AVX512
+func (x Int64x2) saturateToInt32Masked(mask Mask64x2) Int32x4
+
+// saturateToInt32Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVSQD, CPU Feature: AVX512
+func (x Int64x4) saturateToInt32Masked(mask Mask64x4) Int32x8
+
+/* saturateToUint8 */
+
+// saturateToUint8 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVUSWB, CPU Feature: AVX512
+func (x Uint16x8) saturateToUint8() Uint8x16
+
+// saturateToUint8 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVUSWB, CPU Feature: AVX512
+func (x Uint16x16) saturateToUint8() Uint8x32
+
+/* saturateToUint8Masked */
+
+// saturateToUint8Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVUSWB, CPU Feature: AVX512
+func (x Uint16x8) saturateToUint8Masked(mask Mask16x8) Uint8x16
+
+// saturateToUint8Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVUSWB, CPU Feature: AVX512
+func (x Uint16x16) saturateToUint8Masked(mask Mask16x16) Uint8x32
+
+/* saturateToUint16 */
+
+// saturateToUint16 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVUSDW, CPU Feature: AVX512
+func (x Uint32x4) saturateToUint16() Uint16x8
+
+// saturateToUint16 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVUSDW, CPU Feature: AVX512
+func (x Uint32x8) saturateToUint16() Uint16x16
+
+/* saturateToUint16Masked */
+
+// saturateToUint16Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVUSDW, CPU Feature: AVX512
+func (x Uint32x4) saturateToUint16Masked(mask Mask32x4) Uint16x8
+
+// saturateToUint16Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVUSDW, CPU Feature: AVX512
+func (x Uint32x8) saturateToUint16Masked(mask Mask32x8) Uint16x16
+
+/* saturateToUint32 */
+
+// saturateToUint32 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVUSQD, CPU Feature: AVX512
+func (x Uint64x2) saturateToUint32() Uint32x4
+
+// saturateToUint32 converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// Asm: VPMOVUSQD, CPU Feature: AVX512
+func (x Uint64x4) saturateToUint32() Uint32x8
+
+/* saturateToUint32Masked */
+
+// saturateToUint32Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVUSQD, CPU Feature: AVX512
+func (x Uint64x2) saturateToUint32Masked(mask Mask64x2) Uint32x4
+
+// saturateToUint32Masked converts element values with saturation, storing the results in
+// the low half of the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVUSQD, CPU Feature: AVX512
+func (x Uint64x4) saturateToUint32Masked(mask Mask64x4) Uint32x8
+
 /* tern */
 
 // tern performs a logical operation on three vectors based on the 8-bit truth table.
@@ -1138,3 +1386,99 @@ func (x Uint64x4) tern(table uint8, y Uint64x4, z Uint64x4) Uint64x4
 //
 // Asm: VPTERNLOGQ, CPU Feature: AVX512
 func (x Uint64x8) tern(table uint8, y Uint64x8, z Uint64x8) Uint64x8
+
+/* truncToUint8 */
+
+// truncToUint8 truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// Asm: VPMOVWB, CPU Feature: AVX512
+func (x Uint16x8) truncToUint8() Uint8x16
+
+// truncToUint8 truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// Asm: VPMOVWB, CPU Feature: AVX512
+func (x Uint16x16) truncToUint8() Uint8x32
+
+/* truncToUint8Masked */
+
+// truncToUint8Masked truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVWB, CPU Feature: AVX512
+func (x Uint16x8) truncToUint8Masked(mask Mask16x8) Uint8x16
+
+// truncToUint8Masked truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVWB, CPU Feature: AVX512
+func (x Uint16x16) truncToUint8Masked(mask Mask16x16) Uint8x32
+
+/* truncToUint16 */
+
+// truncToUint16 truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// Asm: VPMOVDW, CPU Feature: AVX512
+func (x Uint32x4) truncToUint16() Uint16x8
+
+// truncToUint16 truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// Asm: VPMOVDW, CPU Feature: AVX512
+func (x Uint32x8) truncToUint16() Uint16x16
+
+/* truncToUint16Masked */
+
+// truncToUint16Masked truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVDW, CPU Feature: AVX512
+func (x Uint32x4) truncToUint16Masked(mask Mask32x4) Uint16x8
+
+// truncToUint16Masked truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVDW, CPU Feature: AVX512
+func (x Uint32x8) truncToUint16Masked(mask Mask32x8) Uint16x16
+
+/* truncToUint32 */
+
+// truncToUint32 truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// Asm: VPMOVQD, CPU Feature: AVX512
+func (x Uint64x2) truncToUint32() Uint32x4
+
+// truncToUint32 truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// Asm: VPMOVQD, CPU Feature: AVX512
+func (x Uint64x4) truncToUint32() Uint32x8
+
+/* truncToUint32Masked */
+
+// truncToUint32Masked truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVQD, CPU Feature: AVX512
+func (x Uint64x2) truncToUint32Masked(mask Mask64x2) Uint32x4
+
+// truncToUint32Masked truncates element values, storing the results in the low half of
+// the result and zeroing the rest.
+//
+// This operation is applied selectively under a write mask.
+//
+// Asm: VPMOVQD, CPU Feature: AVX512
+func (x Uint64x4) truncToUint32Masked(mask Mask64x4) Uint32x8

@@ -272,6 +272,8 @@ func init() {
 		{name: "BEXTI", argLength: 1, reg: gp11, asm: "BEXTI", aux: "Int64", earlyOk: true}, // (arg0 >> index) & 1
 		{name: "BINV", argLength: 2, reg: gp21, asm: "BINV", earlyOk: true},                 // arg0 ^ (1 << (arg1 & 63))
 		{name: "BINVI", argLength: 1, reg: gp11, asm: "BINVI", aux: "Int64", earlyOk: true}, // arg0 ^ (1 << index)
+		{name: "BSET", argLength: 2, reg: gp21, asm: "BSET", earlyOk: true},                 // arg0 | (1 << (arg1 & 63))
+		{name: "BSETI", argLength: 1, reg: gp11, asm: "BSETI", aux: "Int64", earlyOk: true}, // arg0 | (1 << index)
 
 		// Generate boolean values
 		{name: "SEQZ", argLength: 1, reg: gp11, asm: "SEQZ", earlyOk: true},                 // arg0 == 0, result is 0 or 1
@@ -326,8 +328,16 @@ func init() {
 			needIntTemp:    true,
 			faultOnNilArg0: true,
 			addrSinkArg0:   true,
+			// We dont save RVV in async preemption yet
+			// so mark this as an unsafe point.
+			unsafePoint: true,
 			reg: regInfo{
-				inputs:       []regMask{gpMask},
+				// For GORISCV64 < rva23 this lowers to a runtime branch that
+				// uses either an RVV loop (clobbering X5/X6) or the scalar loop
+				// (using the int temp). For rva23 and later it always uses RVV.
+				// RVV uses V24-V31, which are not allocated by SSA.
+				inputs:       []regMask{gpMask.minus(r5toR6)},
+				clobbers:     r5toR6,
 				clobbersArg0: true,
 			},
 		},

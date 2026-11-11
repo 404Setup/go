@@ -237,6 +237,9 @@ func newClientServerTest(t testing.TB, mode testMode, h Handler, opts ...any) *c
 		}
 		if fakeNet {
 			pnet := nettest.NewPacketNet()
+			t.Cleanup(func() {
+				pnet.Close()
+			})
 			srvAddr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("192.0.2.1:1000"))
 			var cliPort atomic.Uint32
 			cliPort.Store(10000)
@@ -321,6 +324,9 @@ func newClientServerTest(t testing.TB, mode testMode, h Handler, opts ...any) *c
 		if err := http3.RegisterTransport(tr, http3TransportOpts); err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() {
+			tr.HTTP3Transport().Close()
+		})
 		tr.SetHTTP3DialAddrForTesting(func(addr string) string {
 			if fakeNet || addr == "example.com:443" || strings.HasSuffix(addr, ".example.com:443") {
 				return cst.ts.Listener.Addr().String()
@@ -881,15 +887,14 @@ func h12requestContentLength(t *testing.T, bodyfn func() io.Reader, wantLen int6
 	}.run(t)
 }
 
-// Tests that closing the Request.Cancel channel also while still
-// reading the response body. Issue 13159.
+// Tests canceling a request while still reading the response body. Issue 13159.
 func TestCancelRequestMidBody(t *testing.T) {
-	runSynctest(t, testCancelRequestMidBody, http3SkippedMode)
+	runCancelTest(t, testCancelRequestMidBody)
 }
-func testCancelRequestMidBody(t *testing.T, mode testMode) {
+func testCancelRequestMidBody(t *testing.T, test cancelTest) {
 	unblock := make(chan bool)
 	didFlush := make(chan bool, 1)
-	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+	cst := newClientServerTest(t, test.mode, HandlerFunc(func(w ResponseWriter, r *Request) {
 		io.WriteString(w, "Hello")
 		w.(Flusher).Flush()
 		didFlush <- true
@@ -899,8 +904,7 @@ func testCancelRequestMidBody(t *testing.T, mode testMode) {
 	defer close(unblock)
 
 	req, _ := NewRequest("GET", cst.ts.URL, nil)
-	cancel := make(chan struct{})
-	req.Cancel = cancel
+	req = test.newReq(req)
 
 	res, err := cst.c.Do(req)
 	if err != nil {
@@ -918,16 +922,14 @@ func testCancelRequestMidBody(t *testing.T, mode testMode) {
 	}
 	firstRead = firstRead[:n]
 
-	close(cancel)
+	test.cancel(cst.tr, req)
 
 	rest, err := io.ReadAll(res.Body)
 	all := string(firstRead) + string(rest)
 	if all != "Hello" {
 		t.Errorf("Read %q (%q + %q); want Hello", all, firstRead, rest)
 	}
-	if err != ExportErrRequestCanceled {
-		t.Errorf("ReadAll error = %v; want %v", err, ExportErrRequestCanceled)
-	}
+	test.checkErr("ReadAll", err)
 }
 
 // Tests that clients can send trailers to a server and that the server can read them.
@@ -1713,6 +1715,7 @@ func testWriteHeader0(t *testing.T, mode testMode) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer res.Body.Close()
 	if res.StatusCode != 503 {
 		t.Errorf("Response: %v %q; want 503", res.StatusCode, res.Status)
 	}

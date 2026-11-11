@@ -482,6 +482,7 @@ func testRedirectsByMethod(t *testing.T, mode testMode, method string, table []r
 		if err != nil {
 			t.Fatal(err)
 		}
+		res.Body.Close()
 		if res.StatusCode != tt.want {
 			t.Errorf("POST %s: status code = %d; want %d", tt.suffix, res.StatusCode, tt.want)
 		}
@@ -950,9 +951,11 @@ func testClientWithCorrectTLSServerName(t *testing.T, mode testMode) {
 
 	c := ts.Client()
 	c.Transport.(*Transport).TLSClientConfig.ServerName = serverName
-	if _, err := c.Get("https://" + serverName); err != nil {
+	resp, err := c.Get("https://" + serverName)
+	if err != nil {
 		t.Fatalf("expected successful TLS connection, got error: %v", err)
 	}
+	resp.Body.Close()
 }
 
 func TestClientWithIncorrectTLSServerName(t *testing.T) {
@@ -1332,12 +1335,11 @@ func testClientTimeout_Headers(t *testing.T, mode testMode) {
 
 // Issue 16094: if Client.Timeout is set but not hit, a Timeout error shouldn't be
 // returned.
-func TestClientTimeoutCancel(t *testing.T) { runSynctest(t, testClientTimeoutCancel, http3SkippedMode) }
-func testClientTimeoutCancel(t *testing.T, mode testMode) {
+func TestClientTimeoutCancel(t *testing.T) { runCancelTest(t, testClientTimeoutCancel) }
+func testClientTimeoutCancel(t *testing.T, test cancelTest) {
 	testDone := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
 
-	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+	cst := newClientServerTest(t, test.mode, HandlerFunc(func(w ResponseWriter, r *Request) {
 		w.(Flusher).Flush()
 		<-testDone
 	}))
@@ -1345,16 +1347,15 @@ func testClientTimeoutCancel(t *testing.T, mode testMode) {
 
 	cst.c.Timeout = 1 * time.Hour
 	req, _ := NewRequest("GET", cst.ts.URL, nil)
-	req.Cancel = ctx.Done()
+	req = test.newReq(req)
 	res, err := cst.c.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cancel()
+	defer res.Body.Close()
+	test.cancel(cst.tr, req)
 	_, err = io.Copy(io.Discard, res.Body)
-	if err != ExportErrRequestCanceled {
-		t.Fatalf("error = %v; want errRequestCanceled", err)
-	}
+	test.checkErr("io.Copy", err)
 }
 
 // Issue 49366: if Client.Timeout is set but not hit, no error should be returned.
