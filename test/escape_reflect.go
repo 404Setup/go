@@ -456,7 +456,7 @@ func append1(s []int, x int) []int { // ERROR "leaking param: s$"
 
 // Unfortunate: s doesn't need escape, only leak to result.
 func append2(s, x []int) []int { // ERROR "leaking param: s$" "x does not escape"
-	sv := reflect.ValueOf(s) // ERROR "s escapes to heap"
+	sv := reflect.ValueOf(s) // ERROR "s does not escape"
 	xv := reflect.ValueOf(x) // ERROR "x does not escape"
 	rv := reflect.AppendSlice(sv, xv)
 	return rv.Interface().([]int)
