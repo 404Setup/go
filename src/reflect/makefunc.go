@@ -56,7 +56,7 @@ func MakeFunc(typ Type, fn func(args []Value) (results []Value)) Value {
 	code := abi.FuncPCABI0(makeFuncStub)
 
 	// makeFuncImpl contains a stack map for use by the runtime
-	_, _, abid := funcLayout(ftyp, nil)
+	abid := &funcLayoutOf(ftyp, nil).abid
 
 	impl := &makeFuncImpl{
 		makeFuncCtxt: makeFuncCtxt{
@@ -114,7 +114,7 @@ func makeMethodValue(v Value, i int) Value {
 	code := methodValueCallCodePtr()
 
 	// methodValue contains a stack map for use by the runtime
-	_, _, abid := funcLayout(ftyp, nil)
+	abid := &funcLayoutOf(ftyp, nil).abid
 	fv := &methodValue{
 		makeFuncCtxt: makeFuncCtxt{
 			fn:      code,

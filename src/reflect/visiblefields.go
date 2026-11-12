@@ -4,6 +4,8 @@
 
 package reflect
 
+import "unsafe"
+
 // VisibleFields returns all the visible fields in t, which must be a
 // struct type. A field is defined as visible if it's accessible
 // directly with a FieldByName call. The returned fields include fields
@@ -19,6 +21,9 @@ func VisibleFields(t Type) []StructField {
 	}
 	if t.Kind() != Struct {
 		panic("reflect.VisibleFields of non-struct type")
+	}
+	if fields, ok := visibleFieldsFlat(t); ok {
+		return fields
 	}
 	w := &visibleFieldsWalker{
 		byName:   make(map[string]int),
@@ -44,6 +49,48 @@ func VisibleFields(t Type) []StructField {
 		j++
 	}
 	return w.fields[:j]
+}
+
+// visibleFieldsFlat is [VisibleFields] for the common case of a struct
+// type without embedded fields, where there is nothing to walk or to
+// hide other than blank fields: two or more fields named _ cancel one
+// another out, as they would in the walk. It reports false if t does have
+// embedded fields.
+func visibleFieldsFlat(t Type) ([]StructField, bool) {
+	st, ok := t.(*rtype)
+	if !ok {
+		return nil, false
+	}
+	tt := (*structType)(unsafe.Pointer(st))
+	blanks := 0
+	for i := range tt.Fields {
+		f := &tt.Fields[i]
+		if f.Embedded() {
+			return nil, false
+		}
+		if f.Name.IsBlank() {
+			blanks++
+		}
+	}
+	n := len(tt.Fields)
+	if blanks > 1 {
+		n -= blanks
+	}
+	fields := make([]StructField, 0, n)
+	// Give the fields' Index slices one backing array. Each is limited to
+	// its own element, so appending to one cannot overwrite another.
+	index := make([]int, n)
+	for i := range tt.Fields {
+		if blanks > 1 && tt.Fields[i].Name.IsBlank() {
+			continue
+		}
+		f := tt.Field(i)
+		j := len(fields)
+		index[j] = i
+		f.Index = index[j : j+1 : j+1]
+		fields = append(fields, f)
+	}
+	return fields, true
 }
 
 type visibleFieldsWalker struct {

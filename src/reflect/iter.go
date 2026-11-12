@@ -5,8 +5,25 @@
 package reflect
 
 import (
+	"internal/goarch"
 	"iter"
+	"runtime"
+	"unsafe"
 )
+
+var intType = rtypeOf(0)
+
+func valueOfInt(i int) Value {
+	if uint(i) < 256 && runtime.GOOS != "js" && runtime.GOOS != "wasip1" {
+		staticuint64s := getStaticuint64s()
+		p := unsafe.Pointer(&(*staticuint64s)[i])
+		if goarch.BigEndian && unsafe.Sizeof(int(0)) == 4 {
+			p = unsafe.Add(p, 4)
+		}
+		return Value{intType, p, flag(Int) | flagIndir}
+	}
+	return ValueOf(i)
+}
 
 func rangeNum[T int8 | int16 | int32 | int64 | int |
 	uint8 | uint16 | uint32 | uint64 | uint |
@@ -15,7 +32,12 @@ func rangeNum[T int8 | int16 | int32 | int64 | int |
 		convert := t.PkgPath() != ""
 		// cannot use range T(v) because no core type.
 		for i := T(0); i < T(num); i++ {
-			tmp := ValueOf(i)
+			var tmp Value
+			if t.Kind() == Int {
+				tmp = valueOfInt(int(i))
+			} else {
+				tmp = ValueOf(i)
+			}
 			// if the iteration value type is define by
 			// type T built-in type.
 			if convert {
@@ -74,7 +96,7 @@ func (v Value) Seq() iter.Seq[Value] {
 		n := v.Type().Elem().Len()
 		return func(yield func(Value) bool) {
 			for i := range n {
-				if !yield(ValueOf(i)) {
+				if !yield(valueOfInt(i)) {
 					return
 				}
 			}
@@ -82,7 +104,7 @@ func (v Value) Seq() iter.Seq[Value] {
 	case Array, Slice:
 		return func(yield func(Value) bool) {
 			for i := range v.Len() {
-				if !yield(ValueOf(i)) {
+				if !yield(valueOfInt(i)) {
 					return
 				}
 			}
@@ -90,7 +112,7 @@ func (v Value) Seq() iter.Seq[Value] {
 	case String:
 		return func(yield func(Value) bool) {
 			for i := range v.String() {
-				if !yield(ValueOf(i)) {
+				if !yield(valueOfInt(i)) {
 					return
 				}
 			}
@@ -138,7 +160,7 @@ func (v Value) Seq2() iter.Seq2[Value, Value] {
 		return func(yield func(Value, Value) bool) {
 			v = v.Elem()
 			for i := range v.Len() {
-				if !yield(ValueOf(i), v.Index(i)) {
+				if !yield(valueOfInt(i), v.Index(i)) {
 					return
 				}
 			}
@@ -146,7 +168,7 @@ func (v Value) Seq2() iter.Seq2[Value, Value] {
 	case Array, Slice:
 		return func(yield func(Value, Value) bool) {
 			for i := range v.Len() {
-				if !yield(ValueOf(i), v.Index(i)) {
+				if !yield(valueOfInt(i), v.Index(i)) {
 					return
 				}
 			}
@@ -154,7 +176,7 @@ func (v Value) Seq2() iter.Seq2[Value, Value] {
 	case String:
 		return func(yield func(Value, Value) bool) {
 			for i, v := range v.String() {
-				if !yield(ValueOf(i), ValueOf(v)) {
+				if !yield(valueOfInt(i), ValueOf(v)) {
 					return
 				}
 			}

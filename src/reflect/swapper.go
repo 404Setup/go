@@ -32,7 +32,7 @@ func Swapper(slice any) func(i, j int) {
 		}
 	}
 
-	typ := v.Type().Elem().common()
+	typ := v.typ().Elem()
 	size := typ.Size()
 	hasPtr := typ.Pointers()
 
@@ -42,12 +42,21 @@ func Swapper(slice any) func(i, j int) {
 			ps := *(*[]unsafe.Pointer)(v.ptr)
 			return func(i, j int) { ps[i], ps[j] = ps[j], ps[i] }
 		}
+		if size == 2*goarch.PtrSize && typ.Kind() == abi.Interface {
+			is := *(*[][2]unsafe.Pointer)(v.ptr)
+			return func(i, j int) { is[i], is[j] = is[j], is[i] }
+		}
 		if typ.Kind() == abi.String {
 			ss := *(*[]string)(v.ptr)
 			return func(i, j int) { ss[i], ss[j] = ss[j], ss[i] }
 		}
 	} else {
 		switch size {
+		case 16:
+			if typ.Align() >= 8 {
+				is := *(*[][2]int64)(v.ptr)
+				return func(i, j int) { is[i], is[j] = is[j], is[i] }
+			}
 		case 8:
 			is := *(*[]int64)(v.ptr)
 			return func(i, j int) { is[i], is[j] = is[j], is[i] }

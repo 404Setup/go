@@ -22,6 +22,7 @@ import (
 	"iter"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"sync/v2"
 	"unicode"
 	"unicode/utf8"
@@ -642,6 +643,24 @@ func (t *rtype) NumMethod() int {
 	return len(t.exportedMethods())
 }
 
+// A methodKey is the key for use in the methodCache.
+type methodKey struct {
+	t *rtype
+	i int
+}
+
+// A methodInfo holds the parts of a Method that are expensive to
+// construct and identical for every call of Method with the same key.
+type methodInfo struct {
+	typ Type           // Method.Type
+	tfn unsafe.Pointer // the code pointer; Value.ptr will point here
+}
+
+// methodCache caches the func type and function value built by rtype.Method.
+// It is bounded by the total number of exported methods of types
+// that Method has been called on.
+var methodCache sync.Map[methodKey, *methodInfo]
+
 func (t *rtype) Method(i int) (m Method) {
 	if t.Kind() == Interface {
 		tt := (*interfaceType)(unsafe.Pointer(t))
@@ -654,25 +673,29 @@ func (t *rtype) Method(i int) (m Method) {
 	p := methods[i]
 	pname := t.nameOff(p.Name)
 	m.Name = pname.Name()
-	fl := flag(Func)
-	mtyp := t.typeOff(p.Mtyp)
-	ft := (*funcType)(unsafe.Pointer(mtyp))
-	in := make([]Type, 0, 1+ft.NumIn())
-	in = append(in, t)
-	for _, arg := range ft.InSlice() {
-		in = append(in, toRType(arg))
-	}
-	out := make([]Type, 0, ft.NumOut())
-	for _, ret := range ft.OutSlice() {
-		out = append(out, toRType(ret))
-	}
-	mt := FuncOf(in, out, ft.IsVariadic())
-	m.Type = mt
-	tfn := t.textOff(p.Tfn)
-	fn := unsafe.Pointer(&tfn)
-	m.Func = Value{&mt.(*rtype).t, fn, fl}
-
 	m.Index = i
+
+	key := methodKey{t, i}
+	mi, ok := methodCache.Load(key)
+	if !ok {
+		mtyp := t.typeOff(p.Mtyp)
+		ft := (*funcType)(unsafe.Pointer(mtyp))
+		in := make([]Type, 0, 1+ft.NumIn())
+		in = append(in, t)
+		for _, arg := range ft.InSlice() {
+			in = append(in, toRType(arg))
+		}
+		out := make([]Type, 0, ft.NumOut())
+		for _, ret := range ft.OutSlice() {
+			out = append(out, toRType(ret))
+		}
+		mi, _ = methodCache.LoadOrStore(key, &methodInfo{
+			typ: FuncOf(in, out, ft.IsVariadic()),
+			tfn: t.textOff(p.Tfn),
+		})
+	}
+	m.Type = mi.typ
+	m.Func = Value{&mi.typ.(*rtype).t, unsafe.Pointer(&mi.tfn), flag(Func)}
 	return m
 }
 
@@ -969,9 +992,10 @@ func (t *rtype) Fields() iter.Seq[StructField] {
 	if t.Kind() != Struct {
 		panic("reflect: Fields of non-struct type " + t.String())
 	}
+	tt := (*structType)(unsafe.Pointer(t))
 	return func(yield func(StructField) bool) {
-		for i := range t.NumField() {
-			if !yield(t.Field(i)) {
+		for i := range len(tt.Fields) {
+			if !yield(tt.Field(i)) {
 				return
 			}
 		}
@@ -1383,7 +1407,68 @@ func (t *structType) FieldByName(name string) (f StructField, present bool) {
 	if !hasEmbeds {
 		return
 	}
-	return t.FieldByNameFunc(func(s string) bool { return s == name })
+	f, present = t.promotedFieldByName(name)
+	if present {
+		// The cached Index is shared; callers may modify the slice they get.
+		f.Index = append([]int(nil), f.Index...)
+	}
+	return
+}
+
+// A fieldByNameKey is the key for use in the fieldByNameCache.
+type fieldByNameKey struct {
+	t    *structType
+	name string
+}
+
+// fieldByNameCache caches the result of the breadth-first search done for
+// FieldByName on structs with embedded fields, which is expensive and
+// allocates heavily. A nil value records that the name was not found
+// (or is ambiguous).
+//
+// Successful lookups are bounded by the number of distinct (struct type,
+// field name) pairs that exist. Failed lookups can be made with arbitrary
+// names, so they are only cached while fieldByNameNegatives is below
+// maxFieldByNameNegatives and the name is short.
+var fieldByNameCache sync.Map[fieldByNameKey, *StructField]
+
+const (
+	maxFieldByNameNegatives   = 4096
+	maxFieldByNameNegativeLen = 128
+)
+
+var fieldByNameNegatives atomic.Int32
+
+// promotedFieldByName is like FieldByNameFunc with a match function
+// that compares against name, but caches results.
+// The Index of the returned StructField is shared with the cache
+// and must not be modified or exposed to callers.
+func (t *structType) promotedFieldByName(name string) (StructField, bool) {
+	key := fieldByNameKey{t, name}
+	if p, ok := fieldByNameCache.Load(key); ok {
+		if p == nil {
+			return StructField{}, false
+		}
+		return *p, true
+	}
+	f, ok := t.FieldByNameFunc(func(s string) bool { return s == name })
+	if !ok {
+		if len(name) <= maxFieldByNameNegativeLen && fieldByNameNegatives.Load() < maxFieldByNameNegatives {
+			// Clone the name so that the cache does not pin a larger allocation.
+			key.name = string(append([]byte(nil), name...))
+			if _, loaded := fieldByNameCache.LoadOrStore(key, nil); !loaded {
+				fieldByNameNegatives.Add(1)
+			}
+		}
+		return StructField{}, false
+	}
+	// Key the entry by the field's own name rather than the caller's
+	// string, which might pin a much larger allocation.
+	key.name = f.Name
+	p := new(StructField)
+	*p = f
+	actual, _ := fieldByNameCache.LoadOrStore(key, p)
+	return *actual, true
 }
 
 // TypeOf returns the reflection [Type] that represents the dynamic type of i.
@@ -2856,12 +2941,27 @@ type layoutKey struct {
 }
 
 type layoutType struct {
+	key       layoutKey // the key this layout was computed for; used by layoutFast
 	t         *abi.Type
 	framePool *sync.Pool[unsafe.Pointer]
 	abid      abiDesc
 }
 
-var layoutCache sync.Map[layoutKey, layoutType] // map[layoutKey]layoutType
+var layoutCache sync.Map[layoutKey, *layoutType] // map[layoutKey]*layoutType
+
+// layoutFast is a small direct-mapped cache in front of layoutCache.
+// Hashing a layoutKey for layoutCache is a noticeable part of the cost
+// of a reflect call, whereas here the slot is computed from the key's
+// pointers. A slot may be overwritten by a colliding key at any time;
+// layoutCache remains the source of truth.
+const layoutFastSize = 256 // must be a power of two
+
+var layoutFast [layoutFastSize]atomic.Pointer[layoutType]
+
+func layoutFastIndex(k layoutKey) uintptr {
+	h := uintptr(unsafe.Pointer(k.ftyp))>>4 ^ (uintptr(unsafe.Pointer(k.rcvr))>>4)*0x9E3779B1
+	return (h ^ h>>8) & (layoutFastSize - 1)
+}
 
 // funcLayout computes a struct type representing the layout of the
 // stack-assigned function arguments and return values for the function
@@ -2871,20 +2971,36 @@ var layoutCache sync.Map[layoutKey, layoutType] // map[layoutKey]layoutType
 // Currently, that's just size and the GC program. We also fill in
 // the name for possible debugging use.
 func funcLayout(t *funcType, rcvr *abi.Type) (frametype *abi.Type, framePool *sync.Pool[unsafe.Pointer], abid abiDesc) {
+	lt := funcLayoutOf(t, rcvr)
+	return lt.t, lt.framePool, lt.abid
+}
+
+// funcLayoutOf is like funcLayout but returns the shared cached layout
+// instead of copying it. The result must not be modified.
+func funcLayoutOf(t *funcType, rcvr *abi.Type) *layoutType {
+	k := layoutKey{t, rcvr}
+	slot := &layoutFast[layoutFastIndex(k)]
+	if lt := slot.Load(); lt != nil && lt.key == k {
+		return lt
+	}
+	lt := funcLayoutSlow(t, rcvr, k)
+	slot.Store(lt)
+	return lt
+}
+
+func funcLayoutSlow(t *funcType, rcvr *abi.Type, k layoutKey) *layoutType {
 	if t.Kind() != abi.Func {
 		panic("reflect: funcLayout of non-func type " + stringFor(&t.Type))
 	}
 	if rcvr != nil && rcvr.Kind() == abi.Interface {
 		panic("reflect: funcLayout with interface receiver " + stringFor(rcvr))
 	}
-	k := layoutKey{t, rcvr}
-	if lti, ok := layoutCache.Load(k); ok {
-		lt := lti
-		return lt.t, lt.framePool, lt.abid
+	if lt, ok := layoutCache.Load(k); ok {
+		return lt
 	}
 
 	// Compute the ABI layout.
-	abid = newAbiDesc(t, rcvr)
+	abid := newAbiDesc(t, rcvr)
 
 	// build dummy rtype holding gc program
 	x := &abi.Type{
@@ -2909,16 +3025,16 @@ func funcLayout(t *funcType, rcvr *abi.Type) (frametype *abi.Type, framePool *sy
 	x.Str = resolveReflectName(newName(s, "", false, false))
 
 	// cache result for future callers
-	framePool = &sync.Pool[unsafe.Pointer]{New: func() unsafe.Pointer {
+	framePool := &sync.Pool[unsafe.Pointer]{New: func() unsafe.Pointer {
 		return unsafe_New(x)
 	}}
-	lti, _ := layoutCache.LoadOrStore(k, layoutType{
+	lt, _ := layoutCache.LoadOrStore(k, &layoutType{
+		key:       k,
 		t:         x,
 		framePool: framePool,
 		abid:      abid,
 	})
-	lt := lti
-	return lt.t, lt.framePool, lt.abid
+	return lt
 }
 
 // Note: this type must agree with runtime.bitvector.

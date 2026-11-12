@@ -7,6 +7,7 @@
 package reflect
 
 import (
+	"internal/abi"
 	"internal/bytealg"
 	"unsafe"
 )
@@ -14,21 +15,83 @@ import (
 // During deepValueEqual, must keep track of checks that are
 // in progress. The comparison algorithm assumes that all
 // checks in progress are true when it reencounters them.
-// Visited comparisons are stored in a map indexed by visit.
+// Visited comparisons are stored in a visitSet indexed by visit.
 type visit struct {
 	a1  unsafe.Pointer
 	a2  unsafe.Pointer
-	typ Type
+	typ *abi.Type
+}
+
+// A visitSet is a set of visits. Almost all comparisons visit only a few
+// references, so the first ones are kept in an array that is searched
+// linearly, and the map, which has to be allocated, is only used for the rest.
+type visitSet struct {
+	n     int
+	small [8]visit
+	m     map[visit]struct{}
+}
+
+func (s *visitSet) has(v visit) bool {
+	for i := 0; i < s.n; i++ {
+		if s.small[i] == v {
+			return true
+		}
+	}
+	if s.m != nil {
+		_, ok := s.m[v]
+		return ok
+	}
+	return false
+}
+
+func (s *visitSet) add(v visit) {
+	if s.n < len(s.small) {
+		s.small[s.n] = v
+		s.n++
+		return
+	}
+	if s.m == nil {
+		s.m = make(map[visit]struct{})
+	}
+	s.m[v] = struct{}{}
+}
+
+// mayCycle reports whether comparing values of type t with deepValueEqual
+// can reach a reference cycle, that is, whether a value of type t can hold
+// pointers, maps, slices, or interfaces. Values of other types, including
+// strings, channels and funcs (which are not traversed), cannot.
+func mayCycle(t *abi.Type) bool {
+	if !t.Pointers() {
+		return false
+	}
+	switch t.Kind() {
+	case abi.String, abi.Chan, abi.Func, abi.UnsafePointer:
+		return false
+	case abi.Array:
+		return mayCycle((*abi.ArrayType)(unsafe.Pointer(t)).Elem)
+	case abi.Struct:
+		for _, f := range (*abi.StructType)(unsafe.Pointer(t)).Fields {
+			if mayCycle(f.Typ) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // Tests for deep equality using reflected types. The map argument tracks
 // comparisons that have already been seen, which allows short circuiting on
 // recursive types.
-func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
+func deepValueEqual(v1, v2 Value, visited *visitSet) bool {
 	if !v1.IsValid() || !v2.IsValid() {
 		return v1.IsValid() == v2.IsValid()
 	}
-	if v1.Type() != v2.Type() {
+	if v1.flag&flagMethod == 0 && v2.flag&flagMethod == 0 {
+		if v1.typ() != v2.typ() {
+			return false
+		}
+	} else if v1.Type() != v2.Type() {
 		return false
 	}
 
@@ -47,8 +110,23 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 				// all empty structs.
 				return false
 			}
-			fallthrough
-		case Map, Slice, Interface:
+			if !mayCycle(v1.typ().Elem()) {
+				return false
+			}
+			// Nil pointers cannot be cyclic. Avoid putting them in the visited map.
+			return !v1.IsNil() && !v2.IsNil()
+		case Slice:
+			if !mayCycle(v1.typ().Elem()) {
+				return false
+			}
+			return !v1.IsNil() && !v2.IsNil()
+		case Map:
+			tt := (*abi.MapType)(unsafe.Pointer(v1.typ()))
+			if !mayCycle(tt.Key) && !mayCycle(tt.Elem) {
+				return false
+			}
+			return !v1.IsNil() && !v2.IsNil()
+		case Interface:
 			// Nil pointers cannot be cyclic. Avoid putting them in the visited map.
 			return !v1.IsNil() && !v2.IsNil()
 		}
@@ -77,18 +155,20 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 		}
 
 		// Short circuit if references are already seen.
-		typ := v1.Type()
-		v := visit{addr1, addr2, typ}
-		if visited[v] {
+		v := visit{addr1, addr2, v1.typ()}
+		if visited.has(v) {
 			return true
 		}
 
 		// Remember for later.
-		visited[v] = true
+		visited.add(v)
 	}
 
 	switch v1.Kind() {
 	case Array:
+		if !v1.typ().Pointers() && v1.typ().TFlag&abi.TFlagRegularMemory != 0 {
+			return bytealg.Equal(unsafe.Slice((*byte)(v1.ptr), v1.typ().Size()), unsafe.Slice((*byte)(v2.ptr), v2.typ().Size()))
+		}
 		for i := 0; i < v1.Len(); i++ {
 			if !deepValueEqual(v1.Index(i), v2.Index(i), visited) {
 				return false
@@ -105,9 +185,12 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 		if v1.UnsafePointer() == v2.UnsafePointer() {
 			return true
 		}
-		// Special case for []byte, which is common.
-		if v1.Type().Elem().Kind() == Uint8 {
-			return bytealg.Equal(v1.Bytes(), v2.Bytes())
+		// Special case for slices of types without pointers and without
+		// padding or floating point (such as []byte), which are common:
+		// elements are equal exactly when their memory is.
+		if et := v1.typ().Elem(); et.TFlag&abi.TFlagRegularMemory != 0 && !et.Pointers() {
+			size := uintptr(v1.Len()) * et.Size()
+			return bytealg.Equal(unsafe.Slice((*byte)(v1.UnsafePointer()), size), unsafe.Slice((*byte)(v2.UnsafePointer()), size))
 		}
 		for i := 0; i < v1.Len(); i++ {
 			if !deepValueEqual(v1.Index(i), v2.Index(i), visited) {
@@ -126,6 +209,9 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 		}
 		return deepValueEqual(v1.Elem(), v2.Elem(), visited)
 	case Struct:
+		if !v1.typ().Pointers() && v1.typ().TFlag&abi.TFlagRegularMemory != 0 {
+			return bytealg.Equal(unsafe.Slice((*byte)(v1.ptr), v1.typ().Size()), unsafe.Slice((*byte)(v2.ptr), v2.typ().Size()))
+		}
 		for i, n := 0, v1.NumField(); i < n; i++ {
 			if !deepValueEqual(v1.Field(i), v2.Field(i), visited) {
 				return false
@@ -142,11 +228,16 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 		if v1.UnsafePointer() == v2.UnsafePointer() {
 			return true
 		}
+		// The entries are only read and the map is not modified, so
+		// look at them in place rather than copying each one out.
+		tt := (*abi.MapType)(unsafe.Pointer(v1.typ()))
+		ro := v1.flag.ro()
 		iter := v1.MapRange()
 		for iter.Next() {
-			val1 := iter.Value()
-			val2 := v2.MapIndex(iter.Key())
-			if !val1.IsValid() || !val2.IsValid() || !deepValueEqual(val1, val2, visited) {
+			key := viewVal(tt.Key, ro|flag(tt.Key.Kind()), iter.hiter.Key())
+			val1 := viewVal(tt.Elem, ro|flag(tt.Elem.Kind()), iter.hiter.Elem())
+			e2, fl2 := v2.mapIndexPtr(key)
+			if e2 == nil || !deepValueEqual(val1, viewVal(tt.Elem, fl2, e2), visited) {
 				return false
 			}
 		}
@@ -232,8 +323,13 @@ func DeepEqual(x, y any) bool {
 	}
 	v1 := ValueOf(x)
 	v2 := ValueOf(y)
-	if v1.Type() != v2.Type() {
+	if v1.flag&flagMethod == 0 && v2.flag&flagMethod == 0 {
+		if v1.typ() != v2.typ() {
+			return false
+		}
+	} else if v1.Type() != v2.Type() {
 		return false
 	}
-	return deepValueEqual(v1, v2, make(map[visit]bool))
+	var visited visitSet
+	return deepValueEqual(v1, v2, &visited)
 }

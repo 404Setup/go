@@ -7,6 +7,7 @@ package reflect
 import (
 	"errors"
 	"internal/abi"
+	"internal/bytealg"
 	"internal/goarch"
 	"internal/strconv"
 	"internal/unsafeheader"
@@ -396,13 +397,14 @@ func (v Value) call(op string, in []Value) []Value {
 	t := (*funcType)(unsafe.Pointer(v.typ()))
 	var (
 		fn       unsafe.Pointer
+		fnCell   unsafe.Pointer // backing store for fn of a concrete-receiver method; see methodReceiver
 		rcvr     Value
 		rcvrtype *abi.Type
 	)
 	if v.flag&flagMethod != 0 {
 		fv := (*methodValue)(v.ptr)
 		rcvr = fv.rcvr
-		rcvrtype, t, fn = methodReceiver(op, fv.rcvr, fv.method)
+		rcvrtype, t, fn = methodReceiver(op, fv.rcvr, fv.method, &fnCell)
 	} else if v.flag&flagIndir != 0 {
 		fn = *(*unsafe.Pointer)(v.ptr)
 	} else {
@@ -443,29 +445,45 @@ func (v Value) call(op string, in []Value) []Value {
 		}
 	}
 	for i := 0; i < n; i++ {
-		if xt, targ := in[i].Type(), t.In(i); !xt.AssignableTo(toRType(targ)) {
+		targ := t.In(i)
+		if x := in[i]; x.flag&flagMethod == 0 && x.typ() == targ {
+			// Identical types are trivially assignable.
+			continue
+		}
+		if xt := in[i].Type(); !xt.AssignableTo(toRType(targ)) {
 			panic("reflect: " + op + " using " + xt.String() + " as type " + stringFor(targ))
 		}
 	}
+	// For a variadic call the trailing arguments are packed into a slice.
+	// The slice header lives on the stack: it is only read to copy it into
+	// the argument frame, and is never retained, so only the backing array
+	// is allocated. varHdr is deliberately kept out of in so that a pointer
+	// to the stack never ends up in heap memory.
+	var (
+		varHdr   unsafeheader.Slice
+		varSlice Value
+	)
+	nin := len(in)
 	if !isSlice && isVariadic {
 		// prepare slice for remaining values
 		m := len(in) - n
-		slice := MakeSlice(toRType(t.In(n)), m, m)
-		elem := toRType(t.In(n)).Elem() // FIXME cast to slice type and Elem()
+		sliceType := t.In(n)
+		elemType := sliceType.Elem()
+		varHdr = unsafeheader.Slice{Data: unsafe_NewArray(elemType, m), Len: m, Cap: m}
+		varSlice = Value{sliceType, abi.NoEscape(unsafe.Pointer(&varHdr)), flagIndir | flag(Slice)}
 		for i := 0; i < m; i++ {
 			x := in[n+i]
-			if xt := x.Type(); !xt.AssignableTo(elem) {
-				panic("reflect: cannot use " + xt.String() + " as type " + elem.String() + " in " + op)
+			if x.flag&flagMethod != 0 || x.typ() != elemType {
+				if xt := x.Type(); !xt.AssignableTo(toRType(elemType)) {
+					panic("reflect: cannot use " + xt.String() + " as type " + stringFor(elemType) + " in " + op)
+				}
 			}
-			slice.Index(i).Set(x)
+			varSlice.Index(i).Set(x)
 		}
-		origIn := in
-		in = make([]Value, n+1)
-		copy(in[:n], origIn)
-		in[n] = slice
+		in = in[:n]
+		nin = n + 1
 	}
 
-	nin := len(in)
 	if nin != t.NumIn() {
 		panic("reflect.Value.Call: wrong argument count")
 	}
@@ -475,7 +493,8 @@ func (v Value) call(op string, in []Value) []Value {
 	var regArgs abi.RegArgs
 
 	// Compute frame type.
-	frametype, framePool, abid := funcLayout(t, rcvrtype)
+	lt := funcLayoutOf(t, rcvrtype)
+	frametype, framePool, abid := lt.t, lt.framePool, &lt.abid
 
 	// Allocate a chunk of memory for frame if needed.
 	var stackArgs unsafe.Pointer
@@ -520,7 +539,13 @@ func (v Value) call(op string, in []Value) []Value {
 	}
 
 	// Handle arguments.
-	for i, v := range in {
+	for i := 0; i < nin; i++ {
+		var v Value
+		if i < len(in) {
+			v = in[i]
+		} else {
+			v = varSlice
+		}
 		v.mustBeExported()
 		targ := toRType(t.In(i))
 		// TODO(mknyszek): Figure out if it's possible to get some
@@ -711,7 +736,7 @@ func callReflect(ctxt *makeFuncImpl, frame unsafe.Pointer, retValid *bool, regs 
 	ftyp := ctxt.ftyp
 	f := ctxt.fn
 
-	_, _, abid := funcLayout(ftyp, nil)
+	abid := &funcLayoutOf(ftyp, nil).abid
 
 	// Copy arguments into Values.
 	ptr := frame
@@ -879,7 +904,12 @@ func callReflect(ctxt *makeFuncImpl, frame unsafe.Pointer, retValid *bool, regs 
 // The return value rcvrtype gives the method's actual receiver type.
 // The return value t gives the method type signature (without the receiver).
 // The return value fn is a pointer to the method code.
-func methodReceiver(op string, v Value, methodIndex int) (rcvrtype *abi.Type, t *funcType, fn unsafe.Pointer) {
+//
+// For a concrete receiver type fn points at *cell, which methodReceiver
+// fills in with the code pointer. The caller supplies cell (typically a
+// stack variable that is only handed to [call], which does not retain it)
+// so that no allocation is needed to build the func value.
+func methodReceiver(op string, v Value, methodIndex int, cell *unsafe.Pointer) (rcvrtype *abi.Type, t *funcType, fn unsafe.Pointer) {
 	i := methodIndex
 	if v.typ().Kind() == abi.Interface {
 		tt := (*interfaceType)(unsafe.Pointer(v.typ()))
@@ -907,8 +937,8 @@ func methodReceiver(op string, v Value, methodIndex int) (rcvrtype *abi.Type, t 
 		if !nameOffFor(v.typ(), m.Name).IsExported() {
 			panic("reflect: " + op + " of unexported method")
 		}
-		ifn := textOffFor(v.typ(), m.Ifn)
-		fn = unsafe.Pointer(&ifn)
+		*cell = textOffFor(v.typ(), m.Ifn)
+		fn = unsafe.Pointer(cell)
 		t = (*funcType)(unsafe.Pointer(typeOffFor(v.typ(), m.Mtyp)))
 	}
 	return
@@ -958,7 +988,8 @@ func align(x, n uintptr) uintptr {
 // the values returned from ctxt.fn in registers.
 func callMethod(ctxt *methodValue, frame unsafe.Pointer, retValid *bool, regs *abi.RegArgs) {
 	rcvr := ctxt.rcvr
-	rcvrType, valueFuncType, methodFn := methodReceiver("call", rcvr, ctxt.method)
+	var methodFnCell unsafe.Pointer
+	rcvrType, valueFuncType, methodFn := methodReceiver("call", rcvr, ctxt.method, &methodFnCell)
 
 	// There are two ABIs at play here.
 	//
@@ -968,9 +999,10 @@ func callMethod(ctxt *methodValue, frame unsafe.Pointer, retValid *bool, regs *a
 	// Meanwhile, we need to actually call the method with a receiver, which
 	// has its own ABI ("method ABI"). Everything that follows is a translation
 	// between the two.
-	_, _, valueABI := funcLayout(valueFuncType, nil)
+	valueABI := &funcLayoutOf(valueFuncType, nil).abid
 	valueFrame, valueRegs := frame, regs
-	methodFrameType, methodFramePool, methodABI := funcLayout(valueFuncType, rcvrType)
+	methodLayout := funcLayoutOf(valueFuncType, rcvrType)
+	methodFrameType, methodFramePool, methodABI := methodLayout.t, methodLayout.framePool, &methodLayout.abid
 
 	// Make a new frame that is one word bigger so we can store the receiver.
 	// This space is used for both arguments and return values.
@@ -1362,7 +1394,25 @@ func (v Value) FieldByIndexErr(index []int) (Value, error) {
 // It panics if v's Kind is not [Struct].
 func (v Value) FieldByName(name string) Value {
 	v.mustBe(Struct)
-	if f, ok := toRType(v.typ()).FieldByName(name); ok {
+	t := (*structType)(unsafe.Pointer(v.typ()))
+	// Quick check for top-level name, or struct without embedded fields.
+	hasEmbeds := false
+	if name != "" {
+		for i := range t.Fields {
+			tf := &t.Fields[i]
+			if tf.Name.Name() == name {
+				return v.Field(i)
+			}
+			if tf.Embedded() {
+				hasEmbeds = true
+			}
+		}
+	}
+	if !hasEmbeds {
+		return Value{}
+	}
+	if f, ok := t.promotedFieldByName(name); ok {
+		// f.Index is shared with the cache, but FieldByIndex does not modify it.
 		return v.FieldByIndex(f.Index)
 	}
 	return Value{}
@@ -1690,26 +1740,16 @@ func (v Value) IsZero() bool {
 		if v.ptr == unsafe.Pointer(&zeroVal[0]) {
 			return true
 		}
-		typ := (*abi.ArrayType)(unsafe.Pointer(v.typ()))
 		// If the type is comparable, then compare directly with zero.
-		if typ.Equal != nil && typ.Size() <= abi.ZeroValSize {
+		// This is also checked in isZeroMem, but is repeated here to keep
+		// the common small case free of the extra call.
+		if typ := (*abi.ArrayType)(unsafe.Pointer(v.typ())); typ.Equal != nil && typ.Size() <= abi.ZeroValSize {
 			// v.ptr doesn't escape, as Equal functions are compiler generated
 			// and never escape. The escape analysis doesn't know, as it is a
 			// function pointer call.
 			return typ.Equal(abi.NoEscape(v.ptr), unsafe.Pointer(&zeroVal[0]))
 		}
-		if typ.TFlag&abi.TFlagRegularMemory != 0 {
-			// For some types where the zero value is a value where all bits of this type are 0
-			// optimize it.
-			return isZero(unsafe.Slice(((*byte)(v.ptr)), typ.Size()))
-		}
-		n := int(typ.Len)
-		for i := 0; i < n; i++ {
-			if !v.Index(i).IsZero() {
-				return false
-			}
-		}
-		return true
+		return isZeroMem(v.typ(), v.ptr)
 	case Chan, Func, Interface, Map, Pointer, Slice, UnsafePointer:
 		return v.IsNil()
 	case String:
@@ -1721,29 +1761,95 @@ func (v Value) IsZero() bool {
 		if v.ptr == unsafe.Pointer(&zeroVal[0]) {
 			return true
 		}
-		typ := (*abi.StructType)(unsafe.Pointer(v.typ()))
+		// See the comment in the Array case.
+		if typ := (*abi.StructType)(unsafe.Pointer(v.typ())); typ.Equal != nil && typ.Size() <= abi.ZeroValSize {
+			return typ.Equal(abi.NoEscape(v.ptr), unsafe.Pointer(&zeroVal[0]))
+		}
+		return isZeroMem(v.typ(), v.ptr)
+	default:
+		// This should never happen, but will act as a safeguard for later,
+		// as a default value doesn't makes sense here.
+		panic(&ValueError{"reflect.Value.IsZero", v.Kind()})
+	}
+}
+
+// isZeroMem reports whether the value of type t stored in memory at p is
+// the zero value, using the same rules as [Value.IsZero]. It works directly
+// on memory so that arrays and structs that cannot be compared as a whole
+// are checked without constructing a Value for every element or field.
+func isZeroMem(t *abi.Type, p unsafe.Pointer) bool {
+	switch t.Kind() {
+	case abi.Bool:
+		return !*(*bool)(p)
+	case abi.Int8, abi.Uint8:
+		return *(*uint8)(p) == 0
+	case abi.Int16, abi.Uint16:
+		return *(*uint16)(p) == 0
+	case abi.Int32, abi.Uint32:
+		return *(*uint32)(p) == 0
+	case abi.Int64, abi.Uint64:
+		return *(*uint64)(p) == 0
+	case abi.Int, abi.Uint, abi.Uintptr:
+		return *(*uintptr)(p) == 0
+	case abi.Float32:
+		return *(*float32)(p) == 0
+	case abi.Float64:
+		return *(*float64)(p) == 0
+	case abi.Complex64:
+		return *(*complex64)(p) == 0
+	case abi.Complex128:
+		return *(*complex128)(p) == 0
+	case abi.Chan, abi.Func, abi.Interface, abi.Map, abi.Pointer, abi.Slice, abi.UnsafePointer:
+		// For interfaces and slices only the first word (type or data pointer)
+		// matters, as in Value.IsNil.
+		return *(*unsafe.Pointer)(p) == nil
+	case abi.String:
+		return (*unsafeheader.String)(p).Len == 0
+	case abi.Array:
+		typ := (*abi.ArrayType)(unsafe.Pointer(t))
 		// If the type is comparable, then compare directly with zero.
 		if typ.Equal != nil && typ.Size() <= abi.ZeroValSize {
-			// See noescape justification above.
-			return typ.Equal(abi.NoEscape(v.ptr), unsafe.Pointer(&zeroVal[0]))
+			// p doesn't escape, as Equal functions are compiler generated
+			// and never escape. The escape analysis doesn't know, as it is a
+			// function pointer call.
+			return typ.Equal(abi.NoEscape(p), unsafe.Pointer(&zeroVal[0]))
 		}
 		if typ.TFlag&abi.TFlagRegularMemory != 0 {
 			// For some types where the zero value is a value where all bits of this type are 0
 			// optimize it.
-			return isZero(unsafe.Slice(((*byte)(v.ptr)), typ.Size()))
+			return isZero(unsafe.Slice((*byte)(p), typ.Size()))
 		}
-
-		n := v.NumField()
-		for i := 0; i < n; i++ {
-			if !v.Field(i).IsZero() && v.Type().Field(i).Name != "_" {
+		size := typ.Elem.Size()
+		for i := uintptr(0); i < typ.Len; i++ {
+			if !isZeroMem(typ.Elem, add(p, i*size, "i < typ.Len")) {
+				return false
+			}
+		}
+		return true
+	case abi.Struct:
+		typ := (*abi.StructType)(unsafe.Pointer(t))
+		// If the type is comparable, then compare directly with zero.
+		if typ.Equal != nil && typ.Size() <= abi.ZeroValSize {
+			// See noescape justification above.
+			return typ.Equal(abi.NoEscape(p), unsafe.Pointer(&zeroVal[0]))
+		}
+		if typ.TFlag&abi.TFlagRegularMemory != 0 {
+			// For some types where the zero value is a value where all bits of this type are 0
+			// optimize it.
+			return isZero(unsafe.Slice((*byte)(p), typ.Size()))
+		}
+		for i := range typ.Fields {
+			f := &typ.Fields[i]
+			if f.Name.IsBlank() {
+				continue
+			}
+			if !isZeroMem(f.Typ, add(p, f.Offset, "field offset within struct")) {
 				return false
 			}
 		}
 		return true
 	default:
-		// This should never happen, but will act as a safeguard for later,
-		// as a default value doesn't makes sense here.
-		panic(&ValueError{"reflect.Value.IsZero", v.Kind()})
+		panic(&ValueError{"reflect.Value.IsZero", Kind(t.Kind())})
 	}
 }
 
@@ -2596,13 +2702,13 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 //
 // It panics if v's Kind is not Struct.
 func (v Value) Fields() iter.Seq2[StructField, Value] {
-	t := v.Type()
-	if t.Kind() != Struct {
-		panic("reflect: Fields of non-struct type " + t.String())
+	if v.kind() != Struct {
+		panic("reflect: Fields of non-struct type " + v.Type().String())
 	}
+	tt := (*structType)(unsafe.Pointer(v.typ()))
 	return func(yield func(StructField, Value) bool) {
-		for i := range v.NumField() {
-			if !yield(t.Field(i), v.Field(i)) {
+		for i := range len(tt.Fields) {
+			if !yield(tt.Field(i), v.Field(i)) {
 				return
 			}
 		}
@@ -2621,11 +2727,11 @@ func (v Value) Fields() iter.Seq2[StructField, Value] {
 // Calling this method will force the linker to retain all exported methods in all packages.
 // This may make the executable binary larger but will not affect execution time.
 func (v Value) Methods() iter.Seq2[Method, Value] {
-	rtype := v.Type()
 	n := v.NumMethod()
+	rt := toRType(v.typ())
 	return func(yield func(Method, Value) bool) {
 		for i := range n {
-			if !yield(rtype.Method(i), v.Method(i)) {
+			if !yield(rt.Method(i), v.Method(i)) {
 				return
 			}
 		}
@@ -2743,10 +2849,29 @@ func (v Value) Clear() {
 // As in Go, each x's value must be assignable to the slice's element type.
 func Append(s Value, x ...Value) Value {
 	s.mustBe(Slice)
+	s.mustBeExported()
 	n := s.Len()
 	s = s.extendSlice(len(x))
+	elem := s.typ().Elem()
+	elemSize := elem.Size()
+	sh := (*unsafeheader.Slice)(s.ptr)
 	for i, v := range x {
-		s.Index(n + i).Set(v)
+		v.mustBeExported()
+		addr := arrayAt(sh.Data, n+i, elemSize, "i < len(x)")
+		var target unsafe.Pointer
+		if elem.Kind() == abi.Interface {
+			target = abi.NoEscape(addr)
+		}
+		v = v.assignTo("reflect.Set", elem, target)
+		if v.flag&flagIndir != 0 {
+			if v.ptr == unsafe.Pointer(&zeroVal[0]) {
+				typedmemclr(elem, addr)
+			} else {
+				typedmemmove(elem, addr, v.ptr)
+			}
+		} else {
+			*(*unsafe.Pointer)(addr) = v.ptr
+		}
 	}
 	return s
 }
@@ -2756,11 +2881,26 @@ func Append(s Value, x ...Value) Value {
 func AppendSlice(s, t Value) Value {
 	s.mustBe(Slice)
 	t.mustBe(Slice)
-	typesMustMatch("reflect.AppendSlice", s.Type().Elem(), t.Type().Elem())
+	s.mustBeExported()
+	t.mustBeExported()
+	se := s.typ().Elem()
+	te := t.typ().Elem()
+	if se != te {
+		typesMustMatch("reflect.AppendSlice", toType(se), toType(te))
+	}
 	ns := s.Len()
 	nt := t.Len()
 	s = s.extendSlice(nt)
-	Copy(s.Slice(ns, ns+nt), t)
+	if nt > 0 {
+		sh := (*unsafeheader.Slice)(s.ptr)
+		th := (*unsafeheader.Slice)(t.ptr)
+		ds := unsafeheader.Slice{
+			Data: add(sh.Data, uintptr(ns)*se.Size(), "ns <= s.Len"),
+			Len:  nt,
+			Cap:  nt,
+		}
+		typedslicecopy(se.Common(), ds, *th)
+	}
 	return s
 }
 
@@ -2794,8 +2934,9 @@ func Copy(dst, src Value) int {
 
 	de := dst.typ().Elem()
 	if !stringCopy {
-		se := src.typ().Elem()
-		typesMustMatch("reflect.Copy", toType(de), toType(se))
+		if se := src.typ().Elem(); de != se {
+			typesMustMatch("reflect.Copy", toType(de), toType(se))
+		}
 	}
 
 	var ds, ss unsafeheader.Slice
@@ -2923,7 +3064,10 @@ func select0(cases []SelectCase, runcases []runtimeSelect) (chosen int, recv Val
 	}
 
 	haveDefault := false
-
+	var (
+		recvElem *abi.Type      // element type of the receive buffer in recvBuf
+		recvBuf  unsafe.Pointer // buffer shared by receive cases of type recvElem
+	)
 	// NOTE: Do not trust that caller is not modifying cases data underfoot.
 	// The range is safe because the caller cannot modify our copy of the len
 	// and each iteration makes its own copy of the value c.
@@ -2990,7 +3134,14 @@ func select0(cases []SelectCase, runcases []runtimeSelect) (chosen int, recv Val
 			}
 			rc.ch = ch.pointer()
 			rc.typ = toRType(&tt.Type)
-			rc.val = unsafe_New(tt.Elem)
+			// At most one case is chosen, and only its receive buffer is
+			// written, so receive cases with the same element type, which
+			// is the common case, can share one buffer.
+			if tt.Elem != recvElem {
+				recvElem = tt.Elem
+				recvBuf = unsafe_New(tt.Elem)
+			}
+			rc.val = recvBuf
 		}
 	}
 
@@ -3208,20 +3359,23 @@ func (v Value) Convert(t Type) Value {
 // CanConvert reports whether the value v can be converted to type t.
 // If v.CanConvert(t) returns true then v.Convert(t) will not panic.
 func (v Value) CanConvert(t Type) bool {
-	vt := v.Type()
-	t = toType(t.common())
-	if !vt.ConvertibleTo(t) {
+	if t == nil {
+		panic("reflect: nil type passed to Value.CanConvert")
+	}
+	dst := t.common()
+	src := v.typ()
+	if convertOp(dst, src) == nil {
 		return false
 	}
 	// Converting from slice to array or to pointer-to-array can panic
 	// depending on the value.
 	switch {
-	case vt.Kind() == Slice && t.Kind() == Array:
-		if t.Len() > v.Len() {
+	case v.kind() == Slice && dst.Kind() == abi.Array:
+		if int((*abi.ArrayType)(unsafe.Pointer(dst)).Len) > v.Len() {
 			return false
 		}
-	case vt.Kind() == Slice && t.Kind() == Pointer && t.Elem().Kind() == Array:
-		n := t.Elem().Len()
+	case v.kind() == Slice && dst.Kind() == abi.Pointer && dst.Elem().Kind() == abi.Array:
+		n := int((*abi.ArrayType)(unsafe.Pointer(dst.Elem())).Len)
 		if n > v.Len() {
 			return false
 		}
@@ -3240,30 +3394,31 @@ func (v Value) Comparable() bool {
 		return false
 
 	case Array:
-		switch v.Type().Elem().Kind() {
+		typ := (*abi.ArrayType)(unsafe.Pointer(v.typ()))
+		switch Kind(typ.Elem.Kind()) {
 		case Interface, Array, Struct:
-			for i := 0; i < v.Type().Len(); i++ {
+			for i := 0; i < int(typ.Len); i++ {
 				if !v.Index(i).Comparable() {
 					return false
 				}
 			}
 			return true
 		}
-		return v.Type().Comparable()
+		return typ.Equal != nil
 
 	case Interface:
 		return v.IsNil() || v.Elem().Comparable()
 
 	case Struct:
-		for _, value := range v.Fields() {
-			if !value.Comparable() {
+		for i := range (*structType)(unsafe.Pointer(v.typ())).Fields {
+			if !v.Field(i).Comparable() {
 				return false
 			}
 		}
 		return true
 
 	default:
-		return v.Type().Comparable()
+		return v.typ().Equal != nil
 	}
 }
 
@@ -3276,10 +3431,10 @@ func (v Value) Comparable() bool {
 // During all comparisons, if values of the same type are compared,
 // and the type is not comparable, Equal will panic.
 func (v Value) Equal(u Value) bool {
-	if v.Kind() == Interface {
+	if v.kind() == Interface {
 		v = v.Elem()
 	}
-	if u.Kind() == Interface {
+	if u.kind() == Interface {
 		u = u.Elem()
 	}
 
@@ -3287,13 +3442,21 @@ func (v Value) Equal(u Value) bool {
 		return v.IsValid() == u.IsValid()
 	}
 
-	if v.Kind() != u.Kind() || v.Type() != u.Type() {
+	vk := v.kind()
+	if vk != u.kind() {
+		return false
+	}
+	if v.flag&flagMethod == 0 && u.flag&flagMethod == 0 {
+		if v.typ() != u.typ() {
+			return false
+		}
+	} else if v.Type() != u.Type() {
 		return false
 	}
 
 	// Handle each Kind directly rather than calling valueInterface
 	// to avoid allocating.
-	switch v.Kind() {
+	switch vk {
 	default:
 		panic("reflect.Value.Equal: invalid Kind")
 	case Bool:
@@ -3307,29 +3470,33 @@ func (v Value) Equal(u Value) bool {
 	case Complex64, Complex128:
 		return v.Complex() == u.Complex()
 	case String:
-		return v.String() == u.String()
+		return *(*string)(v.ptr) == *(*string)(u.ptr)
 	case Chan, Pointer, UnsafePointer:
 		return v.Pointer() == u.Pointer()
 	case Array:
-		// u and v have the same type so they have the same length
-		vl := v.Len()
-		if vl == 0 {
+		typ := (*abi.ArrayType)(unsafe.Pointer(v.typ()))
+		if typ.Len == 0 {
 			// panic on [0]func()
-			if !v.Type().Elem().Comparable() {
+			if typ.Elem.Equal == nil {
 				break
 			}
 			return true
 		}
-		for i := 0; i < vl; i++ {
-			if !v.Index(i).Equal(u.Index(i)) {
+		if typ.TFlag&abi.TFlagRegularMemory != 0 {
+			return bytealg.Equal(unsafe.Slice((*byte)(v.ptr), typ.Size()), unsafe.Slice((*byte)(u.ptr), typ.Size()))
+		}
+		for i := uintptr(0); i < typ.Len; i++ {
+			if !v.Index(int(i)).Equal(u.Index(int(i))) {
 				return false
 			}
 		}
 		return true
 	case Struct:
-		// u and v have the same type so they have the same fields
-		nf := v.NumField()
-		for i := 0; i < nf; i++ {
+		typ := (*abi.StructType)(unsafe.Pointer(v.typ()))
+		if typ.TFlag&abi.TFlagRegularMemory != 0 {
+			return bytealg.Equal(unsafe.Slice((*byte)(v.ptr), typ.Size()), unsafe.Slice((*byte)(u.ptr), typ.Size()))
+		}
+		for i := range typ.Fields {
 			if !v.Field(i).Equal(u.Field(i)) {
 				return false
 			}
@@ -3494,24 +3661,24 @@ func makeComplex(f flag, v complex128, t Type) Value {
 }
 
 func makeString(f flag, v string, t Type) Value {
-	ret := New(t).Elem()
-	ret.SetString(v)
-	ret.flag = ret.flag&^flagAddr | f
-	return ret
+	typ := t.common()
+	ptr := unsafe_New(typ)
+	*(*string)(ptr) = v
+	return Value{typ, ptr, f | flagIndir | flag(String)}
 }
 
 func makeBytes(f flag, v []byte, t Type) Value {
-	ret := New(t).Elem()
-	ret.SetBytes(v)
-	ret.flag = ret.flag&^flagAddr | f
-	return ret
+	typ := t.common()
+	ptr := unsafe_New(typ)
+	*(*[]byte)(ptr) = v
+	return Value{typ, ptr, f | flagIndir | flag(Slice)}
 }
 
 func makeRunes(f flag, v []rune, t Type) Value {
-	ret := New(t).Elem()
-	ret.setRunes(v)
-	ret.flag = ret.flag&^flagAddr | f
-	return ret
+	typ := t.common()
+	ptr := unsafe_New(typ)
+	*(*[]rune)(ptr) = v
+	return Value{typ, ptr, f | flagIndir | flag(Slice)}
 }
 
 // These conversion functions are returned by convertOp

@@ -139,7 +139,10 @@ type Buffer struct {
 }
 
 func clearLayoutCache() {
-	layoutCache = sync.Map[layoutKey, layoutType]{}
+	layoutCache = sync.Map[layoutKey, *layoutType]{}
+	for i := range layoutFast {
+		layoutFast[i].Store(nil)
+	}
 }
 
 func SetArgRegs(ints, floats int, floatSize uintptr) (oldInts, oldFloats int, oldFloatSize uintptr) {

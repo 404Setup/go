@@ -181,6 +181,19 @@ var stringType = rtypeOf("")
 // It returns the zero Value if key is not found in the map or if v represents a nil map.
 // As in Go, the key's value must be assignable to the map's key type.
 func (v Value) MapIndex(key Value) Value {
+	e, fl := v.mapIndexPtr(key)
+	if e == nil {
+		return Value{}
+	}
+	return copyVal((*abi.MapType)(unsafe.Pointer(v.typ())).Elem, fl, e)
+}
+
+// mapIndexPtr is like [Value.MapIndex], but instead of a copy of the
+// element it returns a pointer to the element's storage in the map (nil if
+// there is none) and the flag a Value for the element should have, not
+// counting flagIndir. The pointer is only valid until the map is next
+// modified.
+func (v Value) mapIndexPtr(key Value) (e unsafe.Pointer, fl flag) {
 	v.mustBe(Map)
 	tt := (*abi.MapType)(unsafe.Pointer(v.typ()))
 
@@ -192,7 +205,6 @@ func (v Value) MapIndex(key Value) Value {
 	// behavior for structs, which allow read but not write
 	// of unexported fields.
 
-	var e unsafe.Pointer
 	if (tt.Key == stringType || key.kind() == String) && tt.Key == key.typ() && tt.Elem.Size() <= abi.MapMaxElemBytes {
 		k := *(*string)(key.ptr)
 		e = mapaccess_faststr(v.typ(), v.pointer(), k)
@@ -207,12 +219,22 @@ func (v Value) MapIndex(key Value) Value {
 		e = mapaccess(v.typ(), v.pointer(), k)
 	}
 	if e == nil {
-		return Value{}
+		return nil, 0
 	}
-	typ := tt.Elem
-	fl := (v.flag | key.flag).ro()
-	fl |= flag(typ.Kind())
-	return copyVal(typ, fl, e)
+	fl = (v.flag | key.flag).ro()
+	fl |= flag(tt.Elem.Kind())
+	return e, fl
+}
+
+// viewVal returns a Value for the object of type typ at ptr, like
+// [copyVal] but without copying it: if typ is not pointer-shaped the
+// result refers to ptr itself. It is for short-lived read-only use of
+// values in memory that is not going to change, such as map entries.
+func viewVal(typ *abi.Type, fl flag, ptr unsafe.Pointer) Value {
+	if !typ.IsDirectIface() {
+		return Value{typ, ptr, fl | flagIndir}
+	}
+	return Value{typ, *(*unsafe.Pointer)(ptr), fl}
 }
 
 // Equivalent to runtime.mapIterStart.
@@ -259,6 +281,9 @@ func (v Value) MapKeys() []Value {
 	mlen := int(0)
 	if m != nil {
 		mlen = maplen(mptr)
+	}
+	if mlen == 0 {
+		return make([]Value, 0)
 	}
 	var it maps.Iter
 	mapIterStart(tt, m, &it)
