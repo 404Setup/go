@@ -96,6 +96,8 @@ func ParseCookie(line string) ([]*Cookie, error) {
 		return nil, errBlankCookie
 	}
 	cookies := make([]*Cookie, 0, nparts)
+	cookieBuf := make([]Cookie, nparts)
+	idx := 0
 	for s := range strings.SplitSeq(line, ";") {
 		s = textproto.TrimString(s)
 		name, value, found := strings.Cut(s, "=")
@@ -109,7 +111,9 @@ func ParseCookie(line string) ([]*Cookie, error) {
 		if !found {
 			return nil, errInvalidCookieValue
 		}
-		cookies = append(cookies, &Cookie{Name: name, Value: value, Quoted: quoted})
+		cookieBuf[idx] = Cookie{Name: name, Value: value, Quoted: quoted}
+		cookies = append(cookies, &cookieBuf[idx])
+		idx++
 	}
 	return cookies, nil
 }
@@ -117,12 +121,13 @@ func ParseCookie(line string) ([]*Cookie, error) {
 // ParseSetCookie parses a Set-Cookie header value and returns a cookie.
 // It returns an error on syntax error.
 func ParseSetCookie(line string) (*Cookie, error) {
-	parts := strings.Split(textproto.TrimString(line), ";")
-	if len(parts) == 1 && parts[0] == "" {
+	trimmed := textproto.TrimString(line)
+	if trimmed == "" {
 		return nil, errBlankCookie
 	}
-	parts[0] = textproto.TrimString(parts[0])
-	name, value, ok := strings.Cut(parts[0], "=")
+	first, rest, hasMore := strings.Cut(trimmed, ";")
+	first = textproto.TrimString(first)
+	name, value, ok := strings.Cut(first, "=")
 	if !ok {
 		return nil, errEqualNotFoundInCookie
 	}
@@ -140,80 +145,89 @@ func ParseSetCookie(line string) (*Cookie, error) {
 		Quoted: quoted,
 		Raw:    line,
 	}
-	for i := 1; i < len(parts); i++ {
-		parts[i] = textproto.TrimString(parts[i])
-		if len(parts[i]) == 0 {
+	for hasMore {
+		var part string
+		part, rest, hasMore = strings.Cut(rest, ";")
+		part = textproto.TrimString(part)
+		if len(part) == 0 {
 			continue
 		}
 
-		attr, val, _ := strings.Cut(parts[i], "=")
-		lowerAttr, isASCII := ascii.ToLower(attr)
-		if !isASCII {
-			continue
-		}
+		attr, val, _ := strings.Cut(part, "=")
 		val, _, ok = parseCookieValue(val, false)
 		if !ok {
-			c.Unparsed = append(c.Unparsed, parts[i])
+			c.Unparsed = append(c.Unparsed, part)
 			continue
 		}
 
-		switch lowerAttr {
-		case "samesite":
-			lowerVal, ascii := ascii.ToLower(val)
-			if !ascii {
-				c.SameSite = SameSiteDefaultMode
-				continue
-			}
-			switch lowerVal {
-			case "lax":
+		if ascii.EqualFold(attr, "samesite") {
+			if ascii.EqualFold(val, "lax") {
 				c.SameSite = SameSiteLaxMode
-			case "strict":
+			} else if ascii.EqualFold(val, "strict") {
 				c.SameSite = SameSiteStrictMode
-			case "none":
+			} else if ascii.EqualFold(val, "none") {
 				c.SameSite = SameSiteNoneMode
-			default:
+			} else {
 				c.SameSite = SameSiteDefaultMode
 			}
 			continue
-		case "secure":
+		}
+		if ascii.EqualFold(attr, "secure") {
 			c.Secure = true
 			continue
-		case "httponly":
+		}
+		if ascii.EqualFold(attr, "httponly") {
 			c.HttpOnly = true
 			continue
-		case "domain":
+		}
+		if ascii.EqualFold(attr, "domain") {
 			c.Domain = val
 			continue
-		case "max-age":
+		}
+		if ascii.EqualFold(attr, "max-age") {
 			secs, err := strconv.Atoi(val)
-			if err != nil || secs != 0 && val[0] == '0' {
-				break
+			if err != nil || (secs != 0 && val[0] == '0') {
+				c.Unparsed = append(c.Unparsed, part)
+				continue
 			}
 			if secs <= 0 {
 				secs = -1
 			}
 			c.MaxAge = secs
 			continue
-		case "expires":
+		}
+		if ascii.EqualFold(attr, "expires") {
 			c.RawExpires = val
-			exptime, err := time.Parse(time.RFC1123, val)
-			if err != nil {
+			var exptime time.Time
+			var err error
+			if strings.IndexByte(val, '-') >= 0 {
 				exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
 				if err != nil {
-					c.Expires = time.Time{}
-					break
+					exptime, err = time.Parse(time.RFC1123, val)
 				}
+			} else {
+				exptime, err = time.Parse(time.RFC1123, val)
+				if err != nil {
+					exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
+				}
+			}
+			if err != nil {
+				c.Expires = time.Time{}
+				c.Unparsed = append(c.Unparsed, part)
+				continue
 			}
 			c.Expires = exptime.UTC()
 			continue
-		case "path":
+		}
+		if ascii.EqualFold(attr, "path") {
 			c.Path = val
 			continue
-		case "partitioned":
+		}
+		if ascii.EqualFold(attr, "partitioned") {
 			c.Partitioned = true
 			continue
 		}
-		c.Unparsed = append(c.Unparsed, parts[i])
+		c.Unparsed = append(c.Unparsed, part)
 	}
 	return c, nil
 }
@@ -261,37 +275,70 @@ func (c *Cookie) String() string {
 	if c == nil || !isToken(c.Name) {
 		return ""
 	}
-	// extraCookieLength derived from typical length of cookie attributes
-	// see RFC 6265 Sec 4.1.
-	const extraCookieLength = 110
-	var b strings.Builder
-	b.Grow(len(c.Name) + len(c.Value) + len(c.Domain) + len(c.Path) + extraCookieLength)
-	b.WriteString(c.Name)
-	b.WriteRune('=')
-	b.WriteString(sanitizeCookieValue(c.Value, c.Quoted))
+	extra := 1 // '='
+	val := sanitizeCookieValue(c.Value, c.Quoted)
+	extra += len(val)
 
+	var p string
 	if len(c.Path) > 0 {
-		b.WriteString("; Path=")
-		b.WriteString(sanitizeCookiePath(c.Path))
+		p = sanitizeCookiePath(c.Path)
+		extra += 8 + len(p) // "; Path=" + p
 	}
+	var d string
 	if len(c.Domain) > 0 {
 		if validCookieDomain(c.Domain) {
-			// A c.Domain containing illegal characters is not
-			// sanitized but simply dropped which turns the cookie
-			// into a host-only cookie. A leading dot is okay
-			// but won't be sent.
-			d := c.Domain
+			d = c.Domain
 			if d[0] == '.' {
 				d = d[1:]
 			}
-			b.WriteString("; Domain=")
-			b.WriteString(d)
+			extra += 10 + len(d) // "; Domain=" + d
 		} else {
 			log.Printf("net/http: invalid Cookie.Domain %q; dropping domain attribute", c.Domain)
 		}
 	}
+	hasExpires := validCookieExpires(c.Expires)
+	if hasExpires {
+		extra += 11 + len(TimeFormat) // "; Expires=" + format
+	}
+	if c.MaxAge > 0 {
+		extra += 22 // "; Max-Age=" + up to 11 digits
+	} else if c.MaxAge < 0 {
+		extra += 11 // "; Max-Age=0"
+	}
+	if c.HttpOnly {
+		extra += 10 // "; HttpOnly"
+	}
+	if c.Secure {
+		extra += 8 // "; Secure"
+	}
+	switch c.SameSite {
+	case SameSiteNoneMode:
+		extra += 15 // "; SameSite=None"
+	case SameSiteLaxMode:
+		extra += 14 // "; SameSite=Lax"
+	case SameSiteStrictMode:
+		extra += 17 // "; SameSite=Strict"
+	}
+	if c.Partitioned {
+		extra += 13 // "; Partitioned"
+	}
+
+	var b strings.Builder
+	b.Grow(len(c.Name) + extra)
+	b.WriteString(c.Name)
+	b.WriteByte('=')
+	b.WriteString(val)
+
+	if len(p) > 0 {
+		b.WriteString("; Path=")
+		b.WriteString(p)
+	}
+	if len(d) > 0 {
+		b.WriteString("; Domain=")
+		b.WriteString(d)
+	}
 	var buf [len(TimeFormat)]byte
-	if validCookieExpires(c.Expires) {
+	if hasExpires {
 		b.WriteString("; Expires=")
 		b.Write(c.Expires.UTC().AppendFormat(buf[:0], TimeFormat))
 	}
@@ -384,7 +431,9 @@ func readCookies(h Header, filter string) []*Cookie {
 		return []*Cookie{}
 	}
 
-	cookies := make([]*Cookie, 0, len(lines)+strings.Count(lines[0], ";"))
+	cookies := make([]*Cookie, 0, cookieCount)
+	cookieBuf := make([]Cookie, cookieCount)
+	idx := 0
 	for _, line := range lines {
 		line = textproto.TrimString(line)
 
@@ -407,7 +456,9 @@ func readCookies(h Header, filter string) []*Cookie {
 			if !ok {
 				continue
 			}
-			cookies = append(cookies, &Cookie{Name: name, Value: val, Quoted: quoted})
+			cookieBuf[idx] = Cookie{Name: name, Value: val, Quoted: quoted}
+			cookies = append(cookies, &cookieBuf[idx])
+			idx++
 		}
 	}
 	return cookies
@@ -546,6 +597,24 @@ func sanitizeCookieName(n string) string {
 // thus we produce a quoted cookie-value if v contains commas or spaces.
 // See https://golang.org/issue/7243 for the discussion.
 func sanitizeCookieValue(v string, quoted bool) string {
+	hasSpecial := quoted
+	clean := true
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b == ' ' || b == ',' {
+			hasSpecial = true
+		}
+		if !validCookieValueByte(b) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		if hasSpecial {
+			return `"` + v + `"`
+		}
+		return v
+	}
 	v = sanitizeOrWarn("Cookie.Value", validCookieValueByte, v)
 	if strings.ContainsAny(v, " ,") || quoted {
 		return `"` + v + `"`
@@ -560,6 +629,16 @@ func validCookieValueByte(b byte) bool {
 // path-av           = "Path=" path-value
 // path-value        = <any CHAR except CTLs or ";">
 func sanitizeCookiePath(v string) string {
+	clean := true
+	for i := 0; i < len(v); i++ {
+		if !validCookiePathByte(v[i]) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return v
+	}
 	return sanitizeOrWarn("Cookie.Path", validCookiePathByte, v)
 }
 

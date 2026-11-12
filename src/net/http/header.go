@@ -94,13 +94,19 @@ func (h Header) Clone() Header {
 	if h == nil {
 		return nil
 	}
+	if len(h) == 0 {
+		return make(Header)
+	}
 
 	// Find total number of values.
 	nv := 0
 	for _, vv := range h {
 		nv += len(vv)
 	}
-	sv := make([]string, nv) // shared backing array for headers' values
+	var sv []string
+	if nv > 0 {
+		sv = make([]string, nv) // shared backing array for headers' values
+	}
 	h2 := make(Header, len(h))
 	for k, vv := range h {
 		if vv == nil {
@@ -251,4 +257,3 @@ func writeHeaderLine(ws io.StringWriter, key, value string) error {
 // If s contains a space or invalid header field bytes, it is
 // returned without modifications.
 func CanonicalHeaderKey(s string) string { return textproto.CanonicalMIMEHeaderKey(s) }
-

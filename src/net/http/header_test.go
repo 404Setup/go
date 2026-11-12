@@ -227,3 +227,18 @@ func TestCloneOrMakeHeader(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkHeaderClone(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = testHeader.Clone()
+	}
+}
+
+func BenchmarkHeaderCloneEmpty(b *testing.B) {
+	h := Header{}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = h.Clone()
+	}
+}

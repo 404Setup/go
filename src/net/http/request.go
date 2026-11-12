@@ -1387,12 +1387,16 @@ func (l *maxBytesReader) Close() error {
 }
 
 func copyValues(dst, src url.Values) {
-	// Count the values destined for keys not yet present in dst so they
-	// can share a single backing array instead of one allocation per key.
+	// Count the values destined for keys not yet present in dst, or existing keys
+	// whose slice cannot hold the additional values, so they can share a single
+	// backing array instead of triggering multiple allocations.
 	nv := 0
 	for k, vs := range src {
-		if dst[k] == nil {
+		cur := dst[k]
+		if cur == nil {
 			nv += len(vs)
+		} else if cap(cur)-len(cur) < len(vs) {
+			nv += len(cur) + len(vs)
 		}
 	}
 	var sv []string
@@ -1400,13 +1404,26 @@ func copyValues(dst, src url.Values) {
 		sv = make([]string, nv)
 	}
 	for k, vs := range src {
-		if len(vs) > 0 && dst[k] == nil {
-			n := copy(sv, vs)
-			dst[k] = sv[:n:n]
-			sv = sv[n:]
+		cur := dst[k]
+		if cur == nil {
+			if len(vs) > 0 {
+				n := copy(sv, vs)
+				dst[k] = sv[:n:n]
+				sv = sv[n:]
+			} else {
+				dst[k] = nil
+			}
 			continue
 		}
-		dst[k] = append(dst[k], vs...)
+		if cap(cur)-len(cur) < len(vs) {
+			needed := len(cur) + len(vs)
+			n := copy(sv, cur)
+			copy(sv[n:], vs)
+			dst[k] = sv[:needed:needed]
+			sv = sv[needed:]
+			continue
+		}
+		dst[k] = append(cur, vs...)
 	}
 }
 

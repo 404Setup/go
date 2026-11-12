@@ -1707,12 +1707,8 @@ func foreachHeaderElement(v string, fn func(string)) {
 // code is the response status code.
 // scratch is an optional scratch buffer. If it has at least capacity 3, it's used.
 func writeStatusLine(bw *bufio.Writer, is11 bool, code int, scratch []byte) {
-	if code == StatusOK {
-		if is11 {
-			bw.WriteString("HTTP/1.1 200 OK\r\n")
-		} else {
-			bw.WriteString("HTTP/1.0 200 OK\r\n")
-		}
+	if line := statusLine(is11, code); line != "" {
+		bw.WriteString(line)
 		return
 	}
 	if is11 {
@@ -2882,6 +2878,9 @@ func cleanPath(p string) string {
 // the form cleanPath would return: it contains no empty segments ("//")
 // and no "." or ".." segments. A trailing slash is permitted.
 func isCleanPath(p string) bool {
+	if strings.IndexByte(p, '.') < 0 && !strings.Contains(p, "//") {
+		return true
+	}
 	for i := 0; i < len(p); i++ {
 		if p[i] != '/' {
 			continue
@@ -3025,14 +3024,9 @@ func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *
 	// - The URL is an empty string.
 	if u != nil && len(path) > 0 && path[len(path)-1] != '/' && !exactMatch(n, path) {
 		// If there is an exact match with a trailing slash, then redirect.
-		path += "/"
-		n2, _ := mux.tree.match(host, method, path)
-		if exactMatch(n2, path) {
-			// It is safe to return n2 here: it is used only in the second RedirectHandler case
-			// of findHandler, and that method returns before it does the "n == nil" check where
-			// the first return value matters. We return it here only to make the pattern available
-			// to findHandler.
-			return n2, nil, path
+		n2, _ := mux.tree.matchTrailingSlash(host, method, path)
+		if exactMatchTrailingSlash(n2, path) {
+			return n2, nil, path + "/"
 		}
 	}
 	return n, matches, ""
@@ -3117,6 +3111,16 @@ func exactMatch(n *routingNode, path string) bool {
 	// segments should be the same as the number of slashes in the path.
 	// E.g. "/a/b/{$}" and "/a/b/{...}" exactly match "/a/b/", but "/a/" does not.
 	return len(n.pattern.segments) == strings.Count(path, "/")
+}
+
+func exactMatchTrailingSlash(n *routingNode, path string) bool {
+	if n == nil {
+		return false
+	}
+	if !n.pattern.lastSegment().multi {
+		return true
+	}
+	return len(n.pattern.segments) == strings.Count(path, "/")+1
 }
 
 // matchingMethods return a sorted list of all methods that would match with the given host and path.

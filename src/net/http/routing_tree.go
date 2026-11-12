@@ -128,6 +128,80 @@ func (root *routingNode) match(host, method, path string) (*routingNode, []strin
 	return root.emptyChild.matchMethodAndPath(method, path)
 }
 
+// matchTrailingSlash is like match, but matches as if path had a trailing slash.
+// It avoids allocating path + "/" when checking for trailing slash redirection.
+func (root *routingNode) matchTrailingSlash(host, method, path string) (*routingNode, []string) {
+	if host != "" {
+		if c := root.findChild(host); c != nil {
+			if l, m := c.matchMethodAndPathTrailingSlash(method, path); l != nil {
+				return l, m
+			}
+		}
+	}
+	return root.emptyChild.matchMethodAndPathTrailingSlash(method, path)
+}
+
+func (n *routingNode) matchMethodAndPathTrailingSlash(method, path string) (*routingNode, []string) {
+	if n == nil {
+		return nil, nil
+	}
+	if c := n.findChild(method); c != nil {
+		if l, m := c.matchPathTrailingSlash(path, nil); l != nil {
+			return l, m
+		}
+	}
+	if method == "HEAD" {
+		if c := n.findChild("GET"); c != nil {
+			if l, m := c.matchPathTrailingSlash(path, nil); l != nil {
+				return l, m
+			}
+		}
+	}
+	if n.emptyChild == nil {
+		return nil, nil
+	}
+	return n.emptyChild.matchPathTrailingSlash(path, nil)
+}
+
+func (n *routingNode) matchPathTrailingSlash(path string, matches []string) (*routingNode, []string) {
+	if n == nil {
+		return nil, nil
+	}
+	if path == "" {
+		// All path segments matched; now match the virtual trailing slash.
+		if c := n.findChild("/"); c != nil && c.pattern != nil {
+			return c, matches
+		}
+		if c := n.multiChild; c != nil {
+			if c.pattern.lastSegment().s != "" {
+				matches = append(matches, "")
+			}
+			return c, matches
+		}
+		return nil, nil
+	}
+	if n.children.s != nil || n.children.m != nil || n.emptyChild != nil {
+		seg, rest := firstSegment(path)
+		if c := n.findChild(seg); c != nil {
+			if leaf, m := c.matchPathTrailingSlash(rest, matches); leaf != nil {
+				return leaf, m
+			}
+		}
+		if seg != "/" && n.emptyChild != nil {
+			if leaf, m := n.emptyChild.matchPathTrailingSlash(rest, append(matches, seg)); leaf != nil {
+				return leaf, m
+			}
+		}
+	}
+	if c := n.multiChild; c != nil {
+		if c.pattern.lastSegment().s != "" {
+			matches = append(matches, pathUnescape(path[1:])+"/")
+		}
+		return c, matches
+	}
+	return nil, nil
+}
+
 // matchMethodAndPath matches the method and path.
 // Its return values are the same as [routingNode.match].
 // The receiver should be a child of the root.

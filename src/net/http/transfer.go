@@ -616,8 +616,12 @@ func (t *transferReader) determineBodyLength(isResponse bool) error {
 	isRequest := !isResponse
 	contentLength, hasContentLength := t.Header["Content-Length"]
 	transferEncoding, hasTransferEncoding := t.Header["Transfer-Encoding"]
-	delete(t.Header, "Content-Length")
-	delete(t.Header, "Transfer-Encoding")
+	if hasContentLength {
+		delete(t.Header, "Content-Length")
+	}
+	if hasTransferEncoding {
+		delete(t.Header, "Transfer-Encoding")
+	}
 
 	// Early checks of Transfer-Encoding and Content-Length:
 	// If these headers are present, we require them to be correct,
@@ -793,7 +797,26 @@ func shouldClose(major, minor int, header Header, removeCloseHeader bool) bool {
 	}
 
 	conv := header["Connection"]
-	hasClose := httpguts.HeaderValuesContainsToken(conv, "close")
+	if len(conv) == 0 {
+		return major == 1 && minor == 0
+	}
+	hasClose := false
+	if len(conv) == 1 {
+		c := conv[0]
+		if strings.IndexByte(c, ',') < 0 {
+			c = textproto.TrimString(c)
+			if ascii.EqualFold(c, "close") {
+				hasClose = true
+			} else if ascii.EqualFold(c, "keep-alive") {
+				return false
+			}
+		} else {
+			hasClose = httpguts.HeaderValuesContainsToken(conv, "close")
+		}
+	} else {
+		hasClose = httpguts.HeaderValuesContainsToken(conv, "close")
+	}
+
 	if major == 1 && minor == 0 {
 		return hasClose || !httpguts.HeaderValuesContainsToken(conv, "keep-alive")
 	}
