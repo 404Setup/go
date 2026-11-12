@@ -86,13 +86,6 @@ func LookupModOrZero[E Elt, W Width, E2 Ints](x Vec[E, W], indices Vec[E2, W]) (
 // LookupModOrZeroGrouped divides x, indices, and z into groups of 128 bits and
 // performs [LookupModOrZero] on each group.
 //
-//	let vₙ be the n'th 128-bit group of vector v
-//	if indicesₙ[i] >= 0 {
-//	    zₙ[i] = xₙ[indicesₙ[i] % len(xₙ)]
-//	} else {
-//	    zₙ[i] = 0
-//	}
-//
 //specgen:require indices=Int{xN}x{xL}
 func LookupModOrZeroGrouped[E Elt, W Width, E2 Ints](x Vec[E, W], indices Vec[E2, W]) (z Vec[E, W]) {
 	return grouped128(LookupModOrZero[E, Width128, E2], x, indices)
@@ -130,8 +123,6 @@ func LookupOrZero[E int8 | uint8, W Width](x Vec[E, W], indices Vec[uint8, W]) (
 //	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = {{lanes .x "x"}}
 //
 // {{end}}
-//
-//specgen:experiment
 func InterleaveLo[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 	z = makeVec[E, W]()
 	for i := range z.len() / 2 {
@@ -156,14 +147,60 @@ func InterleaveLo[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 //	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = {{lanes .x "x"}}
 //
 // {{end}}
-//
-//specgen:experiment
 func InterleaveHi[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 	z = makeVec[E, W]()
 	half := z.len() / 2
 	for i := range half {
 		z[2*i] = x[half+i]
 		z[2*i+1] = y[half+i]
+	}
+	return z
+}
+
+// InterleaveEven interleaves the even-indexed elements of x and y.
+//
+// {{if eq .xL 2}}
+//
+//	z = {x[0], y[0]}
+//
+// {{else if eq .xL 4}}
+//
+//	z = {x[0], y[0], x[2], y[2]}
+//
+// {{else}}
+//
+//	z = {x[0], y[0], x[2], y[2], ..., x[n-2], y[n-2]}, where n = {{lanes .x "x"}}
+//
+// {{end}}
+func InterleaveEven[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
+	z = makeVec[E, W]()
+	for i := 0; i < z.len(); i += 2 {
+		z[i] = x[i]
+		z[i+1] = y[i]
+	}
+	return z
+}
+
+// InterleaveOdd interleaves the odd-indexed elements of x and y.
+//
+// {{if eq .xL 2}}
+//
+//	z = {x[1], y[1]}
+//
+// {{else if eq .xL 4}}
+//
+//	z = {x[1], y[1], x[3], y[3]}
+//
+// {{else}}
+//
+//	z = {x[1], y[1], x[3], y[3], ..., x[n-1], y[n-1]}, where n = {{lanes .x "x"}}
+//
+// {{end}}
+func InterleaveOdd[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
+	z = makeVec[E, W]()
+	for i := 0; i < z.len(); i += 2 {
+		z[i] = x[i+1]
+		z[i+1] = y[i+1]
 	}
 	return z
 }
@@ -183,8 +220,6 @@ func InterleaveHi[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 //	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = {{lanes .x "x"}}
 //
 // {{end}}
-//
-//specgen:experiment
 func ConcatEven[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 	z = makeVec[E, W]()
 	half := z.len() / 2
@@ -210,8 +245,6 @@ func ConcatEven[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 //	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = {{lanes .x "x"}}
 //
 // {{end}}
-//
-//specgen:experiment
 func ConcatOdd[E Elt, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 	z = makeVec[E, W]()
 	half := z.len() / 2

@@ -92,6 +92,7 @@ var noRaceFuncPkgs = []string{"sync", "sync/v2", "sync/atomic", "sync/atomic/v2"
 
 var allowAsmABIPkgs = []string{
 	"runtime",
+	"runtime/cgo",
 	"reflect",
 	"syscall",
 	"internal/bytealg",

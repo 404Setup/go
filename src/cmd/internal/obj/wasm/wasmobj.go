@@ -1042,6 +1042,8 @@ func regAddr(reg int16) obj.Addr {
 
 // Most of the Go functions have a single parameter (PC_B) in the
 // Wasm ABI. This is a list of exceptions.
+// Keep in sync with the special cases in assemble and with
+// wasmFuncTypes in cmd/link/internal/wasm.
 var notUsePC_B = map[string]bool{
 	"_rt0_wasm_js":            true,
 	"_rt0_wasm_wasip1":        true,
@@ -1068,6 +1070,10 @@ var notUsePC_B = map[string]bool{
 	"memeqbody":               true,
 	"memcmp":                  true,
 	"memchr":                  true,
+	"runtime.wasm_goentry":    true,
+	"runtime.wasm_g0entry":    true,
+	"wasm_scheduler_loop":     true,
+	"wasm_resume":             true,
 }
 
 func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
@@ -1101,10 +1107,12 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 
 	// Function starts with declaration of locals: numbers and types.
 	// Some functions use a special calling convention.
+	// Keep in sync with notUsePC_B and with wasmFuncTypes in cmd/link/internal/wasm.
 	switch s.Name {
 	case "_rt0_wasm_js", "_rt0_wasm_wasip1", "_rt0_wasm_wasip1_lib",
 		"wasm_export_run", "wasm_export_resume", "wasm_export_getsp",
-		"wasm_pc_f_loop", "runtime.wasmDiv", "runtime.wasmTruncS", "runtime.wasmTruncU", "memeqbody":
+		"wasm_pc_f_loop", "runtime.wasmDiv", "runtime.wasmTruncS", "runtime.wasmTruncU", "memeqbody",
+		"runtime.wasm_goentry", "runtime.wasm_g0entry", "wasm_scheduler_loop", "wasm_resume":
 		varDecls = []*varDecl{}
 		useAssemblyRegMap()
 	case "wasm_pc_f_loop_export":
@@ -1431,6 +1439,10 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
 			// Hard coded tag index: We only need one tag, call it "yield" for
 			// the WasmFX implementation of the goroutine scheduler.
 			w.WriteByte(0x00)
+			if hasLocalSP {
+				// The stack may have moved while suspended.
+				updateLocalSP(w)
+			}
 
 		case ASwitch:
 			panic("Unimplemented: Wasm Switch instruction.")
@@ -1482,17 +1494,12 @@ func writeOpcode(w *bytes.Buffer, as obj.As) {
 	case as < AV128Load:
 		w.WriteByte(0xFC)
 		w.WriteByte(byte(as - AI32TruncSatF32S + 0x00))
-	case as < AI16x8Abs: // [AV128Load, AI16x8Abs)
+	case as <= AI32x4RelaxedDotI8x16I7x16AddS: // [AV128Load, AI32x4RelaxedDotI8x16I7x16AddS]
+		// Vector instructions are the 0xFD prefix followed by a
+		// ULEB128-encoded opcode index. The opcodes are declared in
+		// index order, so one subtraction covers all of them.
 		w.WriteByte(0xFD)
-		writeUleb128(w, uint64(as-AV128Load+0x00))
-	case as < AI8x16RelaxedSwizzle: // [AI16x8Abs, AI8x16RelaxedSwizzle)
-		w.WriteByte(0xFD)
-		writeUleb128(w, uint64(as-AI16x8Abs+0x80))
-		w.WriteByte(0x01)
-	case as <= AI32x4RelaxedDotI8x16I7x16AddS: // [AI8x16RelaxedSwizzle, AI32x4RelaxedDotI8x16I7x16AddS]
-		w.WriteByte(0xFD)
-		writeUleb128(w, uint64(as-AI8x16RelaxedSwizzle+0x80))
-		w.WriteByte(0x02)
+		writeUleb128(w, uint64(as-AV128Load))
 
 	default:
 		panic(fmt.Sprintf("unexpected assembler op: %s", as))

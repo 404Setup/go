@@ -7,6 +7,7 @@ package loong64
 import (
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
+	"errors"
 	"fmt"
 	"log"
 	"math/bits"
@@ -2835,24 +2836,37 @@ func (c *ctxt0) asmout(p *obj.Prog, o *Optab, out []uint32) {
 		index := uint32(p.From.Index)
 		c.checkindex(p, index, m)
 
+		// The offset field is si8 scaled by the element size.
 		si := c.regoff(&p.To)
 		switch v & 0x00F00000 {
 		case 0x00100000: // [x]vstelm.d
 			if si&7 != 0 {
 				c.ctxt.Diag("%v: offset must be a multiple of 8.\n", p)
 			}
+			if si < -1024 || si > 1016 {
+				c.ctxt.Diag("%v: offset out of range [-1024, 1016].\n", p)
+			}
 			o1 = OP_5IIRR(v, index, uint32(si>>3)&0xff, rj, vd)
 		case 0x00200000: // [x]vstelm.w
 			if si&3 != 0 {
 				c.ctxt.Diag("%v: offset must be a multiple of 4.\n", p)
+			}
+			if si < -512 || si > 508 {
+				c.ctxt.Diag("%v: offset out of range [-512, 508].\n", p)
 			}
 			o1 = OP_5IIRR(v, index, uint32(si>>2)&0xff, rj, vd)
 		case 0x00400000: // [x]vstelm.h
 			if si&1 != 0 {
 				c.ctxt.Diag("%v: offset must be a multiple of 2.\n", p)
 			}
+			if si < -256 || si > 254 {
+				c.ctxt.Diag("%v: offset out of range [-256, 254].\n", p)
+			}
 			o1 = OP_5IIRR(v, index, uint32(si>>1)&0xff, rj, vd)
 		case 0x00800000: // [x]vstelm.b
+			if si < -128 || si > 127 {
+				c.ctxt.Diag("%v: offset out of range [-128, 127].\n", p)
+			}
 			o1 = OP_5IIRR(v, index, uint32(si)&0xff, rj, vd)
 		}
 
@@ -3441,4 +3455,83 @@ func OpCodeRRR(a obj.As) uint32 {
 	}
 	log.Fatalf("bad rrr opcode %v", a)
 	return 0
+}
+
+var loong64ElemExtMap = map[string]int16{
+	"B":  ARNG_B,
+	"H":  ARNG_H,
+	"W":  ARNG_W,
+	"V":  ARNG_V,
+	"BU": ARNG_BU,
+	"HU": ARNG_HU,
+	"WU": ARNG_WU,
+	"VU": ARNG_VU,
+}
+
+var loong64LsxArngExtMap = map[string]int16{
+	"B16": ARNG_16B,
+	"H8":  ARNG_8H,
+	"W4":  ARNG_4W,
+	"V2":  ARNG_2V,
+}
+
+var loong64LasxArngExtMap = map[string]int16{
+	"B32": ARNG_32B,
+	"H16": ARNG_16H,
+	"W8":  ARNG_8W,
+	"V4":  ARNG_4V,
+	"Q2":  ARNG_2Q,
+}
+
+// Loong64RegisterExtension constructs an Loong64 register with extension or arrangement.
+func EncodeRegisterExtension(a *obj.Addr, ext string, reg, num int16, isAmount, isIndex bool) error {
+	var ok bool
+	var arngType int16
+	var simdType int16
+	var simdReg int16
+
+	switch {
+	case reg >= REG_V0 && reg <= REG_V31:
+		simdType = LSX
+		simdReg = reg - REG_V0
+	case reg >= REG_X0 && reg <= REG_X31:
+		simdType = LASX
+		simdReg = reg - REG_X0
+	default:
+		return errors.New("Loong64 extension: invalid LSX/LASX register: " + fmt.Sprintf("%d", reg))
+	}
+
+	if isIndex {
+		arngType, ok = loong64ElemExtMap[ext]
+		if !ok {
+			return errors.New("Loong64 extension: invalid LSX/LASX arrangement type: " + ext)
+		}
+
+		a.Reg = REG_ELEM
+		a.Reg += ((simdReg & EXT_REG_MASK) << EXT_REG_SHIFT)
+		a.Reg += ((arngType & EXT_TYPE_MASK) << EXT_TYPE_SHIFT)
+		a.Reg += ((simdType & EXT_SIMDTYPE_MASK) << EXT_SIMDTYPE_SHIFT)
+		a.Index = num
+	} else {
+		switch simdType {
+		case LSX:
+			arngType, ok = loong64LsxArngExtMap[ext]
+			if !ok {
+				return errors.New("Loong64 extension: invalid LSX arrangement type: " + ext)
+			}
+
+		case LASX:
+			arngType, ok = loong64LasxArngExtMap[ext]
+			if !ok {
+				return errors.New("Loong64 extension: invalid LASX arrangement type: " + ext)
+			}
+		}
+
+		a.Reg = REG_ARNG
+		a.Reg += ((simdReg & EXT_REG_MASK) << EXT_REG_SHIFT)
+		a.Reg += ((arngType & EXT_TYPE_MASK) << EXT_TYPE_SHIFT)
+		a.Reg += ((simdType & EXT_SIMDTYPE_MASK) << EXT_SIMDTYPE_SHIFT)
+	}
+
+	return nil
 }
