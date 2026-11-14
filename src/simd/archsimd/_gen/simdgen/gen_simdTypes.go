@@ -870,10 +870,6 @@ func (x {{.Name}}) AndNot(y {{.Name}}) {{.Name}}
 
 {{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
 {{end -}}
-func (x {{.Name}}) Equal(y {{.Name}}) {{.Name}}
-
-{{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
-{{end -}}
 func (x {{.Name}}) Or(y {{.Name}}) {{.Name}}
 
 {{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
@@ -902,7 +898,14 @@ func structFields(shape specexpr.Vector) string {
 		width = int(shape.Width.(specexpr.Int))
 		lanes = width / elemBits
 	}
-	tagFieldNameS := fmt.Sprintf("%sx%d", elemBase, lanes)
+	tagBase := elemBase
+	if shape.Elem.Base == "mask" {
+		// Name the tag field after the mask, so that the compiler can tell
+		// a mask from the vector of the same shape (see
+		// types.Type.SIMDShape).
+		tagBase = fmt.Sprintf("mask%d", elemBits)
+	}
+	tagFieldNameS := fmt.Sprintf("%sx%d", tagBase, lanes)
 	tagFieldS := fmt.Sprintf("%s v%d", tagFieldNameS, width)
 	valFieldS := fmt.Sprintf("vals%s[%d]%s", strings.Repeat(" ", len(tagFieldNameS)-3), lanes, elemBase)
 	return fmt.Sprintf("\t%s\n\t%s", tagFieldS, valFieldS)

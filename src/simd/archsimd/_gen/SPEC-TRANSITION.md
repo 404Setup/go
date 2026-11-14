@@ -657,7 +657,7 @@ elements of the result and zero the rest, and widening conversions convert only
 the low elements of their input. The names carry no lane count, since the
 receiver and result types imply it: `ExtendTo*`, `TruncTo*`, `SaturateTo*`, and
 `ConvertTo*`, which work unchanged for scalable vectors. This is spec's
-`ExtendToZ`, `TruncToZ`, `SaturateToZ`, `SaturateIntToUint`, and the
+`ExtendToZ`, `TruncToZ`, `SaturateToZ`, and the
 `ConvertTo*` functions in `internal/spec/converts.go`, which documents them.
 
 On 128-bit vectors, `ExtendLo*` and `ConvertLo*` mean exactly the same as
@@ -665,9 +665,12 @@ On 128-bit vectors, `ExtendLo*` and `ConvertLo*` mean exactly the same as
 `//go:fix inline` (`archsimd/deprecated_*.go`), and `ExtendLoLToZ` and
 `ConvertLoLToZ` now describe exactly those. Delete them along with the wrappers.
 amd64's eight `ExtendLo*` conversions from a 128-bit vector to a wider one, such
-as `Int8x16.ExtendLo8ToInt32`, have no same-width equivalent, so they stay and
-are described by `ExtendLoLToZWiden`. Revisit them if a cheap 128-to-256-bit
-widening operation makes `x.ExtendTo*()` on a wider vector just as good.
+as `Int8x16.ExtendLo8ToInt32`, have no same-width equivalent, and are described
+by `ExtendLoLToZWiden`. `Enlarge` makes them unnecessary: `x.Enlarge()` (once
+per doubling) followed by `ExtendTo*` means the same thing, and the compiler's
+"simd enlarge" pass compiles it to the same single instruction, including load
+folding. So they are also deprecated `//go:fix inline` wrappers in
+`deprecated_amd64.go`; delete them and `ExtendLoLToZWiden` with the others.
 `cmd/specls -f 'ExtendLo|ConvertLo'` produces exactly the declarations the API
 has.
 

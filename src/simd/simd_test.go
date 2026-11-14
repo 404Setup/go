@@ -154,7 +154,6 @@ func TestMask8s(t *testing.T) {
 	test_helpers.TestMM2Me(t, load, simd.Mask8s.Or, test_helpers.Or)
 	test_helpers.TestMM2Me(t, load, simd.Mask8s.Xor, test_helpers.Xor)
 	test_helpers.TestMM2Me(t, load, simd.Mask8s.AndNot, test_helpers.AndNot)
-	test_helpers.TestMM2Me(t, load, simd.Mask8s.Equal, test_helpers.Xnor)
 	test_helpers.TestM2Me(t, load, simd.Mask8s.Not, test_helpers.Not)
 }
 
@@ -164,7 +163,6 @@ func TestMask16s(t *testing.T) {
 	test_helpers.TestMM2Me(t, load, simd.Mask16s.Or, test_helpers.Or)
 	test_helpers.TestMM2Me(t, load, simd.Mask16s.Xor, test_helpers.Xor)
 	test_helpers.TestMM2Me(t, load, simd.Mask16s.AndNot, test_helpers.AndNot)
-	test_helpers.TestMM2Me(t, load, simd.Mask16s.Equal, test_helpers.Xnor)
 	test_helpers.TestM2Me(t, load, simd.Mask16s.Not, test_helpers.Not)
 }
 
@@ -174,7 +172,6 @@ func TestMask32s(t *testing.T) {
 	test_helpers.TestMM2Me(t, load, simd.Mask32s.Or, test_helpers.Or)
 	test_helpers.TestMM2Me(t, load, simd.Mask32s.Xor, test_helpers.Xor)
 	test_helpers.TestMM2Me(t, load, simd.Mask32s.AndNot, test_helpers.AndNot)
-	test_helpers.TestMM2Me(t, load, simd.Mask32s.Equal, test_helpers.Xnor)
 	test_helpers.TestM2Me(t, load, simd.Mask32s.Not, test_helpers.Not)
 }
 
@@ -184,7 +181,6 @@ func TestMask64s(t *testing.T) {
 	test_helpers.TestMM2Me(t, load, simd.Mask64s.Or, test_helpers.Or)
 	test_helpers.TestMM2Me(t, load, simd.Mask64s.Xor, test_helpers.Xor)
 	test_helpers.TestMM2Me(t, load, simd.Mask64s.AndNot, test_helpers.AndNot)
-	test_helpers.TestMM2Me(t, load, simd.Mask64s.Equal, test_helpers.Xnor)
 	test_helpers.TestM2Me(t, load, simd.Mask64s.Not, test_helpers.Not)
 }
 
@@ -580,4 +576,34 @@ func TestLookupOrZero(t *testing.T) {
 	if !slices.Equal(want, got) {
 		t.Errorf("Wanted %v, got %v", want, got)
 	}
+}
+
+func TestStoreShort(t *testing.T) {
+	// Store panics if the slice is shorter than the vector, and StorePart
+	// stores as much as fits.
+	x := simd.BroadcastInt8s(1)
+	s := make([]int8, x.Len()-1)
+	if n := x.StorePart(s); n != len(s) || slices.ContainsFunc(s, func(e int8) bool { return e != 1 }) {
+		t.Errorf("StorePart into %d elements returned %d and stored %v", len(s), n, s)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Errorf("Store into %d elements of a %d-element vector didn't panic", len(s), x.Len())
+		}
+	}()
+	x.Store(s)
+}
+
+func TestStoreShortFloat64s(t *testing.T) {
+	x := simd.BroadcastFloat64s(1)
+	s := make([]float64, x.Len()-1)
+	if n := x.StorePart(s); n != len(s) || slices.ContainsFunc(s, func(e float64) bool { return e != 1 }) {
+		t.Errorf("StorePart into %d elements returned %d and stored %v", len(s), n, s)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Errorf("Store into %d elements of a %d-element vector didn't panic", len(s), x.Len())
+		}
+	}()
+	x.Store(s)
 }

@@ -306,6 +306,29 @@ func MulWidenLo[E Ints | Uints, W Width, zE Ints | Uints](x, y Vec[E, W]) (z Vec
 	return z
 }
 
+// TODO: Should this just be a peephole with some fixed permute? E.g.,
+// x.EvenToLo().MulWidenLo(y.EvenToLo())?
+
+// MulWidenEven multiplies corresponding even-indexed elements of x and y,
+// returning a vector of half as many elements, each with twice the input
+// element size.
+//
+//	z[i] = {{.zE}}(x[2*i]) * {{.zE}}(y[2*i])
+//
+// The doubled element width is sufficient to hold every product without
+// overflow.
+//
+//specgen:commutative
+//specgen:require z={xB}{xN*2}x{xL/2}
+//specgen:experiment
+func MulWidenEven[E Ints | Uints, W Width, zE Ints | Uints](x, y Vec[E, W]) (z Vec[zE, W]) {
+	z = makeVec[zE, W]()
+	for i := range z {
+		z[i] = zE(x[2*i]) * zE(y[2*i])
+	}
+	return z
+}
+
 // MulWidenHi multiplies corresponding elements in the upper half of x and y,
 // returning a vector of half as many elements, each with twice the input
 // element size.
@@ -325,6 +348,19 @@ func MulWidenHi[E Ints | Uints, W Width, zE Ints | Uints](x, y Vec[E, W]) (z Vec
 		z[i] = zE(x[half+i]) * zE(y[half+i])
 	}
 	return z
+}
+
+// MulHigh multiplies corresponding elements of x and y and returns the high
+// half of each double-width product.
+//
+//	z[i] = (x[i] * y[i]) >> {{.xN}}
+//
+// The product is computed exactly, so no bits are lost before the shift.
+//
+//specgen:commutative
+//specgen:experiment
+func MulHigh[E Ints | Uints, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
+	return map2[E, W, E, W](x, y, mulHigh[E])
 }
 
 // MulAddInts returns x * y + z elementwise.
@@ -361,13 +397,7 @@ func MulAddFloats[E Floats, W Width](x, y, z Vec[E, W]) (w Vec[Variation[E], W])
 	// guarantee the right result, we have to do it ourself.
 	w = makeVec[Variation[E], W]()
 	for i := range x {
-		var fused E
-		switch xi := any(x[i]).(type) {
-		case float32:
-			fused = E(math.FMA32(xi, float32(y[i]), float32(z[i])))
-		case float64:
-			fused = E(math.FMA(xi, float64(y[i]), float64(z[i])))
-		}
+		fused := fma(x[i], y[i], z[i])
 		// The explicit conversion prevents the Go compiler from fusing the
 		// multiply and add.
 		unfused := E(x[i]*y[i]) + z[i]
@@ -378,6 +408,50 @@ func MulAddFloats[E Floats, W Width](x, y, z Vec[E, W]) (w Vec[Variation[E], W])
 		w[i] = perPlatformDefault(fused, map[Platform]E{
 			PlatformWASM: unfused,
 		})
+	}
+	return w
+}
+
+// MulAddEvenSubOdd returns x * y + z for the even-indexed elements and
+// x * y - z for the odd-indexed elements.
+//
+//	w[2*i] = x[2*i] * y[2*i] + z[2*i]         // Add even
+//	w[2*i+1] = x[2*i+1] * y[2*i+1] - z[2*i+1] // Subtract odd
+//
+// This performs a fused multiply-add, computing each result with a single
+// rounding rather than two and no intermediate overflow.
+//
+//specgen:experiment
+func MulAddEvenSubOdd[E Floats, W Width](x, y, z Vec[E, W]) (w Vec[E, W]) {
+	w = makeVec[E, W]()
+	for i := range w {
+		if i%2 == 0 {
+			w[i] = fma(x[i], y[i], z[i])
+		} else {
+			w[i] = fma(x[i], y[i], -z[i])
+		}
+	}
+	return w
+}
+
+// MulAddOddSubEven returns x * y + z for the odd-indexed elements and
+// x * y - z for the even-indexed elements.
+//
+//	w[2*i+1] = x[2*i+1] * y[2*i+1] + z[2*i+1] // Add odd
+//	w[2*i] = x[2*i] * y[2*i] - z[2*i]         // Subtract even
+//
+// This performs a fused multiply-add, computing each result with a single
+// rounding rather than two and no intermediate overflow.
+//
+//specgen:experiment
+func MulAddOddSubEven[E Floats, W Width](x, y, z Vec[E, W]) (w Vec[E, W]) {
+	w = makeVec[E, W]()
+	for i := range w {
+		if i%2 == 0 {
+			w[i] = fma(x[i], y[i], -z[i])
+		} else {
+			w[i] = fma(x[i], y[i], z[i])
+		}
 	}
 	return w
 }

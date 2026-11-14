@@ -195,6 +195,31 @@ func mulSaturatedUSS64(x uint64, y int64) int64 {
 	}
 }
 
+// mulHigh returns the high half of the exact double-width product of x and y.
+func mulHigh[E Ints | Uints](x, y E) E {
+	n := elemBits[E]()
+	if n < 64 {
+		// The product fits in 64 bits.
+		if isSigned[E]() {
+			return E((int64(x) * int64(y)) >> n)
+		}
+		return E((uint64(x) * uint64(y)) >> n)
+	}
+	hi, _ := bits.Mul64(uint64(x), uint64(y))
+	if isSigned[E]() {
+		// Convert the unsigned high half to the signed one: as unsigned, a
+		// negative operand v stands for v + 2⁶⁴, which adds the other operand
+		// to the high half.
+		if x < 0 {
+			hi -= uint64(y)
+		}
+		if y < 0 {
+			hi -= uint64(x)
+		}
+	}
+	return E(hi)
+}
+
 // clmul computes the carryless multiplication of a and b, returning the result
 // split into high and low halves.
 func clmul[E Uints](a, b E) (hi, lo E) {
@@ -208,4 +233,15 @@ func clmul[E Uints](a, b E) (hi, lo E) {
 		}
 	}
 	return
+}
+
+// fma returns x*y + z computed with a single rounding.
+func fma[E Floats](x, y, z E) E {
+	switch xx := any(x).(type) {
+	case float32:
+		return E(math.FMA32(xx, float32(y), float32(z)))
+	case float64:
+		return E(math.FMA(xx, float64(y), float64(z)))
+	}
+	panic("unreachable")
 }

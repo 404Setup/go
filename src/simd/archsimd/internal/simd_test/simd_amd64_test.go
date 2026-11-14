@@ -487,6 +487,38 @@ func TestMaskOpt512(t *testing.T) {
 	checkSlices[float64](t, s, []float64{3, 0, 9, 0, 15, 0, 21, 0})
 }
 
+// TestMaskXnor512 tests mask equality, x.Xor(y).Not(), which the compiler
+// folds into KXNOR.
+func TestMaskXnor512(t *testing.T) {
+	if !archsimd.X86.AVX512() {
+		t.Skip("Test requires X86.AVX512, not available on this hardware")
+		return
+	}
+
+	zero8 := archsimd.Int8x64{}
+	x8 := make([]int8, 64)
+	y8 := make([]int8, 64)
+	want8 := make([]int8, 64)
+	for i := range x8 {
+		x8[i], y8[i] = int8(i&1), int8(i>>1&1)
+		if x8[i] == y8[i] {
+			want8[i] = -1
+		}
+	}
+	m8 := archsimd.LoadInt8x64(x8).Greater(zero8)
+	n8 := archsimd.LoadInt8x64(y8).Greater(zero8)
+	got8 := make([]int8, 64)
+	m8.Xor(n8).Not().ToInt8x64().Store(got8)
+	checkSlices(t, got8, want8)
+
+	zero64 := archsimd.Int64x8{}
+	m64 := archsimd.LoadInt64x8([]int64{0, 1, 0, 1, 0, 1, 0, 1}).Greater(zero64)
+	n64 := archsimd.LoadInt64x8([]int64{0, 0, 1, 1, 0, 0, 1, 1}).Greater(zero64)
+	got64 := make([]int64, 8)
+	m64.Xor(n64).Not().ToInt64x8().Store(got64)
+	checkSlices(t, got64, []int64{-1, 0, 0, -1, -1, 0, 0, -1})
+}
+
 // flattenedTranspose tranposes x and y, regarded as a pair of 2x2
 // matrices, but then flattens the rows in order, i.e
 // x: ABCD ==> a: A1B2
@@ -1798,4 +1830,123 @@ func TestMaskedWideningConversion(t *testing.T) {
 		}
 	}
 	checkSlices(t, got, want)
+}
+
+func TestEnlarge(t *testing.T) {
+	// The upper half of each result must be zero.
+	{
+		var got [32]int8
+		archsimd.LoadInt8x16([]int8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []int8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	}
+	{
+		var got [16]uint16
+		archsimd.LoadUint16x8([]uint16{1, 2, 3, 4, 5, 6, 7, 0xffff}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []uint16{1, 2, 3, 4, 5, 6, 7, 0xffff, 0, 0, 0, 0, 0, 0, 0, 0})
+	}
+	{
+		var got [8]int32
+		archsimd.LoadInt32x4([]int32{-1, -2, -3, -4}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []int32{-1, -2, -3, -4, 0, 0, 0, 0})
+	}
+	{
+		var got [4]uint64
+		archsimd.LoadUint64x2([]uint64{1, 1 << 63}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []uint64{1, 1 << 63, 0, 0})
+	}
+	{
+		var got [8]float32
+		archsimd.LoadFloat32x4([]float32{1.5, -2.5, 3.5, -4.5}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []float32{1.5, -2.5, 3.5, -4.5, 0, 0, 0, 0})
+	}
+	{
+		var got [4]float64
+		archsimd.LoadFloat64x2([]float64{1.5, -2.5}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []float64{1.5, -2.5, 0, 0})
+	}
+
+	// Taking the low half of a wider vector may leave the upper bits of
+	// the source register set. Enlarge must clear them.
+	{
+		var got [8]float32
+		y := archsimd.LoadFloat32x8([]float32{1, 2, 3, 4, 5, 6, 7, 8})
+		y.GetLo().Enlarge().Store(got[:])
+		checkSlices(t, got[:], []float32{1, 2, 3, 4, 0, 0, 0, 0})
+		y.GetHi().Enlarge().Store(got[:])
+		checkSlices(t, got[:], []float32{5, 6, 7, 8, 0, 0, 0, 0})
+	}
+	if archsimd.X86.AVX2() {
+		var got [8]int32
+		y := archsimd.LoadInt32x8([]int32{1, 2, 3, 4, 5, 6, 7, 8})
+		y.GetLo().Enlarge().Store(got[:])
+		checkSlices(t, got[:], []int32{1, 2, 3, 4, 0, 0, 0, 0})
+	}
+
+	t.Run("512", testEnlarge512)
+}
+
+func testEnlarge512(t *testing.T) {
+	if !archsimd.X86.AVX512() {
+		t.Skip("Test requires X86.AVX512, not available on this hardware")
+		return
+	}
+	{
+		var got [16]int32
+		archsimd.LoadInt32x8([]int32{1, 2, 3, 4, 5, 6, 7, 8}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []int32{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0})
+	}
+	{
+		var got [8]float64
+		archsimd.LoadFloat64x4([]float64{1, 2, 3, 4}).Enlarge().Store(got[:])
+		checkSlices(t, got[:], []float64{1, 2, 3, 4, 0, 0, 0, 0})
+	}
+	{
+		// The low half of a 512-bit vector, extended back to 512 bits.
+		var got [64]uint8
+		var src [64]uint8
+		for i := range src {
+			src[i] = uint8(i + 1)
+		}
+		archsimd.LoadUint8x64(src[:]).GetLo().Enlarge().Store(got[:])
+		want := make([]uint8, 64)
+		copy(want, src[:32])
+		checkSlices(t, got[:], want)
+	}
+}
+
+// TestEnlargeExtendTo checks that x.Enlarge().ExtendTo*() computes the same
+// thing as the widening ExtendLo* conversions it replaces. The compiler lowers
+// both to the same instruction.
+func TestEnlargeExtendTo(t *testing.T) {
+	if !archsimd.X86.AVX2() {
+		t.Skip("Test requires X86.AVX2, not available on this hardware")
+		return
+	}
+	i8 := archsimd.LoadInt8x16([]int8{-128, -1, 0, 1, 127, -2, 2, -100, 100, 3, -3, 4, -4, 5, -5, 6})
+	u8 := archsimd.LoadUint8x16([]uint8{255, 0, 1, 128, 127, 2, 254, 3, 100, 200, 4, 5, 6, 7, 8, 9})
+	i16 := archsimd.LoadInt16x8([]int16{-32768, -1, 0, 1, 32767, -2, 2, 3})
+	u16 := archsimd.LoadUint16x8([]uint16{65535, 0, 1, 32768, 32767, 2, 3, 4})
+
+	check := func(t *testing.T, name string, got, want interface{ String() string }) {
+		t.Helper()
+		if got.String() != want.String() {
+			t.Errorf("%s: got %s, want %s", name, got, want)
+		}
+	}
+	check(t, "Int8x16 to Int32", i8.Enlarge().ExtendToInt32(), i8.ExtendLo8ToInt32())
+	check(t, "Uint8x16 to Uint32", u8.Enlarge().ExtendToUint32(), u8.ExtendLo8ToUint32())
+	check(t, "Int8x16 to Int64", i8.Enlarge().ExtendToInt64(), i8.ExtendLo4ToInt64())
+	check(t, "Uint8x16 to Uint64", u8.Enlarge().ExtendToUint64(), u8.ExtendLo4ToUint64())
+	check(t, "Int16x8 to Int64", i16.Enlarge().ExtendToInt64(), i16.ExtendLo4ToInt64())
+	check(t, "Uint16x8 to Uint64", u16.Enlarge().ExtendToUint64(), u16.ExtendLo4ToUint64())
+
+	t.Run("512", func(t *testing.T) {
+		if !archsimd.X86.AVX512() {
+			t.Skip("Test requires X86.AVX512, not available on this hardware")
+			return
+		}
+		check(t, "Int8x16 to Int64x8", i8.Enlarge().Enlarge().ExtendToInt64(), i8.ExtendLo8ToInt64())
+		check(t, "Uint8x16 to Uint64x8", u8.Enlarge().Enlarge().ExtendToUint64(), u8.ExtendLo8ToUint64())
+	})
 }
