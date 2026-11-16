@@ -303,12 +303,23 @@ func (r *Resolver) tryOneName(ctx context.Context, cfg *dnsConfig, name string, 
 	if err != nil {
 		return dnsmessage.Parser{}, "", &DNSError{Err: errCannotMarshalDNSMessage.Error(), Name: name}
 	}
+
+	if sLen > 0 {
+		if err := ctx.Err(); err != nil {
+			return dnsmessage.Parser{}, "", newDNSError(mapErr(err), name, cfg.servers[serverOffset%sLen])
+		}
+		if p, server, err, ok := r.getDNSCache().get(cfg, name, qtype); ok {
+			return p, server, err
+		}
+	}
+
 	q := dnsmessage.Question{
 		Name:  n,
 		Type:  qtype,
 		Class: dnsmessage.ClassINET,
 	}
 
+	cache := r.getDNSCache()
 	for i := 0; i < cfg.attempts; i++ {
 		for j := uint32(0); j < sLen; j++ {
 			server := cfg.servers[(serverOffset+j)%sLen]
@@ -329,22 +340,26 @@ func (r *Resolver) tryOneName(ctx context.Context, cfg *dnsConfig, name string, 
 				if err == errNoSuchHost {
 					// The name does not exist, so trying
 					// another server won't help.
+					cache.putNegative(cfg, name, qtype, p, server)
 					return p, server, newDNSError(errNoSuchHost, name, server)
 				}
 				lastErr = newDNSError(err, name, server)
 				continue
 			}
 
+			beforeAnswers := p
 			if err := skipToAnswer(&p, qtype); err != nil {
 				if err == errNoSuchHost {
 					// The name does not exist, so trying
 					// another server won't help.
+					cache.putNegative(cfg, name, qtype, p, server)
 					return p, server, newDNSError(errNoSuchHost, name, server)
 				}
 				lastErr = newDNSError(err, name, server)
 				continue
 			}
 
+			cache.putPositive(cfg, name, qtype, beforeAnswers, p, server)
 			return p, server, nil
 		}
 	}
@@ -496,10 +511,27 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype dnsmessage.Typ
 		server string
 		err    error
 	)
-	for _, fqdn := range conf.nameList(name) {
+	fqdns := conf.nameList(name)
+	var prevNotFound [8]bool
+	for i, fqdn := range fqdns {
 		p, server, err = r.tryOneName(ctx, conf, fqdn, qtype)
 		if err == nil {
+			if i > 0 {
+				cache := r.getDNSCache()
+				if expireAt, srv := cache.positiveEntryExpireAt(conf, fqdn, qtype); expireAt > 0 {
+					for j := 0; j < i && j < len(prevNotFound); j++ {
+						if prevNotFound[j] {
+							cache.putNegativeExpireAt(conf, fqdns[j], qtype, srv, expireAt)
+						}
+					}
+				}
+			}
 			break
+		}
+		if i < len(prevNotFound) {
+			if dnsErr, ok := err.(*DNSError); ok && dnsErr.IsNotFound {
+				prevNotFound[i] = true
+			}
 		}
 		if nerr, ok := err.(Error); ok && nerr.Temporary() && r.strictErrors() {
 			// If we hit a temporary error with StrictErrors enabled,
@@ -621,6 +653,9 @@ func (r *Resolver) goLookupHostOrder(ctx context.Context, name string, order hos
 		if order == hostLookupFiles && !isLocalhostName(name) {
 			return nil, newDNSError(errNoSuchHost, name, "")
 		}
+		if order == hostLookupFilesDNS {
+			order = hostLookupDNS
+		}
 	}
 	ips, _, err := r.goLookupIPCNAMEOrder(ctx, "ip", name, order, conf)
 	if err != nil {
@@ -706,55 +741,92 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 		p      dnsmessage.Parser
 		server string
 		error  error
+		entry  *dnsCacheEntry
+	}
+	type indexedResult struct {
+		idx int
+		res result
 	}
 
 	if conf == nil {
 		conf = getSystemDNSConfig()
 	}
 
-	lane := make(chan result, 1)
-	qtypes := []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA}
+	var qtypesBuf [3]dnsmessage.Type
+	qtypesBuf[0] = dnsmessage.TypeA
+	qtypesBuf[1] = dnsmessage.TypeAAAA
+	qtypes := qtypesBuf[:2]
 	if network == "CNAME" {
-		qtypes = append(qtypes, dnsmessage.TypeCNAME)
+		qtypesBuf[2] = dnsmessage.TypeCNAME
+		qtypes = qtypesBuf[:3]
 	}
 	switch ipVersion(network) {
 	case '4':
-		qtypes = []dnsmessage.Type{dnsmessage.TypeA}
+		qtypes = qtypesBuf[:1]
 	case '6':
-		qtypes = []dnsmessage.Type{dnsmessage.TypeAAAA}
+		qtypes = qtypesBuf[1:2]
 	}
-	var queryFn func(fqdn string, qtype dnsmessage.Type)
-	var responseFn func(fqdn string, qtype dnsmessage.Type) result
-	if conf.singleRequest {
-		queryFn = func(fqdn string, qtype dnsmessage.Type) {}
-		responseFn = func(fqdn string, qtype dnsmessage.Type) result {
-			dnsWaitGroup.Add(1)
-			defer dnsWaitGroup.Done()
-			p, server, err := r.tryOneName(ctx, conf, fqdn, qtype)
-			return result{p, server, err}
-		}
-	} else {
-		queryFn = func(fqdn string, qtype dnsmessage.Type) {
-			dnsWaitGroup.Add(1)
-			go func(qtype dnsmessage.Type) {
-				p, server, err := r.tryOneName(ctx, conf, fqdn, qtype)
-				lane <- result{p, server, err}
-				dnsWaitGroup.Done()
-			}(qtype)
-		}
-		responseFn = func(fqdn string, qtype dnsmessage.Type) result {
-			return <-lane
-		}
-	}
+
+	cache := r.getDNSCache()
+	canUseCache := len(conf.servers) > 0 && ctx.Err() == nil
+	var lane chan indexedResult
 	var lastErr error
-	for _, fqdn := range conf.nameList(name) {
-		for _, qtype := range qtypes {
-			queryFn(fqdn, qtype)
+	fqdns := conf.nameList(name)
+	var prevAllNotFound [8]bool
+	for fqdnIdx, fqdn := range fqdns {
+		var results [3]result
+		var hit [3]bool
+		misses := len(qtypes)
+		if canUseCache {
+			for i, qtype := range qtypes {
+				if entry, err, ok := cache.getEntry(conf, fqdn, qtype); ok {
+					results[i] = result{entry.p, entry.server, err, entry}
+					hit[i] = true
+					misses--
+				}
+			}
 		}
+		if misses > 0 {
+			if conf.singleRequest || misses == 1 {
+				for i, qtype := range qtypes {
+					if !hit[i] {
+						dnsWaitGroup.Add(1)
+						p, server, err := r.tryOneName(ctx, conf, fqdn, qtype)
+						dnsWaitGroup.Done()
+						results[i] = result{p: p, server: server, error: err}
+					}
+				}
+			} else {
+				if lane == nil {
+					lane = make(chan indexedResult, len(qtypes))
+				}
+				for i, qtype := range qtypes {
+					if !hit[i] {
+						dnsWaitGroup.Add(1)
+						go func(idx int, qtype dnsmessage.Type) {
+							p, server, err := r.tryOneName(ctx, conf, fqdn, qtype)
+							lane <- indexedResult{idx: idx, res: result{p: p, server: server, error: err}}
+							dnsWaitGroup.Done()
+						}(i, qtype)
+					}
+				}
+				for range misses {
+					ir := <-lane
+					results[ir.idx] = ir.res
+				}
+			}
+		}
+
 		hitStrictError := false
-		for _, qtype := range qtypes {
-			result := responseFn(fqdn, qtype)
+		fqdnAllNotFound := true
+		var hasError [3]bool
+		for i := range qtypes {
+			result := results[i]
 			if result.error != nil {
+				hasError[i] = true
+				if dnsErr, ok := result.error.(*DNSError); !ok || !dnsErr.IsNotFound {
+					fqdnAllNotFound = false
+				}
 				if nerr, ok := result.error.(Error); ok && nerr.Temporary() && r.strictErrors() {
 					// This error will abort the nameList loop.
 					hitStrictError = true
@@ -762,6 +834,25 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 				} else if lastErr == nil || fqdn == name+"." {
 					// Prefer error for original name.
 					lastErr = result.error
+				}
+				continue
+			}
+			fqdnAllNotFound = false
+			if result.entry != nil {
+				if len(result.entry.ips) > 0 && addrs == nil {
+					n := 0
+					for j := i; j < len(qtypes); j++ {
+						if results[j].error == nil && results[j].entry != nil {
+							n += len(results[j].entry.ips)
+						}
+					}
+					addrs = make([]IPAddr, 0, n)
+				}
+				for _, ip := range result.entry.ips {
+					addrs = append(addrs, IPAddr{IP: ip})
+				}
+				if cname.Length == 0 && result.entry.cname.Length != 0 {
+					cname = result.entry.cname
 				}
 				continue
 			}
@@ -860,7 +951,26 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 			break
 		}
 		if len(addrs) > 0 || network == "CNAME" && cname.Length > 0 {
+			if expireAt, srv := cache.positiveExpireAt(conf, fqdn, qtypes, hasError); expireAt > 0 {
+				for i, qtype := range qtypes {
+					if hasError[i] {
+						if dnsErr, ok := results[i].error.(*DNSError); ok && dnsErr.IsNotFound {
+							cache.putNegativeExpireAt(conf, fqdn, qtype, srv, expireAt)
+						}
+					}
+				}
+				for j := 0; j < fqdnIdx && j < len(prevAllNotFound); j++ {
+					if prevAllNotFound[j] {
+						for _, qtype := range qtypes {
+							cache.putNegativeExpireAt(conf, fqdns[j], qtype, srv, expireAt)
+						}
+					}
+				}
+			}
 			break
+		}
+		if fqdnIdx < len(prevAllNotFound) {
+			prevAllNotFound[fqdnIdx] = fqdnAllNotFound
 		}
 	}
 	if lastErr, ok := lastErr.(*DNSError); ok {

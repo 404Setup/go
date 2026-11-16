@@ -165,6 +165,9 @@ type Resolver struct {
 	// The return values are ([]IPAddr, error).
 	lookupGroup singleflight.Group
 
+	// dnsCache caches DNS responses according to record TTLs.
+	dnsCache dnsCache
+
 	// TODO(bradfitz): optional interface impl override hook
 	// TODO(bradfitz): Timeout time.Duration?
 }

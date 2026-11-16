@@ -7,49 +7,24 @@ This fork is a personal Go branch maintained by 404Setup.
 
 ## Features
 
-> This fork will not release any updates that modify the language syntax or break existing APIs.
+> This fork does not modify language syntax or break existing standard library APIs.
 
 ### Standard Library & Runtime
-- **`std: sync/v2`**: Generic versions of `sync.Pool[T]` (including `GetOK()`) and `sync.Map[K, V]` (backed by `internal/sync.HashTrieMap` with online lock-free `Shrink()` and `abi.NoEscape` zero-allocation empty reads), along with type aliases and wrappers for `sync` primitives. Internal `sync.Pool` and `sync.Map` usages across the standard library (`archive/*`, `crypto/tls`, `encoding/*`, `fmt`, `go/printer`, `internal/poll`, `io`, `log/*`, `math/big`, `net/http`, `os`, `regexp`, `syscall`) are migrated to `sync/v2`.
-- **`std: sync/v2/container`**: Generic ordered and sorted map containers:
-  - `OrderedMap[K, V]`: Concurrent insertion-ordered map with batch-allocated entries and online `Shrink()`.
-  - `ConcurrentSkipListMap[K, V]`: Concurrent sorted skip-list map with lock-free reads/iteration and inline level towers.
-  - `LinkedHashMap[K, V]`: Insertion-ordered or LRU access-ordered map using a typed intrusive doubly-linked list and free-node cache.
-  - `TreeMap[K, V]`: Sorted red-black tree map with iterative insertion, single-pass deletion, and stack-allocated iterators.
-- **`std: sync/atomic/v2`**: Generic `atomic.Value[T]` eliminating interface boxing for scalar and pointer loads, stores, swaps, and compare-and-swaps.
-- **`runtime / gc`**: Zero-allocation inline `poolCleanupHooks` registration in the garbage collector supporting both `sync` and `sync/v2` pools simultaneously, paired with typed `poolDequeue[T]` ring buffers in `sync/v2.Pool`.
-- **`std: net/http`**: CPU and allocation optimizations across common HTTP/1.x and routing paths:
-  - **Cookies**: Single-pass `Cookie.String` serialization with bounded buffer growth; zero-split `ParseSetCookie` with `ascii.EqualFold` matching; contiguous slice batch allocation in `ParseCookie` and `readCookies` (reducing per-header allocations from $N+1$ to 2).
-  - **Status Lines**: $O(1)$ offset-table lookup in `StatusText` and precomputed HTTP/1.0 & HTTP/1.1 status lines in `writeStatusLine`.
-  - **`ServeMux` & Routing Tree**: Virtual trailing-slash matching (`matchTrailingSlash`) directly in the routing tree without heap-allocating `path + "/"` strings, plus a SIMD fast path in `isCleanPath`.
-  - **Headers, Forms & Lifecycle**: Consolidated backing slice allocation in `copyValues`, zero-allocation empty `Header.Clone`, and fast paths in `shouldClose` and `determineBodyLength`.
-- **`std: reflect`**: Performance and allocation optimizations across common reflection operations:
-  - **`DeepEqual`, `Equal` & `Comparable`**: `mayCycle` acyclic type bypass, inline 8-slot `visitSet` stack tracker, `bytealg.Equal` fast path for regular-memory types, in-place map comparison without `Value` copies, and devirtualized `Comparable` / `IsZero` inspection on `*abi.Type`.
-  - **Invocation & `Select`**: Stack-allocated method receiver cells in `callMethod`, stack-allocated variadic slice headers in `Value.Call`, direct-mapped function layout cache in front of `layoutCache`, and shared receive buffers across identical element types in `Select`.
-  - **Introspection, Slices & Iteration**: `visibleFieldsFlat` fast path for structs without embedded fields, direct memory copy in `Append` and `AppendSlice`, direct `unsafe_New` allocation in `makeString`/`makeBytes`/`makeRunes`, specialized `Swapper` paths, and static integer caching in `Seq`/`Seq2`.
-- **`std: net`**: Shuffles resolved DNS IP addresses before RFC 6724 sorting in `Resolver.lookupIPAddr` to improve connection load-balancing across equal-precedence records.
-- **`cmd/go`**: Interactive terminal build progress indicator (`Building [====   ] x/y`) during `go build` and `go install`.
+- **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with online `Shrink()`), with standard library internal usages migrated from `sync`.
+- **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
+- **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
+- **`net`**: Built-in TTL-aware DNS response cache (RFC 1035 / RFC 2308 negative caching, lock-free lookup, RFC 6724 route cache; disable with `GODEBUG=netdnscache=0`) and DNS address shuffling before RFC 6724 sorting.
+- **`net/http`**: Reduced allocations and faster parsing/formatting for cookies, status lines, headers, and `ServeMux` routing.
+- **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, and struct field introspection.
+- **`crypto/fips140`**: Compile-time and link-time dead code elimination of FIPS 140 integrity checks and self-tests when `GOFIPS140=off`.
+- **`cmd/go`**: Terminal progress indicator (`Building [====   ] x/y`) for `go build` and `go install`.
 
-### Compiler & Linker Optimizations
-- **`compiler / runtime (-fmth)`**: Aggressive floating-point optimizations assuming finite operands/results and unsigned zero:
-  - SSA algebraic reductions, reassociation, reciprocal multiplication (`x / d` sharing), `Sqrt` pairing, and FMA contraction.
-  - Fast polynomial approximations for direct calls to `math.Exp`, `Exp2`, `Log`, `Log2`, `Log10`, `Pow`, `Sin`, `Cos`, and `Tan`.
-  - Link-time activation of hardware Flush-to-Zero / Denormals-Are-Zero (`FTZ`/`DAZ` on x86 SSE2, `FPCR.FZ` on arm64) across runtime threads while preserving caller FP state across cgo transitions.
-- **`compiler (-o2)`**:
-  - Bounded loop unrolling (`o2 loop unroll`): Full unrolling for small constant-trip straight-line loops and $2\times$/$4\times$ partial unrolling within a code-size budget.
-  - Late dead code elimination (`o2 deadcode`): Prunes unreachable branches exposed after Sparse Conditional Constant Propagation (`sccp`) and `prove`.
-- **`compiler / linker (-o3)`**: Includes all `-o2` optimizations plus:
-  - **Cost-Based Inlining**: Expanded inlining budget with callsite scoring that credits loop execution, constant argument specialization, and interface/closure devirtualization while penalizing cold/panic/init paths.
-  - **Loop Interchange & Tiling**: Interchanges nested loops over 2D arrays for contiguous row-major memory access and tiles mixed row/column accesses (such as matrix transposes) into $32 \times 32$ blocks.
-  - **Dead Finite Loop & Cross-Loop Bounds Elimination**: Removes provably terminating side-effect-free loops (`o3 deadcode`) and propagates non-negative induction variables across nested loops to eliminate redundant bounds checks (`loopbce`).
-  - **Wrapper Tail Calls**: Emits tail calls for eligible pointer-shaped value-receiver method wrappers.
-  - **Two-Stage Linker & Reflection Dead Code Elimination**: Resolves statically known `reflect.Value.MethodByName` and `reflect.Type.MethodByName` names through local aliases and prunes unreachable interface and reflection methods at link time (`deadcode_o3`), reducing binary size by up to 27.1%–38.4%.
-- **`crypto/fips140`**: True compile-time and link-time dead code elimination of `crypto/internal/fips140` integrity checks and CAST self-tests when `GOFIPS140` is disabled (`GOFIPS140=off`).
+### Compiler & Linker Flags
+- **`-ldflags="-o2"`**: Bounded loop unrolling and post-SCCP/prove dead branch elimination.
+- **`-ldflags="-o3"`**: Includes `-o2`, plus cost-based inlining, 2D loop interchange and $32 \times 32$ tiling, dead finite loop removal, cross-loop bounds check elimination, wrapper tail calls, and two-stage reflection/interface linker dead code elimination.
+- **`-ldflags="-fmth"`**: Fast-math SSA reductions, reciprocal division, FMA contraction, polynomial approximations for `math` transcendentals, and hardware `FTZ`/`DAZ` mode (may relax strict IEEE 754 semantics).
 
-The compiler and linker optimizations above can be enabled via `-ldflags` (use `all=` to apply to dependencies as well):
-- `-ldflags="-o2"` (or `-ldflags="all=-o2"`)
-- `-ldflags="-o3"` (or `-ldflags="all=-o3"`)
-- `-ldflags="-fmth"` (or `-ldflags="all=-fmth"`) — *May violate strict IEEE 754 floating-point semantics; use with caution.*
+Use `all=` (e.g., `-ldflags="all=-o3"`) to apply flags across all dependencies.
 
 ---
 
@@ -121,7 +96,26 @@ xychart-beta
 
 ---
 
-### 3. `reflect` Optimizations
+### 3. `net` DNS Resolver Cache
+
+```mermaid
+xychart-beta
+    title "net DNS Resolver: Uncached (left bar) vs Cached (right bar) — Latency (ns/op, lower is better)"
+    x-axis ["LookupHost (Dual-Stack)", "LookupHost (Parallel)", "LookupTXT"]
+    y-axis "Latency (ns/op)" 0 --> 46000
+    bar [44548, 44548, 3612]
+    bar [1436, 1279, 467.6]
+```
+
+| Benchmark | Uncached (`netdnscache=0`) | Cached (Default) | Latency Delta | Allocs (`Uncached` → `Cached`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `DNSLookupHost` (A + AAAA + RFC 6724) | 44,548 ns/op | **1,436 ns/op** | **-96.8%** (31.02×) | 74 (10,136 B) → **10 (288 B)** |
+| `DNSLookupHostParallel` | 44,548 ns/op | **1,279 ns/op** | **-97.1%** (34.83×) | 74 (10,136 B) → **10 (288 B)** |
+| `DNSLookupTXT` | 3,612 ns/op | **467.6 ns/op** | **-87.1%** (7.72×) | 22 (4,216 B) → **5 (112 B)** |
+
+---
+
+### 4. `reflect` Optimizations
 
 ```mermaid
 xychart-beta
@@ -149,7 +143,7 @@ xychart-beta
 
 ---
 
-### 4. Compiler & Linker Optimizations (`-o2`, `-o3`, `-fmth`, and `GOFIPS140`)
+### 5. Compiler & Linker Optimizations (`-o2`, `-o3`, `-fmth`, and `GOFIPS140`)
 
 #### Loop, Inlining & Bounds Optimizations (`-o2` and `-o3`)
 

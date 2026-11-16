@@ -15,6 +15,13 @@ func sortByRFC6724(addrs []IPAddr) {
 	if len(addrs) < 2 {
 		return
 	}
+	if len(addrs) <= 8 {
+		var srcsBuf [8]netip.Addr
+		srcs := srcsBuf[:len(addrs)]
+		fillSrcAddrs(addrs, srcs)
+		sortByRFC6724withSrcs(addrs, srcs)
+		return
+	}
 	sortByRFC6724withSrcs(addrs, srcAddrs(addrs))
 }
 
@@ -22,7 +29,13 @@ func sortByRFC6724withSrcs(addrs []IPAddr, srcs []netip.Addr) {
 	if len(addrs) != len(srcs) {
 		panic("internal error")
 	}
-	addrInfos := make([]byRFC6724Info, len(addrs))
+	var addrInfosBuf [8]byRFC6724Info
+	var addrInfos []byRFC6724Info
+	if len(addrs) <= len(addrInfosBuf) {
+		addrInfos = addrInfosBuf[:len(addrs)]
+	} else {
+		addrInfos = make([]byRFC6724Info, len(addrs))
+	}
 	for i, v := range addrs {
 		addrAttrIP, _ := netip.AddrFromSlice(v.IP)
 		addrInfos[i] = byRFC6724Info{
@@ -43,8 +56,33 @@ func sortByRFC6724withSrcs(addrs []IPAddr, srcs []netip.Addr) {
 // number is irrelevant.
 func srcAddrs(addrs []IPAddr) []netip.Addr {
 	srcs := make([]netip.Addr, len(addrs))
+	fillSrcAddrs(addrs, srcs)
+	return srcs
+}
+
+func fillSrcAddrs(addrs []IPAddr, srcs []netip.Addr) {
 	dst := UDPAddr{Port: 53}
+	cacheEnabled := dnsCacheEnabled()
+	var now int64
+	if cacheEnabled {
+		now = dnsCacheNow()
+	}
 	for i := range addrs {
+		var dstAddr netip.Addr
+		var hasKey bool
+		if cacheEnabled {
+			if ip, ok := netip.AddrFromSlice(addrs[i].IP); ok {
+				dstAddr = ip.Unmap()
+				if addrs[i].Zone != "" {
+					dstAddr = dstAddr.WithZone(addrs[i].Zone)
+				}
+				hasKey = true
+				if src, ok := lookupSrcAddrCache(dstAddr, now); ok {
+					srcs[i] = src
+					continue
+				}
+			}
+		}
 		dst.IP = addrs[i].IP
 		dst.Zone = addrs[i].Zone
 		c, err := DialUDP("udp", nil, &dst)
@@ -54,8 +92,10 @@ func srcAddrs(addrs []IPAddr) []netip.Addr {
 			}
 			c.Close()
 		}
+		if hasKey {
+			storeSrcAddrCache(dstAddr, srcs[i], now)
+		}
 	}
-	return srcs
 }
 
 type ipAttr struct {
