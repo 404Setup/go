@@ -409,6 +409,9 @@ func (b *workbuf) checknonempty() {
 	if b.nobj == 0 {
 		throw("workbuf is empty")
 	}
+	if uint(b.nobj) > uint(len(b.obj)) {
+		throw("workbuf is corrupted")
+	}
 }
 
 func (b *workbuf) checkempty() {

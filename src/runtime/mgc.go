@@ -2050,20 +2050,16 @@ func gcMark(startTime int64) {
 		// there may be non-zero stats because we allocated
 		// black after the gcMarkDone barrier.
 		gcw.dispose()
-	}
 
-	// Flush scanAlloc from each mcache since we're about to modify
-	// heapScan directly. If we were to flush this later, then scanAlloc
-	// might have incorrect information.
-	//
-	// Note that it's not important to retain this information; we know
-	// exactly what heapScan is at this point via scanWork.
-	for _, p := range allp {
-		c := p.mcache
-		if c == nil {
-			continue
+		// Flush scanAlloc from each mcache since we're about to modify
+		// heapScan directly. If we were to flush this later, then scanAlloc
+		// might have incorrect information.
+		//
+		// Note that it's not important to retain this information; we know
+		// exactly what heapScan is at this point via scanWork.
+		if c := p.mcache; c != nil {
+			c.scanAlloc = 0
 		}
-		c.scanAlloc = 0
 	}
 
 	// Reset controller state.

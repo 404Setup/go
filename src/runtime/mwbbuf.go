@@ -196,6 +196,9 @@ func wbBufFlush1(pp *p) {
 	// Get the buffered pointers.
 	start := uintptr(unsafe.Pointer(&pp.wbBuf.buf[0]))
 	n := (pp.wbBuf.next - start) / unsafe.Sizeof(pp.wbBuf.buf[0])
+	if n > uintptr(len(pp.wbBuf.buf)) {
+		throw("wbBufFlush1: invalid buffer bounds")
+	}
 	ptrs := pp.wbBuf.buf[:n]
 
 	// Poison the buffer to make extra sure nothing is enqueued
@@ -227,16 +230,15 @@ func wbBufFlush1(pp *p) {
 	// un-shaded stacks and flush after each stack scan.
 	gcw := &pp.gcw
 	pos := 0
+	var lastPtr uintptr
 	for _, ptr := range ptrs {
-		if ptr < minLegalPointer {
-			// nil pointers are very common, especially
-			// for the "old" values. Filter out these and
-			// other "obvious" non-heap pointers ASAP.
-			//
-			// TODO: Should we filter out nils in the fast
-			// path to reduce the rate of flushes?
+		if ptr < minLegalPointer || ptr == lastPtr {
+			// nil pointers and consecutive duplicate pointers are very
+			// common, especially for the "old" values or repeated stores.
+			// Filter out these and other "obvious" non-heap pointers ASAP.
 			continue
 		}
+		lastPtr = ptr
 		if tryDeferToSpanScan(ptr, gcw) {
 			continue
 		}

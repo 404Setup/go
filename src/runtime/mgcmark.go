@@ -419,13 +419,9 @@ func markrootSpans(gcw *gcWork, shard int) {
 	for i := range specialsbits {
 		// Find set bits, which correspond to spans with specials.
 		specials := atomic.Load8(&specialsbits[i])
-		if specials == 0 {
-			continue
-		}
-		for j := uint(0); j < 8; j++ {
-			if specials&(1<<j) == 0 {
-				continue
-			}
+		for specials != 0 {
+			j := uint(sys.TrailingZeros8(specials))
+			specials &= specials - 1
 			// Find the span for this bit.
 			//
 			// This value is guaranteed to be non-nil because having
@@ -1496,31 +1492,28 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 	b := b0
 	n := n0
 
-	for i := uintptr(0); i < n; {
-		// Find bits for the next word.
-		bits := uint32(*addb(ptrmask, i/(goarch.PtrSize*8)))
-		if bits == 0 {
-			i += goarch.PtrSize * 8
-			continue
-		}
-		for j := 0; j < 8 && i < n; j++ {
-			if bits&1 != 0 {
-				// Same work as in scanObject; see comments there.
-				p := *(*uintptr)(unsafe.Pointer(b + i))
-				if p != 0 {
-					if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
-						stk.putPtr(p, false)
-					} else {
-						if !tryDeferToSpanScan(p, gcw) {
-							if obj, span, objIndex := findObject(p, b, i); obj != 0 {
-								greyobject(obj, b, i, span, gcw, objIndex)
-							}
+	for base := uintptr(0); base < n; base += goarch.PtrSize * 8 {
+		// Find bits for the next 8 words.
+		bits := uint32(*addb(ptrmask, base/(goarch.PtrSize*8)))
+		for bits != 0 {
+			i := base + uintptr(sys.TrailingZeros32(bits))*goarch.PtrSize
+			if i >= n {
+				break
+			}
+			bits &= bits - 1
+			// Same work as in scanObject; see comments there.
+			p := *(*uintptr)(unsafe.Pointer(b + i))
+			if p != 0 {
+				if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
+					stk.putPtr(p, false)
+				} else {
+					if !tryDeferToSpanScan(p, gcw) {
+						if obj, span, objIndex := findObject(p, b, i); obj != 0 {
+							greyobject(obj, b, i, span, gcw, objIndex)
 						}
 					}
 				}
 			}
-			bits >>= 1
-			i += goarch.PtrSize
 		}
 	}
 }

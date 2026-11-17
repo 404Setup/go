@@ -95,7 +95,8 @@ func (s sweepClass) split() (spc spanClass, full bool) {
 // Returns nil if no such span exists.
 func (h *mheap) nextSpanForSweep() *mspan {
 	sg := h.sweepgen
-	for sc := sweep.centralIndex.load(); sc < numSweepClasses; sc++ {
+	startSc := sweep.centralIndex.load()
+	for sc := startSc; sc < numSweepClasses; sc++ {
 		spc, full := sc.split()
 		c := &h.central[spc].mcentral
 		var s *mspan
@@ -107,12 +108,16 @@ func (h *mheap) nextSpanForSweep() *mspan {
 		if s != nil {
 			// Write down that we found something so future sweepers
 			// can start from here.
-			sweep.centralIndex.update(sc)
+			if sc != startSc {
+				sweep.centralIndex.update(sc)
+			}
 			return s
 		}
 	}
 	// Write down that we found nothing.
-	sweep.centralIndex.update(sweepClassDone)
+	if startSc != sweepClassDone {
+		sweep.centralIndex.update(sweepClassDone)
+	}
 	return nil
 }
 
@@ -676,27 +681,9 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		s.moveInlineMarks(s.gcmarkBits)
 	}
 
-	// Check for zombie objects.
-	if s.freeindex < s.nelems {
-		// Everything < freeindex is allocated and hence
-		// cannot be zombies.
-		//
-		// Check the first bitmap byte, where we have to be
-		// careful with freeindex.
-		obj := uintptr(s.freeindex)
-		if (*s.gcmarkBits.bytep(obj / 8)&^*s.allocBits.bytep(obj / 8))>>(obj%8) != 0 {
-			s.reportZombies()
-		}
-		// Check remaining bytes.
-		for i := obj/8 + 1; i < divRoundUp(uintptr(s.nelems), 8); i++ {
-			if *s.gcmarkBits.bytep(i)&^*s.allocBits.bytep(i) != 0 {
-				s.reportZombies()
-			}
-		}
-	}
-
-	// Count the number of free objects in this span.
-	nalloc := uint16(s.countAlloc())
+	// Check for zombie objects and count the number of allocated objects
+	// in a single 64-bit word pass over gcmarkBits and allocBits.
+	nalloc := s.countAllocAndCheckZombies()
 	nfreed := s.allocCount - nalloc
 	if nalloc > s.allocCount {
 		// The zombie check above should have caught this in

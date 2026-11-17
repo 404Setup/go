@@ -432,27 +432,43 @@ func bulkBarrierPreWrite(dst, src, size uintptr, typ *abi.Type) {
 	} else {
 		tp = s.typePointersOf(dst, size)
 	}
+	limit := dst + size
 	if src == 0 {
 		for {
 			var addr uintptr
-			if tp, addr = tp.next(dst + size); addr == 0 {
-				break
+			if tp, addr = tp.nextFast(); addr == 0 {
+				if tp, addr = tp.next(limit); addr == 0 {
+					break
+				}
 			}
 			dstx := (*uintptr)(unsafe.Pointer(addr))
-			p := buf.get1()
-			p[0] = *dstx
+			if v := *dstx; v >= minLegalPointer {
+				p := buf.get1()
+				p[0] = v
+			}
 		}
 	} else {
 		for {
 			var addr uintptr
-			if tp, addr = tp.next(dst + size); addr == 0 {
-				break
+			if tp, addr = tp.nextFast(); addr == 0 {
+				if tp, addr = tp.next(limit); addr == 0 {
+					break
+				}
 			}
 			dstx := (*uintptr)(unsafe.Pointer(addr))
 			srcx := (*uintptr)(unsafe.Pointer(src + (addr - dst)))
-			p := buf.get2()
-			p[0] = *dstx
-			p[1] = *srcx
+			dstv, srcv := *dstx, *srcx
+			if dstv >= minLegalPointer && srcv >= minLegalPointer {
+				p := buf.get2()
+				p[0] = dstv
+				p[1] = srcv
+			} else if dstv >= minLegalPointer {
+				p := buf.get1()
+				p[0] = dstv
+			} else if srcv >= minLegalPointer {
+				p := buf.get1()
+				p[0] = srcv
+			}
 		}
 	}
 }
@@ -493,14 +509,19 @@ func bulkBarrierPreWriteSrcOnly(dst, src, size uintptr, typ *abi.Type) {
 	} else {
 		tp = s.typePointersOf(dst, size)
 	}
+	limit := dst + size
 	for {
 		var addr uintptr
-		if tp, addr = tp.next(dst + size); addr == 0 {
-			break
+		if tp, addr = tp.nextFast(); addr == 0 {
+			if tp, addr = tp.next(limit); addr == 0 {
+				break
+			}
 		}
 		srcx := (*uintptr)(unsafe.Pointer(addr - dst + src))
-		p := buf.get1()
-		p[0] = *srcx
+		if v := *srcx; v >= minLegalPointer {
+			p := buf.get1()
+			p[0] = v
+		}
 	}
 }
 
@@ -1437,13 +1458,24 @@ func bulkBarrierBitmap(dst, src, size, maskOffset uintptr, bits *uint8) {
 		if *bits&mask != 0 {
 			dstx := (*uintptr)(unsafe.Pointer(dst + i))
 			if src == 0 {
-				p := buf.get1()
-				p[0] = *dstx
+				if v := *dstx; v >= minLegalPointer {
+					p := buf.get1()
+					p[0] = v
+				}
 			} else {
 				srcx := (*uintptr)(unsafe.Pointer(src + i))
-				p := buf.get2()
-				p[0] = *dstx
-				p[1] = *srcx
+				dstv, srcv := *dstx, *srcx
+				if dstv >= minLegalPointer && srcv >= minLegalPointer {
+					p := buf.get2()
+					p[0] = dstv
+					p[1] = srcv
+				} else if dstv >= minLegalPointer {
+					p := buf.get1()
+					p[0] = dstv
+				} else if srcv >= minLegalPointer {
+					p := buf.get1()
+					p[0] = srcv
+				}
 			}
 		}
 		mask <<= 1
@@ -1477,20 +1509,29 @@ func typeBitsBulkBarrier(typ *_type, dst, src, size uintptr) {
 	}
 	ptrmask := getGCMask(typ)
 	buf := &getg().m.p.ptr().wbBuf
-	var bits uint32
-	for i := uintptr(0); i < typ.PtrBytes; i += goarch.PtrSize {
-		if i&(goarch.PtrSize*8-1) == 0 {
-			bits = uint32(*ptrmask)
-			ptrmask = addb(ptrmask, 1)
-		} else {
-			bits = bits >> 1
-		}
-		if bits&1 != 0 {
+	for base := uintptr(0); base < typ.PtrBytes; base += goarch.PtrSize * 8 {
+		bits := uint32(*ptrmask)
+		ptrmask = addb(ptrmask, 1)
+		for bits != 0 {
+			i := base + uintptr(sys.TrailingZeros32(bits))*goarch.PtrSize
+			if i >= typ.PtrBytes {
+				break
+			}
+			bits &= bits - 1
 			dstx := (*uintptr)(unsafe.Pointer(dst + i))
 			srcx := (*uintptr)(unsafe.Pointer(src + i))
-			p := buf.get2()
-			p[0] = *dstx
-			p[1] = *srcx
+			dstv, srcv := *dstx, *srcx
+			if dstv >= minLegalPointer && srcv >= minLegalPointer {
+				p := buf.get2()
+				p[0] = dstv
+				p[1] = srcv
+			} else if dstv >= minLegalPointer {
+				p := buf.get1()
+				p[0] = dstv
+			} else if srcv >= minLegalPointer {
+				p := buf.get1()
+				p[0] = srcv
+			}
 		}
 	}
 }
@@ -1513,6 +1554,44 @@ func (s *mspan) countAlloc() int {
 		count += sys.OnesCount64(mrkBits)
 	}
 	return count
+}
+
+// countAllocAndCheckZombies scans s.gcmarkBits and s.allocBits in 8-byte
+// chunks, checking for marked-but-unallocated (zombie) objects at or after
+// s.freeindex while simultaneously counting the number of marked objects.
+func (s *mspan) countAllocAndCheckZombies() uint16 {
+	if s.freeindex >= s.nelems {
+		return uint16(s.countAlloc())
+	}
+	count := 0
+	bytes := divRoundUp(uintptr(s.nelems), 8)
+	obj := uintptr(s.freeindex)
+	freeWord := (obj / 64) * 8
+	for i := uintptr(0); i < freeWord; i += 8 {
+		mrkBits := *(*uint64)(unsafe.Pointer(s.gcmarkBits.bytep(i)))
+		count += sys.OnesCount64(mrkBits)
+	}
+	if freeWord < bytes {
+		mrkBits := *(*uint64)(unsafe.Pointer(s.gcmarkBits.bytep(freeWord)))
+		alcBits := *(*uint64)(unsafe.Pointer(s.allocBits.bytep(freeWord)))
+		count += sys.OnesCount64(mrkBits)
+		z := mrkBits &^ alcBits
+		if goarch.BigEndian {
+			z = sys.Bswap64(z)
+		}
+		if z>>(obj%64) != 0 {
+			s.reportZombies()
+		}
+		for i := freeWord + 8; i < bytes; i += 8 {
+			mrkBits := *(*uint64)(unsafe.Pointer(s.gcmarkBits.bytep(i)))
+			alcBits := *(*uint64)(unsafe.Pointer(s.allocBits.bytep(i)))
+			count += sys.OnesCount64(mrkBits)
+			if mrkBits&^alcBits != 0 {
+				s.reportZombies()
+			}
+		}
+	}
+	return uint16(count)
 }
 
 // Read the bytes starting at the aligned pointer p into a uintptr.

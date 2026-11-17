@@ -2215,3 +2215,47 @@ func RawByteSliceForTest(size int) []byte {
 func RawRuneSliceForTest(size int) []rune {
 	return rawruneslice(size)
 }
+
+var benchEmptySpanSets [272]spanSet
+
+func ResetEmptySpanSetsForTest() {
+	for i := range benchEmptySpanSets {
+		benchEmptySpanSets[i].reset()
+	}
+}
+
+func ScanBlockForTest(b, n uintptr, ptrmask *uint8) {
+	mp := acquirem()
+	systemstack(func() {
+		scanblock(b, n, ptrmask, &mp.p.ptr().gcw, nil)
+	})
+	releasem(mp)
+}
+
+func WbBufFlushDedupForTest(ptr uintptr) {
+	mp := acquirem()
+	systemstack(func() {
+		pp := mp.p.ptr()
+		pp.wbBuf.reset()
+		for i := 0; i < wbBufEntries; i += 2 {
+			p := pp.wbBuf.get2()
+			p[0] = 0
+			p[1] = ptr
+		}
+		wbBufFlush1(pp)
+	})
+	releasem(mp)
+}
+
+func BulkBarrierBitmapForTest(dst, src, size uintptr, bits *uint8) {
+	mp := acquirem()
+	systemstack(func() {
+		pp := mp.p.ptr()
+		bulkBarrierBitmap(dst, src, size, 0, bits)
+		if !pp.wbBuf.empty() {
+			wbBufFlush1(pp)
+			pp.gcw.bytesMarked = 0
+		}
+	})
+	releasem(mp)
+}

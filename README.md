@@ -16,7 +16,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`net`**: Built-in TTL-aware DNS response cache (RFC 1035 / RFC 2308 negative caching, lock-free lookup, RFC 6724 route cache; disable with `GODEBUG=netdnscache=0`) and DNS address shuffling before RFC 6724 sorting.
 - **`net/http`**: Reduced allocations and faster parsing/formatting for cookies, status lines, headers, and `ServeMux` routing.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, and struct field introspection.
-- **`runtime`**: Synchronous unmarked span reclamation before heap growth (`reclaimBeforeGrow`), `TrailingZeros8` bit scanning in `reclaimChunk`, and zero-size / empty-source fast paths in `makeslice`, `makeslicecopy`, `rawbyteslice`, and `rawruneslice`.
+- **`runtime`**: Synchronous unmarked span reclamation before heap growth (`reclaimBeforeGrow`), fused 64-bit word-wide zombie check and allocation counting during span sweep (`countAllocAndCheckZombies`), `TrailingZeros8`/`TrailingZeros32` bit scanning in `reclaimChunk`, `scanblock`, `markrootSpans`, and `typeBitsBulkBarrier`, `tp.nextFast` and `nil`-pointer filtering in bulk write barriers, consecutive pointer deduplication in `wbBufFlush1` and GreenTeaGC span/object scanners, empty `spanSet.reset` STW fast path, `workbuf`/`wbBuf` bounds checks, and zero-size fast paths in `makeslice`, `makeslicecopy`, `rawbyteslice`, and `rawruneslice`.
 - **`cmd/compile`**: Tiered stack small-buffer optimization (SBO) for non-escaping dynamic `make` and `make+copy` (`128 B` pointerless / `64 B` pointer-bearing), inlining budget promotion for dynamic `make` helpers, and static constant propagation for `make` and `[]byte(s)`.
 - **`crypto/fips140`**: Compile-time and link-time dead code elimination of FIPS 140 integrity checks and self-tests when `GOFIPS140=off`.
 - **`cmd/go`**: Terminal progress indicator (`Building [====   ] x/y`) for `go build` and `go install`.
@@ -202,7 +202,9 @@ xychart-beta
 
 ---
 
-### 6. Memory Allocation & Stack SBO (`runtime` and `cmd/compile`)
+### 6. Memory Allocation, GC & Stack SBO (`runtime` and `cmd/compile`)
+
+#### Dynamic Slice Allocation & Stack SBO
 
 ```mermaid
 xychart-beta
@@ -226,6 +228,26 @@ xychart-beta
 | `MakeSliceZeroDynamic` (`makeslice`, `cap=0`) | 7.49 ns/op | **5.19 ns/op** | **-30.7%** (1.44×) | 0 → 0 |
 | `DynamicMakeInlinePromotion` (inlined helper + SBO, 96 B) | 186.2 ns/op | **165.9 ns/op** | **-10.9%** (1.12×) | 1 (96 B) → **0 (0 B)** |
 | `SpanReclaimChurn` (32 KB span alloc + GC reclaim) | 4,886 ns/op | **4,511 ns/op** | **-7.7%** (1.08×) | 1 (32 KB) → 1 (32 KB) |
+
+#### Garbage Collector, Write Barrier & Sweep (`runtime`)
+
+```mermaid
+xychart-beta
+    title "GC & Runtime Primitives: Upstream (left bar) vs Illium (right bar) — Latency (ns/op, lower is better)"
+    x-axis ["SpanSetReset (STW)", "WbBufFlush1 (Dedup)", "BulkBarrier (Sparse)", "SweepSmallObjects", "ScanBlock (Sparse)"]
+    y-axis "Latency (ns/op)" 0 --> 3500
+    bar [3424, 1708, 961.0, 562.9, 389.1]
+    bar [468.7, 656.8, 543.1, 505.9, 217.0]
+```
+
+| Benchmark | Upstream Go | Illium | Latency Delta | Allocs (`Upstream` → `Illium`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `GCSpanSetResetEmpty` (272 `mcentral` `spanSet.reset` in STW) | 3,424 ns/op | **468.7 ns/op** | **-86.3%** (7.31×) | 0 → 0 |
+| `GCWbBufFlushDedup` (`wbBufFlush1`, 512 entries) | 1,708 ns/op | **656.8 ns/op** | **-61.5%** (2.60×) | 0 → 0 |
+| `GCScanBlockSparse` (`scanblock`, 2 KB root/stack block) | 389.1 ns/op | **217.0 ns/op** | **-44.2%** (1.79×) | 0 → 0 |
+| `GCBulkBarrierBitmapSparseNil` (`bulkBarrierBitmap`, 2 KB) | 961.0 ns/op | **543.1 ns/op** | **-43.5%** (1.77×) | 0 → 0 |
+| `GCScanSharedPointers` (4,096-element graph `runtime.GC()`) | 303.6 µs/op | **271.7 µs/op** | **-10.5%** (1.12×) | 0 → 0 |
+| `GCSweepSmallObjects` (32 B alloc + periodic GC sweep) | 562.9 ns/op | **505.9 ns/op** | **-10.1%** (1.11×) | 0 → 0 |
 
 ---
 

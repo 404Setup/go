@@ -306,13 +306,9 @@ func forEachSpecial(yield func(p uintptr, s *mspan, sp *special) bool) {
 		for i := range ha.pageSpecials[:] {
 			// Find set bits, which correspond to spans with specials.
 			specials := atomic.Load8(&ha.pageSpecials[i])
-			if specials == 0 {
-				continue
-			}
-			for j := uint(0); j < 8; j++ {
-				if specials&(1<<j) == 0 {
-					continue
-				}
+			for specials != 0 {
+				j := uint(sys.TrailingZeros8(specials))
+				specials &= specials - 1
 				// Find the span for this bit.
 				//
 				// This value is guaranteed to be non-nil because having

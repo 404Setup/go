@@ -255,8 +255,12 @@ func (b *spanSet) reset() {
 		print("head = ", head, ", tail = ", tail, "\n")
 		throw("attempt to clear non-empty span set")
 	}
+	spineLen := b.spineLen.Load()
+	if head == 0 && tail == 0 && spineLen == 0 {
+		return
+	}
 	top := head / spanSetBlockEntries
-	if uintptr(top) < b.spineLen.Load() {
+	if uintptr(top) < spineLen {
 		// If the head catches up to the tail and the set is empty,
 		// we may not clean up the block containing the head and tail
 		// since it may be pushed into again. In order to avoid leaking

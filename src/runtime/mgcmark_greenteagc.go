@@ -919,7 +919,12 @@ func scanSpan(p objptr, gcw *gcWork) {
 	}
 
 	// Process all the pointers we just got.
+	var lastP uintptr
 	for _, p := range gcw.ptrBuf[:nptrs] {
+		if p == lastP {
+			continue
+		}
+		lastP = p
 		if !tryDeferToSpanScan(p, gcw) {
 			if obj, span, objIndex := findObject(p, 0, 0); obj != 0 {
 				greyobject(obj, 0, 0, span, gcw, objIndex)
@@ -983,10 +988,9 @@ func scanObjectSmall(spanBase, b, objSize uintptr, gcw *gcWork) {
 	ptrBits := extractHeapBitsSmall(hbits, spanBase, b, objSize)
 	gcw.heapScanWork += int64(sys.Len64(uint64(ptrBits)) * goarch.PtrSize)
 	nptrs := 0
-	n := sys.OnesCount64(uint64(ptrBits))
-	for range n {
+	for ptrBits != 0 {
 		k := sys.TrailingZeros64(uint64(ptrBits))
-		ptrBits &^= 1 << k
+		ptrBits &= ptrBits - 1
 		addr := b + uintptr(k)*goarch.PtrSize
 
 		// Prefetch addr since we're about to use it. This point for prefetching
@@ -999,11 +1003,13 @@ func scanObjectSmall(spanBase, b, objSize uintptr, gcw *gcWork) {
 	}
 
 	// Process all the pointers we just got.
+	var lastP uintptr
 	for _, p := range gcw.ptrBuf[:nptrs] {
 		p = *(*uintptr)(unsafe.Pointer(p))
-		if p == 0 {
+		if p < minLegalPointer || p == lastP {
 			continue
 		}
+		lastP = p
 		if !tryDeferToSpanScan(p, gcw) {
 			if obj, span, objIndex := findObject(p, 0, 0); obj != 0 {
 				greyobject(obj, 0, 0, span, gcw, objIndex)
@@ -1014,25 +1020,23 @@ func scanObjectSmall(spanBase, b, objSize uintptr, gcw *gcWork) {
 
 func scanObjectsSmall(base, objSize uintptr, elems uint16, gcw *gcWork, scans *gc.ObjMask) {
 	nptrs := 0
+	hbitsBase, _ := spanHeapBitsRange(base, gc.PageSize, objSize)
+	hbits := (*byte)(unsafe.Pointer(hbitsBase))
 	for i, bits := range scans {
 		if i*(goarch.PtrSize*8) > int(elems) {
 			break
 		}
-		n := sys.OnesCount64(uint64(bits))
-		hbitsBase, _ := spanHeapBitsRange(base, gc.PageSize, objSize)
-		hbits := (*byte)(unsafe.Pointer(hbitsBase))
-		for range n {
+		for bits != 0 {
 			j := sys.TrailingZeros64(uint64(bits))
-			bits &^= 1 << j
+			bits &= bits - 1
 
 			b := base + uintptr(i*(goarch.PtrSize*8)+j)*objSize
 			ptrBits := extractHeapBitsSmall(hbits, base, b, objSize)
 			gcw.heapScanWork += int64(sys.Len64(uint64(ptrBits)) * goarch.PtrSize)
 
-			n := sys.OnesCount64(uint64(ptrBits))
-			for range n {
+			for ptrBits != 0 {
 				k := sys.TrailingZeros64(uint64(ptrBits))
-				ptrBits &^= 1 << k
+				ptrBits &= ptrBits - 1
 				addr := b + uintptr(k)*goarch.PtrSize
 
 				// Prefetch addr since we're about to use it. This point for prefetching
@@ -1047,11 +1051,13 @@ func scanObjectsSmall(base, objSize uintptr, elems uint16, gcw *gcWork, scans *g
 	}
 
 	// Process all the pointers we just got.
+	var lastP uintptr
 	for _, p := range gcw.ptrBuf[:nptrs] {
 		p = *(*uintptr)(unsafe.Pointer(p))
-		if p == 0 {
+		if p < minLegalPointer || p == lastP {
 			continue
 		}
+		lastP = p
 		if !tryDeferToSpanScan(p, gcw) {
 			if obj, span, objIndex := findObject(p, 0, 0); obj != 0 {
 				greyobject(obj, 0, 0, span, gcw, objIndex)
@@ -1236,6 +1242,7 @@ func scanObject(b uintptr, gcw *gcWork) {
 	}
 
 	var scanSize uintptr
+	var lastObj uintptr
 	for {
 		var addr uintptr
 		if tp, addr = tp.nextFast(); addr == 0 {
@@ -1254,8 +1261,10 @@ func scanObject(b uintptr, gcw *gcWork) {
 		obj := *(*uintptr)(unsafe.Pointer(addr))
 
 		// At this point we have extracted the next potential pointer.
-		// Quickly filter out nil and pointers back to the current object.
-		if obj != 0 && obj-b >= n {
+		// Quickly filter out nil, consecutive duplicate pointers, and
+		// pointers back to the current object.
+		if obj >= minLegalPointer && obj != lastObj && obj-b >= n {
+			lastObj = obj
 			// Test if obj points into the Go heap and, if so,
 			// mark the object.
 			//
