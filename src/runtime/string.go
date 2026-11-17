@@ -335,6 +335,10 @@ func rawstring(size int) (s string, b []byte) {
 
 // rawbyteslice allocates a new byte slice. The byte slice is not zeroed.
 func rawbyteslice(size int) (b []byte) {
+	if size == 0 {
+		*(*slice)(unsafe.Pointer(&b)) = slice{unsafe.Pointer(&zerobase), 0, 0}
+		return
+	}
 	cap := roundupsize(uintptr(size), true)
 	p := mallocgc(cap, nil, false)
 	if cap != uintptr(size) {
@@ -347,6 +351,10 @@ func rawbyteslice(size int) (b []byte) {
 
 // rawruneslice allocates a new rune slice. The rune slice is not zeroed.
 func rawruneslice(size int) (b []rune) {
+	if size == 0 {
+		*(*slice)(unsafe.Pointer(&b)) = slice{unsafe.Pointer(&zerobase), 0, 0}
+		return
+	}
 	if uintptr(size) > maxAlloc/4 {
 		throw("out of memory")
 	}

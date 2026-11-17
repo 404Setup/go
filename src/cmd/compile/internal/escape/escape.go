@@ -523,6 +523,52 @@ func (b *batch) finish(fns []*ir.Func) {
 				n.SetOp(ir.OSTR2BYTESTMP)
 			}
 		}
+		if conv, ok := n.(*ir.ConvExpr); ok && conv.Op() == ir.OSTR2BYTES && conv.X.Op() != ir.OLITERAL && loc.curfn != nil {
+			if ro := b.reassignOracle(loc.curfn); ro != nil {
+				if v := ro.StaticValue(conv.X); v != nil && v.Op() == ir.OLITERAL && v.Val().Kind() == constant.String {
+					if len(constant.StringVal(v.Val())) <= int(ir.MaxImplicitStackVarSize) && base.LiteralAllocHash.MatchPos(conv.Pos(), nil) {
+						tmp := typecheck.TempAt(conv.Pos(), loc.curfn, conv.X.Type())
+						conv.PtrInit().Append(typecheck.Stmt(loc.curfn, ir.NewDecl(conv.Pos(), ir.ODCL, tmp)))
+						conv.PtrInit().Append(typecheck.Stmt(loc.curfn, ir.NewAssignStmt(conv.Pos(), tmp, conv.X)))
+						conv.X = ir.NewBasicLit(conv.Pos(), conv.X.Type(), v.Val())
+					}
+				}
+			}
+		}
+		if mk, ok := n.(*ir.MakeExpr); ok && mk.Op() == ir.OMAKESLICE && mk.Cap != nil && ir.IsSmallIntConst(mk.Cap) && mk.Len.Op() != ir.OLITERAL && !ir.AnySideEffects(mk.Len) && loc.curfn != nil {
+			if ro := b.reassignOracle(loc.curfn); ro != nil {
+				capVal := ir.Int64Val(mk.Cap)
+				s := ro.StaticValue(mk.Len)
+				var newLen ir.Node
+				switch s.Op() {
+				case ir.OLITERAL:
+					if lit, ok := s.(*ir.BasicLit); ok && lit.Val().Kind() == constant.Int {
+						if v, ok := constant.Int64Val(lit.Val()); ok && 0 <= v && v <= capVal {
+							newLen = ir.NewBasicLit(mk.Pos(), mk.Len.Type(), lit.Val())
+						}
+					}
+				case ir.OLEN, ir.OCAP:
+					x := ro.StaticValue(s.(*ir.UnaryExpr).X)
+					if x.Op() == ir.OSLICELIT {
+						x := x.(*ir.CompLitExpr)
+						if 0 <= x.Len && x.Len <= capVal {
+							newLen = ir.NewBasicLit(mk.Pos(), types.Types[types.TINT], constant.MakeInt64(x.Len))
+						}
+					} else if s.Op() == ir.OLEN && x.Op() == ir.OLITERAL && x.Val().Kind() == constant.String {
+						v := int64(len(constant.StringVal(x.Val())))
+						if v <= capVal {
+							newLen = ir.NewBasicLit(mk.Pos(), types.Types[types.TINT], constant.MakeInt64(v))
+						}
+					}
+				}
+				if newLen != nil && base.LiteralAllocHash.MatchPos(mk.Pos(), nil) {
+					tmp := typecheck.TempAt(mk.Pos(), loc.curfn, mk.Len.Type())
+					mk.PtrInit().Append(typecheck.Stmt(loc.curfn, ir.NewDecl(mk.Pos(), ir.ODCL, tmp)))
+					mk.PtrInit().Append(typecheck.Stmt(loc.curfn, ir.NewAssignStmt(mk.Pos(), tmp, mk.Len)))
+					mk.Len = newLen
+				}
+			}
+		}
 	}
 
 	if goexperiment.RuntimeFreegc {
@@ -734,14 +780,19 @@ func (b *batch) rewriteWithLiterals(n ir.Node, fn *ir.Func) {
 			return
 		}
 
-		if (*r).Op() != ir.OLITERAL {
-			// Look up a cached ReassignOracle for the function, lazily computing one if needed.
-			ro := b.reassignOracle(fn)
+		var ro *ir.ReassignOracle
+		getOracle := func() *ir.ReassignOracle {
 			if ro == nil {
-				base.Fatalf("no ReassignOracle for function %v with closure parent %v", fn, fn.ClosureParent)
+				ro = b.reassignOracle(fn)
+				if ro == nil {
+					base.Fatalf("no ReassignOracle for function %v with closure parent %v", fn, fn.ClosureParent)
+				}
 			}
+			return ro
+		}
 
-			s := ro.StaticValue(*r)
+		if (*r).Op() != ir.OLITERAL {
+			s := getOracle().StaticValue(*r)
 			switch s.Op() {
 			case ir.OLITERAL:
 				lit, ok := s.(*ir.BasicLit)
@@ -757,13 +808,22 @@ func (b *batch) rewriteWithLiterals(n ir.Node, fn *ir.Func) {
 					assignTemp(n.Pos(), *r, n.PtrInit())
 					*r = ir.NewBasicLit(n.Pos(), (*r).Type(), lit.Val())
 				}
-			case ir.OLEN:
-				x := ro.StaticValue(s.(*ir.UnaryExpr).X)
+			case ir.OLEN, ir.OCAP:
+				x := getOracle().StaticValue(s.(*ir.UnaryExpr).X)
 				if x.Op() == ir.OSLICELIT {
 					x := x.(*ir.CompLitExpr)
+					if !base.LiteralAllocHash.MatchPos(n.Pos(), nil) {
+						return
+					}
 					// Preserve any side effects of the original expression, then update the value.
 					assignTemp(n.Pos(), *r, n.PtrInit())
 					*r = ir.NewBasicLit(n.Pos(), types.Types[types.TINT], constant.MakeInt64(x.Len))
+				} else if s.Op() == ir.OLEN && x.Op() == ir.OLITERAL && x.Val().Kind() == constant.String {
+					if !base.LiteralAllocHash.MatchPos(n.Pos(), nil) {
+						return
+					}
+					assignTemp(n.Pos(), *r, n.PtrInit())
+					*r = ir.NewBasicLit(n.Pos(), types.Types[types.TINT], constant.MakeInt64(int64(len(constant.StringVal(x.Val())))))
 				}
 			}
 		}

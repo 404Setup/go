@@ -220,6 +220,29 @@ func isAtomicV2InlineCandidate(fn *ir.Func) bool {
 		strings.HasSuffix(name, ").Swap")
 }
 
+const inlineDynamicMakeBoost = 40
+
+// hasDynamicMakeSlice reports whether fn contains a slice allocation
+// with a non-constant length or capacity that can benefit from
+// caller-context constant propagation, escape analysis, and stack
+// small-buffer optimization after inlining.
+func hasDynamicMakeSlice(fn *ir.Func) bool {
+	if len(fn.Body) == 0 {
+		return false
+	}
+	return ir.Any(fn, func(n ir.Node) bool {
+		if n.Op() != ir.OMAKESLICE {
+			return false
+		}
+		mk := n.(*ir.MakeExpr)
+		if mk.Type().Elem().Size() == 0 {
+			return false
+		}
+		return (mk.Len != nil && !ir.IsSmallIntConst(mk.Len)) ||
+			(mk.Cap != nil && !ir.IsSmallIntConst(mk.Cap))
+	})
+}
+
 // inlineBudget determines the max budget for function 'fn' prior to
 // analyzing the hairiness of the body of 'fn'. We pass in the pgo
 // profile if available (which can change the budget), also a
@@ -256,6 +279,9 @@ func inlineBudget(fn *ir.Func, profile *pgoir.Profile, relaxed bool, verbose boo
 		if verbose {
 			fmt.Printf("hot-node enabled increased budget=%v for func=%v\n", budget, ir.PkgFuncName(fn))
 		}
+	}
+	if hasDynamicMakeSlice(fn) {
+		budget += inlineDynamicMakeBoost
 	}
 	if relaxed {
 		budget += inlheur.BudgetExpansion(inlineBaseBudget())
@@ -836,6 +862,14 @@ opSwitch:
 		if n.High != nil && n.High.Op() == ir.OLEN && n.High.(*ir.UnaryExpr).X == n.X {
 			v.budget += 2
 		}
+
+	case ir.OMAKESLICE:
+		n := n.(*ir.MakeExpr)
+		if (n.Len != nil && !ir.IsSmallIntConst(n.Len)) || (n.Cap != nil && !ir.IsSmallIntConst(n.Cap)) {
+			// Discount dynamic make([]T, ...) so helpers that allocate small
+			// buffers can inline and undergo caller-context escape analysis and SBO.
+			v.budget += 2
+		}
 	}
 
 	v.budget--
@@ -1017,6 +1051,9 @@ func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller, closureCal
 		// Match the budget used when computing these generic methods. Their
 		// representation dispatch folds away after instantiation.
 		maxCost = max(maxCost, 4*inlineMaxBudget)
+	}
+	if !bigCaller && hasDynamicMakeSlice(callee) {
+		maxCost = max(maxCost, inlineBaseBudget()+inlineDynamicMakeBoost)
 	}
 
 	if callee.ClosureParent != nil {

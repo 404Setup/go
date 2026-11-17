@@ -935,22 +935,22 @@ func (h *mheap) reclaimChunk(arenas []arenaIdx, pageIdx, n uintptr) uintptr {
 				continue
 			}
 
-			for j := uint(0); j < 8; j++ {
-				if inUseUnmarked&(1<<j) != 0 {
-					s := ha.spans[arenaPage+uint(i)*8+j]
-					if s, ok := sl.tryAcquire(s); ok {
-						npages := s.npages
-						unlock(&h.lock)
-						if s.sweep(false) {
-							nFreed += npages
-						}
-						lock(&h.lock)
-						// Reload inUse. It's possible nearby
-						// spans were freed when we dropped the
-						// lock and we don't want to get stale
-						// pointers from the spans array.
-						inUseUnmarked = atomic.Load8(&inUse[i]) &^ marked[i]
+			for inUseUnmarked != 0 {
+				j := uint(sys.TrailingZeros8(inUseUnmarked))
+				inUseUnmarked &^= 1 << j
+				s := ha.spans[arenaPage+uint(i)*8+j]
+				if s, ok := sl.tryAcquire(s); ok {
+					npages := s.npages
+					unlock(&h.lock)
+					if s.sweep(false) {
+						nFreed += npages
 					}
+					lock(&h.lock)
+					// Reload inUse. It's possible nearby
+					// spans were freed when we dropped the
+					// lock and we don't want to get stale
+					// pointers from the spans array.
+					inUseUnmarked = (atomic.Load8(&inUse[i]) &^ marked[i]) &^ ((1 << (j + 1)) - 1)
 				}
 			}
 		}
@@ -971,6 +971,65 @@ func (h *mheap) reclaimChunk(arenas []arenaIdx, pageIdx, n uintptr) uintptr {
 
 	assertLockHeld(&h.lock) // Must be locked on return.
 	return nFreed
+}
+
+// reclaimBeforeGrow sweeps and reclaims unmarked spans across remaining
+// sweepArenas chunks before falling back to heap growth, stopping early
+// once h.pages can satisfy an allocation of npages.
+//
+// reclaimBeforeGrow must be called on the system stack with h.lock not held.
+//
+//go:systemstack
+func (h *mheap) reclaimBeforeGrow(npages uintptr) {
+	if h.reclaimIndex.Load() >= 1<<63 {
+		return
+	}
+
+	mp := acquirem()
+
+	trace := traceAcquire()
+	if trace.ok() {
+		trace.GCSweepStart()
+		traceRelease(trace)
+	}
+
+	arenas := h.sweepArenas
+	locked := false
+	for {
+		idx := uintptr(h.reclaimIndex.Add(pagesPerReclaimerChunk) - pagesPerReclaimerChunk)
+		if idx/pagesPerArena >= uintptr(len(arenas)) {
+			h.reclaimIndex.Store(1 << 63)
+			break
+		}
+
+		if !locked {
+			lock(&h.lock)
+			locked = true
+		}
+
+		nfound := h.reclaimChunk(arenas, idx, pagesPerReclaimerChunk)
+		if nfound > 0 {
+			// Record reclaimed pages in reclaimCredit since h.alloc
+			// already accounted for npages prior to allocSpan.
+			h.reclaimCredit.Add(nfound)
+			if npages <= 1 {
+				break
+			}
+			if base, _ := h.pages.find(npages); base != 0 {
+				break
+			}
+		}
+	}
+	if locked {
+		unlock(&h.lock)
+	}
+
+	trace = traceAcquire()
+	if trace.ok() {
+		trace.GCSweepDone()
+		traceRelease(trace)
+	}
+	releasem(mp)
 }
 
 // spanAllocType represents the type of allocation to make, or
@@ -1006,6 +1065,13 @@ func (h *mheap) alloc(npages uintptr, spanclass spanClass) *mspan {
 			h.reclaim(npages)
 		}
 		s = h.allocSpan(npages, spanAllocHeap, spanclass)
+		for s == nil && h.reclaimIndex.Load() < 1<<63 {
+			h.reclaimBeforeGrow(npages)
+			s = h.allocSpan(npages, spanAllocHeap, spanclass)
+		}
+		if s == nil {
+			s = h.allocSpan(npages, spanAllocHeap, spanclass)
+		}
 	})
 	return s
 }
@@ -1286,6 +1352,10 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 		// Try to acquire a base address.
 		base, scav = h.pages.alloc(npages)
 		if base == 0 {
+			if !typ.manual() && h.reclaimIndex.Load() < 1<<63 {
+				unlock(&h.lock)
+				return nil
+			}
 			var ok bool
 			growth, ok = h.grow(npages)
 			if !ok {

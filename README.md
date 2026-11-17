@@ -16,6 +16,8 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`net`**: Built-in TTL-aware DNS response cache (RFC 1035 / RFC 2308 negative caching, lock-free lookup, RFC 6724 route cache; disable with `GODEBUG=netdnscache=0`) and DNS address shuffling before RFC 6724 sorting.
 - **`net/http`**: Reduced allocations and faster parsing/formatting for cookies, status lines, headers, and `ServeMux` routing.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, and struct field introspection.
+- **`runtime`**: Synchronous unmarked span reclamation before heap growth (`reclaimBeforeGrow`), `TrailingZeros8` bit scanning in `reclaimChunk`, and zero-size / empty-source fast paths in `makeslice`, `makeslicecopy`, `rawbyteslice`, and `rawruneslice`.
+- **`cmd/compile`**: Tiered stack small-buffer optimization (SBO) for non-escaping dynamic `make` and `make+copy` (`128 B` pointerless / `64 B` pointer-bearing), inlining budget promotion for dynamic `make` helpers, and static constant propagation for `make` and `[]byte(s)`.
 - **`crypto/fips140`**: Compile-time and link-time dead code elimination of FIPS 140 integrity checks and self-tests when `GOFIPS140=off`.
 - **`cmd/go`**: Terminal progress indicator (`Building [====   ] x/y`) for `go build` and `go install`.
 
@@ -197,6 +199,33 @@ xychart-beta
 | Service + `reflect.MethodByName` + Crypto | 8.59 MB (Default) | **5.29 MB** (`-ldflags="all=-o3"`) | **-38.4%** | Prunes unused interface & static `MethodByName` targets (`DropTLS`, `DropCrypto`) |
 | Large-scale Production Codebase (~300k LOC) | Baseline | `-ldflags="all=-o3"` | **-27.1%** | Two-level compiler + linker dead code elimination |
 | Minimal `crypto/sha256` + `crypto/fips140` | 2.40 MB (Upstream) | **2.11 MB** (Illium default) | **-12.0%** | Eliminates `crypto/internal/fips140/check` CAST/integrity init when `GOFIPS140=off` |
+
+---
+
+### 6. Memory Allocation & Stack SBO (`runtime` and `cmd/compile`)
+
+```mermaid
+xychart-beta
+    title "Memory Allocation & Stack SBO: Upstream (left bar) vs Illium (right bar) — Latency (ns/op, lower is better)"
+    x-axis ["make []byte (64B)", "make []byte (128B)", "make []int (16)", "make []*byte (8)", "make+copy (64B)", "make+copy (128B)", "[]byte(s) (48B)"]
+    y-axis "Latency (ns/op)" 0 --> 42
+    bar [20.59, 37.86, 38.06, 23.60, 23.27, 38.86, 22.53]
+    bar [3.70, 3.71, 3.71, 1.84, 3.93, 4.29, 1.88]
+```
+
+| Benchmark | Upstream Go | Illium | Latency Delta | Allocs (`Upstream` → `Illium`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `DynamicMakeSliceSBO_Ptr8` (`make([]*byte, n)`, 64 B) | 23.60 ns/op | **1.84 ns/op** | **-92.2%** (12.83×) | 1 (64 B) → **0 (0 B)** |
+| `StaticStringVarToBytes48` (`[]byte(s)`, 48 B) | 22.53 ns/op | **1.88 ns/op** | **-91.7%** (11.98×) | 1 (48 B) → **0 (0 B)** |
+| `DynamicMakeSliceSBO_Int16` (`make([]int, n)`, 128 B) | 38.06 ns/op | **3.71 ns/op** | **-90.3%** (10.26×) | 1 (128 B) → **0 (0 B)** |
+| `DynamicMakeSliceSBO_Byte128` (`make([]byte, n)`, 128 B) | 37.86 ns/op | **3.71 ns/op** | **-90.2%** (10.20×) | 1 (128 B) → **0 (0 B)** |
+| `DynamicMakeSliceCopySBO_Byte128` (`make`+`copy`, 128 B) | 38.86 ns/op | **4.29 ns/op** | **-89.0%** (9.06×) | 1 (128 B) → **0 (0 B)** |
+| `DynamicMakeSliceCopySBO_Byte64` (`make`+`copy`, 64 B) | 23.27 ns/op | **3.93 ns/op** | **-83.1%** (5.92×) | 1 (64 B) → **0 (0 B)** |
+| `DynamicMakeSliceSBO_Byte64` (`make([]byte, n)`, 64 B) | 20.59 ns/op | **3.70 ns/op** | **-82.0%** (5.56×) | 1 (64 B) → **0 (0 B)** |
+| `MakeSliceCopyZeroDynamic` (`makeslicecopy`, `tolen=0`) | 8.75 ns/op | **5.47 ns/op** | **-37.5%** (1.60×) | 0 → 0 |
+| `MakeSliceZeroDynamic` (`makeslice`, `cap=0`) | 7.49 ns/op | **5.19 ns/op** | **-30.7%** (1.44×) | 0 → 0 |
+| `DynamicMakeInlinePromotion` (inlined helper + SBO, 96 B) | 186.2 ns/op | **165.9 ns/op** | **-10.9%** (1.12×) | 1 (96 B) → **0 (0 B)** |
+| `SpanReclaimChurn` (32 KB span alloc + GC reclaim) | 4,886 ns/op | **4,511 ns/op** | **-7.7%** (1.08×) | 1 (32 KB) → 1 (32 KB) |
 
 ---
 

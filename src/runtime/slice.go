@@ -53,8 +53,15 @@ func makeslicecopy(et *_type, tolen int, fromlen int, from unsafe.Pointer) unsaf
 		copymem = tomem
 	}
 
+	if tomem == 0 {
+		return unsafe.Pointer(&zerobase)
+	}
+
 	var to unsafe.Pointer
 	if !et.Pointers() {
+		if copymem == 0 {
+			return mallocgc(tomem, nil, true)
+		}
 		to = mallocgc(tomem, nil, false)
 		if copymem < tomem {
 			memclrNoHeapPointers(add(to, copymem), tomem-copymem)
@@ -62,7 +69,10 @@ func makeslicecopy(et *_type, tolen int, fromlen int, from unsafe.Pointer) unsaf
 	} else {
 		// Note: can't use rawmem (which avoids zeroing of memory), because then GC can scan uninitialized memory.
 		to = mallocgc(tomem, et, true)
-		if copymem > 0 && writeBarrier.enabled {
+		if copymem == 0 {
+			return to
+		}
+		if writeBarrier.enabled {
 			// Only shade the pointers in old.array since we know the destination slice to
 			// only contains nil pointers because it has been cleared during alloc.
 			//
@@ -112,6 +122,9 @@ func makeslice(et *_type, len, cap int) unsafe.Pointer {
 			panicmakeslicelen()
 		}
 		panicmakeslicecap()
+	}
+	if mem == 0 {
+		return unsafe.Pointer(&zerobase)
 	}
 
 	return mallocgc(mem, et, true)

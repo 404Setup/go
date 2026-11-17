@@ -421,6 +421,23 @@ func (w *walkState) walkMakeMap(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 	return w.mkcall1(fn, n.Type(), init, reflectdata.MakeMapRType(w.curfunc, base.Pos, n), typecheck.Conv(w.curfunc, hint, argtype), m)
 }
 
+// makeSliceMaxStackSize returns the maximum stack buffer size in bytes
+// for dynamic non-escaping make([]E, ...).
+// When VariableMakeThreshold is at its default (32), use a larger
+// threshold (128B for pointerless elements, 64B for pointer-containing
+// elements) that stays within straightline zeroing limits and avoids
+// excessive GC stack scanning.
+func makeSliceMaxStackSize(elem *types.Type) int64 {
+	maxStackSize := int64(base.Debug.VariableMakeThreshold)
+	if maxStackSize == 32 {
+		if !elem.HasPointers() {
+			return 128
+		}
+		return 64
+	}
+	return maxStackSize
+}
+
 // walkMakeSlice walks an OMAKESLICE node.
 func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 	len := n.Len
@@ -431,6 +448,7 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 	} else {
 		cap = len
 	}
+
 	t := n.Type()
 	if t.Elem().NotInHeap() {
 		base.Errorf("%v can't be allocated in Go; it is incomplete (or unallocatable)", t.Elem())
@@ -452,11 +470,13 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 			//     if len < 0 { panicmakeslicelen() }
 			//     panicmakeslicecap()
 			// }
-			nif := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OGT, typecheck.Conv(w.curfunc, len, types.Types[types.TUINT64]), ir.NewInt(base.Pos, cap)), nil, nil)
-			niflen := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OLT, len, ir.NewInt(base.Pos, 0)), nil, nil)
-			niflen.Body = []ir.Node{w.mkcall("panicmakeslicelen", nil, init)}
-			nif.Body.Append(niflen, w.mkcall("panicmakeslicecap", nil, init))
-			w.appendWalkStmt(init, nif)
+			if !ir.IsSmallIntConst(len) || typecheck.IndexConst(len) < 0 || typecheck.IndexConst(len) > cap {
+				nif := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OGT, typecheck.Conv(w.curfunc, len, types.Types[types.TUINT64]), ir.NewInt(base.Pos, cap)), nil, nil)
+				niflen := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OLT, len, ir.NewInt(base.Pos, 0)), nil, nil)
+				niflen.Body = []ir.Node{w.mkcall("panicmakeslicelen", nil, init)}
+				nif.Body.Append(niflen, w.mkcall("panicmakeslicecap", nil, init))
+				w.appendWalkStmt(init, nif)
+			}
 
 			// var arr [cap]E
 			// s = arr[:len]
@@ -464,6 +484,7 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 			arr := typecheck.TempAt(base.Pos, w.curfunc, t)
 			w.appendWalkStmt(init, ir.NewAssignStmt(base.Pos, arr, nil))  // zero temp
 			s := ir.NewSliceExpr(base.Pos, ir.OSLICE, arr, nil, len, nil) // arr[:len]
+			s.SetBounded(true)
 			// The conv is necessary in case n.Type is named.
 			return w.walkExpr(typecheck.Expr(w.curfunc, typecheck.Conv(w.curfunc, s, n.Type())), init)
 		}
@@ -482,7 +503,7 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 		// } else {
 		//     slice = makeslice(elemType, len, cap)
 		// }
-		maxStackSize := int64(base.Debug.VariableMakeThreshold)
+		maxStackSize := makeSliceMaxStackSize(t.Elem())
 		K := maxStackSize / t.Elem().Size() // rounds down
 		if K > 0 {                          // skip if elem size is too big.
 			nif := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OLE, typecheck.Conv(w.curfunc, cap, types.Types[types.TUINT64]), ir.NewInt(base.Pos, K)), nil, nil)
@@ -491,12 +512,16 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 			// (Note that the slicing below would generate a panic for
 			// the same bad cases, but we want makeslice panics, not
 			// regular slicing panics.)
-			lenCap := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OGT, typecheck.Conv(w.curfunc, len, types.Types[types.TUINT64]), typecheck.Conv(w.curfunc, cap, types.Types[types.TUINT64])), nil, nil)
-			lenZero := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OLT, len, ir.NewInt(base.Pos, 0)), nil, nil)
-			lenZero.Body.Append(w.mkcall("panicmakeslicelen", nil, &lenZero.Body))
-			lenCap.Body.Append(lenZero)
-			lenCap.Body.Append(w.mkcall("panicmakeslicecap", nil, &lenCap.Body))
-			nif.Body.Append(lenCap)
+			// When n.Cap == nil (or len and cap are the same safe expression),
+			// uint64(cap) <= K already guarantees 0 <= len == cap <= K.
+			if n.Cap != nil && !ir.SameSafeExpr(len, cap) {
+				lenCap := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OGT, typecheck.Conv(w.curfunc, len, types.Types[types.TUINT64]), typecheck.Conv(w.curfunc, cap, types.Types[types.TUINT64])), nil, nil)
+				lenZero := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OLT, len, ir.NewInt(base.Pos, 0)), nil, nil)
+				lenZero.Body.Append(w.mkcall("panicmakeslicelen", nil, &lenZero.Body))
+				lenCap.Body.Append(lenZero)
+				lenCap.Body.Append(w.mkcall("panicmakeslicecap", nil, &lenCap.Body))
+				nif.Body.Append(lenCap)
+			}
 
 			t := types.NewArray(t.Elem(), K) // [K]E
 			// Wrap in a struct containing a [0]uintptr field to force
@@ -514,6 +539,7 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 			nif.Body.Append(ir.NewAssignStmt(base.Pos, store, nil))       // store = {} (zero it)
 			arr := ir.NewSelectorExpr(base.Pos, ir.ODOT, store, field)    // arr = store.arr
 			s := ir.NewSliceExpr(base.Pos, ir.OSLICE, arr, nil, len, cap) // store.arr[:len:cap]
+			s.SetBounded(true)
 			nif.Body.Append(ir.NewAssignStmt(base.Pos, slice, s))         // slice = store.arr[:len:cap]
 
 			w.appendWalkStmt(init, typecheck.Stmt(w.curfunc, nif))
@@ -550,7 +576,7 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 
 // walkMakeSliceCopy walks an OMAKESLICECOPY node.
 func (w *walkState) walkMakeSliceCopy(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
-	if n.Esc() == ir.EscNone {
+	if n.Esc() == ir.EscNone && (n.Type().Elem().HasPointers() || !n.Bounded()) {
 		base.Fatalf("OMAKESLICECOPY with EscNone: %v", n)
 	}
 
@@ -565,23 +591,51 @@ func (w *walkState) walkMakeSliceCopy(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 
 	if !t.Elem().HasPointers() && n.Bounded() {
 		// When len(to)==len(from) and elements have no pointers:
-		// replace make+copy with runtime.mallocgc+runtime.memmove.
+		// replace make+copy with runtime.mallocgc+runtime.memmove,
+		// using an unzeroed stack SBO buffer first when non-escaping.
+		if n.Esc() == ir.EscNone {
+			length = w.safeExpr(length, init)
+		}
 
 		// We do not check for overflow of len(to)*elem.Width here
 		// since len(from) is an existing checked slice capacity
 		// with same elem.Width for the from slice.
 		size := ir.NewBinaryExpr(base.Pos, ir.OMUL, typecheck.Conv(w.curfunc, length, types.Types[types.TUINTPTR]), typecheck.Conv(w.curfunc, ir.NewInt(base.Pos, t.Elem().Size()), types.Types[types.TUINTPTR]))
 
+		s := typecheck.TempAt(base.Pos, w.curfunc, t)
+		allocInit := init
+
+		if n.Esc() == ir.EscNone && base.Flag.N == 0 && base.VariableMakeHash.MatchPos(n.Pos(), nil) && t.Elem().Size() > 0 {
+			maxStackSize := makeSliceMaxStackSize(t.Elem())
+			K := maxStackSize / t.Elem().Size()
+			if K > 0 {
+				nif := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OLE, typecheck.Conv(w.curfunc, length, types.Types[types.TUINT64]), ir.NewInt(base.Pos, K)), nil, nil)
+				arrType := types.NewArray(t.Elem(), K)
+				field := typecheck.Lookup("arr")
+				storeType := types.NewStruct([]*types.Field{
+					{Sym: types.BlankSym, Type: types.NewArray(types.Types[types.TUINTPTR], 0)},
+					{Sym: field, Type: arrType},
+				})
+				storeType.SetNoalg(true)
+				store := typecheck.TempAt(base.Pos, w.curfunc, storeType)
+				arr := ir.NewSelectorExpr(base.Pos, ir.ODOT, store, field)
+				sl := ir.NewSliceExpr(base.Pos, ir.OSLICE, arr, nil, length, length)
+				sl.SetBounded(true)
+				nif.Body.Append(ir.NewAssignStmt(base.Pos, s, sl))
+				w.appendWalkStmt(init, typecheck.Stmt(w.curfunc, nif))
+				allocInit = &nif.Else
+			}
+		}
+
 		// instantiate mallocgc(size uintptr, typ *byte, needszero bool) unsafe.Pointer
 		fn := typecheck.LookupRuntime("mallocgc")
-		ptr := w.mkcall1(fn, types.Types[types.TUNSAFEPTR], init, size, typecheck.NodNil(), ir.NewBool(base.Pos, false))
+		ptr := w.mkcall1(fn, types.Types[types.TUNSAFEPTR], allocInit, size, typecheck.NodNil(), ir.NewBool(base.Pos, false))
 		ptr.MarkNonNil()
 		sh := ir.NewSliceHeaderExpr(base.Pos, t, ptr, length, length)
 
-		s := typecheck.TempAt(base.Pos, w.curfunc, t)
 		r := typecheck.Stmt(w.curfunc, ir.NewAssignStmt(base.Pos, s, sh))
-		r = w.walkExpr(r, init)
-		init.Append(r)
+		r = w.walkExpr(r, allocInit)
+		allocInit.Append(r)
 
 		// instantiate memmove(to *any, frm *any, size uintptr)
 		fn = typecheck.LookupRuntime("memmove", t.Elem(), t.Elem())

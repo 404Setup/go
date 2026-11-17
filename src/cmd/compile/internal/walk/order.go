@@ -495,13 +495,19 @@ func orderMakeSliceCopy(curfunc *ir.Func, s []ir.Node) {
 	}
 
 	mk := as.Y.(*ir.MakeExpr)
-	if mk.Esc() == ir.EscNone || mk.Len == nil || mk.Cap != nil {
+	if mk.Len == nil || mk.Cap != nil {
 		return
+	}
+	bounded := mk.Len.Op() == ir.OLEN && ir.SameSafeExpr(mk.Len.(*ir.UnaryExpr).X, cp.Y)
+	if mk.Esc() == ir.EscNone {
+		if !bounded || mk.Type().Elem().HasPointers() || ir.IsSmallIntConst(mk.Len) {
+			return
+		}
 	}
 	mk.SetOp(ir.OMAKESLICECOPY)
 	mk.Cap = cp.Y
 	// Set bounded when m = OMAKESLICE([]T, len(s)); OCOPY(m, s)
-	mk.SetBounded(mk.Len.Op() == ir.OLEN && ir.SameSafeExpr(mk.Len.(*ir.UnaryExpr).X, cp.Y))
+	mk.SetBounded(bounded)
 	as.Y = typecheck.Expr(curfunc, mk)
 	s[1] = nil // remove separate copy call
 }

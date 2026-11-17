@@ -2193,3 +2193,25 @@ func FuncNamePiecesForPrint(name string) (string, string, string, string, string
 }
 
 var InHeapOrStack = inHeapOrStack
+
+func ReclaimBeforeGrowForTest(npages uintptr) {
+	systemstack(func() {
+		mheap_.reclaimBeforeGrow(npages)
+	})
+}
+
+func ReclaimIndexForTest() uint64 {
+	return mheap_.reclaimIndex.Load()
+}
+
+func ResetReclaimIndexForTest() {
+	mheap_.reclaimIndex.Store(0)
+}
+
+func RawByteSliceForTest(size int) []byte {
+	return rawbyteslice(size)
+}
+
+func RawRuneSliceForTest(size int) []rune {
+	return rawruneslice(size)
+}
