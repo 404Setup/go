@@ -1130,12 +1130,11 @@ func main() {
 	}
 
 	specDir := specgen.MustFindSpecDir(genFlags.GOROOT)
-	specFuncs, err := specgen.Load(specDir, nil)
+	specIdx, err := specgen.LoadIndex(specDir, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "loading spec: %v\n", err)
 		os.Exit(1)
 	}
-	specIdx := specgen.NewIndex(specFuncs)
 
 	var files gentools.Files
 	files.AddPostProcessor(specdoc.Filler(specIdx, specdoc.Options{
@@ -1186,7 +1185,6 @@ func Broadcast{{.Name}}(x {{.Elem}}) {{.Name}}
 `)
 
 var typeDecl = templateOf("type decl", `
-// {{.Name}} is a 128-bit SIMD vector of {{.Count}} {{.Elem}}s.
 type {{.Name}} struct {
 	{{.Elem}}x{{.Count}} v128
 	vals      [{{.Count}}]{{.Elem}}
@@ -1194,7 +1192,6 @@ type {{.Name}} struct {
 `)
 
 var maskTypeDecl = templateOf("type decl", `
-// {{.Name}} is a 128-bit SIMD mask of {{.Count}} {{.Elem}}s.
 type {{.Name}} struct {
 	mask{{slice .Elem 3}}x{{.Count}} v128
 	vals      [{{.Count}}]{{.Elem}}
