@@ -1226,7 +1226,7 @@ func (r *reader) funcExt(name *ir.Name, method *types.Sym) {
 	fn.Pragma = r.pragmaFlag()
 	r.linkname(name)
 
-	if buildcfg.GOARCH == "wasm" {
+	if buildcfg.GOARCH == "wasm" || buildcfg.GOARCH == "wasm32" {
 		importmod := r.String()
 		importname := r.String()
 		exportname := r.String()
@@ -1544,7 +1544,7 @@ func (pr *pkgReader) dictNameOf(dict *readerDict) *ir.Name {
 		rsym := method.FuncName().Linksym()
 		assert(rsym.ABI() == obj.ABIInternal) // must be ABIInternal; see ir.OCFUNC in ssagen/ssa.go
 
-		ot = objw.SymPtr(lsym, ot, rsym, 0)
+		ot = objw.SymFuncPtr(lsym, ot, rsym)
 	}
 
 	assertOffset("subdictionaries", dict.subdictsOffset())
@@ -4341,7 +4341,7 @@ func addTailCall(pos src.XPos, fn *ir.Func, recv ir.Node, method *types.Field) {
 		base.Flag.O3 && base.Flag.N == 0 && sig.Recv() != nil && method.Type.Recv().Type.IsPtrShaped()
 	if recv.Type() != nil && recv.Type().IsPtr() && tailReceiver &&
 		method.Embedded != 0 &&
-		(types.IsInterfaceMethod(method.Type) && base.Ctxt.Arch.Name != "wasm" ||
+		(types.IsInterfaceMethod(method.Type) && base.Ctxt.Arch.Name != "wasm" && base.Ctxt.Arch.Name != "wasm32" ||
 			!types.IsInterfaceMethod(method.Type) && !unifiedHaveInlineBody(ir.MethodExprName(dot).Func)) &&
 		// TODO: implement wasm indirect tail calls
 		// TODO: do we need the ppc64le/dynlink restriction for interface tail calls?
