@@ -223,26 +223,62 @@ func removeChunkExtension(p []byte) ([]byte, error) {
 // would result in double chunking or chunking with a Content-Length
 // length, both of which are wrong.
 func NewChunkedWriter(w io.Writer) io.WriteCloser {
-	return &chunkedWriter{w}
+	return &chunkedWriter{Wire: w}
 }
 
 // Writing to chunkedWriter translates to writing in HTTP chunked Transfer
 // Encoding wire format to the underlying Wire chunkedWriter.
 type chunkedWriter struct {
 	Wire io.Writer
+	buf  [20]byte
 }
 
 // Write the contents of data as one chunk to Wire.
 // NOTE: Note that the corresponding chunk-writing procedure in Conn.Write has
 // a bug since it does not check for success of [io.WriteString]
 func (cw *chunkedWriter) Write(data []byte) (n int, err error) {
-
 	// Don't send 0-length data. It looks like EOF for chunked encoding.
 	if len(data) == 0 {
 		return 0, nil
 	}
 
-	if err = writeChunkSize(cw.Wire, len(data)); err != nil {
+	var bw *bufio.Writer
+	var flushAfter *FlushAfterChunkWriter
+	switch w := cw.Wire.(type) {
+	case *bufio.Writer:
+		bw = w
+	case *FlushAfterChunkWriter:
+		bw = w.Writer
+		flushAfter = w
+	}
+
+	// Fast path: coalesce "<hex>\r\n" + data + "\r\n" directly into bw's spare buffer.
+	// Up to 16 hex digits + "\r\n" + "\r\n" = 20 bytes of framing overhead.
+	if bw != nil && bw.Available()-20 >= len(data) {
+		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(data)), 16)
+		b = append(b, '\r', '\n')
+		b = append(b, data...)
+		b = append(b, '\r', '\n')
+		if _, err = bw.Write(b); err != nil {
+			return 0, err
+		}
+		n = len(data)
+		if flushAfter != nil {
+			err = flushAfter.Flush()
+		}
+		return n, err
+	}
+
+	if bw != nil {
+		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(data)), 16)
+		b = append(b, '\r', '\n')
+		_, err = bw.Write(b)
+	} else {
+		b := strconv.AppendUint(cw.buf[:0], uint64(len(data)), 16)
+		b = append(b, '\r', '\n')
+		_, err = cw.Wire.Write(b)
+	}
+	if err != nil {
 		return 0, err
 	}
 	if n, err = cw.Wire.Write(data); err != nil {
@@ -255,37 +291,14 @@ func (cw *chunkedWriter) Write(data []byte) (n int, err error) {
 	if _, err = io.WriteString(cw.Wire, "\r\n"); err != nil {
 		return
 	}
-	if bw, ok := cw.Wire.(*FlushAfterChunkWriter); ok {
-		err = bw.Flush()
+	if flushAfter != nil {
+		err = flushAfter.Flush()
 	}
 	return
 }
 
 func (cw *chunkedWriter) Close() error {
 	_, err := io.WriteString(cw.Wire, "0\r\n")
-	return err
-}
-
-// writeChunkSize writes the chunk-size line "<hex size>\r\n" to w.
-// When w is backed by a [bufio.Writer], the line is formatted directly into
-// its spare buffer capacity, avoiding any allocation.
-func writeChunkSize(w io.Writer, n int) error {
-	var bw *bufio.Writer
-	switch w := w.(type) {
-	case *bufio.Writer:
-		bw = w
-	case *FlushAfterChunkWriter:
-		bw = w.Writer
-	}
-	if bw != nil {
-		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(n), 16)
-		b = append(b, '\r', '\n')
-		_, err := bw.Write(b)
-		return err
-	}
-	b := strconv.AppendUint(make([]byte, 0, 18), uint64(n), 16)
-	b = append(b, '\r', '\n')
-	_, err := w.Write(b)
 	return err
 }
 

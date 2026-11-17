@@ -326,3 +326,135 @@ func (r *funcReader) Read(p []byte) (n int, err error) {
 	}
 	return n, r.err
 }
+
+func TestChunkWriterPaths(t *testing.T) {
+	t.Run("zero-length", func(t *testing.T) {
+		var dst bytes.Buffer
+		bw := bufio.NewWriter(&dst)
+		cw := NewChunkedWriter(bw)
+		n, err := cw.Write(nil)
+		if n != 0 || err != nil {
+			t.Fatalf("Write(nil) = %d, %v; want 0, nil", n, err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if dst.Len() != 0 {
+			t.Fatalf("unexpected output for empty write: %q", dst.String())
+		}
+	})
+
+	t.Run("bufio-coalesced-and-fallback", func(t *testing.T) {
+		var dst bytes.Buffer
+		bw := bufio.NewWriterSize(&dst, 32)
+		cw := NewChunkedWriter(bw)
+		// Fits in bw.Available()-20 (32-20 = 12 bytes).
+		if n, err := cw.Write([]byte("1234567890")); n != 10 || err != nil {
+			t.Fatalf("small write = %d, %v", n, err)
+		}
+		// Exceeds remaining bw.Available()-20, forcing fallback writeChunkSize + direct Write.
+		large := strings.Repeat("a", 64)
+		if n, err := cw.Write([]byte(large)); n != len(large) || err != nil {
+			t.Fatalf("large write = %d, %v", n, err)
+		}
+		if err := cw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(NewChunkedReader(&dst))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "1234567890" + large
+		if string(got) != want {
+			t.Fatalf("roundtrip = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("flush-after-chunk", func(t *testing.T) {
+		var dst bytes.Buffer
+		fw := &FlushAfterChunkWriter{Writer: bufio.NewWriterSize(&dst, 64)}
+		cw := NewChunkedWriter(fw)
+		if _, err := cw.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		// FlushAfterChunkWriter must flush immediately on coalesced write.
+		if got, want := dst.String(), "5\r\nhello\r\n"; got != want {
+			t.Fatalf("after flushed chunk got %q, want %q", got, want)
+		}
+	})
+}
+
+func TestChunkWriterAllocs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	payload := []byte("hello world, chunked payload!")
+
+	bw := bufio.NewWriter(io.Discard)
+	cwBufio := NewChunkedWriter(bw)
+	if mallocs := testing.AllocsPerRun(100, func() {
+		if _, err := cwBufio.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}); mallocs != 0 {
+		t.Errorf("bufio Write mallocs = %v; want 0", mallocs)
+	}
+
+	cwUnbuf := NewChunkedWriter(io.Discard)
+	if mallocs := testing.AllocsPerRun(100, func() {
+		if _, err := cwUnbuf.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}); mallocs != 0 {
+		t.Errorf("unbuffered Write mallocs = %v; want 0", mallocs)
+	}
+}
+
+func BenchmarkChunkedWriter(b *testing.B) {
+	small := []byte("hello world, chunked payload!")
+	large := bytes.Repeat([]byte("x"), 16*1024)
+
+	b.Run("BufioSmall", func(b *testing.B) {
+		bw := bufio.NewWriter(io.Discard)
+		cw := NewChunkedWriter(bw)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := cw.Write(small); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("BufioLarge", func(b *testing.B) {
+		bw := bufio.NewWriter(io.Discard)
+		cw := NewChunkedWriter(bw)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := cw.Write(large); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("FlushAfterChunk", func(b *testing.B) {
+		fw := &FlushAfterChunkWriter{Writer: bufio.NewWriter(io.Discard)}
+		cw := NewChunkedWriter(fw)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := cw.Write(small); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("Unbuffered", func(b *testing.B) {
+		cw := NewChunkedWriter(io.Discard)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := cw.Write(small); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
