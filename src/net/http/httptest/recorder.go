@@ -91,12 +91,17 @@ func (rw *ResponseRecorder) writeHeader(b []byte, str string) {
 	m := rw.Header()
 
 	_, hasType := m["Content-Type"]
-	hasTE := m.Get("Transfer-Encoding") != ""
+	te := m["Transfer-Encoding"]
+	hasTE := len(te) > 0 && te[0] != ""
 	if !hasType && !hasTE {
 		if b == nil {
-			b = []byte(str)
+			if str != "" {
+				var buf [512]byte
+				n := copy(buf[:], str)
+				b = buf[:n]
+			}
 		}
-		m.Set("Content-Type", http.DetectContentType(b))
+		m["Content-Type"] = []string{http.DetectContentType(b)}
 	}
 
 	rw.WriteHeader(200)
@@ -230,24 +235,29 @@ func (rw *ResponseRecorder) Result() *http.Response {
 	} else {
 		res.Body = http.NoBody
 	}
-	res.ContentLength = parseContentLength(res.Header.Get("Content-Length"))
+	var cl string
+	if vv := res.Header["Content-Length"]; len(vv) > 0 {
+		cl = vv[0]
+	}
+	res.ContentLength = parseContentLength(cl)
 
 	if trailers, ok := rw.snapHeader["Trailer"]; ok {
 		res.Trailer = make(http.Header, len(trailers))
 		for _, k := range trailers {
-			for k := range strings.SplitSeq(k, ",") {
-				k = http.CanonicalHeaderKey(textproto.TrimString(k))
-				if !httpguts.ValidTrailerHeader(k) {
-					// Ignore since forbidden by RFC 7230, section 4.1.2.
-					continue
+			for {
+				name, rest, hasComma := strings.Cut(k, ",")
+				name = http.CanonicalHeaderKey(textproto.TrimString(name))
+				if httpguts.ValidTrailerHeader(name) {
+					if vv, ok := rw.HeaderMap[name]; ok {
+						vv2 := make([]string, len(vv))
+						copy(vv2, vv)
+						res.Trailer[name] = vv2
+					}
 				}
-				vv, ok := rw.HeaderMap[k]
-				if !ok {
-					continue
+				if !hasComma {
+					break
 				}
-				vv2 := make([]string, len(vv))
-				copy(vv2, vv)
-				res.Trailer[k] = vv2
+				k = rest
 			}
 		}
 	}

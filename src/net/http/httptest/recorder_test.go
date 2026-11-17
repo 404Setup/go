@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -390,3 +392,128 @@ func TestRecorderPanicsOnNonXXXStatusCode(t *testing.T) {
 		})
 	}
 }
+
+func TestResponseRecorderOptimizations(t *testing.T) {
+	t.Run("status_strings", func(t *testing.T) {
+		for _, tc := range []struct {
+			code int
+			want string
+		}{
+			{200, "200 OK"},
+			{299, "299 "},
+			{404, "404 Not Found"},
+			{999, "999 "},
+		} {
+			rw := NewRecorder()
+			rw.WriteHeader(tc.code)
+			res := rw.Result()
+			if res.StatusCode != tc.code || res.Status != tc.want {
+				t.Errorf("code=%d: StatusCode=%d Status=%q, want %d %q", tc.code, res.StatusCode, res.Status, tc.code, tc.want)
+			}
+			if res2 := rw.Result(); res2 != res {
+				t.Errorf("Result() not cached")
+			}
+		}
+
+		// Zero Code falls back to 200 OK.
+		rwZero := NewRecorder()
+		rwZero.Code = 0
+		res := rwZero.Result()
+		if res.StatusCode != 200 || res.Status != "200 OK" {
+			t.Errorf("Code=0: StatusCode=%d Status=%q, want 200 200 OK", res.StatusCode, res.Status)
+		}
+	})
+
+	t.Run("write_string_sniff_and_te", func(t *testing.T) {
+		rw := NewRecorder()
+		rw.Header()["Transfer-Encoding"] = []string{""}
+		longHTML := "<!DOCTYPE html><html><body>" + strings.Repeat("a", 600) + "</body></html>"
+		n, err := rw.WriteString(longHTML)
+		if err != nil || n != len(longHTML) {
+			t.Fatalf("WriteString = (%d, %v), want (%d, nil)", n, err, len(longHTML))
+		}
+		res := rw.Result()
+		if got := res.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
+			t.Fatalf("Content-Type = %q, want text/html; charset=utf-8", got)
+		}
+
+		// Non-empty Transfer-Encoding suppresses Content-Type sniffing.
+		rwTE := NewRecorder()
+		rwTE.Header()["Transfer-Encoding"] = []string{"chunked"}
+		rwTE.WriteString("<html>hello</html>")
+		if got := rwTE.Result().Header.Get("Content-Type"); got != "" {
+			t.Fatalf("with Transfer-Encoding, Content-Type = %q, want empty", got)
+		}
+	})
+
+	t.Run("trailers_and_header_snapshot", func(t *testing.T) {
+		rw := NewRecorder()
+		rw.Header().Set("X-Initial", "v1")
+		rw.Header().Add("Trailer", "X-Tr-A, x-tr-b, Connection")
+		rw.Write([]byte("body"))
+		// Mutating HeaderMap after Write should not affect snapped Response.Header,
+		// except declared trailer values and TrailerPrefix entries.
+		rw.Header().Set("X-Initial", "mutated")
+		rw.Header().Set("X-Tr-A", "va")
+		rw.Header().Add("X-Tr-B", "vb1")
+		rw.Header().Add("X-Tr-B", "vb2")
+		rw.Header().Set("Connection", "close")
+		rw.Header().Set(http.TrailerPrefix+"X-Tr-C", "vc")
+
+		res := rw.Result()
+		if got := res.Header.Get("X-Initial"); got != "v1" {
+			t.Errorf("snapped X-Initial = %q, want v1", got)
+		}
+		if got := res.Trailer["X-Tr-A"]; !slices.Equal(got, []string{"va"}) {
+			t.Errorf("Trailer X-Tr-A = %v, want [va]", got)
+		}
+		if got := res.Trailer["X-Tr-B"]; !slices.Equal(got, []string{"vb1", "vb2"}) {
+			t.Errorf("Trailer X-Tr-B = %v, want [vb1 vb2]", got)
+		}
+		if _, ok := res.Trailer["Connection"]; ok {
+			t.Errorf("invalid trailer Connection included: %v", res.Trailer)
+		}
+		if got := res.Trailer["X-Tr-C"]; !slices.Equal(got, []string{"vc"}) {
+			t.Errorf("Trailer X-Tr-C = %v, want [vc]", got)
+		}
+	})
+
+	t.Run("nil_body_and_body_disallowed", func(t *testing.T) {
+		for _, code := range []int{http.StatusContinue, http.StatusNoContent, http.StatusNotModified} {
+			rw := &ResponseRecorder{HeaderMap: make(http.Header)}
+			rw.WriteHeader(code)
+			if n, err := rw.WriteString("x"); err != http.ErrBodyNotAllowed || n != 0 {
+				t.Errorf("status %d WriteString = (%d, %v), want (0, ErrBodyNotAllowed)", code, n, err)
+			}
+			res := rw.Result()
+			if res.Body != http.NoBody {
+				t.Errorf("status %d Body != http.NoBody", code)
+			}
+		}
+	})
+}
+
+func BenchmarkResponseRecorderWriteString(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rw := NewRecorder()
+		rw.Header()["Content-Type"] = []string{"text/plain"}
+		rw.WriteString("hello, world")
+		_ = rw.Result()
+	}
+}
+
+func BenchmarkResponseRecorderResult(b *testing.B) {
+	rw := NewRecorder()
+	rw.Header().Set("Content-Type", "application/json")
+	rw.Header().Set("Content-Length", "13")
+	rw.Header().Set("Cache-Control", "no-store")
+	rw.WriteString(`{"ok":true}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rw.result = nil
+		_ = rw.Result()
+	}
+}
+

@@ -2484,3 +2484,129 @@ func TestReverseProxyURLSanitization(t *testing.T) {
 		}
 	}
 }
+
+func TestReverseProxyOptimizations(t *testing.T) {
+	t.Run("removeHopByHop_Http2Settings_and_Connection", func(t *testing.T) {
+		h := http.Header{
+			"Http2-Settings": {"AAMAAABkAARAAAAAAAIAAAAA"},
+			"Connection":     {"x-custom-hop, X-Other-Hop"},
+			"X-Custom-Hop":   {"1"},
+			"X-Other-Hop":    {"2"},
+			"X-Keep":         {"yes"},
+		}
+		removeHopByHopHeaders(h)
+		for _, gone := range []string{"Http2-Settings", "Connection", "X-Custom-Hop", "X-Other-Hop"} {
+			if _, ok := h[gone]; ok {
+				t.Errorf("hop-by-hop header %q was not removed", gone)
+			}
+		}
+		if got := h.Get("X-Keep"); got != "yes" {
+			t.Errorf("X-Keep = %q, want yes", got)
+		}
+	})
+
+	t.Run("flushInterval_SSE_and_fallback", func(t *testing.T) {
+		p := &ReverseProxy{FlushInterval: 500 * time.Millisecond}
+		for _, tc := range []struct {
+			ct   string
+			want time.Duration
+		}{
+			{"text/event-stream", -1},
+			{"  TEXT/EVENT-STREAM ; charset=utf-8 ", -1},
+			{"text/event-stream;boundary=\"foo\"", -1},
+			{"text/event-stream; foo=\"bar\x80baz\"", -1}, // non-ASCII falls back to mime.ParseMediaType
+			{"text/plain", 500 * time.Millisecond},
+		} {
+			res := &http.Response{
+				Header:        http.Header{"Content-Type": {tc.ct}},
+				ContentLength: 10,
+			}
+			if got := p.flushInterval(res); got != tc.want {
+				t.Errorf("flushInterval(%q) = %v, want %v", tc.ct, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("copyHeader_collision_and_isolation", func(t *testing.T) {
+		src := http.Header{
+			"x-dup":  {"first"},
+			"X-Dup":  {"second"},
+			"X-One":  {"1"},
+			"X-Two":  {"2"},
+			"Empty":  nil,
+		}
+		dst := make(http.Header)
+		copyHeader(dst, src)
+		if !slices.Equal(dst["X-One"], []string{"1"}) || !slices.Equal(dst["X-Two"], []string{"2"}) {
+			t.Fatalf("unexpected X-One/X-Two: %#v", dst)
+		}
+		if len(dst["X-Dup"]) != 2 || !slices.Contains(dst["X-Dup"], "first") || !slices.Contains(dst["X-Dup"], "second") {
+			t.Fatalf("unexpected X-Dup: %#v", dst["X-Dup"])
+		}
+		if _, ok := dst["Empty"]; ok {
+			t.Fatalf("empty value key should not be copied")
+		}
+		// Appending to one slab slice must not overwrite sibling slab slices.
+		dst["X-One"] = append(dst["X-One"], "mutated")
+		if !slices.Equal(dst["X-Two"], []string{"2"}) {
+			t.Fatalf("slab aliasing affected X-Two: %#v", dst["X-Two"])
+		}
+	})
+
+	t.Run("serve_NoBody_and_Trailers", func(t *testing.T) {
+		p := &ReverseProxy{
+			Rewrite: func(r *ProxyRequest) {
+				r.Out.URL.Scheme = "http"
+				r.Out.URL.Host = "backend.tld"
+			},
+			Transport: RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"X-Ok": {"1"}},
+					Trailer:    http.Header{"X-Tr": {"tval"}},
+					Body:       http.NoBody,
+				}, nil
+			}),
+		}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://example.tld/", nil)
+		p.ServeHTTP(rec, req)
+		res := rec.Result()
+		if res.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", res.StatusCode)
+		}
+		if got := res.Header.Get("Trailer"); got != "X-Tr" {
+			t.Fatalf("Trailer = %q, want X-Tr", got)
+		}
+	})
+}
+
+func BenchmarkReverseProxyFlushInterval(b *testing.B) {
+	p := &ReverseProxy{FlushInterval: 100 * time.Millisecond}
+	res := &http.Response{
+		Header:        http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}},
+		ContentLength: 10,
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if p.flushInterval(res) != -1 {
+			b.Fatal("expected -1")
+		}
+	}
+}
+
+func BenchmarkReverseProxyCopyHeader(b *testing.B) {
+	src := http.Header{
+		"Content-Type":   {"application/json"},
+		"Cache-Control":  {"no-store"},
+		"X-Request-Id":   {"req-123"},
+		"X-Trace-Id":     {"trace-456"},
+		"X-Forwarded-By": {"proxy"},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		dst := make(http.Header, len(src))
+		copyHeader(dst, src)
+	}
+}
+

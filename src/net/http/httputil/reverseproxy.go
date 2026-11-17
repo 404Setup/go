@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	syncv2 "sync/v2"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -86,15 +87,15 @@ func (r *ProxyRequest) SetXForwarded() {
 		if len(prior) > 0 {
 			clientIP = strings.Join(prior, ", ") + ", " + clientIP
 		}
-		r.Out.Header.Set("X-Forwarded-For", clientIP)
+		r.Out.Header["X-Forwarded-For"] = []string{clientIP}
 	} else {
-		r.Out.Header.Del("X-Forwarded-For")
+		delete(r.Out.Header, "X-Forwarded-For")
 	}
-	r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
+	r.Out.Header["X-Forwarded-Host"] = []string{r.In.Host}
 	if r.In.TLS == nil {
-		r.Out.Header.Set("X-Forwarded-Proto", "http")
+		r.Out.Header["X-Forwarded-Proto"] = []string{"http"}
 	} else {
-		r.Out.Header.Set("X-Forwarded-Proto", "https")
+		r.Out.Header["X-Forwarded-Proto"] = []string{"https"}
 	}
 }
 
@@ -372,12 +373,20 @@ func rewriteRequestURL(req *http.Request, target *url.URL) {
 }
 
 func copyHeader(dst, src http.Header) {
+	if len(src) == 0 {
+		return
+	}
 	for k, vv := range src {
-		if len(vv) == 0 {
+		switch len(vv) {
+		case 0:
 			continue
+		case 1:
+			k = http.CanonicalHeaderKey(k)
+			dst[k] = append(dst[k], vv[0])
+		default:
+			k = http.CanonicalHeaderKey(k)
+			dst[k] = append(dst[k], vv...)
 		}
-		k = http.CanonicalHeaderKey(k)
-		dst[k] = append(dst[k], vv...)
 	}
 }
 
@@ -396,7 +405,7 @@ var hopHeaders = []string{
 	"Trailer", // not Trailers per URL above; https://www.rfc-editor.org/errata_search.php?eid=4522
 	"Transfer-Encoding",
 	"Upgrade",
-	"HTTP2-Settings", // RFC 7540
+	"Http2-Settings", // RFC 7540
 }
 
 func (p *ReverseProxy) defaultErrorHandler(rw http.ResponseWriter, req *http.Request, err error) {
@@ -511,24 +520,24 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// mentioning.) Note that we look at req.Header, not outreq.Header, since
 	// the latter has passed through removeHopByHopHeaders.
 	if httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
-		outreq.Header.Set("Te", "trailers")
+		outreq.Header["Te"] = []string{"trailers"}
 	}
 
 	// After stripping all the hop-by-hop connection headers above, add back any
 	// necessary for protocol upgrades, such as for websockets.
 	if reqUpType != "" {
-		outreq.Header.Set("Connection", "Upgrade")
-		outreq.Header.Set("Upgrade", reqUpType)
+		outreq.Header["Connection"] = []string{"Upgrade"}
+		outreq.Header["Upgrade"] = []string{reqUpType}
 	}
 
 	if p.Rewrite != nil {
 		// Strip client-provided forwarding headers.
 		// The Rewrite func may use SetXForwarded to set new values
 		// for these or copy the previous values from the inbound request.
-		outreq.Header.Del("Forwarded")
-		outreq.Header.Del("X-Forwarded-For")
-		outreq.Header.Del("X-Forwarded-Host")
-		outreq.Header.Del("X-Forwarded-Proto")
+		delete(outreq.Header, "Forwarded")
+		delete(outreq.Header, "X-Forwarded-For")
+		delete(outreq.Header, "X-Forwarded-Host")
+		delete(outreq.Header, "X-Forwarded-Proto")
 
 		// Remove unparsable query parameters from the outbound request.
 		outreq.URL.RawQuery = cleanQueryParams(outreq.URL.RawQuery)
@@ -558,7 +567,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				clientIP = strings.Join(prior, ", ") + ", " + clientIP
 			}
 			if !omit {
-				outreq.Header.Set("X-Forwarded-For", clientIP)
+				outreq.Header["X-Forwarded-For"] = []string{clientIP}
 			}
 		}
 	}
@@ -581,45 +590,17 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if _, ok := outreq.Header["User-Agent"]; !ok {
 		// If the outbound request doesn't have a User-Agent header set,
 		// don't send the default Go HTTP client User-Agent.
-		outreq.Header.Set("User-Agent", "")
+		outreq.Header["User-Agent"] = []string{""}
 	}
 
-	var (
-		roundTripMutex sync.Mutex
-		roundTripDone  bool
-	)
-	trace := &httptrace.ClientTrace{
-		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
-			roundTripMutex.Lock()
-			defer roundTripMutex.Unlock()
-			if roundTripDone {
-				// If RoundTrip has returned, don't try to further modify
-				// the ResponseWriter's header map.
-				return nil
-			}
-			h := rw.Header()
-			var orig http.Header
-			if len(h) > 0 {
-				orig = h.Clone()
-			}
-
-			copyHeader(h, http.Header(header))
-			rw.WriteHeader(code)
-
-			// Restore the original headers (which may include headers added
-			// by middleware that ran before us).
-			clear(h)
-			maps.Copy(h, orig)
-
-			return nil
-		},
-	}
-	outreq = outreq.WithContext(httptrace.WithClientTrace(outreq.Context(), trace))
+	h1xx := &reverseProxy1xxHandler{rw: rw}
+	h1xx.trace.Got1xxResponse = h1xx.got1xxResponse
+	outreq = outreq.WithContext(httptrace.WithClientTrace(outreq.Context(), &h1xx.trace))
 
 	res, err := transport.RoundTrip(outreq)
-	roundTripMutex.Lock()
-	roundTripDone = true
-	roundTripMutex.Unlock()
+	h1xx.mu.Lock()
+	h1xx.done = true
+	h1xx.mu.Unlock()
 	if err != nil {
 		p.getErrorHandler()(rw, outreq, err)
 		return
@@ -646,11 +627,20 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// at least for *http.Transport. Build it up from Trailer.
 	announcedTrailers := len(res.Trailer)
 	if announcedTrailers > 0 {
-		trailerKeys := make([]string, 0, len(res.Trailer))
-		for k := range res.Trailer {
-			trailerKeys = append(trailerKeys, k)
+		var trailerVal string
+		if announcedTrailers == 1 {
+			for k := range res.Trailer {
+				trailerVal = k
+			}
+		} else {
+			trailerKeys := make([]string, 0, announcedTrailers)
+			for k := range res.Trailer {
+				trailerKeys = append(trailerKeys, k)
+			}
+			trailerVal = strings.Join(trailerKeys, ", ")
 		}
-		rw.Header().Add("Trailer", strings.Join(trailerKeys, ", "))
+		hdr := rw.Header()
+		hdr["Trailer"] = append(hdr["Trailer"], trailerVal)
 	}
 
 	rw.WriteHeader(res.StatusCode)
@@ -689,6 +679,44 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
+type reverseProxy1xxHandler struct {
+	mu    sync.Mutex
+	done  bool
+	rw    http.ResponseWriter
+	trace httptrace.ClientTrace
+}
+
+func (h1xx *reverseProxy1xxHandler) got1xxResponse(code int, header textproto.MIMEHeader) error {
+	h1xx.mu.Lock()
+	defer h1xx.mu.Unlock()
+	if h1xx.done {
+		// If RoundTrip has returned, don't try to further modify
+		// the ResponseWriter's header map.
+		return nil
+	}
+	h := h1xx.rw.Header()
+	var orig http.Header
+	if len(h) > 0 {
+		orig = h.Clone()
+	}
+
+	copyHeader(h, http.Header(header))
+	h1xx.rw.WriteHeader(code)
+
+	// Restore the original headers (which may include headers added
+	// by middleware that ran before us).
+	clear(h)
+	maps.Copy(h, orig)
+
+	return nil
+}
+
+var copyBufPool = syncv2.Pool[*[32 * 1024]byte]{
+	New: func() *[32 * 1024]byte {
+		return new([32 * 1024]byte)
+	},
+}
+
 var inOurTests bool // whether we're in our own tests
 
 // shouldPanicOnCopyError reports whether the reverse proxy should
@@ -713,31 +741,57 @@ func shouldPanicOnCopyError(req *http.Request) bool {
 
 // removeHopByHopHeaders removes hop-by-hop headers.
 func removeHopByHopHeaders(h http.Header) {
+	if len(h) == 0 {
+		return
+	}
 	// RFC 7230, section 6.1: Remove headers listed in the "Connection" header.
 	for _, f := range h["Connection"] {
-		for sf := range strings.SplitSeq(f, ",") {
+		for {
+			sf, rest, hasComma := strings.Cut(f, ",")
 			if sf = textproto.TrimString(sf); sf != "" {
-				h.Del(sf)
+				delete(h, http.CanonicalHeaderKey(sf))
 			}
+			if !hasComma {
+				break
+			}
+			f = rest
 		}
 	}
 	// RFC 2616, section 13.5.1: Remove a set of known hop-by-hop headers.
 	// This behavior is superseded by the RFC 7230 Connection header, but
 	// preserve it for backwards compatibility.
 	for _, f := range hopHeaders {
-		h.Del(f)
+		delete(h, f)
 	}
+}
+
+func isASCIIContentTypeBase(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 0x20 || c > 0x7e) && c != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
 // overriding its value for a specific request/response.
 func (p *ReverseProxy) flushInterval(res *http.Response) time.Duration {
-	resCT := res.Header.Get("Content-Type")
-
-	// For Server-Sent Events responses, flush immediately.
-	// The MIME type is defined in https://www.w3.org/TR/eventsource/#text-event-stream
-	if baseCT, _, _ := mime.ParseMediaType(resCT); baseCT == "text/event-stream" {
-		return -1 // negative means immediately
+	if cts := res.Header["Content-Type"]; len(cts) > 0 && cts[0] != "" {
+		resCT := cts[0]
+		// For Server-Sent Events responses, flush immediately.
+		// The MIME type is defined in https://www.w3.org/TR/eventsource/#text-event-stream
+		if resCT == "text/event-stream" {
+			return -1 // negative means immediately
+		}
+		if base, _, _ := strings.Cut(resCT, ";"); isASCIIContentTypeBase(base) {
+			if ascii.EqualFold(textproto.TrimString(base), "text/event-stream") {
+				return -1 // negative means immediately
+			}
+		} else if baseCT, _, _ := mime.ParseMediaType(resCT); baseCT == "text/event-stream" {
+			return -1 // negative means immediately
+		}
 	}
 
 	// We might have the case of streaming for which Content-Length might be unset.
@@ -749,6 +803,9 @@ func (p *ReverseProxy) flushInterval(res *http.Response) time.Duration {
 }
 
 func (p *ReverseProxy) copyResponse(dst http.ResponseWriter, src io.Reader, flushInterval time.Duration) error {
+	if src == http.NoBody && p.BufferPool == nil {
+		return nil
+	}
 	var w io.Writer = dst
 
 	if flushInterval != 0 {
@@ -779,7 +836,9 @@ func (p *ReverseProxy) copyResponse(dst http.ResponseWriter, src io.Reader, flus
 // of bytes written.
 func (p *ReverseProxy) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 	if len(buf) == 0 {
-		buf = make([]byte, 32*1024)
+		bp := copyBufPool.Get()
+		buf = bp[:]
+		defer copyBufPool.Put(bp)
 	}
 	var written int64
 	for {
@@ -869,7 +928,10 @@ func upgradeType(h http.Header) string {
 	if !httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade") {
 		return ""
 	}
-	return h.Get("Upgrade")
+	if vv := h["Upgrade"]; len(vv) > 0 {
+		return vv[0]
+	}
+	return ""
 }
 
 func (p *ReverseProxy) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request, res *http.Response) {
