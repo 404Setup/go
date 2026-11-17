@@ -76,25 +76,49 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "net/http: Upstream (left bar) vs Illium (right bar) — Latency (ns/op, lower is better)"
-    x-axis ["CookieString", "CopyValues", "ServerMatch (Mux)", "ReadRequest (Wrk)", "ReadRequest (Curl)", "ReadSetCookies"]
-    y-axis "Latency (ns/op)" 0 --> 2000
-    bar [419.2, 756.5, 921.3, 919.2, 1239.7, 1864.3]
-    bar [360.9, 856.0, 618.1, 785.5, 1069.3, 1412.7]
+    x-axis ["ParseHTTPDate (RFC850)", "CookieString", "ResponseWrite", "ServerMatch", "ReadRequest (Wrk)", "ParseSetCookie", "ReadSetCookies"]
+    y-axis "Latency (ns/op)" 0 --> 1900
+    bar [431.8, 431.4, 682.5, 895.5, 989.1, 1081.0, 1810.5]
+    bar [26.0, 195.5, 340.7, 528.4, 741.6, 361.7, 590.7]
 ```
 
 | Benchmark | Upstream Go | Illium | Latency Delta | Allocs (`Upstream` → `Illium`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `StatusText` | 3.41 ns/op | **0.35 ns/op** | **-89.7%** (9.74×) | 0 → 0 |
-| `ResponseStatusLine404` | 14.83 ns/op | **3.56 ns/op** | **-76.0%** (4.17×) | 0 → 0 |
-| `CookieString` | 419.2 ns/op | **360.9 ns/op** | **-13.9%** (1.16×) | 1 (176 B) → **1 (144 B)** |
-| `ReadSetCookies` | 1,864 ns/op | **1,413 ns/op** | **-24.2%** (1.32×) | 21 (1,168 B) → **11 (726 B)** |
-| `ReadCookies/ParseCookie` | 2,254 ns/op | **2,234 ns/op** | **-0.9%** | 11 (2,000 B) → **2 (2,128 B)** (-81.8% allocs) |
-| `CopyValues` | 756.5 ns/op | **856.0 ns/op** | +13.1% | 11 (736 B) → **6 (784 B)** (-45.5% allocs) |
-| `ServerMatch` (`ServeMux`) | 921.3 ns/op | **618.1 ns/op** | **-32.9%** (1.49×) | 10 (791 B) → **5 (568 B)** (-50.0% allocs) |
-| `ServeMux` (end-to-end) | 43.03 µs/op | **32.82 µs/op** | **-23.7%** (1.31×) | 360 → 360 |
-| `ReadRequest/Wrk` | 919.2 ns/op | **785.5 ns/op** | **-14.5%** (1.17×) | 7 (912 B) → **6 (896 B)** |
-| `ReadRequest/Curl` | 1,240 ns/op | **1,069 ns/op** | **-13.8%** (1.16×) | 9 (960 B) → **8 (944 B)** |
-| `ServerFakeConn/KeepAliveLite` | 3,929 ns/op | **3,505 ns/op** | **-10.8%** (1.12×) | 12 (1,312 B) → **10 (1,248 B)** |
+| `StatusCodeString` (`internal`) | 21.29 ns/op | **0.33 ns/op** | **-98.4%** (64.52×) | 1 (3 B) → **0 (0 B)** |
+| `DetectContentType/Binary512` (`internal`) | 263.0 ns/op | **6.55 ns/op** | **-97.5%** (40.15×) | 0 → 0 |
+| `DetectContentType/PNG` (`internal`) | 146.7 ns/op | **3.89 ns/op** | **-97.4%** (37.71×) | 0 → 0 |
+| `DetectContentType/MP4` (`internal`) | 186.9 ns/op | **7.13 ns/op** | **-96.2%** (26.21×) | 0 → 0 |
+| `DetectContentType/HTML` (`internal`) | 14.54 ns/op | **5.44 ns/op** | **-62.5%** (2.67×) | 0 → 0 |
+| `ParseHTTPDate/RFC850` (`internal`) | 431.8 ns/op | **26.02 ns/op** | **-94.0%** (16.59×) | 7 (307 B) → **0 (0 B)** |
+| `ParseCookieDate` (`internal`) | 309.4 ns/op | **25.14 ns/op** | **-91.9%** (12.31×) | 4 (163 B) → **0 (0 B)** |
+| `EncodeHeaders/Empty` (`http2`) | 33.64 ns/op | **2.55 ns/op** | **-92.4%** (13.19×) | 0 → 0 |
+| `ReverseProxy.ServeHTTP` (`httputil`) | 9,173 ns/op | **791.0 ns/op** | **-91.4%** (11.60×) | 14 (34,256 B) → **10 (1,443 B)** |
+| `StatusText` | 3.67 ns/op | **0.34 ns/op** | **-90.7%** (10.79×) | 0 → 0 |
+| `ReverseProxyFlushInterval` (`httputil`, SSE) | 308.9 ns/op | **49.48 ns/op** | **-84.0%** (6.24×) | 2 (336 B) → **0 (0 B)** |
+| `ResponseStatusLine404` | 15.93 ns/op | **3.23 ns/op** | **-79.7%** (4.93×) | 0 → 0 |
+| `ChunkedWriter/BufioSmall` (`internal`) | 68.55 ns/op | **16.20 ns/op** | **-76.4%** (4.23×) | 0 → 0 |
+| `ChunkedWriter/Unbuffered` (`internal`) | 67.94 ns/op | **21.71 ns/op** | **-68.0%** (3.13×) | 0 → 0 |
+| `AppendHTTPDate` (`internal`) | 130.4 ns/op | **31.47 ns/op** | **-75.9%** (4.14×) | 0 → 0 |
+| `HTTPDateNowString` (`internal`) | 220.4 ns/op | **61.20 ns/op** | **-72.2%** (3.60×) | 1 (32 B) → **0 (0 B)** |
+| `ReadSetCookies` | 1,811 ns/op | **590.7 ns/op** | **-67.4%** (3.07×) | 21 (1,168 B) → **3 (400 B)** |
+| `ParseSetCookie` | 1,081 ns/op | **361.7 ns/op** | **-66.5%** (2.99×) | 13 (640 B) → **1 (192 B)** |
+| `LowerHeader/Known` (`httpcommon`) | 11.04 ns/op | **4.50 ns/op** | **-59.3%** (2.45×) | 0 → 0 |
+| `CanonicalHeader/Known` (`httpcommon`) | 8.86 ns/op | **5.39 ns/op** | **-39.1%** (1.64×) | 0 → 0 |
+| `StreamWriteVarint` (`http3`) | 312.6 ns/op | **128.7 ns/op** | **-58.9%** (2.43×) | 0 (15 B) → 0 (15 B) |
+| `CookieString` | 431.4 ns/op | **195.5 ns/op** | **-54.7%** (2.21×) | 1 (176 B) → **1 (144 B)** |
+| `ResponseRecorderResult` (`httptest`) | 401.0 ns/op | **194.6 ns/op** | **-51.5%** (2.06×) | 5 (232 B) → **3 (208 B)** |
+| `ResponseWrite` | 682.5 ns/op | **340.7 ns/op** | **-50.1%** (2.00×) | 4 (201 B) → **1 (24 B)** |
+| `HeaderWriteSubsetBuilder` | 458.6 ns/op | **257.0 ns/op** | **-44.0%** (1.78×) | 4 (240 B) → **1 (112 B)** |
+| `HeaderWriteSubsetBufio` | 294.3 ns/op | **204.1 ns/op** | **-30.7%** (1.44×) | 0 → 0 |
+| `ServerMatch` (`ServeMux`) | 895.5 ns/op | **528.4 ns/op** | **-41.0%** (1.69×) | 10 (791 B) → **5 (568 B)** |
+| `ServeMux` (end-to-end) | 45.24 µs/op | **30.41 µs/op** | **-32.8%** (1.49×) | 360 → 360 |
+| `QPACKPrefixedString/EncoderHeaders` (`http3`) | 476.0 ns/op | **356.7 ns/op** | **-25.1%** (1.33×) | 7 (176 B) → **4 (184 B)** |
+| `ReadRequest/Wrk` | 989.1 ns/op | **741.6 ns/op** | **-25.0%** (1.33×) | 7 (912 B) → **6 (896 B)** |
+| `ServerHandlerTypeLen` | 5,278 ns/op | **3,997 ns/op** | **-24.3%** (1.32×) | 19 (2,129 B) → **18 (2,113 B)** |
+| `ClientRequestHeaders/1000` (`http2`) | 1,114 µs/op | **893.8 µs/op** | **-19.8%** (1.25×) | 4,074 (324 KB) → **3,054 (230 KB)** |
+| `ParseRange` | 267.7 ns/op | **219.1 ns/op** | **-18.2%** (1.22×) | 3 (112 B) → **1 (64 B)** |
+| `ClientServer/h1` | 19.58 µs/op | **16.52 µs/op** | **-15.6%** (1.19×) | 61 (5,420 B) → **52 (5,123 B)** |
+| `ServeContent` | 3,016 ns/op | **2,585 ns/op** | **-14.3%** (1.17×) | 16 (5,244 B) → 16 (5,244 B) |
 
 ---
 
