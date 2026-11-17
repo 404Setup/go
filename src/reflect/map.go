@@ -288,6 +288,21 @@ func (v Value) MapKeys() []Value {
 	var it maps.Iter
 	mapIterStart(tt, m, &it)
 	a := make([]Value, mlen)
+
+	// Keys that are not pointer-shaped must be copied so that later
+	// changes to the map do not affect them. Copy them into shared
+	// chunks rather than allocating each key separately. The chunk size
+	// is bounded so that a retained key does not pin an arbitrarily
+	// large amount of memory.
+	direct := keyType.IsDirectIface()
+	keySize := keyType.Size()
+	chunkKeys := mlen
+	if keySize != 0 {
+		chunkKeys = max(int(mapKeysChunkBytes/keySize), 1)
+	}
+	var chunk unsafe.Pointer
+	n, used := 0, 0 // slots in chunk, and slots of chunk already handed out
+
 	var i int
 	for i = 0; i < len(a); i++ {
 		key := it.Key()
@@ -297,11 +312,28 @@ func (v Value) MapKeys() []Value {
 			// we can do about it.
 			break
 		}
-		a[i] = copyVal(keyType, fl, key)
+		if direct {
+			a[i] = Value{keyType, *(*unsafe.Pointer)(key), fl}
+		} else {
+			if used == n {
+				n, used = min(chunkKeys, len(a)-i), 0
+				chunk = unsafe_NewArray(keyType, n)
+			}
+			// Slot used is within the allocation, so the pointer
+			// never points past the end of chunk.
+			p := add(chunk, uintptr(used)*keySize, "used < n")
+			typedmemmove(keyType, p, key)
+			a[i] = Value{keyType, p, fl | flagIndir}
+			used++
+		}
 		mapIterNext(&it)
 	}
 	return a[:i]
 }
+
+// mapKeysChunkBytes is the maximum size of a single allocation used by
+// [Value.MapKeys] to hold copies of map keys.
+const mapKeysChunkBytes = 4096
 
 // A MapIter is an iterator for ranging over a map.
 // See [Value.MapRange].
