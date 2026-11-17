@@ -128,10 +128,10 @@ func TestGenericsHashKeyInPprofBuilder(t *testing.T) {
 	defer func() {
 		runtime.MemProfileRate = previousRate
 	}()
-	for _, sz := range []int{128, 256} {
+	for _, sz := range []int{512, 1024} {
 		genericAllocFunc[uint32](sz / 4)
 	}
-	for _, sz := range []int{64, 128} {
+	for _, sz := range []int{256, 512} {
 		genericAllocFunc[uint64](sz / 8)
 	}
 
@@ -147,10 +147,10 @@ func TestGenericsHashKeyInPprofBuilder(t *testing.T) {
 
 	actual := profileToStrings(p)
 	expected := []string{
-		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint32] [1 128 0 0]",
-		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint32] [1 256 0 0]",
-		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint64] [1 64 0 0]",
-		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint64] [1 128 0 0]",
+		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint32] [1 512 0 0]",
+		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint32] [1 1024 0 0]",
+		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint64] [1 256 0 0]",
+		"testing.tRunner;runtime/pprof.TestGenericsHashKeyInPprofBuilder;runtime/pprof.genericAllocFunc[go.shape.uint64] [1 512 0 0]",
 	}
 
 	for _, l := range expected {
