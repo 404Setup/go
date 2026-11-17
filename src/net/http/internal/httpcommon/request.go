@@ -11,7 +11,7 @@ import (
 	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -154,59 +154,77 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 
 		var didUA bool
 		for k, vv := range req.Header {
-			if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") {
-				// Host is :authority, already sent.
-				// Content-Length is automatic, set below.
-				continue
-			} else if asciiEqualFold(k, "connection") ||
-				asciiEqualFold(k, "proxy-connection") ||
-				asciiEqualFold(k, "transfer-encoding") ||
-				asciiEqualFold(k, "upgrade") ||
-				asciiEqualFold(k, "keep-alive") {
-				// Per 8.1.2.2 Connection-Specific Header
-				// Fields, don't send connection-specific
-				// fields. We have already checked if any
-				// are error-worthy so just ignore the rest.
-				continue
-			} else if asciiEqualFold(k, "user-agent") {
-				// Match Go's http1 behavior: at most one
-				// User-Agent. If set to nil or empty string,
-				// then omit it. Otherwise if not mentioned,
-				// include the default (below).
-				didUA = true
-				if len(vv) < 1 {
+			switch len(k) {
+			case 4:
+				if k == "Host" || asciiEqualFold(k, "host") {
+					// Host is :authority, already sent.
 					continue
 				}
-				vv = vv[:1]
-				if vv[0] == "" {
-					continue
-				}
-			} else if asciiEqualFold(k, "cookie") {
-				// Per 8.1.2.5 To allow for better compression efficiency, the
-				// Cookie header field MAY be split into separate header fields,
-				// each with one or more cookie-pairs.
-				for _, v := range vv {
-					for {
-						p := strings.IndexByte(v, ';')
-						if p < 0 {
-							break
-						}
-						f("cookie", v[:p])
-						p++
-						// strip space after semicolon if any.
-						for p+1 <= len(v) && v[p] == ' ' {
+			case 6:
+				if k == "Cookie" || asciiEqualFold(k, "cookie") {
+					// Per 8.1.2.5 To allow for better compression efficiency, the
+					// Cookie header field MAY be split into separate header fields,
+					// each with one or more cookie-pairs.
+					for _, v := range vv {
+						for {
+							p := strings.IndexByte(v, ';')
+							if p < 0 {
+								break
+							}
+							f("cookie", v[:p])
 							p++
+							// strip space after semicolon if any.
+							for p+1 <= len(v) && v[p] == ' ' {
+								p++
+							}
+							v = v[p:]
 						}
-						v = v[p:]
+						if len(v) > 0 {
+							f("cookie", v)
+						}
 					}
-					if len(v) > 0 {
-						f("cookie", v)
-					}
+					continue
 				}
-				continue
-			} else if k == ":protocol" {
-				// :protocol pseudo-header was already sent above.
-				continue
+			case 7:
+				if k == "Upgrade" || asciiEqualFold(k, "upgrade") {
+					continue
+				}
+			case 9:
+				if k == ":protocol" {
+					// :protocol pseudo-header was already sent above.
+					continue
+				}
+			case 10:
+				if k == "User-Agent" || asciiEqualFold(k, "user-agent") {
+					// Match Go's http1 behavior: at most one
+					// User-Agent. If set to nil or empty string,
+					// then omit it. Otherwise if not mentioned,
+					// include the default (below).
+					didUA = true
+					if len(vv) < 1 {
+						continue
+					}
+					vv = vv[:1]
+					if vv[0] == "" {
+						continue
+					}
+				} else if k == "Connection" || k == "Keep-Alive" ||
+					asciiEqualFold(k, "connection") || asciiEqualFold(k, "keep-alive") {
+					continue
+				}
+			case 14:
+				if k == "Content-Length" || asciiEqualFold(k, "content-length") {
+					// Content-Length is automatic, set below.
+					continue
+				}
+			case 16:
+				if k == "Proxy-Connection" || asciiEqualFold(k, "proxy-connection") {
+					continue
+				}
+			case 17:
+				if k == "Transfer-Encoding" || asciiEqualFold(k, "transfer-encoding") {
+					continue
+				}
 			}
 
 			for _, v := range vv {
@@ -309,10 +327,27 @@ func checkConnHeaders(h map[string][]string) error {
 }
 
 func commaSeparatedTrailers(trailer map[string][]string) (string, error) {
-	if len(trailer) == 0 {
+	n := len(trailer)
+	if n == 0 {
 		return "", nil
 	}
-	keys := make([]string, 0, len(trailer))
+	if n == 1 {
+		for k := range trailer {
+			k = CanonicalHeader(k)
+			switch k {
+			case "Transfer-Encoding", "Trailer", "Content-Length":
+				return "", fmt.Errorf("invalid Trailer key %q", k)
+			}
+			return k, nil
+		}
+	}
+	var stack [8]string
+	var keys []string
+	if n <= len(stack) {
+		keys = stack[:0]
+	} else {
+		keys = make([]string, 0, n)
+	}
 	for k := range trailer {
 		k = CanonicalHeader(k)
 		switch k {
@@ -321,11 +356,20 @@ func commaSeparatedTrailers(trailer map[string][]string) (string, error) {
 		}
 		keys = append(keys, k)
 	}
-	if len(keys) > 0 {
-		sort.Strings(keys)
-		return strings.Join(keys, ","), nil
+	if len(keys) <= 16 {
+		for i := 1; i < len(keys); i++ {
+			cur := keys[i]
+			j := i - 1
+			for j >= 0 && keys[j] > cur {
+				keys[j+1] = keys[j]
+				j--
+			}
+			keys[j+1] = cur
+		}
+	} else {
+		slices.Sort(keys)
 	}
-	return "", nil
+	return strings.Join(keys, ","), nil
 }
 
 // validPseudoPath reports whether v is a valid :path pseudo-header
