@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -323,3 +324,93 @@ func TestParseContentLength(t *testing.T) {
 		}
 	}
 }
+
+func TestSeeUpcomingDoubleCRLF(t *testing.T) {
+	tests := []struct {
+		name    string
+		bufSize int
+		in      string
+		wantErr string
+	}{
+		{
+			name:    "valid_short",
+			bufSize: 64,
+			in:      "X-Foo: bar\r\n\r\n",
+		},
+		{
+			name:    "valid_multi_peek",
+			bufSize: 256,
+			in:      "X-Long: " + strings.Repeat("a", 120) + "\r\nX-Two: 2\r\n\r\n",
+		},
+		{
+			name:    "invalid_bare_lf",
+			bufSize: 64,
+			in:      "X-Foo: bar\n\r\n\r\n",
+			wantErr: "invalid trailer",
+		},
+		{
+			name:    "invalid_bare_cr",
+			bufSize: 64,
+			in:      "X-Foo: bar\rbaz\r\n\r\n",
+			wantErr: "invalid trailer",
+		},
+		{
+			name:    "too_long",
+			bufSize: 32,
+			in:      "X-Long: " + strings.Repeat("a", 128) + "\r\n\r\n",
+			wantErr: "suspiciously long trailer",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			br := bufio.NewReaderSize(strings.NewReader(tc.in), tc.bufSize)
+			// Pre-fill buffer partially to exercise max(4, r.Buffered()).
+			br.Peek(1)
+			err := seeUpcomingDoubleCRLF(br)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("got err = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got err = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestFixTrailer(t *testing.T) {
+	h := Header{"Trailer": {" , , ", " x-one , X-Two "}, "Keep": {"1"}}
+	tr, err := fixTrailer(h, true, 10)
+	if err != nil {
+		t.Fatalf("fixTrailer valid: %v", err)
+	}
+	if _, ok := h["Trailer"]; ok {
+		t.Fatalf("Trailer header was not removed")
+	}
+	if len(tr) != 2 || !slices.Contains([]string{"X-One", "X-Two"}, "X-One") {
+		t.Fatalf("unexpected trailer map: %v", tr)
+	}
+	if _, ok := tr["X-One"]; !ok {
+		t.Fatalf("missing X-One: %v", tr)
+	}
+	if _, ok := tr["X-Two"]; !ok {
+		t.Fatalf("missing X-Two: %v", tr)
+	}
+
+	emptyH := Header{"Trailer": {" , , "}}
+	if trEmpty, err := fixTrailer(emptyH, true, 10); err != nil || trEmpty != nil {
+		t.Fatalf("fixTrailer empty = (%v, %v), want (nil, nil)", trEmpty, err)
+	}
+
+	for _, badKey := range []string{"Transfer-Encoding", "Trailer", "Content-Length"} {
+		if _, err := fixTrailer(Header{"Trailer": {badKey}}, true, 10); err == nil {
+			t.Errorf("fixTrailer(%q) = nil, want error", badKey)
+		}
+	}
+	if _, err := fixTrailer(Header{"Trailer": {"A, B, C"}}, true, 2); err == nil {
+		t.Fatalf("fixTrailer over maxHeaders succeeded, want errTooLarge")
+	}
+}
+

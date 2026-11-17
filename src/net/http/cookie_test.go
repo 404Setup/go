@@ -968,3 +968,77 @@ func TestParseSetCookie(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSetCookieOptimizedAttributes(t *testing.T) {
+	line := "sid=abc; Path=/app; Domain=example.org; Secure; HttpOnly; Max-Age=0; Expires=Tue, 10 Nov 2009 23:00:00 UTC; SameSite=Lax; Partitioned; UnknownAttr=1"
+	c, err := ParseSetCookie(line)
+	if err != nil {
+		t.Fatalf("ParseSetCookie(%q): %v", line, err)
+	}
+	if c.Path != "/app" || c.Domain != "example.org" || !c.Secure || !c.HttpOnly || c.MaxAge != -1 || c.SameSite != SameSiteLaxMode || !c.Partitioned {
+		t.Fatalf("unexpected parsed cookie: %+v", c)
+	}
+	wantExp := time.Date(2009, 11, 10, 23, 0, 0, 0, time.UTC)
+	if !c.Expires.Equal(wantExp) {
+		t.Fatalf("Expires = %v, want %v", c.Expires, wantExp)
+	}
+	if !slices.Equal(c.Unparsed, []string{"UnknownAttr=1"}) {
+		t.Fatalf("Unparsed = %v, want [UnknownAttr=1]", c.Unparsed)
+	}
+
+	// Leading zeros in non-zero Max-Age and invalid Expires go to Unparsed cleanly.
+	c2, err := ParseSetCookie("a=b; Max-Age=05; Expires=not-a-date; SameSite=Unknown")
+	if err != nil {
+		t.Fatalf("ParseSetCookie: %v", err)
+	}
+	if c2.MaxAge != 0 || !c2.Expires.IsZero() || c2.SameSite != SameSiteDefaultMode {
+		t.Fatalf("unexpected fallback cookie fields: %+v", c2)
+	}
+	if want := []string{"Max-Age=05", "Expires=not-a-date"}; !slices.Equal(c2.Unparsed, want) {
+		t.Fatalf("Unparsed = %v, want %v", c2.Unparsed, want)
+	}
+
+	// Non-GMT/UTC RFC1123 timestamps hit time.Parse fallbacks and match time.Parse(...).UTC().
+	for _, tc := range []struct {
+		layout string
+		ts     string
+	}{
+		{time.RFC1123, "Tue, 10 Nov 2009 16:00:00 MST"},
+		{"Mon, 02-Jan-2006 15:04:05 MST", "Tue, 10-Nov-2009 16:00:00 MST"},
+	} {
+		wantFallback, err := time.Parse(tc.layout, tc.ts)
+		if err != nil {
+			t.Fatalf("time.Parse(%q, %q): %v", tc.layout, tc.ts, err)
+		}
+		c3, err := ParseSetCookie("a=b; Expires=" + tc.ts)
+		if err != nil {
+			t.Fatalf("ParseSetCookie(%q): %v", tc.ts, err)
+		}
+		if !c3.Expires.Equal(wantFallback.UTC()) || c3.Expires.Location() != time.UTC {
+			t.Fatalf("ParseSetCookie(%q) Expires = %v, want %v", tc.ts, c3.Expires, wantFallback.UTC())
+		}
+	}
+}
+
+func TestReadCookiesFiltered(t *testing.T) {
+	h := Header{"Cookie": {"a=1; b=2; b=3; c=4"}}
+	got := readCookies(h, "b")
+	if len(got) != 2 || got[0].Name != "b" || got[0].Value != "2" || got[1].Value != "3" {
+		t.Fatalf("readCookies filter=b got %s", toJSON(got))
+	}
+	none := readCookies(h, "missing")
+	if none == nil || len(none) != 0 {
+		t.Fatalf("readCookies filter=missing got %#v, want non-nil empty slice", none)
+	}
+}
+
+func BenchmarkParseSetCookie(b *testing.B) {
+	const line = "NID=99=YsDT5i3E-CXax-; expires=Wed, 23-Nov-2011 01:05:03 GMT; path=/; domain=.google.ch; Secure; HttpOnly; SameSite=Lax"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := ParseSetCookie(line); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+

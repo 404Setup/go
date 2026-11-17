@@ -7,11 +7,13 @@
 package http
 
 import (
+	"bufio"
 	"bytes"
 	"internal/testenv"
 	"io/fs"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -194,3 +196,153 @@ func BenchmarkHexEscapeNonASCII(b *testing.B) {
 		hexEscapeNonASCII(redirectURL)
 	}
 }
+
+func TestCopyValues(t *testing.T) {
+	src := url.Values{
+		"a": {"1", "2"},
+		"b": {"3"},
+		"z": nil,
+	}
+	dst := make(url.Values)
+	copyValues(dst, src)
+	if !reflect.DeepEqual(dst, src) {
+		t.Fatalf("empty dst copyValues = %#v, want %#v", dst, src)
+	}
+	// Mutating appended slice on one key must not clobber adjacent slab elements.
+	dst["a"] = append(dst["a"], "extra")
+	if !slices.Equal(dst["b"], []string{"3"}) {
+		t.Fatalf("slab aliasing corrupted dst[b] = %#v", dst["b"])
+	}
+
+	// Non-empty dst appends cleanly.
+	copyValues(dst, url.Values{"b": {"4"}, "new": {"5"}})
+	if !slices.Equal(dst["b"], []string{"3", "4"}) || !slices.Equal(dst["new"], []string{"5"}) {
+		t.Fatalf("non-empty dst copyValues produced %#v", dst)
+	}
+}
+
+func BenchmarkCopyValuesEmptyDst(b *testing.B) {
+	b.ReportAllocs()
+	src := url.Values{
+		"a": {"1", "2", "3", "4", "5"},
+		"b": {"2", "2", "3", "4", "5"},
+		"c": {"3", "2", "3", "4", "5"},
+		"d": {"4", "2", "3", "4", "5"},
+		"e": {"1", "1", "2", "3", "4", "5", "6", "7"},
+		"j": {"1", "2"},
+		"m": nil,
+	}
+	for i := 0; i < b.N; i++ {
+		dst := make(url.Values, len(src))
+		copyValues(dst, src)
+		if valuesCount = len(dst["a"]); valuesCount != 5 {
+			b.Fatalf("len(dst[a]) = %d, want 5", valuesCount)
+		}
+	}
+}
+
+func TestContainsDotDot(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"/", false},
+		{"/a/b/c", false},
+		{"/a/..b/c", false},
+		{"/a/b../c", false},
+		{"..", true},
+		{"/..", true},
+		{"../", true},
+		{"/a/../b", true},
+		{`\a\..\b`, true},
+		{`/a\../b`, true},
+		{"/a/..../b", false},
+	}
+	for _, tt := range tests {
+		if got := containsDotDot(tt.in); got != tt.want {
+			t.Errorf("containsDotDot(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestWriteReqLine(t *testing.T) {
+	var bb bytes.Buffer
+	bw := bufio.NewWriterSize(&bb, 64)
+	if err := writeReqLine(bw, "Host: ", "example.com", "\r\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Overflow bufio buffer to exercise non-bufio fallback cleanly.
+	long := strings.Repeat("x", 300)
+	if err := writeReqLine(bw, "X-Long: ", long, "\r\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	bw.Flush()
+	want := "Host: example.com\r\nX-Long: " + long + "\r\n"
+	if bb.String() != want {
+		t.Fatalf("got %d bytes, want %d bytes", bb.Len(), len(want))
+	}
+
+	var raw bytes.Buffer
+	if err := writeReqLine(&raw, "A", long, "B", "C"); err != nil {
+		t.Fatal(err)
+	}
+	if raw.String() != "A"+long+"BC" {
+		t.Fatalf("raw writeReqLine mismatch")
+	}
+}
+
+func TestExtraHeaderWriteAndChunkWriter(t *testing.T) {
+	eh := extraHeader{
+		date:             []byte("Tue, 10 Nov 2009 23:00:00 GMT"),
+		contentLength:    []byte("12"),
+		contentType:      "text/plain",
+		connection:       "keep-alive",
+		transferEncoding: "chunked",
+	}
+	// Fast path via bufio.Writer AvailableBuffer.
+	var fastBuf bytes.Buffer
+	bwFast := bufio.NewWriterSize(&fastBuf, 4096)
+	eh.Write(bwFast)
+	bwFast.Flush()
+
+	// Slow path via small bufio.Writer triggering writeSlow.
+	var slowBuf bytes.Buffer
+	bwSlow := bufio.NewWriterSize(&slowBuf, 16)
+	eh.Write(bwSlow)
+	bwSlow.Flush()
+
+	if fastBuf.String() != slowBuf.String() || !strings.Contains(fastBuf.String(), "Transfer-Encoding: chunked\r\n") {
+		t.Fatalf("extraHeader mismatch:\nfast=%q\nslow=%q", fastBuf.String(), slowBuf.String())
+	}
+
+	// chunkWriter zero-len, coalesced fast path, and oversized write fallback.
+	var cwOut bytes.Buffer
+	c := &conn{bufw: bufio.NewWriterSize(&cwOut, 64)}
+	resp := &response{
+		conn:          c,
+		req:           &Request{Method: "GET"},
+		handlerHeader: Header{},
+	}
+	cw := &chunkWriter{
+		res:         resp,
+		wroteHeader: true,
+		chunking:    true,
+	}
+	if n, err := cw.Write(nil); n != 0 || err != nil {
+		t.Fatalf("cw.Write(nil) = (%d, %v), want (0, nil)", n, err)
+	}
+	if n, err := cw.Write([]byte("hi")); n != 2 || err != nil {
+		t.Fatalf("cw.Write(hi) = (%d, %v)", n, err)
+	}
+	big := strings.Repeat("Z", 128)
+	if n, err := cw.Write([]byte(big)); n != len(big) || err != nil {
+		t.Fatalf("cw.Write(big) = (%d, %v)", n, err)
+	}
+	c.bufw.Flush()
+	wantCW := "2\r\nhi\r\n80\r\n" + big + "\r\n"
+	if cwOut.String() != wantCW {
+		t.Fatalf("chunkWriter output = %q, want %q", cwOut.String(), wantCW)
+	}
+}
+

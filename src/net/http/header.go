@@ -5,8 +5,11 @@
 package http
 
 import (
+	"bufio"
+	"bytes"
 	"io"
 	"net/http/httptrace"
+	"net/http/internal"
 	"net/textproto"
 	"slices"
 	"strings"
@@ -132,6 +135,9 @@ var timeFormats = []string{
 // trying each of the three formats allowed by HTTP/1.1:
 // [TimeFormat], [time.RFC850], and [time.ANSIC].
 func ParseTime(text string) (t time.Time, err error) {
+	if t, ok := internal.ParseHTTPDate(text); ok {
+		return t, nil
+	}
 	for _, layout := range timeFormats {
 		t, err = time.Parse(layout, text)
 		if err == nil {
@@ -175,8 +181,9 @@ func (h Header) sortedKeyValues(exclude map[string]bool) (kvs []keyValues, hs *h
 		hs.kvs = make([]keyValues, 0, len(h))
 	}
 	kvs = hs.kvs[:0]
+	hasExclude := len(exclude) > 0
 	for k, vv := range h {
-		if !exclude[k] {
+		if !hasExclude || !exclude[k] {
 			kvs = append(kvs, keyValues{k, vv})
 		}
 	}
@@ -194,15 +201,198 @@ func (h Header) WriteSubset(w io.Writer, exclude map[string]bool) error {
 	return h.writeSubset(w, exclude, nil)
 }
 
+func formatHeaderValue(v string) string {
+	if strings.IndexByte(v, '\r') >= 0 || strings.IndexByte(v, '\n') >= 0 {
+		v = headerNewlineToSpace.Replace(v)
+	}
+	return textproto.TrimString(v)
+}
+
 func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptrace.ClientTrace) error {
 	if len(h) == 0 {
 		return nil
 	}
+	var stackKVs [16]keyValues
+	var kvs []keyValues
+	var sorter *headerSorter
+	if len(h) <= len(stackKVs) {
+		kvs = stackKVs[:0]
+		hasExclude := len(exclude) > 0
+		for k, vv := range h {
+			if !hasExclude || !exclude[k] {
+				kvs = append(kvs, keyValues{k, vv})
+			}
+		}
+		for i := 1; i < len(kvs); i++ {
+			cur := kvs[i]
+			j := i - 1
+			for j >= 0 && kvs[j].key > cur.key {
+				kvs[j+1] = kvs[j]
+				j--
+			}
+			kvs[j+1] = cur
+		}
+	} else {
+		kvs, sorter = h.sortedKeyValues(exclude)
+	}
+
+	if trace == nil || trace.WroteHeaderField == nil {
+		switch cw := w.(type) {
+		case *bufio.Writer:
+			buf := cw.AvailableBuffer()
+			avail := cap(buf)
+			for _, kv := range kvs {
+				if !httpguts.ValidHeaderFieldName(kv.key) {
+					continue
+				}
+				for _, v := range kv.values {
+					v = formatHeaderValue(v)
+					need := len(kv.key) + len(v) + 4
+					if len(buf)+need <= avail {
+						buf = append(buf, kv.key...)
+						buf = append(buf, ':', ' ')
+						buf = append(buf, v...)
+						buf = append(buf, '\r', '\n')
+						continue
+					}
+					if len(buf) > 0 {
+						if _, err := cw.Write(buf); err != nil {
+							if sorter != nil {
+								headerSorterPool.Put(sorter)
+							}
+							return err
+						}
+						buf = cw.AvailableBuffer()
+						avail = cap(buf)
+						if need <= avail {
+							buf = append(buf, kv.key...)
+							buf = append(buf, ':', ' ')
+							buf = append(buf, v...)
+							buf = append(buf, '\r', '\n')
+							continue
+						}
+					}
+					if err := writeHeaderLine(cw, kv.key, v); err != nil {
+						if sorter != nil {
+							headerSorterPool.Put(sorter)
+						}
+						return err
+					}
+					buf = cw.AvailableBuffer()
+					avail = cap(buf)
+				}
+			}
+			if len(buf) > 0 {
+				if _, err := cw.Write(buf); err != nil {
+					if sorter != nil {
+						headerSorterPool.Put(sorter)
+					}
+					return err
+				}
+			}
+			if sorter != nil {
+				headerSorterPool.Put(sorter)
+			}
+			return nil
+		case *bytes.Buffer:
+			var scratch [512]byte
+			off := 0
+			for _, kv := range kvs {
+				if !httpguts.ValidHeaderFieldName(kv.key) {
+					continue
+				}
+				for _, v := range kv.values {
+					v = formatHeaderValue(v)
+					need := len(kv.key) + len(v) + 4
+					if off+need <= len(scratch) {
+						off += copy(scratch[off:], kv.key)
+						scratch[off] = ':'
+						scratch[off+1] = ' '
+						off += 2
+						off += copy(scratch[off:], v)
+						scratch[off] = '\r'
+						scratch[off+1] = '\n'
+						off += 2
+						continue
+					}
+					if off > 0 {
+						cw.Write(scratch[:off])
+						off = 0
+						if need <= len(scratch) {
+							off += copy(scratch[off:], kv.key)
+							scratch[off] = ':'
+							scratch[off+1] = ' '
+							off += 2
+							off += copy(scratch[off:], v)
+							scratch[off] = '\r'
+							scratch[off+1] = '\n'
+							off += 2
+							continue
+						}
+					}
+					writeHeaderLine(cw, kv.key, v)
+				}
+			}
+			if off > 0 {
+				cw.Write(scratch[:off])
+			}
+			if sorter != nil {
+				headerSorterPool.Put(sorter)
+			}
+			return nil
+		case *strings.Builder:
+			var scratch [512]byte
+			off := 0
+			for _, kv := range kvs {
+				if !httpguts.ValidHeaderFieldName(kv.key) {
+					continue
+				}
+				for _, v := range kv.values {
+					v = formatHeaderValue(v)
+					need := len(kv.key) + len(v) + 4
+					if off+need <= len(scratch) {
+						off += copy(scratch[off:], kv.key)
+						scratch[off] = ':'
+						scratch[off+1] = ' '
+						off += 2
+						off += copy(scratch[off:], v)
+						scratch[off] = '\r'
+						scratch[off+1] = '\n'
+						off += 2
+						continue
+					}
+					if off > 0 {
+						cw.Write(scratch[:off])
+						off = 0
+						if need <= len(scratch) {
+							off += copy(scratch[off:], kv.key)
+							scratch[off] = ':'
+							scratch[off+1] = ' '
+							off += 2
+							off += copy(scratch[off:], v)
+							scratch[off] = '\r'
+							scratch[off+1] = '\n'
+							off += 2
+							continue
+						}
+					}
+					writeHeaderLine(cw, kv.key, v)
+				}
+			}
+			if off > 0 {
+				cw.Write(scratch[:off])
+			}
+			if sorter != nil {
+				headerSorterPool.Put(sorter)
+			}
+			return nil
+		}
+	}
+
 	ws, ok := w.(io.StringWriter)
 	if !ok {
 		ws = stringWriter{w}
 	}
-	kvs, sorter := h.sortedKeyValues(exclude)
 	var formattedVals []string
 	for _, kv := range kvs {
 		if !httpguts.ValidHeaderFieldName(kv.key) {
@@ -213,12 +403,11 @@ func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptra
 			continue
 		}
 		for _, v := range kv.values {
-			if strings.ContainsAny(v, "\r\n") {
-				v = headerNewlineToSpace.Replace(v)
-			}
-			v = textproto.TrimString(v)
+			v = formatHeaderValue(v)
 			if err := writeHeaderLine(ws, kv.key, v); err != nil {
-				headerSorterPool.Put(sorter)
+				if sorter != nil {
+					headerSorterPool.Put(sorter)
+				}
 				return err
 			}
 			if trace != nil && trace.WroteHeaderField != nil {
@@ -230,7 +419,9 @@ func (h Header) writeSubset(w io.Writer, exclude map[string]bool, trace *httptra
 			formattedVals = nil
 		}
 	}
-	headerSorterPool.Put(sorter)
+	if sorter != nil {
+		headerSorterPool.Put(sorter)
+	}
 	return nil
 }
 

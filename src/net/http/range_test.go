@@ -81,6 +81,9 @@ func TestParseRange(t *testing.T) {
 			}
 		}
 	}
+	if _, err := parseRange("bytes=20-", 10); err != errNoOverlap {
+		t.Errorf("parseRange(bytes=20-, 10) err = %v, want %v", err, errNoOverlap)
+	}
 }
 
 func TestParseRangeLimit(t *testing.T) {
@@ -179,3 +182,14 @@ func TestParseRangeLimit(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkParseRange(b *testing.B) {
+	const hdr = "bytes=0-499, 1000-1499, -200, 5000-"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := parseRange(hdr, 10000); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+

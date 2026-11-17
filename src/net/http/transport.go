@@ -2387,8 +2387,8 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	// requested it.
 	requestedGzip := false
 	if !pc.t.DisableCompression &&
-		req.Header.Get("Accept-Encoding") == "" &&
-		req.Header.Get("Range") == "" &&
+		req.Header.get("Accept-Encoding") == "" &&
+		req.Header.get("Range") == "" &&
 		req.Method != "HEAD" {
 		// Request gzip only, not deflate. Deflate is ambiguous and
 		// not as universally supported anyway.
@@ -2403,7 +2403,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 		// auto-decoding a portion of a gzipped document will just fail
 		// anyway. See https://golang.org/issue/8923
 		requestedGzip = true
-		req.extraHeaders().Set("Accept-Encoding", "gzip")
+		req.extraHeaders()["Accept-Encoding"] = []string{"gzip"}
 	}
 
 	var continueCh chan struct{}
@@ -2415,7 +2415,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 		!req.wantsClose() &&
 		!isProtocolSwitchHeader(req.Header) &&
 		!pc.isClientConn {
-		req.extraHeaders().Set("Connection", "close")
+		req.extraHeaders()["Connection"] = []string{"close"}
 	}
 
 	gone := make(chan struct{})

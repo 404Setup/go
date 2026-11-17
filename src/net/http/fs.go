@@ -192,7 +192,7 @@ func serveError(w ResponseWriter, text string, code int) {
 	h := w.Header()
 
 	nonDefault := false
-	for _, k := range []string{
+	for _, k := range [...]string{
 		"Cache-Control",
 		"Content-Encoding",
 		"Etag",
@@ -204,7 +204,7 @@ func serveError(w ResponseWriter, text string, code int) {
 		if httpservecontentkeepheaders.Value() == "1" {
 			nonDefault = true
 		} else {
-			h.Del(k)
+			delete(h, k)
 		}
 	}
 	if nonDefault {
@@ -246,24 +246,12 @@ func serveError(w ResponseWriter, text string, code int) {
 // The GODEBUG setting httpservecontentkeepheaders=1 causes ServeContent
 // to preserve these headers.
 func ServeContent(w ResponseWriter, req *Request, name string, modtime time.Time, content io.ReadSeeker) {
-	sizeFunc := func() (int64, error) {
-		size, err := content.Seek(0, io.SeekEnd)
-		if err != nil {
-			return 0, errSeeker
-		}
-		_, err = content.Seek(0, io.SeekStart)
-		if err != nil {
-			return 0, errSeeker
-		}
-		return size, nil
-	}
-	serveContent(w, req, name, modtime, sizeFunc, content)
+	serveContent(w, req, name, modtime, -1, true, content)
 }
 
-// errSeeker is returned by ServeContent's sizeFunc when the content
+// errSeeker is returned by serveContent when the content
 // doesn't seek properly. The underlying Seeker's error text isn't
-// included in the sizeFunc reply so it's not sent over HTTP to end
-// users.
+// included in the reply so it's not sent over HTTP to end users.
 var errSeeker = errors.New("seeker can't seek")
 
 // errNoOverlap is returned by serveContent's parseRange if first-byte-pos of
@@ -273,8 +261,8 @@ var errNoOverlap = errors.New("invalid range: failed to overlap")
 // if name is empty, filename is unknown. (used for mime type, before sniffing)
 // if modtime.IsZero(), modtime is unknown.
 // content must be seeked to the beginning of the file.
-// The sizeFunc is called at most once. Its error, if any, is sent in the HTTP response.
-func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, sizeFunc func() (int64, error), content io.ReadSeeker) {
+// If seekSize is true, content is seeked to determine size instead of using size.
+func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, size int64, seekSize bool, content io.ReadSeeker) {
 	setLastModified(w, modtime)
 	done, rangeReq := checkPreconditions(w, r, modtime)
 	if done {
@@ -282,10 +270,11 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 	}
 
 	code := StatusOK
+	hdr := w.Header()
 
 	// If Content-Type isn't set, use the file's extension to find it, but
 	// if the Content-Type is unset explicitly, do not sniff the type.
-	ctypes, haveType := w.Header()["Content-Type"]
+	ctypes, haveType := hdr["Content-Type"]
 	var ctype string
 	if !haveType {
 		ctype = mime.TypeByExtension(filepath.Ext(name))
@@ -300,15 +289,23 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 				return
 			}
 		}
-		w.Header().Set("Content-Type", ctype)
+		hdr["Content-Type"] = []string{ctype}
 	} else if len(ctypes) > 0 {
 		ctype = ctypes[0]
 	}
 
-	size, err := sizeFunc()
-	if err != nil {
-		serveError(w, err.Error(), StatusInternalServerError)
-		return
+	if seekSize {
+		var err error
+		size, err = content.Seek(0, io.SeekEnd)
+		if err != nil {
+			serveError(w, errSeeker.Error(), StatusInternalServerError)
+			return
+		}
+		_, err = content.Seek(0, io.SeekStart)
+		if err != nil {
+			serveError(w, errSeeker.Error(), StatusInternalServerError)
+			return
+		}
 	}
 	if size < 0 {
 		// Should never happen but just to be sure
@@ -331,7 +328,10 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 			ranges = nil
 			break
 		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		var crBuf [64]byte
+		cr := append(crBuf[:0], "bytes */"...)
+		cr = strconv.AppendInt(cr, size, 10)
+		hdr["Content-Range"] = []string{string(cr)}
 		fallthrough
 	default:
 		serveError(w, err.Error(), StatusRequestedRangeNotSatisfiable)
@@ -365,14 +365,14 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		}
 		sendSize = ra.length
 		code = StatusPartialContent
-		w.Header().Set("Content-Range", ra.contentRange(size))
+		hdr["Content-Range"] = []string{ra.contentRange(size)}
 	case len(ranges) > 1:
 		sendSize = rangesMIMESize(ranges, ctype, size)
 		code = StatusPartialContent
 
 		pr, pw := io.Pipe()
 		mw := multipart.NewWriter(pw)
-		w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
+		hdr["Content-Type"] = []string{"multipart/byteranges; boundary=" + mw.Boundary()}
 		sendContent = pr
 		defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
 		go func() {
@@ -396,7 +396,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		}()
 	}
 
-	w.Header().Set("Accept-Ranges", "bytes")
+	hdr["Accept-Ranges"] = []string{"bytes"}
 
 	// We should be able to unconditionally set the Content-Length here.
 	//
@@ -423,8 +423,8 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 	// A possible future improvement on this might be to look at the type
 	// of the ResponseWriter, and always set Content-Length if it's one
 	// that we recognize.
-	if len(ranges) > 0 || w.Header().Get("Content-Encoding") == "" {
-		w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
+	if len(ranges) > 0 || hdr.get("Content-Encoding") == "" {
+		hdr["Content-Length"] = []string{strconv.FormatInt(sendSize, 10)}
 	}
 	w.WriteHeader(code)
 
@@ -484,7 +484,7 @@ const (
 )
 
 func checkIfMatch(w ResponseWriter, r *Request) condResult {
-	im := r.Header.Get("If-Match")
+	im := r.Header.get("If-Match")
 	if im == "" {
 		return condNone
 	}
@@ -514,7 +514,7 @@ func checkIfMatch(w ResponseWriter, r *Request) condResult {
 }
 
 func checkIfUnmodifiedSince(r *Request, modtime time.Time) condResult {
-	ius := r.Header.Get("If-Unmodified-Since")
+	ius := r.Header.get("If-Unmodified-Since")
 	if ius == "" || isZeroTime(modtime) {
 		return condNone
 	}
@@ -566,7 +566,7 @@ func checkIfModifiedSince(r *Request, modtime time.Time) condResult {
 	if r.Method != "GET" && r.Method != "HEAD" {
 		return condNone
 	}
-	ims := r.Header.Get("If-Modified-Since")
+	ims := r.Header.get("If-Modified-Since")
 	if ims == "" || isZeroTime(modtime) {
 		return condNone
 	}
@@ -593,7 +593,7 @@ func checkIfRange(w ResponseWriter, r *Request, modtime time.Time) condResult {
 	}
 	etag, _ := scanETag(ir)
 	if etag != "" {
-		if etagStrongMatch(etag, w.Header().Get("Etag")) {
+		if etagStrongMatch(etag, w.Header().get("Etag")) {
 			return condTrue
 		} else {
 			return condFalse
@@ -623,7 +623,8 @@ func isZeroTime(t time.Time) bool {
 
 func setLastModified(w ResponseWriter, modtime time.Time) {
 	if !isZeroTime(modtime) {
-		w.Header().Set("Last-Modified", modtime.UTC().Format(TimeFormat))
+		var buf [len(TimeFormat)]byte
+		w.Header()["Last-Modified"] = []string{string(internal.AppendHTTPDate(buf[:0], modtime))}
 	}
 }
 
@@ -637,7 +638,7 @@ func writeNotModified(w ResponseWriter) {
 	delete(h, "Content-Type")
 	delete(h, "Content-Length")
 	delete(h, "Content-Encoding")
-	if h.Get("Etag") != "" {
+	if h.get("Etag") != "" {
 		delete(h, "Last-Modified")
 	}
 	w.WriteHeader(StatusNotModified)
@@ -760,8 +761,7 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 	}
 
 	// serveContent will check modification time
-	sizeFunc := func() (int64, error) { return d.Size(), nil }
-	serveContent(w, r, d.Name(), d.ModTime(), sizeFunc, f)
+	serveContent(w, r, d.Name(), d.ModTime(), d.Size(), false, f)
 }
 
 // toHTTPError returns a non-specific HTTP error message and status code
@@ -795,7 +795,7 @@ func localRedirect(w ResponseWriter, r *Request, newPath string) {
 	if q := r.URL.RawQuery; q != "" {
 		newPath += "?" + q
 	}
-	w.Header().Set("Location", newPath)
+	w.Header()["Location"] = []string{newPath}
 	w.WriteHeader(StatusMovedPermanently)
 }
 
@@ -871,15 +871,20 @@ func containsDotDot(v string) bool {
 	if !strings.Contains(v, "..") {
 		return false
 	}
-	for ent := range strings.FieldsFuncSeq(v, isSlashRune) {
-		if ent == ".." {
+	for i := 0; i < len(v); {
+		for i < len(v) && (v[i] == '/' || v[i] == '\\') {
+			i++
+		}
+		start := i
+		for i < len(v) && v[i] != '/' && v[i] != '\\' {
+			i++
+		}
+		if i-start == 2 && v[start] == '.' && v[start+1] == '.' {
 			return true
 		}
 	}
 	return false
 }
-
-func isSlashRune(r rune) bool { return r == '/' || r == '\\' }
 
 type fileHandler struct {
 	root FileSystem
@@ -1045,6 +1050,8 @@ func maxContentRanges() int {
 	return maxRanges
 }
 
+var errInvalidRange = errors.New("invalid range")
+
 // parseRange parses a Range header string as per RFC 7233.
 // errNoOverlap is returned if none of the ranges overlap.
 func parseRange(s string, size int64) ([]httpRange, error) {
@@ -1053,7 +1060,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 	}
 	const b = "bytes="
 	if len(s) < len(b) || !ascii.EqualFold(s[:len(b)], b) {
-		return nil, errors.New("invalid range")
+		return nil, errInvalidRange
 	}
 	noOverlap := false
 	numRanges := strings.Count(s[len(b):], ",") + 1
@@ -1075,7 +1082,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		}
 		start, end, ok := strings.Cut(ra, "-")
 		if !ok {
-			return nil, errors.New("invalid range")
+			return nil, errInvalidRange
 		}
 		start, end = textproto.TrimString(start), textproto.TrimString(end)
 		var r httpRange
@@ -1086,11 +1093,11 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 			// which has to be a non-negative integer as per
 			// RFC 7233 Section 2.1 "Byte-Ranges".
 			if end == "" || end[0] == '-' {
-				return nil, errors.New("invalid range")
+				return nil, errInvalidRange
 			}
 			i, err := strconv.ParseInt(end, 10, 64)
 			if i < 0 || err != nil {
-				return nil, errors.New("invalid range")
+				return nil, errInvalidRange
 			}
 			if i > size {
 				i = size
@@ -1100,7 +1107,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		} else {
 			i, err := strconv.ParseInt(start, 10, 64)
 			if err != nil || i < 0 {
-				return nil, errors.New("invalid range")
+				return nil, errInvalidRange
 			}
 			if i >= size {
 				// If the range begins after the size of the content,
@@ -1115,7 +1122,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 			} else {
 				i, err := strconv.ParseInt(end, 10, 64)
 				if err != nil || r.start > i {
-					return nil, errors.New("invalid range")
+					return nil, errInvalidRange
 				}
 				if i >= size {
 					i = size - 1

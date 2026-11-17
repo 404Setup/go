@@ -4,6 +4,8 @@
 
 package http
 
+import "net/http/internal"
+
 // HTTP status codes as registered with IANA.
 // See: https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml
 const (
@@ -76,106 +78,12 @@ const (
 	StatusNetworkAuthenticationRequired = 511 // RFC 6585, 6
 )
 
-var statusTextTable = [...]string{
-	StatusContinue - 100:                      "Continue",
-	StatusSwitchingProtocols - 100:            "Switching Protocols",
-	StatusProcessing - 100:                    "Processing",
-	StatusEarlyHints - 100:                    "Early Hints",
-	StatusOK - 100:                            "OK",
-	StatusCreated - 100:                       "Created",
-	StatusAccepted - 100:                      "Accepted",
-	StatusNonAuthoritativeInfo - 100:          "Non-Authoritative Information",
-	StatusNoContent - 100:                     "No Content",
-	StatusResetContent - 100:                  "Reset Content",
-	StatusPartialContent - 100:                "Partial Content",
-	StatusMultiStatus - 100:                   "Multi-Status",
-	StatusAlreadyReported - 100:               "Already Reported",
-	StatusIMUsed - 100:                        "IM Used",
-	StatusMultipleChoices - 100:               "Multiple Choices",
-	StatusMovedPermanently - 100:              "Moved Permanently",
-	StatusFound - 100:                         "Found",
-	StatusSeeOther - 100:                      "See Other",
-	StatusNotModified - 100:                   "Not Modified",
-	StatusUseProxy - 100:                      "Use Proxy",
-	StatusTemporaryRedirect - 100:             "Temporary Redirect",
-	StatusPermanentRedirect - 100:             "Permanent Redirect",
-	StatusBadRequest - 100:                    "Bad Request",
-	StatusUnauthorized - 100:                  "Unauthorized",
-	StatusPaymentRequired - 100:               "Payment Required",
-	StatusForbidden - 100:                     "Forbidden",
-	StatusNotFound - 100:                      "Not Found",
-	StatusMethodNotAllowed - 100:              "Method Not Allowed",
-	StatusNotAcceptable - 100:                 "Not Acceptable",
-	StatusProxyAuthRequired - 100:             "Proxy Authentication Required",
-	StatusRequestTimeout - 100:                "Request Timeout",
-	StatusConflict - 100:                      "Conflict",
-	StatusGone - 100:                          "Gone",
-	StatusLengthRequired - 100:                "Length Required",
-	StatusPreconditionFailed - 100:            "Precondition Failed",
-	StatusRequestEntityTooLarge - 100:         "Request Entity Too Large",
-	StatusRequestURITooLong - 100:             "Request URI Too Long",
-	StatusUnsupportedMediaType - 100:          "Unsupported Media Type",
-	StatusRequestedRangeNotSatisfiable - 100:  "Requested Range Not Satisfiable",
-	StatusExpectationFailed - 100:             "Expectation Failed",
-	StatusTeapot - 100:                        "I'm a teapot",
-	StatusMisdirectedRequest - 100:            "Misdirected Request",
-	StatusUnprocessableEntity - 100:           "Unprocessable Entity",
-	StatusLocked - 100:                        "Locked",
-	StatusFailedDependency - 100:              "Failed Dependency",
-	StatusTooEarly - 100:                      "Too Early",
-	StatusUpgradeRequired - 100:               "Upgrade Required",
-	StatusPreconditionRequired - 100:          "Precondition Required",
-	StatusTooManyRequests - 100:               "Too Many Requests",
-	StatusRequestHeaderFieldsTooLarge - 100:   "Request Header Fields Too Large",
-	StatusUnavailableForLegalReasons - 100:    "Unavailable For Legal Reasons",
-	StatusInternalServerError - 100:           "Internal Server Error",
-	StatusNotImplemented - 100:                "Not Implemented",
-	StatusBadGateway - 100:                    "Bad Gateway",
-	StatusServiceUnavailable - 100:            "Service Unavailable",
-	StatusGatewayTimeout - 100:                "Gateway Timeout",
-	StatusHTTPVersionNotSupported - 100:       "HTTP Version Not Supported",
-	StatusVariantAlsoNegotiates - 100:         "Variant Also Negotiates",
-	StatusInsufficientStorage - 100:           "Insufficient Storage",
-	StatusLoopDetected - 100:                  "Loop Detected",
-	StatusNotExtended - 100:                   "Not Extended",
-	StatusNetworkAuthenticationRequired - 100: "Network Authentication Required",
-}
-
-var (
-	statusLines11 [len(statusTextTable)]string
-	statusLines10 [len(statusTextTable)]string
-)
-
-func init() {
-	for i, text := range statusTextTable {
-		if text != "" {
-			c := i + 100
-			c0 := byte(c/100 + '0')
-			c1 := byte((c/10)%10 + '0')
-			c2 := byte(c%10 + '0')
-			statusLines11[i] = "HTTP/1.1 " + string([]byte{c0, c1, c2}) + " " + text + "\r\n"
-			statusLines10[i] = "HTTP/1.0 " + string([]byte{c0, c1, c2}) + " " + text + "\r\n"
-		}
-	}
-}
-
 // StatusText returns a text for the HTTP status code. It returns the empty
 // string if the code is unknown.
 func StatusText(code int) string {
-	idx := code - 100
-	if uint(idx) < uint(len(statusTextTable)) {
-		return statusTextTable[idx]
-	}
-	return ""
+	return internal.StatusText(code)
 }
 
 func statusLine(is11 bool, code int) string {
-	idx := code - 100
-	if uint(idx) < uint(len(statusLines11)) {
-		if is11 {
-			return statusLines11[idx]
-		}
-		return statusLines10[idx]
-	}
-	return ""
+	return internal.StatusLine(is11, code)
 }

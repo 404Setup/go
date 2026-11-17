@@ -547,7 +547,36 @@ func valueOrDefault(value, def string) string {
 // It was changed at the time of Go 1.1 release because the former User-Agent
 // had ended up blocked by some intrusion detection systems.
 // See https://codereview.appspot.com/7532043.
-const defaultUserAgent = "Go-http-client/1.1"
+const (
+	defaultUserAgent       = "Go-http-client/1.1"
+	defaultUserAgentHeader = "User-Agent: " + defaultUserAgent + "\r\n"
+)
+
+func writeReqLine(w io.Writer, a, b, c, d string) error {
+	if bufw, ok := w.(*bufio.Writer); ok {
+		avail := bufw.Available()
+		if len(a)+len(b)+len(c)+len(d) <= avail {
+			buf := bufw.AvailableBuffer()
+			buf = append(buf, a...)
+			buf = append(buf, b...)
+			buf = append(buf, c...)
+			buf = append(buf, d...)
+			_, err := bufw.Write(buf)
+			return err
+		}
+	}
+	var stack [256]byte
+	buf := stack[:0]
+	if len(a)+len(b)+len(c)+len(d) > len(stack) {
+		buf = make([]byte, 0, len(a)+len(b)+len(c)+len(d))
+	}
+	buf = append(buf, a...)
+	buf = append(buf, b...)
+	buf = append(buf, c...)
+	buf = append(buf, d...)
+	_, err := w.Write(buf)
+	return err
+}
 
 // Write writes an HTTP/1.1 request, which is the header and body, in wire format.
 // This method consults the following fields of the request:
@@ -688,35 +717,12 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		w = bw
 	}
 
-	writeLine := func(a, b, c, d string) error {
-		if bufw, ok := w.(*bufio.Writer); ok {
-			buf := bufw.AvailableBuffer()
-			buf = append(buf, a...)
-			buf = append(buf, b...)
-			buf = append(buf, c...)
-			buf = append(buf, d...)
-			_, err := bufw.Write(buf)
-			return err
-		}
-		var stack [256]byte
-		buf := stack[:0]
-		if len(a)+len(b)+len(c)+len(d) > len(stack) {
-			buf = make([]byte, 0, len(a)+len(b)+len(c)+len(d))
-		}
-		buf = append(buf, a...)
-		buf = append(buf, b...)
-		buf = append(buf, c...)
-		buf = append(buf, d...)
-		_, err := w.Write(buf)
-		return err
-	}
-
-	if err = writeLine(valueOrDefault(r.Method, "GET"), " ", ruri, " HTTP/1.1\r\n"); err != nil {
+	if err = writeReqLine(w, valueOrDefault(r.Method, "GET"), " ", ruri, " HTTP/1.1\r\n"); err != nil {
 		return err
 	}
 
 	// Header lines
-	if err = writeLine("Host: ", host, "\r\n", ""); err != nil {
+	if err = writeReqLine(w, "Host: ", host, "\r\n", ""); err != nil {
 		return err
 	}
 	if trace != nil && trace.WroteHeaderField != nil {
@@ -726,18 +732,18 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	// Use the defaultUserAgent unless the Header contains one, which
 	// may be blank to not send the header.
 	if !r.Header.has("User-Agent") {
-		if _, err = io.WriteString(w, "User-Agent: "+defaultUserAgent+"\r\n"); err != nil {
+		if _, err = io.WriteString(w, defaultUserAgentHeader); err != nil {
 			return err
 		}
 		if trace != nil && trace.WroteHeaderField != nil {
 			trace.WroteHeaderField("User-Agent", []string{defaultUserAgent})
 		}
 	} else if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
-		if strings.ContainsAny(userAgent, "\r\n") {
+		if strings.IndexByte(userAgent, '\r') >= 0 || strings.IndexByte(userAgent, '\n') >= 0 {
 			userAgent = headerNewlineToSpace.Replace(userAgent)
 		}
 		userAgent = textproto.TrimString(userAgent)
-		if err = writeLine("User-Agent: ", userAgent, "\r\n", ""); err != nil {
+		if err = writeReqLine(w, "User-Agent: ", userAgent, "\r\n", ""); err != nil {
 			return err
 		}
 		if trace != nil && trace.WroteHeaderField != nil {
@@ -1387,25 +1393,19 @@ func (l *maxBytesReader) Close() error {
 }
 
 func copyValues(dst, src url.Values) {
-	// Count the values destined for keys not yet present in dst, or existing keys
-	// whose slice cannot hold the additional values, so they can share a single
-	// backing array instead of triggering multiple allocations.
-	nv := 0
-	for k, vs := range src {
-		cur := dst[k]
-		if cur == nil {
+	if len(src) == 0 {
+		return
+	}
+	if len(dst) == 0 {
+		nv := 0
+		for _, vs := range src {
 			nv += len(vs)
-		} else if cap(cur)-len(cur) < len(vs) {
-			nv += len(cur) + len(vs)
 		}
-	}
-	var sv []string
-	if nv > 0 {
-		sv = make([]string, nv)
-	}
-	for k, vs := range src {
-		cur := dst[k]
-		if cur == nil {
+		var sv []string
+		if nv > 0 {
+			sv = make([]string, nv)
+		}
+		for k, vs := range src {
 			if len(vs) > 0 {
 				n := copy(sv, vs)
 				dst[k] = sv[:n:n]
@@ -1413,17 +1413,11 @@ func copyValues(dst, src url.Values) {
 			} else {
 				dst[k] = nil
 			}
-			continue
 		}
-		if cap(cur)-len(cur) < len(vs) {
-			needed := len(cur) + len(vs)
-			n := copy(sv, cur)
-			copy(sv[n:], vs)
-			dst[k] = sv[:needed:needed]
-			sv = sv[needed:]
-			continue
-		}
-		dst[k] = append(cur, vs...)
+		return
+	}
+	for k, vs := range src {
+		dst[k] = append(dst[k], vs...)
 	}
 }
 
@@ -1503,23 +1497,23 @@ func (r *Request) ParseForm() error {
 	}
 	if r.Form == nil {
 		if len(r.PostForm) > 0 {
-			r.Form = make(url.Values)
+			r.Form = make(url.Values, len(r.PostForm))
 			copyValues(r.Form, r.PostForm)
 		}
 		var newValues url.Values
-		if r.URL != nil {
+		if r.URL != nil && r.URL.RawQuery != "" {
 			var e error
 			newValues, e = url.ParseQuery(r.URL.RawQuery)
 			if err == nil {
 				err = e
 			}
 		}
-		if newValues == nil {
-			newValues = make(url.Values)
-		}
 		if r.Form == nil {
+			if newValues == nil {
+				newValues = make(url.Values)
+			}
 			r.Form = newValues
-		} else {
+		} else if len(newValues) > 0 {
 			copyValues(r.Form, newValues)
 		}
 	}

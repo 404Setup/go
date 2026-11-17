@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http/internal"
 	"net/url"
 	"strconv"
 	"strings"
@@ -138,7 +139,7 @@ var ErrNoLocation = errors.New("http: no Location header in response")
 // [Response.Request]. [ErrNoLocation] is returned if no
 // Location header is present.
 func (r *Response) Location() (*url.URL, error) {
-	lv := r.Header.Get("Location")
+	lv := r.Header.get("Location")
 	if lv == "" {
 		return nil, ErrNoLocation
 	}
@@ -173,12 +174,15 @@ func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 		resp.ProtoMajor = 1
 		resp.ProtoMinor = 1
 	} else {
-		before, after, ok := bytes.Cut(lineBytes, []byte{' '})
-		if !ok {
+		i := bytes.IndexByte(lineBytes, ' ')
+		if i < 0 {
 			return nil, badStringError("malformed HTTP response", string(lineBytes))
 		}
-		protoBytes := before
-		statusBytes := bytes.TrimLeft(after, " ")
+		protoBytes := lineBytes[:i]
+		statusBytes := lineBytes[i+1:]
+		for len(statusBytes) > 0 && statusBytes[0] == ' ' {
+			statusBytes = statusBytes[1:]
+		}
 		var protoOK bool
 		switch string(protoBytes) {
 		case "HTTP/1.1":
@@ -194,19 +198,28 @@ func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 		default:
 			resp.Proto = string(protoBytes)
 		}
-		if string(statusBytes) == "200 OK" {
-			resp.Status = "200 OK"
-			resp.StatusCode = 200
+		var statusCodeBytes []byte
+		if sp := bytes.IndexByte(statusBytes, ' '); sp >= 0 {
+			statusCodeBytes = statusBytes[:sp]
+		} else {
+			statusCodeBytes = statusBytes
+		}
+		if len(statusCodeBytes) != 3 {
+			return nil, badStringError("malformed HTTP status code", string(statusCodeBytes))
+		}
+		d0, d1, d2 := statusCodeBytes[0]-'0', statusCodeBytes[1]-'0', statusCodeBytes[2]-'0'
+		if d0 <= 9 && d1 <= 9 && d2 <= 9 {
+			resp.StatusCode = int(d0)*100 + int(d1)*10 + int(d2)
+		} else {
+			resp.StatusCode, err = strconv.Atoi(string(statusCodeBytes))
+			if err != nil || resp.StatusCode < 0 {
+				return nil, badStringError("malformed HTTP status code", string(statusCodeBytes))
+			}
+		}
+		if canonical := internal.StatusCodeText(resp.StatusCode); canonical != "" && len(statusBytes) == len(canonical) && string(statusBytes) == canonical {
+			resp.Status = canonical
 		} else {
 			resp.Status = string(statusBytes)
-			statusCode, _, _ := strings.Cut(resp.Status, " ")
-			if len(statusCode) != 3 {
-				return nil, badStringError("malformed HTTP status code", statusCode)
-			}
-			resp.StatusCode, err = strconv.Atoi(statusCode)
-			if err != nil || resp.StatusCode < 0 {
-				return nil, badStringError("malformed HTTP status code", statusCode)
-			}
 		}
 		if !protoOK {
 			var ok bool
@@ -260,24 +273,24 @@ func (r *Response) ProtoAtLeast(major, minor int) bool {
 		r.ProtoMajor == major && r.ProtoMinor >= minor
 }
 
-// Write writes r to w in the HTTP/1.x server response format,
-// including the status line, headers, body, and optional trailer.
-//
-// This method consults the following fields of the response r:
-//
-//	StatusCode
-//	ProtoMajor
-//	ProtoMinor
-//	Request.Method
-//	TransferEncoding
-//	Trailer
-//	Body
-//	ContentLength
-//	Header, values for non-canonical keys will have unpredictable behavior
-//
-// The Response Body is closed after it is sent.
-func (r *Response) Write(w io.Writer) error {
-	// Status line
+func writeResponseStatusLine(w io.Writer, r *Response) error {
+	if r.Status == "" && r.ProtoMajor == 1 && (r.ProtoMinor == 1 || r.ProtoMinor == 0) {
+		if line := internal.StatusLine(r.ProtoMinor == 1, r.StatusCode); line != "" {
+			if sw, ok := w.(io.StringWriter); ok {
+				_, err := sw.WriteString(line)
+				return err
+			}
+			var buf [64]byte
+			if len(line) <= len(buf) {
+				n := copy(buf[:], line)
+				_, err := w.Write(buf[:n])
+				return err
+			}
+			_, err := io.WriteString(w, line)
+			return err
+		}
+	}
+
 	text := r.Status
 	if text == "" {
 		text = StatusText(r.StatusCode)
@@ -305,16 +318,38 @@ func (r *Response) Write(w io.Writer) error {
 		b = append(b, byte('0'+r.StatusCode/100), byte('0'+(r.StatusCode/10)%10), byte('0'+r.StatusCode%10), ' ')
 		b = append(b, text...)
 		b = append(b, "\r\n"...)
-		if _, err := w.Write(b); err != nil {
-			return err
-		}
-	} else if _, err := fmt.Fprintf(w, "HTTP/%d.%d %03d %s\r\n", r.ProtoMajor, r.ProtoMinor, r.StatusCode, text); err != nil {
+		_, err := w.Write(b)
+		return err
+	}
+	_, err := fmt.Fprintf(w, "HTTP/%d.%d %03d %s\r\n", r.ProtoMajor, r.ProtoMinor, r.StatusCode, text)
+	return err
+}
+
+// Write writes r to w in the HTTP/1.x server response format,
+// including the status line, headers, body, and optional trailer.
+//
+// This method consults the following fields of the response r:
+//
+//	StatusCode
+//	ProtoMajor
+//	ProtoMinor
+//	Request.Method
+//	TransferEncoding
+//	Trailer
+//	Body
+//	ContentLength
+//	Header, values for non-canonical keys will have unpredictable behavior
+//
+// The Response Body is closed after it is sent.
+func (r *Response) Write(w io.Writer) error {
+	// Status line
+	if err := writeResponseStatusLine(w, r); err != nil {
 		return err
 	}
 
 	// Clone it, so we can modify r1 as needed.
 	r1 := *r
-	if r1.ContentLength == 0 && r1.Body != nil {
+	if r1.ContentLength == 0 && r1.Body != nil && r1.Body != NoBody {
 		// Is it actually 0 length? Or just unknown?
 		var buf [1]byte
 		n, err := r1.Body.Read(buf[:])
@@ -364,13 +399,10 @@ func (r *Response) Write(w io.Writer) error {
 	// POST/PUT requests, even if zero length. See Issue 8180.
 	contentLengthAlreadySent := tw.shouldSendContentLength()
 	if r1.ContentLength == 0 && !chunked(r1.TransferEncoding) && !contentLengthAlreadySent && bodyAllowedForStatus(r.StatusCode) {
-		if _, err := io.WriteString(w, "Content-Length: 0\r\n"); err != nil {
+		if _, err := io.WriteString(w, "Content-Length: 0\r\n\r\n"); err != nil {
 			return err
 		}
-	}
-
-	// End-of-header
-	if _, err := io.WriteString(w, "\r\n"); err != nil {
+	} else if _, err := io.WriteString(w, "\r\n"); err != nil {
 		return err
 	}
 
@@ -417,6 +449,6 @@ func isProtocolSwitchResponse(code int, h Header) bool {
 // isProtocolSwitchHeader reports whether the request or response header
 // is for a protocol switch.
 func isProtocolSwitchHeader(h Header) bool {
-	return h.Get("Upgrade") != "" &&
+	return h.get("Upgrade") != "" &&
 		httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade")
 }

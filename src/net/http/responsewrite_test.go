@@ -5,7 +5,10 @@
 package http
 
 import (
+	"bytes"
 	"io"
+	"net/http/httptrace"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -330,3 +333,101 @@ func TestResponseWriteInvalidTrailer(t *testing.T) {
 		})
 	}
 }
+
+func TestResponseWriteStatusLinesAndTrailers(t *testing.T) {
+	// Long status (>128B stack buffer) + custom code.
+	longStatus := "299 " + strings.Repeat("Z", 160)
+	resp := Response{
+		StatusCode:    299,
+		Status:        longStatus,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Request:       dummyReq11("GET"),
+		Header:        Header{},
+		Body:          NoBody,
+		ContentLength: 0,
+	}
+	var bb bytes.Buffer
+	if err := resp.Write(&bb); err != nil {
+		t.Fatalf("Response.Write long status: %v", err)
+	}
+	wantPrefix := "HTTP/1.1 " + longStatus + "\r\nContent-Length: 0\r\n\r\n"
+	if bb.String() != wantPrefix {
+		t.Fatalf("got %q, want %q", bb.String(), wantPrefix)
+	}
+
+	// Trailer header fast stack sort (<=8 keys) vs slices.Sort (>8 keys) + >128B Trailer line.
+	for _, nKeys := range []int{1, 4, 10} {
+		tr := make(Header, nKeys)
+		var wantKeys []string
+		for i := range nKeys {
+			k := "X-Trailer-" + string(rune('A'+nKeys-1-i)) + strings.Repeat("k", 12)
+			tr[k] = []string{"v"}
+			wantKeys = append(wantKeys, k)
+		}
+		slices.Sort(wantKeys)
+		r := Response{
+			StatusCode:       200,
+			ProtoMajor:       1,
+			ProtoMinor:       1,
+			Request:          dummyReq11("GET"),
+			Header:           Header{},
+			Body:             io.NopCloser(strings.NewReader("hi")),
+			ContentLength:    -1,
+			TransferEncoding: []string{"chunked"},
+			Trailer:          tr,
+		}
+		var out strings.Builder
+		if err := r.Write(&out); err != nil {
+			t.Fatalf("Response.Write(%d trailers): %v", nKeys, err)
+		}
+		wantLine := "Trailer: " + strings.Join(wantKeys, ",") + "\r\n"
+		if !strings.Contains(out.String(), wantLine) {
+			t.Fatalf("%d trailers: missing %q in %q", nKeys, wantLine, out.String())
+		}
+		// Ensure transferWriter.writeHeader emits WroteHeaderField for Trailer.
+		var gotTrailer []string
+		tw := &transferWriter{
+			Method:           "GET",
+			TransferEncoding: []string{"chunked"},
+			Trailer:          tr,
+			Body:             NoBody,
+			BodyCloser:       NoBody,
+		}
+		var discard bytes.Buffer
+		err := tw.writeHeader(&discard, &httptrace.ClientTrace{
+			WroteHeaderField: func(key string, val []string) {
+				if key == "Trailer" {
+					gotTrailer = slices.Clone(val)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("tw.writeHeader: %v", err)
+		}
+		if !slices.Equal(gotTrailer, wantKeys) {
+			t.Fatalf("traced Trailer = %v, want %v", gotTrailer, wantKeys)
+		}
+	}
+}
+
+func BenchmarkResponseWrite(b *testing.B) {
+	resp := Response{
+		StatusCode:    StatusOK,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Request:       dummyReq11("GET"),
+		Header:        Header{"Content-Type": {"text/plain"}, "X-Req-Id": {"12345"}},
+		Body:          NoBody,
+		ContentLength: 0,
+	}
+	var bb bytes.Buffer
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		bb.Reset()
+		if err := resp.Write(&bb); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+

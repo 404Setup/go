@@ -5,8 +5,12 @@
 package http
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"internal/race"
+	"io"
+	"net/http/httptrace"
 	"reflect"
 	"runtime"
 	"strings"
@@ -242,3 +246,156 @@ func BenchmarkHeaderCloneEmpty(b *testing.B) {
 		_ = h.Clone()
 	}
 }
+
+type plainWriter struct{ b bytes.Buffer }
+
+func (p *plainWriter) Write(d []byte) (int, error) { return p.b.Write(d) }
+
+type failAfterNWriter struct{ rem int }
+
+func (w *failAfterNWriter) Write(p []byte) (int, error) {
+	if w.rem <= 0 {
+		return 0, errors.New("write error")
+	}
+	n := min(len(p), w.rem)
+	w.rem -= n
+	if n < len(p) {
+		return n, errors.New("short write error")
+	}
+	return n, nil
+}
+
+func TestHeaderWriteSubsetWriters(t *testing.T) {
+	longVal := strings.Repeat("x", 600)
+	// Cover <=16 keys (stack array) and >16 keys (headerSorterPool).
+	smallHdr := Header{
+		"Content-Type":   {"text/plain"},
+		"X-Exclude":      {"skip"},
+		"Invalid\nKey":   {"bad"},
+		"X-Newline":      {" a\r\nb "},
+		"X-Long":         {longVal},
+		"X-Multi":        {"v1", "v2"},
+	}
+	largeHdr := Header{}
+	for i := range 20 {
+		largeHdr[string(rune('A'+i))+"-Header"] = []string{"val"}
+	}
+	largeHdr["X-Long"] = []string{longVal}
+	largeHdr["Bad Key"] = []string{"ignored"}
+	largeHdr["X-Exclude"] = []string{"skip"}
+
+	exclude := map[string]bool{"X-Exclude": true}
+
+	for _, tc := range []struct {
+		name string
+		h    Header
+	}{
+		{"small", smallHdr},
+		{"large", largeHdr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ref plainWriter
+			if err := tc.h.WriteSubset(&ref, exclude); err != nil {
+				t.Fatalf("plainWriter WriteSubset: %v", err)
+			}
+			want := ref.b.String()
+
+			var bb bytes.Buffer
+			if err := tc.h.WriteSubset(&bb, exclude); err != nil || bb.String() != want {
+				t.Errorf("*bytes.Buffer mismatch: err=%v, eq=%v", err, bb.String() == want)
+			}
+
+			var sb strings.Builder
+			if err := tc.h.WriteSubset(&sb, exclude); err != nil || sb.String() != want {
+				t.Errorf("*strings.Builder mismatch: err=%v, eq=%v", err, sb.String() == want)
+			}
+
+			// Large bufio.Writer exercises AvailableBuffer coalescing + oversized writeHeaderLine fallback.
+			var bwLarge bytes.Buffer
+			bw := bufio.NewWriterSize(&bwLarge, 4096)
+			if err := tc.h.WriteSubset(bw, exclude); err != nil {
+				t.Errorf("*bufio.Writer(4096): %v", err)
+			}
+			bw.Flush()
+			if bwLarge.String() != want {
+				t.Errorf("*bufio.Writer(4096) mismatch")
+			}
+
+			// Small bufio.Writer forces flush between headers inside the loop.
+			var bwSmall bytes.Buffer
+			bws := bufio.NewWriterSize(&bwSmall, 16)
+			if err := tc.h.WriteSubset(bws, exclude); err != nil {
+				t.Errorf("*bufio.Writer(16): %v", err)
+			}
+			bws.Flush()
+			if bwSmall.String() != want {
+				t.Errorf("*bufio.Writer(16) mismatch:\n got %q\nwant %q", bwSmall.String(), want)
+			}
+
+			// Trace path bypasses writer fast paths cleanly.
+			var traced []string
+			trace := &httptrace.ClientTrace{
+				WroteHeaderField: func(k string, v []string) {
+					traced = append(traced, k)
+				},
+			}
+			var tw bytes.Buffer
+			if err := tc.h.writeSubset(&tw, exclude, trace); err != nil || tw.String() != want {
+				t.Errorf("traced writeSubset mismatch: err=%v, eq=%v", err, tw.String() == want)
+			}
+			if len(traced) == 0 {
+				t.Errorf("WroteHeaderField trace callback not invoked")
+			}
+		})
+	}
+}
+
+func TestHeaderWriteSubsetErrorReturnsSorter(t *testing.T) {
+	largeHdr := Header{}
+	for i := range 20 {
+		largeHdr[string(rune('A'+i))+"-Header"] = []string{strings.Repeat("v", 32)}
+	}
+	for _, bufSize := range []int{16, 4096} {
+		bw := bufio.NewWriterSize(&failAfterNWriter{rem: 10}, bufSize)
+		if err := largeHdr.WriteSubset(bw, nil); err == nil {
+			bw.Flush()
+		}
+	}
+	if err := largeHdr.writeSubset(&failAfterNWriter{rem: 10}, nil, &httptrace.ClientTrace{
+		WroteHeaderField: func(string, []string) {},
+	}); err == nil {
+		t.Fatal("expected error from failing writer")
+	}
+}
+
+func BenchmarkHeaderWriteSubsetBuilder(b *testing.B) {
+	var sb strings.Builder
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sb.Reset()
+		testHeader.WriteSubset(&sb, nil)
+	}
+}
+
+func BenchmarkHeaderWriteSubsetBufio(b *testing.B) {
+	bw := bufio.NewWriterSize(io.Discard, 4096)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		bw.Reset(io.Discard)
+		testHeader.WriteSubset(bw, nil)
+	}
+}
+
+func BenchmarkHeaderWriteSubsetLarge(b *testing.B) {
+	h := make(Header, 20)
+	for i := range 20 {
+		h[string(rune('A'+i))+"-Header"] = []string{"some-value-here"}
+	}
+	var bb bytes.Buffer
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		bb.Reset()
+		h.WriteSubset(&bb, nil)
+	}
+}
+

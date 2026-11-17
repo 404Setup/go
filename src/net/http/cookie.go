@@ -10,6 +10,7 @@ import (
 	"internal/godebug"
 	"log"
 	"net"
+	"net/http/internal"
 	"net/http/internal/ascii"
 	"net/textproto"
 	"strconv"
@@ -98,7 +99,11 @@ func ParseCookie(line string) ([]*Cookie, error) {
 	cookies := make([]*Cookie, 0, nparts)
 	cookieBuf := make([]Cookie, nparts)
 	idx := 0
-	for s := range strings.SplitSeq(line, ";") {
+	rest := line
+	for {
+		var s string
+		var hasMore bool
+		s, rest, hasMore = strings.Cut(rest, ";")
 		s = textproto.TrimString(s)
 		name, value, found := strings.Cut(s, "=")
 		if !found {
@@ -114,6 +119,9 @@ func ParseCookie(line string) ([]*Cookie, error) {
 		cookieBuf[idx] = Cookie{Name: name, Value: value, Quoted: quoted}
 		cookies = append(cookies, &cookieBuf[idx])
 		idx++
+		if !hasMore {
+			break
+		}
 	}
 	return cookies, nil
 }
@@ -160,72 +168,82 @@ func ParseSetCookie(line string) (*Cookie, error) {
 			continue
 		}
 
-		if ascii.EqualFold(attr, "samesite") {
-			if ascii.EqualFold(val, "lax") {
-				c.SameSite = SameSiteLaxMode
-			} else if ascii.EqualFold(val, "strict") {
-				c.SameSite = SameSiteStrictMode
-			} else if ascii.EqualFold(val, "none") {
-				c.SameSite = SameSiteNoneMode
-			} else {
-				c.SameSite = SameSiteDefaultMode
-			}
-			continue
-		}
-		if ascii.EqualFold(attr, "secure") {
-			c.Secure = true
-			continue
-		}
-		if ascii.EqualFold(attr, "httponly") {
-			c.HttpOnly = true
-			continue
-		}
-		if ascii.EqualFold(attr, "domain") {
-			c.Domain = val
-			continue
-		}
-		if ascii.EqualFold(attr, "max-age") {
-			secs, err := strconv.Atoi(val)
-			if err != nil || (secs != 0 && val[0] == '0') {
-				c.Unparsed = append(c.Unparsed, part)
+		switch len(attr) {
+		case 4:
+			if ascii.EqualFold(attr, "path") {
+				c.Path = val
 				continue
 			}
-			if secs <= 0 {
-				secs = -1
-			}
-			c.MaxAge = secs
-			continue
-		}
-		if ascii.EqualFold(attr, "expires") {
-			c.RawExpires = val
-			var exptime time.Time
-			var err error
-			if strings.IndexByte(val, '-') >= 0 {
-				exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
-				if err != nil {
-					exptime, err = time.Parse(time.RFC1123, val)
-				}
-			} else {
-				exptime, err = time.Parse(time.RFC1123, val)
-				if err != nil {
-					exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
-				}
-			}
-			if err != nil {
-				c.Expires = time.Time{}
-				c.Unparsed = append(c.Unparsed, part)
+		case 6:
+			if ascii.EqualFold(attr, "domain") {
+				c.Domain = val
 				continue
 			}
-			c.Expires = exptime.UTC()
-			continue
-		}
-		if ascii.EqualFold(attr, "path") {
-			c.Path = val
-			continue
-		}
-		if ascii.EqualFold(attr, "partitioned") {
-			c.Partitioned = true
-			continue
+			if ascii.EqualFold(attr, "secure") {
+				c.Secure = true
+				continue
+			}
+		case 7:
+			if ascii.EqualFold(attr, "expires") {
+				c.RawExpires = val
+				exptime, ok := internal.ParseCookieDate(val)
+				if !ok {
+					var err error
+					if strings.IndexByte(val, '-') >= 0 {
+						exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
+						if err != nil {
+							exptime, err = time.Parse(time.RFC1123, val)
+						}
+					} else {
+						exptime, err = time.Parse(time.RFC1123, val)
+						if err != nil {
+							exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
+						}
+					}
+					if err != nil {
+						c.Expires = time.Time{}
+						c.Unparsed = append(c.Unparsed, part)
+						continue
+					}
+					exptime = exptime.UTC()
+				}
+				c.Expires = exptime
+				continue
+			}
+			if ascii.EqualFold(attr, "max-age") {
+				secs, err := strconv.Atoi(val)
+				if err != nil || (secs != 0 && val[0] == '0') {
+					c.Unparsed = append(c.Unparsed, part)
+					continue
+				}
+				if secs <= 0 {
+					secs = -1
+				}
+				c.MaxAge = secs
+				continue
+			}
+		case 8:
+			if ascii.EqualFold(attr, "samesite") {
+				if ascii.EqualFold(val, "lax") {
+					c.SameSite = SameSiteLaxMode
+				} else if ascii.EqualFold(val, "strict") {
+					c.SameSite = SameSiteStrictMode
+				} else if ascii.EqualFold(val, "none") {
+					c.SameSite = SameSiteNoneMode
+				} else {
+					c.SameSite = SameSiteDefaultMode
+				}
+				continue
+			}
+			if ascii.EqualFold(attr, "httponly") {
+				c.HttpOnly = true
+				continue
+			}
+		case 11:
+			if ascii.EqualFold(attr, "partitioned") {
+				c.Partitioned = true
+				continue
+			}
 		}
 		c.Unparsed = append(c.Unparsed, part)
 	}
@@ -340,7 +358,7 @@ func (c *Cookie) String() string {
 	var buf [len(TimeFormat)]byte
 	if hasExpires {
 		b.WriteString("; Expires=")
-		b.Write(c.Expires.UTC().AppendFormat(buf[:0], TimeFormat))
+		b.Write(internal.AppendHTTPDate(buf[:0], c.Expires))
 	}
 	if c.MaxAge > 0 {
 		b.WriteString("; Max-Age=")
@@ -431,9 +449,13 @@ func readCookies(h Header, filter string) []*Cookie {
 		return []*Cookie{}
 	}
 
-	cookies := make([]*Cookie, 0, cookieCount)
-	cookieBuf := make([]Cookie, cookieCount)
+	var cookies []*Cookie
+	var cookieBuf []Cookie
 	idx := 0
+	if filter == "" {
+		cookies = make([]*Cookie, 0, cookieCount)
+		cookieBuf = make([]Cookie, cookieCount)
+	}
 	for _, line := range lines {
 		line = textproto.TrimString(line)
 
@@ -456,10 +478,17 @@ func readCookies(h Header, filter string) []*Cookie {
 			if !ok {
 				continue
 			}
-			cookieBuf[idx] = Cookie{Name: name, Value: val, Quoted: quoted}
-			cookies = append(cookies, &cookieBuf[idx])
-			idx++
+			if filter == "" {
+				cookieBuf[idx] = Cookie{Name: name, Value: val, Quoted: quoted}
+				cookies = append(cookies, &cookieBuf[idx])
+				idx++
+			} else {
+				cookies = append(cookies, &Cookie{Name: name, Value: val, Quoted: quoted})
+			}
 		}
+	}
+	if cookies == nil {
+		return []*Cookie{}
 	}
 	return cookies
 }
@@ -579,6 +608,9 @@ func isCookieDomainName(s string) bool {
 var cookieNameSanitizer = strings.NewReplacer("\n", "-", "\r", "-")
 
 func sanitizeCookieName(n string) string {
+	if strings.IndexByte(n, '\n') < 0 && strings.IndexByte(n, '\r') < 0 {
+		return n
+	}
 	return cookieNameSanitizer.Replace(n)
 }
 

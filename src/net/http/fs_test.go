@@ -1848,3 +1848,58 @@ func testServeContentHeadersWithError(t *testing.T, keepHeaders bool) {
 		t.Errorf("got other-header = %q, want %q", g, e)
 	}
 }
+
+type failSeekReader struct {
+	failSecond bool
+	calls      int
+}
+
+func (f *failSeekReader) Read(p []byte) (int, error) { return 0, io.EOF }
+func (f *failSeekReader) Seek(offset int64, whence int) (int64, error) {
+	f.calls++
+	if !f.failSecond && whence == io.SeekEnd {
+		return 0, errors.New("seek end boom")
+	}
+	if f.failSecond && whence == io.SeekStart {
+		return 0, errors.New("seek start boom")
+	}
+	return 10, nil
+}
+
+func TestServeContentSeekError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failSecond bool
+	}{
+		{"seek_end_error", false},
+		{"seek_start_error", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "http://example.com/file.txt", nil)
+			ServeContent(rec, req, "file.txt", time.Unix(1257894000, 0), &failSeekReader{failSecond: tc.failSecond})
+			if rec.Code != StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", rec.Code)
+			}
+			if got := rec.Body.String(); got != "seeker can't seek\n" {
+				t.Fatalf("body = %q, want %q", got, "seeker can't seek\n")
+			}
+		})
+	}
+}
+
+func BenchmarkServeContent(b *testing.B) {
+	payload := bytes.Repeat([]byte("a"), 4096)
+	mod := time.Unix(1257894000, 0)
+	req := httptest.NewRequest("GET", "http://example.com/data.txt", nil)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		rec.Body = nil
+		ServeContent(rec, req, "data.txt", mod, bytes.NewReader(payload))
+		if rec.Code != StatusOK {
+			b.Fatalf("status = %d", rec.Code)
+		}
+	}
+}
+

@@ -316,8 +316,14 @@ func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) 
 	}
 
 	// Write Trailer header
-	if t.Trailer != nil {
-		keys := make([]string, 0, len(t.Trailer))
+	if len(t.Trailer) > 0 {
+		var stackKeys [8]string
+		var keys []string
+		if len(t.Trailer) <= len(stackKeys) {
+			keys = stackKeys[:0]
+		} else {
+			keys = make([]string, 0, len(t.Trailer))
+		}
 		for k := range t.Trailer {
 			k = CanonicalHeaderKey(k)
 			switch k {
@@ -326,20 +332,63 @@ func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) 
 			}
 			keys = append(keys, k)
 		}
-		if len(keys) > 0 {
+		if len(keys) <= len(stackKeys) {
+			for i := 1; i < len(keys); i++ {
+				cur := keys[i]
+				j := i - 1
+				for j >= 0 && keys[j] > cur {
+					keys[j+1] = keys[j]
+					j--
+				}
+				keys[j+1] = cur
+			}
+		} else {
 			slices.Sort(keys)
-			// TODO: could do better allocation-wise here, but trailers are rare,
-			// so being lazy for now.
-			if _, err := io.WriteString(w, "Trailer: "+strings.Join(keys, ",")+"\r\n"); err != nil {
-				return err
-			}
-			if trace != nil && trace.WroteHeaderField != nil {
-				trace.WroteHeaderField("Trailer", keys)
-			}
+		}
+		if err := writeTrailerHeader(w, keys); err != nil {
+			return err
+		}
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("Trailer", slices.Clone(keys))
 		}
 	}
 
 	return nil
+}
+
+func writeTrailerHeader(w io.Writer, keys []string) error {
+	var buf [128]byte
+	total := len("Trailer: ") + len("\r\n") + len(keys) - 1
+	for _, k := range keys {
+		total += len(k)
+	}
+	if total <= len(buf) {
+		b := append(buf[:0], "Trailer: "...)
+		for i, k := range keys {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			b = append(b, k...)
+		}
+		b = append(b, "\r\n"...)
+		_, err := w.Write(b)
+		return err
+	}
+	if _, err := io.WriteString(w, "Trailer: "); err != nil {
+		return err
+	}
+	for i, k := range keys {
+		if i > 0 {
+			if _, err := io.WriteString(w, ","); err != nil {
+				return err
+			}
+		}
+		if _, err := io.WriteString(w, k); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "\r\n")
+	return err
 }
 
 // always closes t.BodyCloser
@@ -844,34 +893,42 @@ func fixTrailer(header Header, chunked bool, maxHeaders int64) (Header, error) {
 		// See issue #27197.
 		return nil, nil
 	}
-	header.Del("Trailer")
+	delete(header, "Trailer")
+	totalKeys := 0
 	for _, v := range vv {
-		maxHeaders -= int64(strings.Count(v, ",") + 1)
+		c := strings.Count(v, ",") + 1
+		maxHeaders -= int64(c)
 		if maxHeaders < 0 {
 			return nil, errTooLarge
 		}
+		totalKeys += c
 	}
 
-	trailer := make(Header)
-	var err error
+	var trailer Header
 	for _, v := range vv {
-		foreachHeaderElement(v, func(key string) {
-			key = CanonicalHeaderKey(key)
-			switch key {
-			case "Transfer-Encoding", "Trailer", "Content-Length":
-				if err == nil {
-					err = badStringError("bad trailer key", key)
-					return
+		v = textproto.TrimString(v)
+		if v == "" {
+			continue
+		}
+		for {
+			elem, rest, hasComma := strings.Cut(v, ",")
+			key := textproto.TrimString(elem)
+			if key != "" {
+				key = CanonicalHeaderKey(key)
+				switch key {
+				case "Transfer-Encoding", "Trailer", "Content-Length":
+					return nil, badStringError("bad trailer key", key)
 				}
+				if trailer == nil {
+					trailer = make(Header, totalKeys)
+				}
+				trailer[key] = nil
 			}
-			trailer[key] = nil
-		})
-	}
-	if err != nil {
-		return nil, err
-	}
-	if len(trailer) == 0 {
-		return nil, nil
+			if !hasComma {
+				break
+			}
+			v = rest
+		}
 	}
 	return trailer, nil
 }
@@ -962,54 +1019,45 @@ func (b *body) readLocked(p []byte) (n int, err error) {
 	return n, err
 }
 
-var (
-	singleCRLF = []byte("\r\n")
-	doubleCRLF = []byte("\r\n\r\n")
-)
+var singleCRLF = []byte("\r\n")
 
 func seeUpcomingDoubleCRLF(r *bufio.Reader) error {
-	containsValidTrailers := func(buf []byte) (valid, complete bool) {
-		if !bytes.HasSuffix(buf, doubleCRLF) {
-			return
-		}
-		complete = true
-		cr := false
-		for _, c := range buf {
-			if cr {
-				switch c {
-				case '\n':
-					cr = false
-				default:
-					return
-				}
-			} else {
-				switch c {
-				case '\r':
-					cr = true
-				case '\n':
-					return
-				}
-			}
-		}
-		if !cr {
-			valid = true
-		}
-		return
-	}
-	for peekSize := 4; ; peekSize++ {
+	scanned := 0
+	cr := false
+	invalid := false
+	for peekSize := max(4, r.Buffered()); ; {
 		// This loop stops when Peek returns an error,
 		// which it does when r's buffer has been filled.
 		buf, err := r.Peek(peekSize)
-		valid, complete := containsValidTrailers(buf)
-		if complete {
-			if valid {
+		for i := scanned; i < len(buf); i++ {
+			c := buf[i]
+			if !invalid {
+				if cr {
+					if c == '\n' {
+						cr = false
+					} else {
+						invalid = true
+					}
+				} else {
+					if c == '\r' {
+						cr = true
+					} else if c == '\n' {
+						invalid = true
+					}
+				}
+			}
+			if i >= 3 && c == '\n' && buf[i-1] == '\r' && buf[i-2] == '\n' && buf[i-3] == '\r' {
+				if invalid || cr {
+					return errors.New("http: invalid trailer")
+				}
 				return nil
 			}
-			return errors.New("http: invalid trailer")
 		}
+		scanned = len(buf)
 		if err != nil {
 			break
 		}
+		peekSize = max(scanned+1, r.Buffered())
 	}
 	return errors.New("http: suspiciously long trailer after chunked body")
 }

@@ -1168,3 +1168,44 @@ func TestResponseWritesOnlySingleConnectionClose(t *testing.T) {
 		t.Errorf("Found %d %q header", count, connectionCloseHeader)
 	}
 }
+
+func TestReadResponseStatusAndLocation(t *testing.T) {
+	for _, tc := range []struct {
+		raw        string
+		wantCode   int
+		wantStatus string
+		wantMajor  int
+		wantMinor  int
+	}{
+		{"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 200, "200 OK", 1, 1},
+		{"HTTP/1.0 404 Not Found\r\n\r\n", 404, "404 Not Found", 1, 0},
+		{"HTTP/1.1    204 No Content\r\n\r\n", 204, "204 No Content", 1, 1},
+		{"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n", 200, "200", 1, 1},
+		{"HTTP/1.1 299 Custom Text\r\nContent-Length: 0\r\n\r\n", 299, "299 Custom Text", 1, 1},
+	} {
+		resp, err := ReadResponse(bufio.NewReader(strings.NewReader(tc.raw)), nil)
+		if err != nil {
+			t.Fatalf("ReadResponse(%q): %v", tc.raw, err)
+		}
+		if resp.StatusCode != tc.wantCode || resp.Status != tc.wantStatus || resp.ProtoMajor != tc.wantMajor || resp.ProtoMinor != tc.wantMinor {
+			t.Errorf("ReadResponse(%q) = (%d, %q, %d.%d), want (%d, %q, %d.%d)",
+				tc.raw, resp.StatusCode, resp.Status, resp.ProtoMajor, resp.ProtoMinor,
+				tc.wantCode, tc.wantStatus, tc.wantMajor, tc.wantMinor)
+		}
+	}
+
+	reqURL, _ := url.Parse("https://example.com/a/b")
+	res := &Response{
+		Header:  Header{"Location": {"/next"}},
+		Request: &Request{URL: reqURL},
+	}
+	loc, err := res.Location()
+	if err != nil || loc.String() != "https://example.com/next" {
+		t.Fatalf("Location() = (%v, %v), want https://example.com/next", loc, err)
+	}
+	noLoc := &Response{Header: Header{}}
+	if _, err := noLoc.Location(); err != ErrNoLocation {
+		t.Fatalf("empty Location() err = %v, want ErrNoLocation", err)
+	}
+}
+

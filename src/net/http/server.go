@@ -389,7 +389,22 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 		return len(p), nil
 	}
 	if cw.chunking {
+		if len(p) == 0 {
+			return 0, nil
+		}
 		bw := cw.res.conn.bufw
+		// Up to 16 hex digits + "\r\n" + "\r\n" = 20 bytes framing overhead.
+		if bw.Available()-20 >= len(p) {
+			b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(p)), 16)
+			b = append(b, '\r', '\n')
+			b = append(b, p...)
+			b = append(b, '\r', '\n')
+			if _, err = bw.Write(b); err != nil {
+				cw.res.conn.rwc.Close()
+				return 0, err
+			}
+			return len(p), nil
+		}
 		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(p)), 16)
 		b = append(b, '\r', '\n')
 		_, err = bw.Write(b)
@@ -1158,14 +1173,9 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
 		return nil, badRequestError("malformed Host header")
 	}
-	for k, vv := range req.Header {
-		if !httpguts.ValidHeaderFieldName(k) {
+	for k := range req.Header {
+		if strings.IndexByte(k, ' ') >= 0 {
 			return nil, badRequestError("invalid header name")
-		}
-		for _, v := range vv {
-			if !httpguts.ValidHeaderFieldValue(v) {
-				return nil, badRequestError("invalid header value")
-			}
 		}
 	}
 	delete(req.Header, "Host")
@@ -1370,6 +1380,59 @@ var (
 // of h, because it prevents an allocation. The escape analysis isn't
 // smart enough to realize this function doesn't mutate h.
 func (h extraHeader) Write(w *bufio.Writer) {
+	need := 0
+	if h.date != nil {
+		need += 8 + len(h.date)
+	}
+	if h.contentLength != nil {
+		need += 18 + len(h.contentLength)
+	}
+	if h.contentType != "" {
+		need += 16 + len(h.contentType)
+	}
+	if h.connection != "" {
+		need += 14 + len(h.connection)
+	}
+	if h.transferEncoding != "" {
+		need += 21 + len(h.transferEncoding)
+	}
+	if need == 0 {
+		return
+	}
+	if w.Available() < need {
+		h.writeSlow(w)
+		return
+	}
+	buf := w.AvailableBuffer()
+	if h.date != nil {
+		buf = append(buf, "Date: "...)
+		buf = append(buf, h.date...)
+		buf = append(buf, '\r', '\n')
+	}
+	if h.contentLength != nil {
+		buf = append(buf, "Content-Length: "...)
+		buf = append(buf, h.contentLength...)
+		buf = append(buf, '\r', '\n')
+	}
+	if h.contentType != "" {
+		buf = append(buf, "Content-Type: "...)
+		buf = append(buf, h.contentType...)
+		buf = append(buf, '\r', '\n')
+	}
+	if h.connection != "" {
+		buf = append(buf, "Connection: "...)
+		buf = append(buf, h.connection...)
+		buf = append(buf, '\r', '\n')
+	}
+	if h.transferEncoding != "" {
+		buf = append(buf, "Transfer-Encoding: "...)
+		buf = append(buf, h.transferEncoding...)
+		buf = append(buf, '\r', '\n')
+	}
+	w.Write(buf)
+}
+
+func (h extraHeader) writeSlow(w *bufio.Writer) {
 	if h.date != nil {
 		w.WriteString("Date: ")
 		w.Write(h.date)
@@ -1579,7 +1642,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 
 		// If the Content-Encoding was set and is non-blank,
 		// we shouldn't sniff the body. See Issue 31753.
-		ce := header.Get("Content-Encoding")
+		ce := header.get("Content-Encoding")
 		hasCE := len(ce) > 0
 		if !hasCE && !haveType && !hasTE && len(p) > 0 {
 			setHeader.contentType = DetectContentType(p)
@@ -1591,7 +1654,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	}
 
 	if !header.has("Date") {
-		setHeader.date = time.Now().UTC().AppendFormat(cw.res.dateBuf[:0], TimeFormat)
+		setHeader.date = internal.AppendHTTPDateNow(cw.res.dateBuf[:0])
 	}
 
 	if hasCL && hasTE && te != "identity" {
@@ -1695,10 +1758,15 @@ func foreachHeaderElement(v string, fn func(string)) {
 		fn(v)
 		return
 	}
-	for f := range strings.SplitSeq(v, ",") {
+	for {
+		f, rest, ok := strings.Cut(v, ",")
 		if f = textproto.TrimString(f); f != "" {
 			fn(f)
 		}
+		if !ok {
+			return
+		}
+		v = rest
 	}
 }
 

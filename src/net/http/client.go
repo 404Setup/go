@@ -245,12 +245,12 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 		req.Header = make(Header)
 	}
 
-	if u := req.URL.User; u != nil && req.Header.Get("Authorization") == "" {
+	if u := req.URL.User; u != nil && req.Header.get("Authorization") == "" {
 		username := u.Username()
 		password, _ := u.Password()
 		forkReq()
 		req.Header = cloneOrMakeHeader(ireq.Header)
-		req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
+		req.Header["Authorization"] = []string{"Basic " + basicAuth(username, password)}
 	}
 
 	if !deadline.IsZero() {
@@ -644,7 +644,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 		// For all but the first request, create the next
 		// request hop and replace req.
 		if len(reqs) > 0 {
-			loc := resp.Header.Get("Location")
+			loc := resp.Header.get("Location")
 			if loc == "" {
 				// While most 3xx responses include a Location, it is not
 				// required and 3xx responses without a Location have been
@@ -697,8 +697,8 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			copyHeaders(req, stripSensitiveHeaders, !includeBody)
 			// Add the Referer header from the most recent
 			// request URL to the new one, if it's not https->http:
-			if ref := refererForURL(reqs[len(reqs)-1].URL, req.URL, req.Header.Get("Referer")); ref != "" {
-				req.Header.Set("Referer", ref)
+			if ref := refererForURL(reqs[len(reqs)-1].URL, req.URL, req.Header.get("Referer")); ref != "" {
+				req.Header["Referer"] = []string{ref}
 			}
 			err = c.checkRedirect(req, reqs)
 
@@ -768,7 +768,7 @@ func (c *Client) makeHeadersCopier(ireq *Request) func(req *Request, stripSensit
 		ireqhdr  = cloneOrMakeHeader(ireq.Header)
 		icookies map[string][]*Cookie
 	)
-	if c.Jar != nil && ireq.Header.Get("Cookie") != "" {
+	if c.Jar != nil && ireq.Header.get("Cookie") != "" {
 		icookies = make(map[string][]*Cookie)
 		for _, c := range ireq.Cookies() {
 			icookies[c.Name] = append(icookies[c.Name], c)
@@ -797,7 +797,7 @@ func (c *Client) makeHeadersCopier(ireq *Request) func(req *Request, stripSensit
 				}
 			}
 			if changed {
-				ireqhdr.Del("Cookie")
+				delete(ireqhdr, "Cookie")
 				var ss []string
 				for _, cs := range icookies {
 					for _, c := range cs {
@@ -805,7 +805,7 @@ func (c *Client) makeHeadersCopier(ireq *Request) func(req *Request, stripSensit
 					}
 				}
 				slices.Sort(ss) // Ensure deterministic headers
-				ireqhdr.Set("Cookie", strings.Join(ss, "; "))
+				ireqhdr["Cookie"] = []string{strings.Join(ss, "; ")}
 			}
 		}
 
@@ -880,7 +880,7 @@ func (c *Client) Post(url, contentType string, body io.Reader) (resp *Response, 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", contentType)
+	req.Header["Content-Type"] = []string{contentType}
 	return c.Do(req)
 }
 

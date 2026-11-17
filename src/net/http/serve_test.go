@@ -8546,3 +8546,56 @@ func TestHandleRequest(t *testing.T) {
 		}
 	})
 }
+
+func TestServerReadRequestHeaderValidation(t *testing.T) {
+	t.Parallel()
+	srv := &Server{
+		Handler: HandlerFunc(func(w ResponseWriter, r *Request) {
+			w.Header().Set("X-Echo-Val", r.Header.Get("X-Test"))
+			w.WriteHeader(200)
+			io.WriteString(w, "ok")
+		}),
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
+
+	sendRaw := func(raw string) *Response {
+		t.Helper()
+		c1, c2 := net.Pipe()
+		go srv.Serve(&oneConnListener{conn: c1})
+		go func() {
+			io.WriteString(c2, raw)
+		}()
+		resp, err := ReadResponse(bufio.NewReader(c2), &Request{Method: "GET"})
+		c2.Close()
+		if err != nil {
+			t.Fatalf("ReadResponse for %q: %v", raw, err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+
+	t.Run("space_in_header_name", func(t *testing.T) {
+		resp := sendRaw("GET / HTTP/1.1\r\nHost: example.com\r\nBad Name: val\r\nConnection: close\r\n\r\n")
+		if resp.StatusCode != 400 {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("ctl_in_header_value", func(t *testing.T) {
+		resp := sendRaw("GET / HTTP/1.1\r\nHost: example.com\r\nX-Test: a\x7fb\r\nConnection: close\r\n\r\n")
+		if resp.StatusCode != 400 {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("obs_text_in_header_value", func(t *testing.T) {
+		resp := sendRaw("GET / HTTP/1.1\r\nHost: example.com\r\nX-Test: hi\x80\xff\r\nConnection: close\r\n\r\n")
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if got := resp.Header.Get("X-Echo-Val"); got != "hi\x80\xff" {
+			t.Fatalf("X-Echo-Val = %q, want %q", got, "hi\x80\xff")
+		}
+	})
+}
+
