@@ -338,10 +338,47 @@ func (wu writeWindowUpdate) writeFrame(ctx writeContext) error {
 	return ctx.Framer().WriteWindowUpdate(wu.streamID, wu.n)
 }
 
+func encodeHeaderEntry(enc *hpack.Encoder, k string, vv []string) {
+	k, ascii := httpcommon.LowerHeader(k)
+	if !ascii {
+		// Skip writing invalid headers. Per RFC 7540, Section 8.1.2, header
+		// field names have to be ASCII characters (just as in HTTP/1.x).
+		return
+	}
+	if !validWireHeaderFieldName(k) {
+		// Skip it as backup paranoia. Per
+		// golang.org/issue/14048, these should
+		// already be rejected at a higher level.
+		return
+	}
+	isTE := k == "transfer-encoding"
+	for _, v := range vv {
+		if !httpguts.ValidHeaderFieldValue(v) {
+			// TODO: return an error? golang.org/issue/14048
+			// For now just omit it.
+			continue
+		}
+		// TODO: more of "8.1.2.2 Connection-Specific Header Fields"
+		if isTE && v != "trailers" {
+			continue
+		}
+		encKV(enc, k, v)
+	}
+}
+
 // encodeHeaders encodes an http.Header. If keys is not nil, then (k, h[k])
 // is encoded only if k is in keys.
 func encodeHeaders(enc *hpack.Encoder, h Header, keys []string) {
+	if len(h) == 0 {
+		return
+	}
 	if keys == nil {
+		if len(h) == 1 {
+			for k, vv := range h {
+				encodeHeaderEntry(enc, k, vv)
+			}
+			return
+		}
 		sorter := sorterPool.Get()
 		// Using defer here, since the returned keys from the
 		// sorter.Keys method is only valid until the sorter
@@ -350,31 +387,6 @@ func encodeHeaders(enc *hpack.Encoder, h Header, keys []string) {
 		keys = sorter.Keys(h)
 	}
 	for _, k := range keys {
-		vv := h[k]
-		k, ascii := httpcommon.LowerHeader(k)
-		if !ascii {
-			// Skip writing invalid headers. Per RFC 7540, Section 8.1.2, header
-			// field names have to be ASCII characters (just as in HTTP/1.x).
-			continue
-		}
-		if !validWireHeaderFieldName(k) {
-			// Skip it as backup paranoia. Per
-			// golang.org/issue/14048, these should
-			// already be rejected at a higher level.
-			continue
-		}
-		isTE := k == "transfer-encoding"
-		for _, v := range vv {
-			if !httpguts.ValidHeaderFieldValue(v) {
-				// TODO: return an error? golang.org/issue/14048
-				// For now just omit it.
-				continue
-			}
-			// TODO: more of "8.1.2.2 Connection-Specific Header Fields"
-			if isTE && v != "trailers" {
-				continue
-			}
-			encKV(enc, k, v)
-		}
+		encodeHeaderEntry(enc, k, h[k])
 	}
 }

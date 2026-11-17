@@ -6049,3 +6049,86 @@ func protocols(protos ...string) *http.Protocols {
 
 //go:linkname transportFromH1Transport
 func transportFromH1Transport(tr *http.Transport) any
+
+func TestServerEmptySnapHeaderAndCustomStatus(t *testing.T) {
+	synctestSubtest(t, "empty_headers_custom_status", func(t *testing.T) {
+		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+			// Empty Content-Encoding should still allow Content-Type sniffing,
+			// and after removing internal headers snapH should become nil.
+			w.Header()["Content-Encoding"] = []string{""}
+			w.Header()["Content-Length"] = []string{"17"}
+			w.WriteHeader(299)
+			w.Write([]byte("<html>hello</html>"))
+		})
+		defer st.Close()
+		st.greet()
+		st.bodylessReq1()
+
+		st.wantHeaders(wantHeader{
+			streamID:  1,
+			endStream: false,
+			header: http.Header{
+				":status":        {"299"},
+				"content-type":   {"text/html; charset=utf-8"},
+				"content-length": {"17"},
+			},
+		})
+		st.wantData(wantData{
+			streamID:  1,
+			endStream: true,
+			data:      []byte("<html>hello</html>"),
+		})
+	})
+
+	synctestSubtest(t, "no_headers_no_body", func(t *testing.T) {
+		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(299)
+		})
+		defer st.Close()
+		st.greet()
+		st.bodylessReq1()
+
+		st.wantHeaders(wantHeader{
+			streamID:  1,
+			endStream: true,
+			header: http.Header{
+				":status": {"299"},
+			},
+		})
+	})
+}
+
+func TestServerManyRequestHeadersSlab(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gotHeaders := make(chan http.Header, 1)
+		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+			gotHeaders <- r.Header.Clone()
+		})
+		defer st.Close()
+		st.greet()
+
+		const numCustom = 110
+		kv := make([]string, 0, (numCustom+2)*2)
+		kv = append(kv, "x-multi", "first")
+		for i := range numCustom {
+			kv = append(kv, fmt.Sprintf("x-h-%03d", i), fmt.Sprintf("val-%03d", i))
+		}
+		// Interleave a second value for x-multi after other headers to verify
+		// slab capacity=1 prevents clobbering adjacent entries.
+		kv = append(kv, "x-multi", "second")
+
+		st.bodylessReq1(kv...)
+		h := <-gotHeaders
+		if got := h["X-Multi"]; !slices.Equal(got, []string{"first", "second"}) {
+			t.Fatalf("X-Multi = %v, want [first second]", got)
+		}
+		for i := range numCustom {
+			k := fmt.Sprintf("X-H-%03d", i)
+			want := fmt.Sprintf("val-%03d", i)
+			if got := h[k]; !slices.Equal(got, []string{want}) {
+				t.Fatalf("Header[%q] = %v, want [%q]", k, got, want)
+			}
+		}
+	})
+}
+

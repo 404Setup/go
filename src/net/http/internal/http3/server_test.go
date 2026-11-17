@@ -2117,3 +2117,86 @@ func (call *serverHandlerCall) exit() {
 		close(call.ch)
 	})
 }
+
+func TestServerCustomStatusTrailersAndInferHeader(t *testing.T) {
+	t.Run("custom_status_code_299", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ts := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(299)
+			}))
+			tc := ts.connect()
+			tc.greet()
+
+			reqStream := tc.newStream(streamTypeRequest)
+			reqStream.writeHeaders(requestHeader(nil))
+			reqStream.wantSomeHeaders(http.Header{":status": {"299"}})
+			reqStream.wantClosed("request complete")
+		})
+	})
+
+	for _, nTrailers := range []int{0, 1, 5, 10} {
+		t.Run("trailer_count_"+strconv.Itoa(nTrailers), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var names []string
+				for i := range nTrailers {
+					names = append(names, fmt.Sprintf("X-T-%02d", nTrailers-1-i))
+				}
+				wantSorted := slices.Clone(names)
+				slices.Sort(wantSorted)
+				wantHeader := strings.Join(wantSorted, ", ")
+
+				ts := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if nTrailers == 0 {
+						w.Header()["Trailer"] = []string{""}
+					} else {
+						for _, n := range names {
+							w.Header().Add("Trailer", n)
+						}
+					}
+					w.Write([]byte("payload"))
+					for _, n := range wantSorted {
+						w.Header()[n] = []string{"val"}
+					}
+				}))
+				tc := ts.connect()
+				tc.greet()
+
+				reqStream := tc.newStream(streamTypeRequest)
+				reqStream.writeHeaders(requestHeader(nil))
+				reqStream.wantSomeHeaders(http.Header{
+					":status": {"200"},
+					"Trailer": {wantHeader},
+				})
+				reqStream.wantData([]byte("payload"))
+				if nTrailers > 0 {
+					wantTr := make(http.Header, nTrailers)
+					for _, n := range wantSorted {
+						wantTr[n] = []string{"val"}
+					}
+					reqStream.wantHeaders(wantTr)
+				}
+				reqStream.wantClosed("request complete")
+			})
+		})
+	}
+
+	t.Run("bodyBuffer_inferHeader", func(t *testing.T) {
+		bb := bodyBuffer("<html>hello</html>")
+		h := http.Header{}
+		bb.inferHeader(h, 200)
+		if got := h.Get("Content-Type"); got != "text/html; charset=utf-8" {
+			t.Fatalf("Content-Type = %q, want text/html; charset=utf-8", got)
+		}
+		if h.Get("Date") == "" {
+			t.Fatal("missing Date header")
+		}
+
+		// With non-empty Content-Encoding, do not sniff Content-Type.
+		hCE := http.Header{"Content-Encoding": {"gzip"}, "Date": {"existing"}}
+		bb.inferHeader(hCE, 200)
+		if _, ok := hCE["Content-Type"]; ok {
+			t.Fatalf("Content-Type unexpectedly inferred with Content-Encoding: %v", hCE)
+		}
+	})
+}
+

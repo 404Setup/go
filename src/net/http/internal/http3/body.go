@@ -23,12 +23,16 @@ import (
 func extractTrailerFromHeader(header, trailer http.Header) {
 	for _, names := range header["Trailer"] {
 		names = textproto.TrimString(names)
-		for name := range strings.SplitSeq(names, ",") {
+		for {
+			name, rest, hasComma := strings.Cut(names, ",")
 			name = textproto.CanonicalMIMEHeaderKey(textproto.TrimString(name))
-			if !httpguts.ValidTrailerHeader(name) {
-				continue
+			if httpguts.ValidTrailerHeader(name) {
+				trailer[name] = nil
 			}
-			trailer[name] = nil
+			if !hasComma {
+				break
+			}
+			names = rest
 		}
 	}
 }

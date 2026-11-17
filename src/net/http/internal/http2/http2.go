@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"internal/godebug"
 	"net"
+	"net/http/internal"
 	"os"
 	"slices"
 	"strconv"
@@ -217,13 +218,9 @@ func validWireHeaderFieldName(v string) bool {
 	return true
 }
 
-// TODO: avoid alloc when code is neither 200 nor 404.
 func httpCodeString(code int) string {
-	switch code {
-	case 200:
-		return "200"
-	case 404:
-		return "404"
+	if s := internal.StatusCodeString(code); s != "" {
+		return s
 	}
 	return strconv.Itoa(code)
 }

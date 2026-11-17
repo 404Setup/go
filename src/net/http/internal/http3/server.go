@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -465,7 +464,8 @@ func (sc *serverConn) parseHeader(st *stream) (http.Header, pseudoHeader, error)
 			if !validWireHeaderFieldName(name) {
 				return &streamError{errH3MessageError, "invalid field name"}
 			}
-			header.Add(name, value)
+			cname := httpcommon.CanonicalHeader(name)
+			header[cname] = append(header[cname], value)
 		}
 		return nil
 	}); err != nil {
@@ -600,8 +600,10 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 	}
 
 	contentLength := int64(-1)
-	if n, err := strconv.ParseUint(header.Get("Content-Length"), 10, 63); err == nil {
-		contentLength = int64(n)
+	if clens := header["Content-Length"]; len(clens) > 0 && clens[0] != "" {
+		if n, err := strconv.ParseUint(clens[0], 10, 63); err == nil {
+			contentLength = int64(n)
+		}
 	}
 
 	// TODO: Similar to HTTP/2, we probably should also cancel the ctx when the
@@ -712,6 +714,13 @@ func (rw *responseWriter) prepareTrailerForWriteLocked() {
 	}
 }
 
+func statusCodeString(code int) string {
+	if s := internal.StatusCodeString(code); s != "" {
+		return s
+	}
+	return strconv.Itoa(code)
+}
+
 // writeHeaderLockedOnce writes the final response header. If rw.wroteHeader is
 // true, calling this method is a no-op. Sending informational status headers
 // should be done using writeInfoHeaderLocked, rather than this method.
@@ -728,12 +737,44 @@ func (rw *responseWriter) writeHeaderLockedOnce() {
 	// canonicalized, for consistency.
 	if _, ok := rw.snapHeaders["Trailer"]; ok {
 		extractTrailerFromHeader(rw.snapHeaders, rw.trailer)
-		rw.snapHeaders.Set("Trailer", strings.Join(slices.Sorted(maps.Keys(rw.trailer)), ", "))
+		switch len(rw.trailer) {
+		case 0:
+			rw.snapHeaders["Trailer"] = []string{""}
+		case 1:
+			for k := range rw.trailer {
+				rw.snapHeaders["Trailer"] = []string{k}
+			}
+		default:
+			var buf [8]string
+			var keys []string
+			if len(rw.trailer) <= len(buf) {
+				keys = buf[:0]
+				for k := range rw.trailer {
+					keys = append(keys, k)
+				}
+				for i := 1; i < len(keys); i++ {
+					k := keys[i]
+					j := i - 1
+					for j >= 0 && keys[j] > k {
+						keys[j+1] = keys[j]
+						j--
+					}
+					keys[j+1] = k
+				}
+			} else {
+				keys = make([]string, 0, len(rw.trailer))
+				for k := range rw.trailer {
+					keys = append(keys, k)
+				}
+				slices.Sort(keys)
+			}
+			rw.snapHeaders["Trailer"] = []string{strings.Join(keys, ", ")}
+		}
 	}
 
 	rw.bb.inferHeader(rw.snapHeaders, rw.statusCode)
 	encHeaders := rw.bw.enc.encode(func(f func(itype indexType, name, value string)) {
-		f(mayIndex, ":status", strconv.Itoa(rw.statusCode))
+		f(mayIndex, ":status", statusCodeString(rw.statusCode))
 		for name, values := range rw.snapHeaders {
 			if !httpguts.ValidHeaderFieldName(name) {
 				continue
@@ -769,7 +810,7 @@ func (rw *responseWriter) writeHeaderLocked(statusCode int) {
 		rw.sent100 = true
 	}
 	encHeaders := rw.bw.enc.encode(func(f func(itype indexType, name, value string)) {
-		f(mayIndex, ":status", strconv.Itoa(statusCode))
+		f(mayIndex, ":status", statusCodeString(statusCode))
 		for name, values := range rw.headers {
 			if name == "Content-Length" || name == "Transfer-Encoding" {
 				continue
@@ -831,11 +872,13 @@ func (rw *responseWriter) WriteHeader(statusCode int) {
 
 	// Non-informational headers should only be set once, and should be
 	// buffered.
-	if n, err := strconv.ParseUint(rw.headers.Get("Content-Length"), 10, 63); err == nil {
-		rw.bodyLenLeft = int64(n)
-	} else {
-		rw.headers.Del("Content-Length")
-		rw.bodyLenLeft = -1 // Unknown.
+	rw.bodyLenLeft = -1 // Unknown.
+	if clens := rw.headers["Content-Length"]; len(clens) > 0 {
+		if n, err := strconv.ParseUint(clens[0], 10, 63); err == nil {
+			rw.bodyLenLeft = int64(n)
+		} else {
+			delete(rw.headers, "Content-Length")
+		}
 	}
 	rw.statusCode = statusCode
 	rw.snapHeaders = rw.headers.Clone()
@@ -987,14 +1030,15 @@ func (bb *bodyBuffer) discard() {
 // properly is the responsibility of the caller.
 func (bb *bodyBuffer) inferHeader(h http.Header, status int) {
 	if _, ok := h["Date"]; !ok {
-		h.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		h["Date"] = []string{internal.HTTPDateNowString()}
 	}
 	// If the Content-Encoding is non-blank, we shouldn't
 	// sniff the body. See Issue golang.org/issue/31753.
-	hasCE := len(h.Get("Content-Encoding")) > 0
+	ces := h["Content-Encoding"]
+	hasCE := len(ces) > 0 && len(ces[0]) > 0
 	_, hasCT := h["Content-Type"]
 	if !hasCE && !hasCT && internal.BodyAllowedForStatus(status) && len(*bb) > 0 {
-		h.Set("Content-Type", http.DetectContentType(*bb))
+		h["Content-Type"] = []string{internal.DetectContentType(*bb)}
 	}
 	// We can technically infer Content-Length too here, as long as the entire
 	// response body fits within hi.buf and does not require flushing. However,

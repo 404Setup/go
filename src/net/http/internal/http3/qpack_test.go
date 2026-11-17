@@ -6,6 +6,7 @@ package http3
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -169,3 +170,108 @@ func TestHuffmanDecodingFailure(t *testing.T) {
 		t.Fatalf("readPrefixedString(7) = %x, %v, nil; want error", b, v)
 	}
 }
+
+func TestQPACKScratchBoundary(t *testing.T) {
+	st1, st2 := newStreamPair(t)
+	// Use uncompressible byte pattern (Huffman len >= raw len) and highly compressible ASCII
+	// so both plain and Huffman branches cross the 256-byte scratch buffer boundary.
+	makeUncompressible := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(0x80 + (i % 64))
+		}
+		return string(b)
+	}
+	for _, size := range []int{255, 256, 257, 410, 1024} {
+		for _, prefixLen := range []uint8{3, 7} {
+			for _, tc := range []struct {
+				name  string
+				value string
+			}{
+				{"plain", makeUncompressible(size)},
+				{"huffman", strings.Repeat("a", size)},
+			} {
+				enc := appendPrefixedString(nil, 0, prefixLen, tc.value)
+				if _, err := st1.Write(enc); err != nil {
+					t.Fatal(err)
+				}
+				if err := st1.Flush(); err != nil {
+					t.Fatal(err)
+				}
+				_, got, err := st2.readPrefixedString(prefixLen)
+				if err != nil {
+					t.Fatalf("size=%d prefix=%d %s: readPrefixedString error: %v", size, prefixLen, tc.name, err)
+				}
+				if got != tc.value {
+					t.Fatalf("size=%d prefix=%d %s: mismatch (got len=%d want len=%d)", size, prefixLen, tc.name, len(got), len(tc.value))
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkQPACKPrefixedString(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		s    string
+	}{
+		{"Small", "application/json; charset=utf-8"},
+		{"Boundary256", strings.Repeat("abcd1234", 32)},
+		{"Large1024", strings.Repeat("abcd1234", 128)},
+	} {
+		b.Run("Encode/"+tc.name, func(b *testing.B) {
+			var dst []byte
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				dst = appendPrefixedString(dst[:0], 0, 7, tc.s)
+			}
+		})
+	}
+
+	b.Run("EncoderHeaders", func(b *testing.B) {
+		var qe qpackEncoder
+		qe.init()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = qe.encode(func(emit func(itype indexType, name, value string)) {
+				emit(mayIndex, ":status", "200")
+				emit(mayIndex, "Content-Type", "application/json")
+				emit(mayIndex, "Cache-Control", "max-age=3600")
+				emit(mayIndex, "X-Custom-Header", "value")
+			})
+		}
+	})
+
+	b.Run("Decode/Small", func(b *testing.B) {
+		st1, st2 := newStreamPair(b)
+		done := make(chan struct{})
+		enc := appendPrefixedString(nil, 0, 7, "application/json; charset=utf-8")
+		go func() {
+			defer close(done)
+			for i := range b.N {
+				if _, err := st1.Write(enc); err != nil {
+					return
+				}
+				if i&63 == 63 {
+					if err := st1.Flush(); err != nil {
+						return
+					}
+				}
+			}
+			_ = st1.Flush()
+			st1.CloseWrite()
+		}()
+		b.Cleanup(func() {
+			st1.CloseWrite()
+			<-done
+		})
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, _, err := st2.readPrefixedString(7); err != nil {
+				b.Fatal(err)
+			}
+		}
+		<-done
+	})
+}
+

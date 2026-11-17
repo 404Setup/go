@@ -1971,7 +1971,18 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 	if status == "" {
 		return nil, errors.New("malformed response from server: missing status pseudo header")
 	}
-	statusCode, err := strconv.Atoi(status)
+	var statusCode int
+	var err error
+	if len(status) == 3 {
+		d0, d1, d2 := status[0]-'0', status[1]-'0', status[2]-'0'
+		if d0 <= 9 && d1 <= 9 && d2 <= 9 {
+			statusCode = int(d0)*100 + int(d1)*10 + int(d2)
+		} else {
+			statusCode, err = strconv.Atoi(status)
+		}
+	} else {
+		statusCode, err = strconv.Atoi(status)
+	}
 	if err != nil {
 		return nil, errors.New("malformed response from server: malformed non-numeric status pseudo header")
 	}

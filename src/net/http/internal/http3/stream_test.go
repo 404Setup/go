@@ -313,3 +313,60 @@ func newStreamPair(t testing.TB) (s1, s2 *stream) {
 	q1, q2 := newQUICStreamPair(t)
 	return newStream(q1), newStream(q2)
 }
+
+func TestStreamWriteVarintBoundaries(t *testing.T) {
+	st1, st2 := newStreamPair(t)
+	vals := []int64{
+		0, 1, 63,
+		64, 16383,
+		16384, (1 << 30) - 1,
+		1 << 30, (1 << 62) - 1,
+	}
+	for _, v := range vals {
+		st1.writeVarint(v)
+	}
+	if err := st1.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range vals {
+		got, err := st2.readVarint()
+		if err != nil {
+			t.Fatalf("readVarint for %d: %v", want, err)
+		}
+		if got != want {
+			t.Fatalf("readVarint = %d, want %d", got, want)
+		}
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic on 1<<62")
+			}
+		}()
+		st1.writeVarint(1 << 62)
+	}()
+}
+
+func BenchmarkStreamWriteVarint(b *testing.B) {
+	st1, st2 := newStreamPair(b)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		io.Copy(io.Discard, st2)
+	}()
+	b.Cleanup(func() {
+		st1.CloseWrite()
+		<-done
+	})
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		st1.writeVarint(1 << 20)
+		st1.writeVarint(1 << 50)
+		if i&255 == 255 {
+			st1.Flush()
+		}
+	}
+	st1.Flush()
+}
+

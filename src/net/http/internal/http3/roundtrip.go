@@ -308,12 +308,16 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 				st.CloseRead(uint64(errH3NoError))
 				rt.finish(roundTripReadDone)
 			}
+			status := internal.StatusCodeText(statusCode)
+			if status == "" {
+				status = strconv.Itoa(statusCode) + " " + http.StatusText(statusCode)
+			}
 			resp := &http.Response{
 				Proto:         "HTTP/3.0",
 				ProtoMajor:    3,
 				Header:        h,
 				StatusCode:    statusCode,
-				Status:        strconv.Itoa(statusCode) + " " + http.StatusText(statusCode),
+				Status:        status,
 				ContentLength: contentLength,
 				Trailer:       trailer,
 				Body:          rt.respBody,
@@ -321,12 +325,14 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 			if hasBody {
 				resp.Body = (*transportResponseBody)(rt)
 			}
-			if addedGzip && hasBody && ascii.EqualFold(h.Get("Content-Encoding"), "gzip") {
-				resp.Body = &httpcommon.GzipReader{Body: resp.Body}
-				h.Del("Content-Encoding")
-				h.Del("Content-Length")
-				resp.ContentLength = -1
-				resp.Uncompressed = true
+			if addedGzip && hasBody {
+				if ces := h["Content-Encoding"]; len(ces) > 0 && ascii.EqualFold(ces[0], "gzip") {
+					resp.Body = &httpcommon.GzipReader{Body: resp.Body}
+					delete(h, "Content-Encoding")
+					delete(h, "Content-Length")
+					resp.ContentLength = -1
+					resp.Uncompressed = true
+				}
 			}
 			return resp, nil
 		case frameTypePushPromise:
@@ -372,7 +378,10 @@ func (cc *clientConn) writeBodyAndTrailer(rt *roundTripState, req *http.Request)
 	defer rt.finish(roundTripWriteDone)
 	defer rt.closeReqBody()
 
-	declaredTrailer := req.Trailer.Clone()
+	var declaredTrailer http.Header
+	if len(req.Trailer) > 0 {
+		declaredTrailer = req.Trailer.Clone()
+	}
 
 	rt.reqBodyWriter.st = rt.st
 	rt.reqBodyWriter.remain = actualContentLength(req)
@@ -391,9 +400,11 @@ func (cc *clientConn) writeBodyAndTrailer(rt *roundTripState, req *http.Request)
 	// Get rid of any trailer that was not declared beforehand, before we
 	// close the request body which will cause the trailer headers to be
 	// written.
-	for name := range req.Trailer {
-		if _, ok := declaredTrailer[name]; !ok {
-			delete(req.Trailer, name)
+	if len(req.Trailer) > 0 {
+		for name := range req.Trailer {
+			if _, ok := declaredTrailer[name]; !ok {
+				delete(req.Trailer, name)
+			}
 		}
 	}
 	if err := rt.reqBodyWriter.Close(); err != nil {
@@ -502,9 +513,23 @@ func (rt *roundTripState) handleHeaders() (statusCode int, h http.Header, err er
 				return &streamError{errH3MessageError, "duplicate :status"}
 			}
 			haveStatus = true
-			statusCode, err = strconv.Atoi(value)
-			if err != nil {
-				return &streamError{errH3MessageError, "invalid :status"}
+			if len(value) == 3 {
+				d0, d1, d2 := value[0]-'0', value[1]-'0', value[2]-'0'
+				if d0 <= 9 && d1 <= 9 && d2 <= 9 {
+					statusCode = int(d0)*100 + int(d1)*10 + int(d2)
+				} else {
+					var perr error
+					statusCode, perr = strconv.Atoi(value)
+					if perr != nil {
+						return &streamError{errH3MessageError, "invalid :status"}
+					}
+				}
+			} else {
+				var perr error
+				statusCode, perr = strconv.Atoi(value)
+				if perr != nil {
+					return &streamError{errH3MessageError, "invalid :status"}
+				}
 			}
 		case name[0] == ':':
 			// "Endpoints MUST treat a request or response

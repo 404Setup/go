@@ -290,10 +290,26 @@ func (st *stream) readPrefixedStringWithByte(firstByte byte, prefixLen uint8) (s
 	hbit := byte(1) << prefixLen
 	isHuffman := firstByte&hbit != 0
 
-	// TODO: Avoid allocating here.
-	data := make([]byte, size)
-	if _, err := io.ReadFull(st, data); err != nil {
-		return "", errQPACKDecompressionFailed
+	// TODO: Avoid allocating here for larger strings.
+	var scratch [256]byte
+	var data []byte
+	if size <= int64(len(scratch)) {
+		data = scratch[:size]
+	} else {
+		data = make([]byte, size)
+	}
+	for off := 0; off < len(data); {
+		n, err := st.Read(data[off:])
+		off += n
+		if err != nil {
+			if err == io.EOF && off == len(data) {
+				break
+			}
+			return "", errQPACKDecompressionFailed
+		}
+		if n == 0 {
+			return "", errQPACKDecompressionFailed
+		}
 	}
 	if isHuffman {
 		// TODO: Move Huffman functions into a new package that hpack (HTTP/2)

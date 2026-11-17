@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"slices"
 	"strings"
 	"sync/v2"
 
@@ -1790,7 +1789,8 @@ func (mh *MetaHeadersFrame) rfc9218Priority(priorityAware bool) (p PriorityParam
 			s = field.Value
 			priorityAware = true
 		}
-		if slices.Contains([]string{"via", "forwarded", "x-forwarded-for"}, field.Name) {
+		switch field.Name {
+		case "via", "forwarded", "x-forwarded-for":
 			hasIntermediary = true
 		}
 	}

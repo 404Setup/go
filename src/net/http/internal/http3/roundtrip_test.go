@@ -1304,3 +1304,63 @@ func TestRoundTripHeaderLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestRoundTripStatusFastAndUndeclaredTrailer(t *testing.T) {
+	t.Run("custom_status_code", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			tc := newTestClientConn(t)
+			tc.greet()
+
+			req, _ := http.NewRequest("GET", "https://example.tld/", nil)
+			rt := tc.roundTrip(req)
+			st := tc.wantStream(streamTypeRequest)
+			st.wantHeaders(nil)
+			st.writeHeaders(http.Header{":status": {"299"}})
+			st.CloseWrite()
+
+			res, err := rt.result()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.StatusCode != 299 || res.Status != "299 " {
+				t.Fatalf("got status (%d, %q), want (299, %q)", res.StatusCode, res.Status, "299 ")
+			}
+		})
+	})
+
+	t.Run("undeclared_request_trailer_stripped", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			tc := newTestClientConn(t)
+			tc.greet()
+
+			// Dynamically insert an undeclared trailer into req.Trailer during body Read
+			// after RoundTrip starts (so initially len(req.Trailer) == 0).
+			var req *http.Request
+			body := &funcReader{read: func(p []byte) (int, error) {
+				req.Trailer["X-Undeclared"] = []string{"dropme"}
+				return 0, io.EOF
+			}}
+			req, _ = http.NewRequest("POST", "https://example.tld/", body)
+			req.Trailer = make(http.Header)
+
+			rt := tc.roundTrip(req)
+			st := tc.wantStream(streamTypeRequest)
+			st.wantHeaders(nil)
+			st.wantClosed("request body finished")
+			st.writeHeaders(http.Header{":status": {"200"}})
+			st.CloseWrite()
+
+			if _, err := rt.result(); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := req.Trailer["X-Undeclared"]; ok {
+				t.Fatalf("undeclared trailer remained in req.Trailer: %v", req.Trailer)
+			}
+		})
+	})
+}
+
+type funcReader struct{ read func([]byte) (int, error) }
+
+func (f *funcReader) Read(p []byte) (int, error) { return f.read(p) }
+

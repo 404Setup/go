@@ -2441,16 +2441,28 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		return nil, nil, sc.countError("bad_path_method", streamError(f.StreamID, ErrCodeProtocol))
 	}
 
-	header := make(Header)
+	regularFields := f.RegularFields()
+	strs := make([]string, len(regularFields))
+	header := make(Header, len(regularFields))
 	rp.Header = header
-	for _, hf := range f.RegularFields() {
-		header.Add(sc.canonicalHeader(hf.Name), hf.Value)
+	for _, hf := range regularFields {
+		key := sc.canonicalHeader(hf.Name)
+		vv := header[key]
+		if vv == nil && len(strs) > 0 {
+			vv, strs = strs[:1:1], strs[1:]
+			vv[0] = hf.Value
+			header[key] = vv
+		} else {
+			header[key] = append(vv, hf.Value)
+		}
 	}
 	if rp.Authority == "" {
-		rp.Authority = header.Get("Host")
+		if hosts := header["Host"]; len(hosts) > 0 {
+			rp.Authority = hosts[0]
+		}
 	}
 	if rp.Protocol != "" {
-		header.Set(":protocol", rp.Protocol)
+		header[":protocol"] = []string{rp.Protocol}
 	}
 
 	rw, req, err := sc.newWriterAndRequestNoBody(st, rp)
@@ -2856,8 +2868,9 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 	if !rws.sentHeader {
 		rws.sentHeader = true
 		var ctype, clen string
-		if clen = rws.snapHeader.Get("Content-Length"); clen != "" {
-			rws.snapHeader.Del("Content-Length")
+		if clens := rws.snapHeader["Content-Length"]; len(clens) > 0 && clens[0] != "" {
+			clen = clens[0]
+			delete(rws.snapHeader, "Content-Length")
 			if cl, err := strconv.ParseUint(clen, 10, 63); err == nil {
 				rws.sentContentLen = int64(cl)
 			} else {
@@ -2871,15 +2884,16 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		_, hasContentType := rws.snapHeader["Content-Type"]
 		// If the Content-Encoding is non-blank, we shouldn't
 		// sniff the body. See Issue golang.org/issue/31753.
-		ce := rws.snapHeader.Get("Content-Encoding")
-		hasCE := len(ce) > 0
+		hasCE := false
+		if ces := rws.snapHeader["Content-Encoding"]; len(ces) > 0 && ces[0] != "" {
+			hasCE = true
+		}
 		if !hasCE && !hasContentType && bodyAllowedForStatus(rws.status) && len(p) > 0 {
 			ctype = internal.DetectContentType(p)
 		}
 		var date string
 		if _, ok := rws.snapHeader["Date"]; !ok {
-			// TODO(bradfitz): be faster here, like net/http? measure.
-			date = time.Now().UTC().Format(TimeFormat)
+			date = internal.HTTPDateNowString()
 		}
 
 		for _, v := range rws.snapHeader["Trailer"] {
@@ -2898,11 +2912,15 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			}
 		}
 
+		snapH := rws.snapHeader
+		if len(snapH) == 0 {
+			snapH = nil
+		}
 		endStream := (rws.handlerDone && !rws.hasTrailers() && len(p) == 0) || isHeadResp
 		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
 			streamID:      rws.stream.id,
 			httpResCode:   rws.status,
-			h:             rws.snapHeader,
+			h:             snapH,
 			endStream:     endStream,
 			contentType:   ctype,
 			contentLength: clen,
@@ -3161,8 +3179,8 @@ func (rws *responseWriterState) writeHeader(code int) {
 		_, te := h["Transfer-Encoding"]
 		if cl || te {
 			h = cloneHeader(h)
-			h.Del("Content-Length")
-			h.Del("Transfer-Encoding")
+			delete(h, "Content-Length")
+			delete(h, "Transfer-Encoding")
 		}
 
 		rws.conn.writeHeaders(rws.stream, &writeResHeaders{
@@ -3464,10 +3482,15 @@ func foreachHeaderElement(v string, fn func(string)) {
 		fn(v)
 		return
 	}
-	for f := range strings.SplitSeq(v, ",") {
+	for {
+		f, rest, ok := strings.Cut(v, ",")
 		if f = textproto.TrimString(f); f != "" {
 			fn(f)
 		}
+		if !ok {
+			return
+		}
+		v = rest
 	}
 }
 

@@ -381,26 +381,30 @@ func readVarint[T ~int64 | ~uint64](st *stream) (T, error) {
 
 // writeVarint writes a QUIC variable-length integer to the stream.
 func (st *stream) writeVarint(v int64) {
+	var buf [8]byte
 	switch {
 	case v <= (1<<6)-1:
 		st.WriteByte(byte(v))
 	case v <= (1<<14)-1:
-		st.WriteByte((1 << 6) | byte(v>>8))
-		st.WriteByte(byte(v))
+		buf[0] = (1 << 6) | byte(v>>8)
+		buf[1] = byte(v)
+		st.Write(buf[:2])
 	case v <= (1<<30)-1:
-		st.WriteByte((2 << 6) | byte(v>>24))
-		st.WriteByte(byte(v >> 16))
-		st.WriteByte(byte(v >> 8))
-		st.WriteByte(byte(v))
+		buf[0] = (2 << 6) | byte(v>>24)
+		buf[1] = byte(v >> 16)
+		buf[2] = byte(v >> 8)
+		buf[3] = byte(v)
+		st.Write(buf[:4])
 	case v <= (1<<62)-1:
-		st.WriteByte((3 << 6) | byte(v>>56))
-		st.WriteByte(byte(v >> 48))
-		st.WriteByte(byte(v >> 40))
-		st.WriteByte(byte(v >> 32))
-		st.WriteByte(byte(v >> 24))
-		st.WriteByte(byte(v >> 16))
-		st.WriteByte(byte(v >> 8))
-		st.WriteByte(byte(v))
+		buf[0] = (3 << 6) | byte(v>>56)
+		buf[1] = byte(v >> 48)
+		buf[2] = byte(v >> 40)
+		buf[3] = byte(v >> 32)
+		buf[4] = byte(v >> 24)
+		buf[5] = byte(v >> 16)
+		buf[6] = byte(v >> 8)
+		buf[7] = byte(v)
+		st.Write(buf[:8])
 	default:
 		panic("varint too large")
 	}

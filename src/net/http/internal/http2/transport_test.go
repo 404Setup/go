@@ -6282,3 +6282,76 @@ func TestTransportUnblockPendingRequestOnUnusableConn(t *testing.T) {
 		}
 	})
 }
+
+func TestTransportCustomStatusAndMultiHeaders(t *testing.T) {
+	synctestSubtest(t, "custom_status_and_multi_headers", func(t *testing.T) {
+		tc := newTestClientConn(t)
+		tc.greet()
+
+		req, _ := http.NewRequestWithContext(t.Context(), "GET", "https://dummy.tld/", nil)
+		rt := tc.roundTrip(req)
+		hf := readFrame[*HeadersFrame](t, tc)
+
+		kv := []string{":status", "299", "x-multi", "v1"}
+		for i := range 25 {
+			kv = append(kv, fmt.Sprintf("x-r-%02d", i), fmt.Sprintf("val-%02d", i))
+		}
+		kv = append(kv, "x-multi", "v2")
+
+		tc.writeHeaders(HeadersFrameParam{
+			StreamID:      hf.StreamID,
+			EndHeaders:    true,
+			EndStream:     true,
+			BlockFragment: tc.makeHeaderBlockFragment(kv...),
+		})
+		rt.wantStatus(299)
+		res := rt.response()
+		if got := res.Header["X-Multi"]; !slices.Equal(got, []string{"v1", "v2"}) {
+			t.Fatalf("X-Multi = %v, want [v1 v2]", got)
+		}
+		for i := range 25 {
+			k := fmt.Sprintf("X-R-%02d", i)
+			want := fmt.Sprintf("val-%02d", i)
+			if got := res.Header[k]; !slices.Equal(got, []string{want}) {
+				t.Fatalf("Header[%q] = %v, want [%q]", k, got, want)
+			}
+		}
+	})
+
+	synctestSubtest(t, "non_3_digit_status_fallback", func(t *testing.T) {
+		tc := newTestClientConn(t)
+		tc.greet()
+
+		req, _ := http.NewRequestWithContext(t.Context(), "GET", "https://dummy.tld/", nil)
+		rt := tc.roundTrip(req)
+		hf := readFrame[*HeadersFrame](t, tc)
+
+		tc.writeHeaders(HeadersFrameParam{
+			StreamID:      hf.StreamID,
+			EndHeaders:    true,
+			EndStream:     true,
+			BlockFragment: tc.makeHeaderBlockFragment(":status", "2000"),
+		})
+		rt.wantStatus(2000)
+	})
+
+	synctestSubtest(t, "invalid_3_char_status", func(t *testing.T) {
+		tc := newTestClientConn(t)
+		tc.greet()
+
+		req, _ := http.NewRequestWithContext(t.Context(), "GET", "https://dummy.tld/", nil)
+		rt := tc.roundTrip(req)
+		hf := readFrame[*HeadersFrame](t, tc)
+
+		tc.writeHeaders(HeadersFrameParam{
+			StreamID:      hf.StreamID,
+			EndHeaders:    true,
+			EndStream:     true,
+			BlockFragment: tc.makeHeaderBlockFragment(":status", "20a"),
+		})
+		if err := rt.err(); err == nil {
+			t.Fatal("expected error for invalid :status 20a, got nil")
+		}
+	})
+}
+

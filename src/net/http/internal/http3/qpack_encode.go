@@ -27,7 +27,7 @@ func (qe *qpackEncoder) encode(headers func(func(itype indexType, name, value st
 	// Encoded Field Section prefix.
 	//
 	// We don't yet use the dynamic table, so both values here are zero.
-	var b []byte
+	b := make([]byte, 0, 128)
 	b = appendPrefixedInt(b, 0, 8, 0) // Required Insert Count
 	b = appendPrefixedInt(b, 0, 7, 0) // Delta Base
 
