@@ -14,6 +14,7 @@ package io
 
 import (
 	"errors"
+	"internal/bytealg"
 	"sync/v2"
 )
 
@@ -702,22 +703,38 @@ func (c nopCloserWriterTo) WriteTo(w Writer) (n int64, err error) {
 	return c.Reader.(WriterTo).WriteTo(w)
 }
 
+var readAllPools = [4]sync.Pool[*[]byte]{
+	{New: func() *[]byte { b := make([]byte, 4<<10); return &b }},
+	{New: func() *[]byte { b := make([]byte, 16<<10); return &b }},
+	{New: func() *[]byte { b := make([]byte, 64<<10); return &b }},
+	{New: func() *[]byte { b := make([]byte, 256<<10); return &b }},
+}
+
+type pooledChunk struct {
+	bufp *[]byte
+	n    int
+}
+
+func getReadAllChunk(idx int) *[]byte {
+	if idx > 3 {
+		idx = 3
+	}
+	return readAllPools[idx].Get()
+}
+
+func putReadAllChunk(idx int, bufp *[]byte) {
+	if idx > 3 {
+		idx = 3
+	}
+	readAllPools[idx].Put(bufp)
+}
+
 // ReadAll reads from r until an error or EOF and returns the data it read.
 // A successful call returns err == nil, not err == EOF. Because ReadAll is
 // defined to read from src until EOF, it does not treat an EOF from Read
 // as an error to be reported.
 func ReadAll(r Reader) ([]byte, error) {
-	// Build slices of exponentially growing size,
-	// then copy into a perfectly-sized slice at the end.
 	b := make([]byte, 0, 512)
-	// Starting with next equal to 256 (instead of say 512 or 1024)
-	// allows less memory usage for small inputs that finish in the
-	// early growth stages, but we grow the read sizes quickly such that
-	// it does not materially impact medium or large inputs.
-	next := 256
-	chunks := make([][]byte, 0, 4)
-	// Invariant: finalSize = sum(len(c) for c in chunks)
-	var finalSize int
 	for {
 		n, err := r.Read(b[len(b):cap(b)])
 		b = b[:len(b)+n]
@@ -725,26 +742,67 @@ func ReadAll(r Reader) ([]byte, error) {
 			if err == EOF {
 				err = nil
 			}
-			if len(chunks) == 0 {
-				return b, err
-			}
-
-			// Build our final right-sized slice.
-			finalSize += len(b)
-			final := append([]byte(nil), make([]byte, finalSize)...)[:0]
-			for _, chunk := range chunks {
-				final = append(final, chunk...)
-			}
-			final = append(final, b...)
-			return final, err
+			return b, err
 		}
 
 		if cap(b)-len(b) < cap(b)/16 {
-			// Move to the next intermediate slice.
-			chunks = append(chunks, b)
-			finalSize += len(b)
-			b = append([]byte(nil), make([]byte, next)...)[:0]
-			next += next / 2
+			return readAllOverflow(r, b)
+		}
+	}
+}
+
+func readAllOverflow(r Reader, chunk0 []byte) ([]byte, error) {
+	var stack [16]pooledChunk
+	nStack := 0
+	var extra []pooledChunk
+	nChunks := 0
+	finalSize := len(chunk0)
+
+	curBufp := getReadAllChunk(0)
+	cur := *curBufp
+	curLen := 0
+
+	for {
+		n, err := r.Read(cur[curLen:])
+		curLen += n
+		if err != nil {
+			if err == EOF {
+				err = nil
+			}
+			if nChunks == 0 && curLen == 0 {
+				putReadAllChunk(0, curBufp)
+				return chunk0, err
+			}
+
+			finalSize += curLen
+			final := bytealg.MakeNoZero(finalSize)[:finalSize:finalSize]
+			off := copy(final, chunk0)
+			for i := range nStack {
+				c := stack[i]
+				off += copy(final[off:], (*c.bufp)[:c.n])
+				putReadAllChunk(i, c.bufp)
+			}
+			for i, c := range extra {
+				off += copy(final[off:], (*c.bufp)[:c.n])
+				putReadAllChunk(len(stack)+i, c.bufp)
+			}
+			copy(final[off:], cur[:curLen])
+			putReadAllChunk(nChunks, curBufp)
+			return final, err
+		}
+
+		if len(cur)-curLen < len(cur)/16 {
+			if nStack < len(stack) {
+				stack[nStack] = pooledChunk{bufp: curBufp, n: curLen}
+				nStack++
+			} else {
+				extra = append(extra, pooledChunk{bufp: curBufp, n: curLen})
+			}
+			finalSize += curLen
+			nChunks++
+			curBufp = getReadAllChunk(nChunks)
+			cur = *curBufp
+			curLen = 0
 		}
 	}
 }

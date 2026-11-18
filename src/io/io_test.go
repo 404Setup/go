@@ -692,3 +692,150 @@ func TestOffsetWriter_Write(t *testing.T) {
 		checkContent(name, f)
 	})
 }
+
+type chunkedTestReader struct {
+	data     []byte
+	off      int
+	step     int
+	eofWithN bool
+	err      error
+}
+
+func (r *chunkedTestReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		if r.err != nil {
+			err := r.err
+			r.err = nil
+			return 0, err
+		}
+		return 0, EOF
+	}
+	n := len(r.data) - r.off
+	if r.step > 0 && n > r.step {
+		n = r.step
+	}
+	if n > len(p) {
+		n = len(p)
+	}
+	copy(p[:n], r.data[r.off:r.off+n])
+	r.off += n
+	if r.off == len(r.data) {
+		if r.err != nil {
+			err := r.err
+			r.err = nil
+			return n, err
+		}
+		if r.eofWithN {
+			return n, EOF
+		}
+	}
+	return n, nil
+}
+
+func testPatternBytes(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i*31 + 7)
+	}
+	return b
+}
+
+func TestReadAllVariants(t *testing.T) {
+	sizes := []int{
+		0, 1, 17, 480, 481, 511, 512, 513,
+		4096, 4608, 20000, 100000, 1 << 20, 4 << 20,
+	}
+	for _, sz := range sizes {
+		want := testPatternBytes(sz)
+		for _, eofWithN := range []bool{false, true} {
+			r := &chunkedTestReader{data: want, eofWithN: eofWithN}
+			got, err := ReadAll(r)
+			if err != nil {
+				t.Fatalf("size=%d eofWithN=%v: err=%v", sz, eofWithN, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("size=%d eofWithN=%v: mismatch len got=%d want=%d", sz, eofWithN, len(got), len(want))
+			}
+			if sz > 512 && cap(got) != len(got) {
+				t.Fatalf("size=%d eofWithN=%v: cap(got)=%d != len(got)=%d", sz, eofWithN, cap(got), len(got))
+			}
+		}
+	}
+
+	// 1-byte-at-a-time reader across overflow boundaries.
+	want6K := testPatternBytes(6 * 1024)
+	got, err := ReadAll(&chunkedTestReader{data: want6K, step: 1})
+	if err != nil || !bytes.Equal(got, want6K) {
+		t.Fatalf("1-byte step ReadAll got len=%d err=%v, want len=%d nil", len(got), err, len(want6K))
+	}
+
+	// Partial read with custom error on small and overflow paths.
+	customErr := errors.New("boom")
+	for _, tc := range []struct {
+		name string
+		size int
+		step int
+	}{
+		{"small", 200, 0},
+		{"overflow_0_extra", 500, 500},
+		{"overflow_multi", 70 * 1024, 8192},
+	} {
+		want := testPatternBytes(tc.size)
+		got, err := ReadAll(&chunkedTestReader{data: want, step: tc.step, err: customErr})
+		if err != customErr {
+			t.Fatalf("%s: err = %v, want %v", tc.name, err, customErr)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: got len=%d != want len=%d", tc.name, len(got), len(want))
+		}
+	}
+}
+
+func TestReadAllConcurrent(t *testing.T) {
+	sizes := []int{0, 128, 500, 8192, 65536, 300000}
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := range 20 {
+				sz := sizes[(id+i)%len(sizes)]
+				want := testPatternBytes(sz)
+				got, err := ReadAll(bytes.NewReader(want))
+				if err != nil {
+					t.Errorf("ReadAll(sz=%d) err = %v", sz, err)
+					return
+				}
+				if !bytes.Equal(got, want) {
+					t.Errorf("ReadAll(sz=%d) data mismatch", sz)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+func BenchmarkReadAll(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"256B", 256},
+		{"32KB", 32 << 10},
+		{"1MB", 1 << 20},
+	} {
+		data := testPatternBytes(tc.size)
+		b.Run(tc.name, func(b *testing.B) {
+			var r bytes.Reader
+			b.ReportAllocs()
+			for b.Loop() {
+				r.Reset(data)
+				out, err := ReadAll(&r)
+				if err != nil || len(out) != len(data) {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
