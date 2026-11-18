@@ -400,6 +400,7 @@ func TestResponseRecorderOptimizations(t *testing.T) {
 			want string
 		}{
 			{200, "200 OK"},
+			{201, "201 Created"},
 			{299, "299 "},
 			{404, "404 Not Found"},
 			{999, "999 "},
@@ -478,7 +479,37 @@ func TestResponseRecorderOptimizations(t *testing.T) {
 		}
 	})
 
-	t.Run("nil_body_and_body_disallowed", func(t *testing.T) {
+	t.Run("body_interfaces_empty_and_disallowed", func(t *testing.T) {
+		rwBody := NewRecorder()
+		rwBody.WriteString("hello body")
+		body := rwBody.Result().Body
+		if _, ok := body.(io.WriterTo); !ok {
+			t.Errorf("non-empty Result().Body does not implement io.WriterTo")
+		}
+		if _, ok := body.(io.Seeker); ok {
+			t.Errorf("non-empty Result().Body unexpectedly implements io.Seeker")
+		}
+		if _, ok := body.(io.ReaderAt); ok {
+			t.Errorf("non-empty Result().Body unexpectedly implements io.ReaderAt")
+		}
+		var out bytes.Buffer
+		if _, err := io.Copy(&out, body); err != nil || out.String() != "hello body" {
+			t.Fatalf("Copy(Result().Body) = (%q, %v), want (hello body, nil)", out.String(), err)
+		}
+		if err := body.Close(); err != nil {
+			t.Fatalf("Body.Close = %v", err)
+		}
+
+		// Empty buffer and nil Body both yield http.NoBody.
+		rwEmpty := NewRecorder()
+		if rwEmpty.Result().Body != http.NoBody {
+			t.Errorf("empty buffer Body != http.NoBody")
+		}
+		rwNil := &ResponseRecorder{HeaderMap: make(http.Header)}
+		if rwNil.Result().Body != http.NoBody {
+			t.Errorf("nil Body != http.NoBody")
+		}
+
 		for _, code := range []int{http.StatusContinue, http.StatusNoContent, http.StatusNotModified} {
 			rw := &ResponseRecorder{HeaderMap: make(http.Header)}
 			rw.WriteHeader(code)
@@ -489,6 +520,28 @@ func TestResponseRecorderOptimizations(t *testing.T) {
 			if res.Body != http.NoBody {
 				t.Errorf("status %d Body != http.NoBody", code)
 			}
+		}
+	})
+
+	t.Run("result_allocs", func(t *testing.T) {
+		rwBody := NewRecorder()
+		rwBody.Header().Set("Content-Type", "application/json")
+		rwBody.Header().Set("Content-Length", "11")
+		rwBody.WriteString(`{"ok":true}`)
+		if allocs := testing.AllocsPerRun(50, func() {
+			rwBody.result = nil
+			_ = rwBody.Result()
+		}); allocs > 2 {
+			t.Errorf("Result() with body allocs = %v, want <= 2", allocs)
+		}
+
+		rwEmpty := NewRecorder()
+		rwEmpty.Header().Set("X-Empty", "1")
+		if allocs := testing.AllocsPerRun(50, func() {
+			rwEmpty.result = nil
+			_ = rwEmpty.Result()
+		}); allocs > 1 {
+			t.Errorf("Result() empty body allocs = %v, want <= 1", allocs)
 		}
 	})
 }

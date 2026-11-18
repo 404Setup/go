@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	syncv2 "sync/v2"
 	"time"
 
@@ -466,7 +467,9 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}()
 	}
 
-	outreq := req.Clone(ctx)
+	h1xx := &reverseProxy1xxHandler{rw: rw, ctx: ctx}
+
+	outreq := req.Clone(h1xx)
 	if req.ContentLength == 0 {
 		outreq.Body = nil // Issue 16036: nil Body for http.Transport retries
 	}
@@ -593,9 +596,13 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Header["User-Agent"] = []string{""}
 	}
 
-	h1xx := &reverseProxy1xxHandler{rw: rw}
-	h1xx.trace.Got1xxResponse = h1xx.got1xxResponse
-	outreq = outreq.WithContext(httptrace.WithClientTrace(outreq.Context(), &h1xx.trace))
+	if outCtx := outreq.Context(); outCtx != context.Context(h1xx) {
+		outreq = h1xx.withFallbackTrace(outreq, outCtx)
+	} else {
+		h1xx.trace.Got1xxResponse = h1xx.got1xxResponse
+		h1xx.traceCtx = httptrace.WithClientTrace(ctx, &h1xx.trace)
+		h1xx.traceActive.Store(true)
+	}
 
 	res, err := transport.RoundTrip(outreq)
 	h1xx.mu.Lock()
@@ -680,10 +687,37 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 type reverseProxy1xxHandler struct {
-	mu    sync.Mutex
-	done  bool
-	rw    http.ResponseWriter
-	trace httptrace.ClientTrace
+	mu          sync.Mutex
+	done        bool
+	rw          http.ResponseWriter
+	trace       httptrace.ClientTrace
+	ctx         context.Context
+	traceCtx    context.Context
+	traceActive atomic.Bool
+}
+
+func (h1xx *reverseProxy1xxHandler) Deadline() (deadline time.Time, ok bool) {
+	return h1xx.ctx.Deadline()
+}
+
+func (h1xx *reverseProxy1xxHandler) Done() <-chan struct{} {
+	return h1xx.ctx.Done()
+}
+
+func (h1xx *reverseProxy1xxHandler) Err() error {
+	return h1xx.ctx.Err()
+}
+
+func (h1xx *reverseProxy1xxHandler) Value(key any) any {
+	if h1xx.traceActive.Load() {
+		return h1xx.traceCtx.Value(key)
+	}
+	return h1xx.ctx.Value(key)
+}
+
+func (h1xx *reverseProxy1xxHandler) withFallbackTrace(req *http.Request, ctx context.Context) *http.Request {
+	h1xx.trace.Got1xxResponse = h1xx.got1xxResponse
+	return req.WithContext(httptrace.WithClientTrace(ctx, &h1xx.trace))
 }
 
 func (h1xx *reverseProxy1xxHandler) got1xxResponse(code int, header textproto.MIMEHeader) error {

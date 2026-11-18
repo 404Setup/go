@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -2609,4 +2610,232 @@ func BenchmarkReverseProxyCopyHeader(b *testing.B) {
 		copyHeader(dst, src)
 	}
 }
+
+type closeNotifyRecorder struct {
+	*httptest.ResponseRecorder
+	notifyCh chan bool
+}
+
+func (c *closeNotifyRecorder) CloseNotify() <-chan bool {
+	return c.notifyCh
+}
+
+type multiStatusRecorder struct {
+	hdr     http.Header
+	codes   []int
+	headers []http.Header
+}
+
+func (m *multiStatusRecorder) Header() http.Header {
+	if m.hdr == nil {
+		m.hdr = make(http.Header)
+	}
+	return m.hdr
+}
+func (m *multiStatusRecorder) WriteHeader(code int) {
+	m.codes = append(m.codes, code)
+	m.headers = append(m.headers, m.hdr.Clone())
+}
+func (m *multiStatusRecorder) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestReverseProxyH1xxContextPreservation(t *testing.T) {
+	type ctxKey struct{}
+
+	t.Run("RewriteWithValueAnd1xx", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			test := newReverseProxyTest(t)
+			var gotVal any
+			test.backendHandler = func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("X-Early", "yes")
+				w.WriteHeader(103)
+				w.WriteHeader(200)
+			}
+			test.proxy.Transport = RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				gotVal = req.Context().Value(ctxKey{})
+				return test.backend.Client().Transport.RoundTrip(req)
+			})
+			test.proxy.Rewrite = func(r *ProxyRequest) {
+				r.SetURL(url.MustParse("http://backend.tld/"))
+				r.Out = r.Out.WithContext(context.WithValue(r.Out.Context(), ctxKey{}, "preserved"))
+			}
+
+			var inbound1xx atomic.Int32
+			trace := &httptrace.ClientTrace{
+				Got1xxResponse: func(code int, _ textproto.MIMEHeader) error {
+					inbound1xx.Add(1)
+					return nil
+				},
+			}
+			req, _ := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), "GET", "http://example.tld/", nil)
+			resp, err := test.client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if gotVal != "preserved" {
+				t.Errorf("backend context value = %v, want preserved", gotVal)
+			}
+			if got := inbound1xx.Load(); got != 1 {
+				t.Errorf("inbound Got1xxResponse count = %d, want 1", got)
+			}
+		})
+	})
+
+	t.Run("RewriteSharedClientTraceConcurrentAndAbort", func(t *testing.T) {
+		var user1xxCount atomic.Int32
+		var userConnCount atomic.Int32
+		errAbort := errors.New("abort 1xx")
+		sharedUserTrace := &httptrace.ClientTrace{
+			GotConn: func(httptrace.GotConnInfo) {
+				userConnCount.Add(1)
+			},
+			Got1xxResponse: func(code int, hdr textproto.MIMEHeader) error {
+				user1xxCount.Add(1)
+				if hdr.Get("X-Abort") == "1" {
+					return errAbort
+				}
+				return nil
+			},
+		}
+
+		p := &ReverseProxy{
+			Rewrite: func(r *ProxyRequest) {
+				if ct := httptrace.ContextClientTrace(r.Out.Context()); ct != nil && r.In.Header.Get("X-Expect-Nil-Trace") == "1" {
+					t.Errorf("unexpected ClientTrace on Out during Rewrite: %+v", ct)
+				}
+				r.SetURL(url.MustParse("http://backend.tld/"))
+				r.Out = r.Out.WithContext(httptrace.WithClientTrace(r.Out.Context(), sharedUserTrace))
+			},
+			Transport: RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				ct := httptrace.ContextClientTrace(req.Context())
+				if ct == nil || ct.GotConn == nil || ct.Got1xxResponse == nil {
+					return nil, errors.New("missing composed ClientTrace hooks")
+				}
+				ct.GotConn(httptrace.GotConnInfo{})
+				hdr := textproto.MIMEHeader{"X-Early": {"1"}}
+				if req.Header.Get("X-Do-Abort") == "1" {
+					hdr.Set("X-Abort", "1")
+				}
+				if err := ct.Got1xxResponse(103, hdr); err != nil {
+					return nil, err
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody}, nil
+			}),
+			ErrorLog: log.New(io.Discard, "", 0),
+		}
+
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				req := httptest.NewRequest("GET", "http://example.tld/", nil)
+				req.Header.Set("X-Expect-Nil-Trace", "1")
+				rec := &multiStatusRecorder{}
+				p.ServeHTTP(rec, req)
+				if !slices.Equal(rec.codes, []int{103, 200}) {
+					t.Errorf("codes = %v, want [103 200]", rec.codes)
+				}
+			})
+		}
+		wg.Wait()
+		if got := user1xxCount.Load(); got != 8 {
+			t.Errorf("user Got1xxResponse count = %d, want 8", got)
+		}
+		if got := userConnCount.Load(); got != 8 {
+			t.Errorf("user GotConn count = %d, want 8", got)
+		}
+
+		// Verify userTrace.Got1xxResponse error aborts RoundTrip after h1xx forwards 103.
+		abortReq := httptest.NewRequest("GET", "http://example.tld/", nil)
+		abortReq.Header.Set("X-Do-Abort", "1")
+		abortRec := &multiStatusRecorder{}
+		p.ServeHTTP(abortRec, abortReq)
+		if !slices.Equal(abortRec.codes, []int{103, http.StatusBadGateway}) {
+			t.Errorf("aborted 1xx codes = %v, want [103 502]", abortRec.codes)
+		}
+	})
+
+	t.Run("InboundTraceNotLeakedWhenOutReplaced", func(t *testing.T) {
+		var inboundGotConn atomic.Int32
+		inboundTrace := &httptrace.ClientTrace{
+			GotConn: func(httptrace.GotConnInfo) {
+				inboundGotConn.Add(1)
+			},
+		}
+		p := &ReverseProxy{
+			Rewrite: func(r *ProxyRequest) {
+				out, _ := http.NewRequestWithContext(context.Background(), "GET", "http://backend.tld/", nil)
+				r.Out = out
+			},
+			Transport: RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				ct := httptrace.ContextClientTrace(req.Context())
+				if ct != nil && ct.GotConn != nil {
+					ct.GotConn(httptrace.GotConnInfo{})
+				}
+				if ct != nil && ct.Got1xxResponse != nil {
+					if err := ct.Got1xxResponse(103, textproto.MIMEHeader{"X-Early": {"1"}}); err != nil {
+						return nil, err
+					}
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody}, nil
+			}),
+		}
+
+		req := httptest.NewRequest("GET", "http://example.tld/", nil)
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), inboundTrace))
+		rec := &multiStatusRecorder{}
+		p.ServeHTTP(rec, req)
+		if !slices.Equal(rec.codes, []int{103, 200}) {
+			t.Fatalf("codes = %v, want [103 200]", rec.codes)
+		}
+		if got := inboundGotConn.Load(); got != 0 {
+			t.Errorf("old inbound GotConn fired %d times on replaced pr.Out, want 0", got)
+		}
+		if got := rec.headers[0].Get("X-Early"); got != "1" {
+			t.Errorf("1xx header not forwarded when pr.Out replaced: X-Early=%q", got)
+		}
+		if got := rec.headers[1].Get("X-Early"); got != "" {
+			t.Errorf("1xx header leaked into 200 response: X-Early=%q", got)
+		}
+	})
+
+	t.Run("CloseNotifierCancellation", func(t *testing.T) {
+		started := make(chan struct{})
+		canceled := make(chan error, 1)
+		p := &ReverseProxy{
+			Rewrite: func(r *ProxyRequest) {
+				r.SetURL(url.MustParse("http://backend.tld/"))
+			},
+			Transport: RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				close(started)
+				<-req.Context().Done()
+				canceled <- req.Context().Err()
+				return nil, req.Context().Err()
+			}),
+			ErrorLog: log.New(io.Discard, "", 0),
+		}
+
+		// Use context without a Done channel so ServeHTTP bridges CloseNotifier -> WithCancel.
+		req := &http.Request{
+			Method: "GET",
+			URL:    url.MustParse("http://example.tld/"),
+			Header: make(http.Header),
+		}
+		rw := &closeNotifyRecorder{
+			ResponseRecorder: httptest.NewRecorder(),
+			notifyCh:         make(chan bool, 1),
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			p.ServeHTTP(rw, req)
+		}()
+		<-started
+		rw.notifyCh <- true
+		if err := <-canceled; !errors.Is(err, context.Canceled) {
+			t.Errorf("canceled err = %v, want context.Canceled", err)
+		}
+		<-done
+	})
+}
+
 
