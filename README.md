@@ -10,11 +10,12 @@ This fork is a personal Go branch maintained by 404Setup.
 > This fork does not modify language syntax or break existing standard library APIs.
 
 ### Standard Library & Runtime
+- **`io`**: Tiered chunk pooling (`4 KiB`–`256 KiB` via `sync/v2.Pool`) and exact-sized `bytealg.MakeNoZero` final buffer allocation in `ReadAll` overflow paths.
 - **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with online `Shrink()`), with standard library internal usages migrated from `sync`.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
-- **`net`**: Built-in TTL-aware DNS response cache (RFC 1035 / RFC 2308 negative caching, lock-free lookup, RFC 6724 route cache; disable with `GODEBUG=netdnscache=0`) and DNS address shuffling before RFC 6724 sorting.
-- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations, goroutine churn, and parsing/formatting overhead across HTTP/1.1 request/header readers (`requestWithURL` combined allocation, `Host`-only fast path, header key/value interning, contiguous value buffer slicing), server connection and request lifecycle (`connWorkerPool` and `bgReadWorkerPool` with GC-driven pruning, on-demand `backgroundRead` for synchronous handlers, embedded `connReader` and `serverConnContext`, `responsePool`, zero-alloc `snapshotHeader`, lazy connection/request context creation, direct `conn.bufw` write bypass), clean origin-form URL parsing, cookies, status lines, and `ServeMux` routing.
+- **`net`**: Built-in TTL-aware DNS response cache (RFC 1035 / RFC 2308 negative caching, lock-free lookup, RFC 6724 route cache; disable with `GODEBUG=netdnscache=0`), DNS address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting for zone-less IPv4/IPv6 addresses.
+- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations, goroutine churn, and parsing/formatting overhead across HTTP/1.1 request/response header readers (`requestWithURL` combined allocation, `Host`-only and buffered two-pass `readMIMEHeaderBuffered` fast paths, header key/value interning, `CanonicalMIMEHeaderKey` common-key switch and ASCII validation, contiguous value buffer slicing), server connection and request lifecycle (`connWorkerPool` and `bgReadWorkerPool` with GC-driven pruning, on-demand `backgroundRead` for synchronous handlers, embedded `connReader` and `serverConnContext`, `responsePool`, flat-slice header snapshotting via `snapshotHeader`, atomic hijack and read/write deadline tracking, lazy connection/request context creation, direct `conn.bufw` write bypass), client `Transport` paths (`NoBody` write bypass, closure-free `setRequestCancel`/`bodyEOFSignal`, reusable `persistConn` channels, inline `addedGzip`/`addedClose` flags, ASCII `canonicalAddr` fast path, lock-closure removal in `poolGetConn`/`poolConnStateHook`), clean origin-form URL/query parsing (`scanCleanOriginURI`), cookies, status lines, and `ServeMux` routing.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys` (chunked key copies), and struct field introspection.
 - **`runtime`**: Synchronous unmarked span reclamation before heap growth (`reclaimBeforeGrow`), fused 64-bit word-wide zombie check and allocation counting during span sweep (`countAllocAndCheckZombies`), `TrailingZeros8`/`TrailingZeros32` bit scanning in `reclaimChunk`, `scanblock`, `markrootSpans`, and `typeBitsBulkBarrier`, `tp.nextFast` and `nil`-pointer filtering in bulk write barriers, consecutive pointer deduplication in `wbBufFlush1` and GreenTeaGC span/object scanners, empty `spanSet.reset` STW fast path, `workbuf`/`wbBuf` bounds checks, and zero-size fast paths in `makeslice`, `makeslicecopy`, `rawbyteslice`, and `rawruneslice`.
 - **`cmd/compile`**: Tiered stack small-buffer optimization (SBO) for non-escaping dynamic `make` and `make+copy` (`128 B` pointerless / `64 B` pointer-bearing), inlining budget promotion for dynamic `make` helpers, and static constant propagation for `make` and `[]byte(s)`.
@@ -79,7 +80,7 @@ xychart-beta
     x-axis ["ReadRequest (Wrk)", "ServerMatch", "ReadRequest (Chrome)", "ReadMIMEHeader", "ServerKeepAliveLite", "ServerHandlerNoLen", "ServerHandlerTypeLen", "ServerKeepAlive"]
     y-axis "Latency (ns/op)" 0 --> 6600
     bar [989.1, 895.5, 2790, 2704, 3383, 4796, 5278, 6496]
-    bar [238.4, 528.4, 1954, 1913, 918.9, 1534, 1713, 3166]
+    bar [231.7, 528.4, 1693, 1578, 801.0, 1172, 1303, 2495]
 ```
 
 | Benchmark | Upstream Go | Illium | Latency Delta | Allocs (`Upstream` → `Illium`) |
@@ -96,42 +97,68 @@ xychart-beta
 | `StatusText` | 3.67 ns/op | **0.34 ns/op** | **-90.7%** (10.79×) | 0 → 0 |
 | `ReverseProxyFlushInterval` (`httputil`, SSE) | 308.9 ns/op | **49.48 ns/op** | **-84.0%** (6.24×) | 2 (336 B) → **0 (0 B)** |
 | `ResponseStatusLine404` | 15.93 ns/op | **3.23 ns/op** | **-79.7%** (4.93×) | 0 → 0 |
+| `ReadRequest/Wrk` | 989.1 ns/op | **231.7 ns/op** | **-76.6%** (4.27×) | 7 (912 B) → **2 (496 B)** |
 | `ChunkedWriter/BufioSmall` (`internal`) | 68.55 ns/op | **16.20 ns/op** | **-76.4%** (4.23×) | 0 → 0 |
 | `ChunkedWriter/Unbuffered` (`internal`) | 67.94 ns/op | **21.71 ns/op** | **-68.0%** (3.13×) | 0 → 0 |
-| `ReadRequest/Wrk` | 989.1 ns/op | **238.4 ns/op** | **-75.9%** (4.15×) | 7 (912 B) → **2 (496 B)** |
+| `ServerFakeConnWithKeepAliveLite` | 3,383 ns/op | **801.0 ns/op** | **-76.3%** (4.22×) | 10 (1,248 B) → **2 (496 B)** |
 | `AppendHTTPDate` (`internal`) | 130.4 ns/op | **31.47 ns/op** | **-75.9%** (4.14×) | 0 → 0 |
-| `ServerFakeConnWithKeepAliveLite` | 3,383 ns/op | **918.9 ns/op** | **-72.8%** (3.68×) | 10 (1,248 B) → **2 (496 B)** |
+| `ServerHandlerNoLen` | 4,796 ns/op | **1,172 ns/op** | **-75.6%** (4.09×) | 16 (2,080 B) → **3 (512 B)** |
+| `ServerHandlerNoType` | 4,888 ns/op | **1,200 ns/op** | **-75.5%** (4.07×) | 17 (2,080 B) → **4 (516 B)** |
+| `ServerHandlerTypeLen` | 5,278 ns/op | **1,303 ns/op** | **-75.3%** (4.05×) | 19 (2,129 B) → **5 (532 B)** |
+| `ServerHandlerNoHeader` | 3,398 ns/op | **863.8 ns/op** | **-74.6%** (3.93×) | 10 (1,248 B) → **2 (496 B)** |
 | `HTTPDateNowString` (`internal`) | 220.4 ns/op | **61.20 ns/op** | **-72.2%** (3.60×) | 1 (32 B) → **0 (0 B)** |
-| `ServerHandlerNoHeader` | 3,398 ns/op | **1,023 ns/op** | **-69.9%** (3.32×) | 10 (1,248 B) → **2 (496 B)** |
-| `ServerHandlerNoLen` | 4,796 ns/op | **1,534 ns/op** | **-68.0%** (3.13×) | 16 (2,080 B) → **3 (512 B)** |
-| `ServerHandlerTypeLen` | 5,278 ns/op | **1,713 ns/op** | **-67.5%** (3.08×) | 19 (2,129 B) → **5 (532 B)** |
 | `ReadSetCookies` | 1,811 ns/op | **590.7 ns/op** | **-67.4%** (3.07×) | 21 (1,168 B) → **3 (400 B)** |
-| `ServerHandlerNoType` | 4,888 ns/op | **1,613 ns/op** | **-67.0%** (3.03×) | 17 (2,080 B) → **4 (516 B)** |
 | `ParseSetCookie` | 1,081 ns/op | **361.7 ns/op** | **-66.5%** (2.99×) | 13 (640 B) → **1 (192 B)** |
+| `ResponseWrite` | 682.5 ns/op | **238.1 ns/op** | **-65.1%** (2.87×) | 4 (201 B) → **0 (0 B)** |
+| `ClientServerParallel/4/h1` | 18.40 µs/op | **6.57 µs/op** | **-64.3%** (2.80×) | 56 (7,120 B) → **21 (3,293 B)** |
+| `ServerFakeConnWithKeepAlive` | 6,496 ns/op | **2,495 ns/op** | **-61.6%** (2.60×) | 21 (2,424 B) → **6 (1,216 B)** |
 | `LowerHeader/Known` (`httpcommon`) | 11.04 ns/op | **4.50 ns/op** | **-59.3%** (2.45×) | 0 → 0 |
 | `CanonicalHeader/Known` (`httpcommon`) | 8.86 ns/op | **5.39 ns/op** | **-39.1%** (1.64×) | 0 → 0 |
 | `StreamWriteVarint` (`http3`) | 312.6 ns/op | **128.7 ns/op** | **-58.9%** (2.43×) | 0 (15 B) → 0 (15 B) |
+| `ServerFakeConnNoKeepAlive` | 12,721 ns/op | **5,433 ns/op** | **-57.3%** (2.34×) | 46 (4,689 B) → **22 (3,016 B)** |
 | `CookieString` | 431.4 ns/op | **195.5 ns/op** | **-54.7%** (2.21×) | 1 (176 B) → **1 (144 B)** |
 | `ResponseRecorderResult` (`httptest`) | 401.0 ns/op | **194.6 ns/op** | **-51.5%** (2.06×) | 5 (232 B) → **3 (208 B)** |
-| `ServerFakeConnWithKeepAlive` | 6,496 ns/op | **3,166 ns/op** | **-51.3%** (2.05×) | 21 (2,424 B) → **6 (1,200 B)** |
-| `ResponseWrite` | 682.5 ns/op | **340.7 ns/op** | **-50.1%** (2.00×) | 4 (201 B) → **1 (24 B)** |
-| `ServerFakeConnNoKeepAlive` | 12,721 ns/op | **6,687 ns/op** | **-47.4%** (1.90×) | 46 (4,689 B) → **22 (3,004 B)** |
 | `HeaderWriteSubsetBuilder` | 458.6 ns/op | **257.0 ns/op** | **-44.0%** (1.78×) | 4 (240 B) → **1 (112 B)** |
+| `ClientServer/h1` | 19.58 µs/op | **11.07 µs/op** | **-43.5%** (1.77×) | 61 (5,420 B) → **22 (3,097 B)** |
 | `ServeMux` (end-to-end) | 45.24 µs/op | **25.95 µs/op** | **-42.6%** (1.74×) | 360 → 360 |
+| `ReadMIMEHeader/client_headers` (`textproto`) | 2,704 ns/op | **1,578 ns/op** | **-41.6%** (1.71×) | 16 (1,552 B) → **7 (1,480 B)** |
 | `ServerMatch` (`ServeMux`) | 895.5 ns/op | **528.4 ns/op** | **-41.0%** (1.69×) | 10 (791 B) → **5 (568 B)** |
+| `ReadRequest/Chrome` | 2,790 ns/op | **1,693 ns/op** | **-39.3%** (1.65×) | 13 (1,512 B) → **5 (1,456 B)** |
+| `ReadRequest/Siege` | 1,568 ns/op | **1,008 ns/op** | **-35.7%** (1.56×) | 10 (1,029 B) → **5 (976 B)** |
+| `ReadRequest/Curl` | 1,156 ns/op | **756.9 ns/op** | **-34.5%** (1.53×) | 8 (944 B) → **5 (928 B)** |
+| `ReadRequest/Apachebench` | 1,179 ns/op | **777.5 ns/op** | **-34.1%** (1.52×) | 8 (947 B) → **5 (920 B)** |
 | `HeaderWriteSubsetBufio` | 294.3 ns/op | **204.1 ns/op** | **-30.7%** (1.44×) | 0 → 0 |
-| `ReadRequest/Chrome` | 2,790 ns/op | **1,954 ns/op** | **-30.0%** (1.43×) | 13 (1,512 B) → **5 (1,424 B)** |
-| `ReadMIMEHeader/client_headers` (`textproto`) | 2,704 ns/op | **1,913 ns/op** | **-29.3%** (1.41×) | 16 (1,552 B) → **7 (1,480 B)** |
 | `QPACKPrefixedString/EncoderHeaders` (`http3`) | 476.0 ns/op | **356.7 ns/op** | **-25.1%** (1.33×) | 7 (176 B) → **4 (184 B)** |
 | `ServeMux_SkipServe` | 16.51 µs/op | **12.47 µs/op** | **-24.4%** (1.32×) | 0 → 0 |
-| `ClientServerParallel/4/h1` | 18.40 µs/op | **14.37 µs/op** | **-21.9%** (1.28×) | 56 (7,120 B) → **45 (5,946 B)** |
-| `ClientServer/h1` | 19.58 µs/op | **15.65 µs/op** | **-20.1%** (1.25×) | 61 (5,420 B) → **42 (4,669 B)** |
-| `ReadRequest/Curl` | 1,156 ns/op | **924.8 ns/op** | **-20.0%** (1.25×) | 8 (944 B) → **5 (912 B)** |
 | `ClientRequestHeaders/1000` (`http2`) | 1,114 µs/op | **893.8 µs/op** | **-19.8%** (1.25×) | 4,074 (324 KB) → **3,054 (230 KB)** |
-| `ReadRequest/Siege` | 1,568 ns/op | **1,267 ns/op** | **-19.2%** (1.24×) | 10 (1,029 B) → **5 (976 B)** |
-| `ReadRequest/Apachebench` | 1,179 ns/op | **954.2 ns/op** | **-19.1%** (1.24×) | 8 (947 B) → **5 (912 B)** |
 | `ParseRange` | 267.7 ns/op | **219.1 ns/op** | **-18.2%** (1.22×) | 3 (112 B) → **1 (64 B)** |
 | `ServeContent` | 3,016 ns/op | **2,585 ns/op** | **-14.3%** (1.17×) | 16 (5,244 B) → 16 (5,244 B) |
+
+#### `valyala/fasthttp` Suite (`-cpu=2`)
+
+| Benchmark | `fasthttp` | Upstream `net/http` | Illium `net/http` | Illium vs Upstream | Ratio (`net/http` / `fasthttp`) | Allocs (`Upstream` → `Illium`) |
+| :--- | ---: | ---: | ---: | ---: | ---: | :---: |
+| Server GET (`NumCPU` clients, 1 req/conn) | 1,936 ns/op | 6,547 ns/op | **3,734 ns/op** | **-43.0%** (1.75×) | **1.93×** (upstream 3.38×) | 34 (3,176 B) → **10 (1,408 B)** |
+| Server GET (`NumCPU` clients, 2 req/conn) | 1,395 ns/op | 4,617 ns/op | **2,615 ns/op** | **-43.4%** (1.77×) | **1.87×** (upstream 3.31×) | 26 (2,720 B) → **8 (1,240 B)** |
+| Server GET (`NumCPU` clients, 10 req/conn) | 658.9 ns/op | 3,125 ns/op | **1,675 ns/op** | **-46.4%** (1.87×) | **2.54×** (upstream 4.74×) | 21 (2,380 B) → **7 (1,118 B)** |
+| Server GET (`NumCPU` clients, 10K req/conn) | 439.0 ns/op | 2,770 ns/op | **1,471 ns/op** | **-46.9%** (1.88×) | **3.35×** (upstream 6.31×) | 19 (2,280 B) → **7 (1,089 B)** |
+| Server POST (`NumCPU` clients, 1 req/conn) | 2,124 ns/op | 6,850 ns/op | **4,356 ns/op** | **-36.4%** (1.57×) | **2.05×** (upstream 3.23×) | 40 (3,864 B) → **12 (2,064 B)** |
+| Server POST (`NumCPU` clients, 2 req/conn) | 1,532 ns/op | 5,048 ns/op | **3,140 ns/op** | **-37.8%** (1.61×) | **2.05×** (upstream 3.30×) | 32 (3,408 B) → **10 (1,896 B)** |
+| Server POST (`NumCPU` clients, 10 req/conn) | 719.8 ns/op | 3,702 ns/op | **2,307 ns/op** | **-37.7%** (1.60×) | **3.21×** (upstream 5.14×) | 27 (3,068 B) → **9 (1,774 B)** |
+| Server POST (`NumCPU` clients, 10K req/conn) | 538.0 ns/op | 3,269 ns/op | **2,097 ns/op** | **-35.9%** (1.56×) | **3.90×** (upstream 6.08×) | 25 (2,969 B) → **9 (1,746 B)** |
+| Server GET (10K clients, 1 req/conn) | 2,063 ns/op | 5,159 ns/op | **3,641 ns/op** | **-29.4%** (1.42×) | **1.76×** (upstream 2.50×) | 34 (3,186 B) → **10 (1,483 B)** |
+| Server GET (10K clients, 2 req/conn) | 1,278 ns/op | 4,050 ns/op | **2,537 ns/op** | **-37.4%** (1.60×) | **1.99×** (upstream 3.17×) | 26 (2,729 B) → **8 (1,267 B)** |
+| Server GET (10K clients, 10 req/conn) | 606.0 ns/op | 3,171 ns/op | **1,708 ns/op** | **-46.1%** (1.86×) | **2.82×** (upstream 5.23×) | 21 (2,389 B) → **7 (1,128 B)** |
+| Server GET (10K clients, 100 req/conn) | 460.1 ns/op | 2,674 ns/op | **1,560 ns/op** | **-41.7%** (1.71×) | **3.39×** (upstream 5.81×) | 19 (2,298 B) → **7 (1,106 B)** |
+| Client+Server E2E GET (TCP, p=1) | 9,272 ns/op | 21,399 ns/op | **15,675 ns/op** | **-26.7%** (1.37×) | **1.69×** (upstream 2.31×) | 70 (6,381 B) → **20 (2,913 B)** |
+| Client+Server E2E GET (TCP, p=10) | 7,606 ns/op | 17,646 ns/op | **14,737 ns/op** | **-16.5%** (1.20×) | **1.94×** (upstream 2.32×) | 70 (6,393 B) → **20 (2,921 B)** |
+| Client+Server E2E GET (TCP, p=100) | 7,548 ns/op | 19,177 ns/op | **14,373 ns/op** | **-25.1%** (1.33×) | **1.90×** (upstream 2.54×) | 70 (6,522 B) → **20 (3,034 B)** |
+| Client+Server E2E GET (Inmemory, p=1) | 2,169 ns/op | 10,848 ns/op | **7,480 ns/op** | **-31.0%** (1.45×) | **3.45×** (upstream 5.00×) | 70 (6,313 B) → **21 (2,929 B)** |
+| Client+Server E2E GET (Inmemory, p=10) | 2,597 ns/op | 11,733 ns/op | **7,458 ns/op** | **-36.4%** (1.57×) | **2.87×** (upstream 4.52×) | 69 (6,304 B) → **21 (2,933 B)** |
+| Client+Server E2E GET (Inmemory, p=100) | 2,688 ns/op | 12,921 ns/op | **8,697 ns/op** | **-32.7%** (1.49×) | **3.24×** (upstream 4.81×) | 69 (6,405 B) → **21 (2,992 B)** |
+| Client+Server E2E GET (Inmemory, p=1000) | 2,468 ns/op | 14,472 ns/op | **10,928 ns/op** | **-24.5%** (1.32×) | **4.43×** (upstream 5.86×) | 71 (7,150 B) → **23 (3,724 B)** |
+| Client+Server E2E 1MB Body (Inmemory, p=1) | 455.4 µs/op | 782.9 µs/op | **315.2 µs/op** | **-59.7%** (2.48×) | **0.69×** (upstream 1.72×) | 103 (2.13 MiB) → **30 (1.00 MiB)** |
+| Client+Server E2E 1MB Body (Inmemory, p=10) | 365.3 µs/op | 757.8 µs/op | **453.7 µs/op** | **-40.1%** (1.67×) | **1.24×** (upstream 2.07×) | 103 (2.14 MiB) → **31 (1.01 MiB)** |
 
 ---
 
