@@ -836,3 +836,43 @@ func TestTCPListenAfterClose(t *testing.T) {
 		t.Errorf("after l.Close(), l.Accept() = _, %v\nwant %v", err, ErrClosed)
 	}
 }
+
+func TestTCPAddrString(t *testing.T) {
+	tests := []struct {
+		addr *TCPAddr
+		want string
+	}{
+		{nil, "<nil>"},
+		{&TCPAddr{}, ":0"},
+		{&TCPAddr{Port: 80}, ":80"},
+		{&TCPAddr{Port: -1}, ":-1"},
+		{&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 8080}, "127.0.0.1:8080"},
+		{&TCPAddr{IP: IPv4(255, 255, 255, 255).To4(), Port: 65535}, "255.255.255.255:65535"},
+		{&TCPAddr{IP: ParseIP("127.0.0.1"), Port: 8080}, "127.0.0.1:8080"}, // IPv4-mapped 16-byte form
+		{&TCPAddr{IP: IPv6loopback, Port: 443}, "[::1]:443"},
+		{&TCPAddr{IP: ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Port: 65535}, "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"},
+		{&TCPAddr{IP: ParseIP("fe80::1"), Port: 80, Zone: "eth0"}, "[fe80::1%eth0]:80"},
+		{&TCPAddr{Port: 80, Zone: "eth0"}, "%eth0:80"},
+		{&TCPAddr{IP: IP{1, 2}, Port: 80}, "?0102:80"},
+	}
+	for _, tt := range tests {
+		if got := tt.addr.String(); got != tt.want {
+			t.Errorf("(%#v).String() = %q, want %q", tt.addr, got, tt.want)
+		}
+	}
+
+	for _, addr := range []*TCPAddr{
+		{Port: 8080},
+		{IP: IPv4(127, 0, 0, 1).To4(), Port: 8080},
+		{IP: ParseIP("127.0.0.1"), Port: 8080},
+		{IP: IPv6loopback, Port: 8080},
+	} {
+		if allocs := testing.AllocsPerRun(50, func() {
+			if addr.String() == "" {
+				t.Fatal("empty")
+			}
+		}); allocs > 1 {
+			t.Errorf("(%v).String() allocs = %v, want <= 1", addr, allocs)
+		}
+	}
+}

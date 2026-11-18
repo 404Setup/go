@@ -45,6 +45,35 @@ func (a *TCPAddr) String() string {
 	if a == nil {
 		return "<nil>"
 	}
+	if a.Zone == "" {
+		switch len(a.IP) {
+		case 0:
+			var buf [24]byte
+			b := append(buf[:0], ':')
+			b = strconv.AppendInt(b, int64(a.Port), 10)
+			return string(b)
+		case IPv4len:
+			var buf [40]byte
+			b := netip.AddrFrom4([4]byte(a.IP)).AppendTo(buf[:0])
+			b = append(b, ':')
+			b = strconv.AppendInt(b, int64(a.Port), 10)
+			return string(b)
+		case IPv6len:
+			if p4 := a.IP.To4(); len(p4) == IPv4len {
+				var buf [40]byte
+				b := netip.AddrFrom4([4]byte(p4)).AppendTo(buf[:0])
+				b = append(b, ':')
+				b = strconv.AppendInt(b, int64(a.Port), 10)
+				return string(b)
+			}
+			var buf [64]byte
+			b := append(buf[:0], '[')
+			b = netip.AddrFrom16([16]byte(a.IP)).AppendTo(b)
+			b = append(b, "]:"...)
+			b = strconv.AppendInt(b, int64(a.Port), 10)
+			return string(b)
+		}
+	}
 	ip := ipEmptyString(a.IP)
 	if a.Zone != "" {
 		return JoinHostPort(ip+"%"+a.Zone, strconv.Itoa(a.Port))
