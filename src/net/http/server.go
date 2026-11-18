@@ -687,25 +687,29 @@ type writerOnly struct {
 // to a [*net.TCPConn] with sendfile, or from a supported src type such
 // as a *net.TCPConn on Linux with splice.
 func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
-	buf := getCopyBuf()
-	defer putCopyBuf(buf)
-
 	// Our underlying w.conn.rwc is usually a *TCPConn (with its
 	// own ReadFrom method). If not, just fall back to the normal
 	// copy method.
 	rf, ok := w.conn.rwc.(io.ReaderFrom)
 	if !ok {
-		return io.CopyBuffer(writerOnly{w}, src, buf)
+		buf := getCopyBuf()
+		n, err = io.CopyBuffer(writerOnly{w}, src, buf)
+		putCopyBuf(buf)
+		return n, err
 	}
 
+	var buf []byte
 	// Copy the first sniffLen bytes before switching to ReadFrom.
 	// This ensures we don't start writing the response before the
 	// source is available (see golang.org/issue/5660) and provides
 	// enough bytes to perform Content-Type sniffing when required.
 	if !w.cw.wroteHeader {
-		n0, err := io.CopyBuffer(writerOnly{w}, io.LimitReader(src, internal.SniffLen), buf)
+		buf = getCopyBuf()
+		lr := io.LimitedReader{R: src, N: internal.SniffLen}
+		n0, err := io.CopyBuffer(writerOnly{w}, &lr, buf)
 		n += n0
 		if err != nil || n0 < internal.SniffLen {
+			putCopyBuf(buf)
 			return n, err
 		}
 	}
@@ -715,6 +719,9 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 
 	// Now that cw has been flushed, its chunking field is guaranteed initialized.
 	if !w.cw.chunking && w.bodyAllowed() && w.req.Method != "HEAD" {
+		if buf != nil {
+			putCopyBuf(buf)
+		}
 		// When a content length is declared, but exceeded; any excess bytes
 		// from src should be ignored, and ErrContentLength should be returned.
 		// This mirrors the behavior of response.Write.
@@ -723,7 +730,8 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 				if w.written != w.contentLength {
 					return
 				}
-				if n, _ := originalReader.Read([]byte{0}); err == nil && n != 0 {
+				var probe [1]byte
+				if n, _ := originalReader.Read(probe[:]); err == nil && n != 0 {
 					err = ErrContentLength
 				}
 			}(src)
@@ -736,7 +744,7 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 					lr.N -= lenDiff
 				}
 			} else {
-				src = io.LimitReader(src, w.contentLength-w.written)
+				src = &io.LimitedReader{R: src, N: w.contentLength - w.written}
 			}
 		}
 		n0, err := rf.ReadFrom(src)
@@ -745,7 +753,11 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 		return n, err
 	}
 
+	if buf == nil {
+		buf = getCopyBuf()
+	}
 	n0, err := io.CopyBuffer(writerOnly{w}, src, buf)
+	putCopyBuf(buf)
 	n += n0
 	return n, err
 }
@@ -948,11 +960,11 @@ type connReader struct {
 	byteBuf      [1]byte
 	hasByte      bool
 	inRead       bool
-	aborted      bool // set true before conn.rwc deadline is set to past
-	probing      bool // set true during conn.serve's idle probe read, when a timeout is expected
-	reqActive    bool // set true while a request handler is active
-	bgReadReady  bool // set true when request body has reached EOF
-	bgReadWanted bool // set true when request context, CloseNotify, or streaming write needs disconnect detection
+	aborted      bool        // set true before conn.rwc deadline is set to past
+	probing      atomic.Bool // set true during conn.serve's idle probe read, when a timeout is expected
+	reqActive    bool        // set true while a request handler is active
+	bgReadReady  bool        // set true when request body has reached EOF
+	bgReadWanted bool        // set true when request context, CloseNotify, or streaming write needs disconnect detection
 }
 
 func (cr *connReader) lock() {
@@ -1030,7 +1042,7 @@ func (cr *connReader) lazyServerRequestContext(scc *serverConnContext) (context.
 	return ctx, cancel
 }
 
-func (cr *connReader) cancelReqCtx() {
+func (cr *connReader) cancelReqCtx() (inRead bool) {
 	cr.lock()
 	cr.reqActive = false
 	cr.bgReadReady = false
@@ -1038,10 +1050,12 @@ func (cr *connReader) cancelReqCtx() {
 	cr.reqCtx = nil
 	cancel := cr.reqCancel
 	cr.reqCancel = nil
+	inRead = cr.inRead
 	cr.unlock()
 	if cancel != nil {
 		cancel()
 	}
+	return inRead
 }
 
 // cr.mu must be held.
@@ -1194,9 +1208,7 @@ func (cr *connReader) abortPendingRead() {
 }
 
 func (cr *connReader) setProbing(v bool) {
-	cr.lock()
-	cr.probing = v
-	cr.unlock()
+	cr.probing.Store(v)
 }
 
 func (cr *connReader) setReadLimit(remain int64) { cr.remain = remain }
@@ -1235,7 +1247,7 @@ func (cr *connReader) handleReadErrorLocked(err error) {
 	// every subsequent request's context on this connection, so
 	// canceling it would deliver already-canceled contexts to all
 	// future requests.
-	if cr.probing && isNetTimeoutError(err) {
+	if cr.probing.Load() && isNetTimeoutError(err) {
 		return
 	}
 	// io.EOF means the client half closed and may still be waiting for a
@@ -1469,11 +1481,12 @@ var errTooLarge = errors.New("http: request too large")
 
 var responsePool sync.Pool[*response]
 
-func (w *response) cancelCtx() {
+func (w *response) cancelCtx() (inRead bool) {
 	if w.conn != nil && w.conn.r != nil {
-		w.conn.r.cancelReqCtx()
+		inRead = w.conn.r.cancelReqCtx()
 	}
 	w.req.cancelServerCtx()
+	return inRead
 }
 
 func putResponse(w *response) {
@@ -2550,7 +2563,7 @@ func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err er
 	}
 }
 
-func (w *response) finishRequest() {
+func (w *response) finishRequest(abortRead bool) {
 	w.handlerDone.Store(true)
 
 	if !w.wroteHeader {
@@ -2563,7 +2576,9 @@ func (w *response) finishRequest() {
 	w.cw.close()
 	w.conn.bufw.Flush()
 
-	w.conn.r.abortPendingRead()
+	if abortRead {
+		w.conn.r.abortPendingRead()
+	}
 	w.reqBody.registerOnHitEOF(nil) // prevent new background read from starting
 
 	if w.canWriteContinue.Load() {
@@ -3005,12 +3020,12 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		inFlightResponse = nil
-		w.cancelCtx()
+		abortRead := w.cancelCtx()
 		if c.hijacked() {
 			c.r.releaseConn()
 			return
 		}
-		w.finishRequest()
+		w.finishRequest(abortRead)
 		c.curReq.Store(nil)
 		c.clearWriteDeadline()
 		if !w.shouldReuseConnection() {
@@ -3038,9 +3053,10 @@ func (c *conn) serve(ctx context.Context) {
 		putResponse(w)
 
 		if c.bufr.Buffered() < 4 {
+			now := time.Now()
 			var idleDeadline time.Time
 			if d := c.server.idleTimeout(); d > 0 {
-				idleDeadline = time.Now().Add(d)
+				idleDeadline = now.Add(d)
 			}
 
 			// Wait for the connection to become readable again before trying to
@@ -3059,7 +3075,7 @@ func (c *conn) serve(ctx context.Context) {
 			// The byte read by waitReadable is stashed in the connReader
 			// and yielded by its next Read after fresh buffers are
 			// acquired.
-			shortDeadline := time.Now().Add(idleBufsReleaseDelay)
+			shortDeadline := now.Add(idleBufsReleaseDelay)
 			if !idleDeadline.IsZero() && idleDeadline.Before(shortDeadline) {
 				shortDeadline = idleDeadline
 			}
@@ -3205,7 +3221,7 @@ func (w *response) sendExpectationFailed() {
 	// expectation cannot be met."
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(StatusExpectationFailed)
-	w.finishRequest()
+	w.finishRequest(true)
 }
 
 // Hijack implements the [Hijacker.Hijack] method. Our response is both a [ResponseWriter]
@@ -3352,6 +3368,54 @@ func StripPrefix(prefix string, h Handler) Handler {
 	})
 }
 
+func isCleanRedirectPath(url string) (isClean, isHTMLSafe bool) {
+	if len(url) == 0 || url[0] != '/' {
+		return false, false
+	}
+	if len(url) > 1 && url[1] == '/' {
+		return false, false
+	}
+	htmlSafe := true
+	prevSlash := true
+	inQuery := false
+	for i := 1; i < len(url); i++ {
+		c := url[i]
+		if c < ' ' || c >= 0x7f {
+			return false, false
+		}
+		switch c {
+		case '&', '<', '>', '\'', '"':
+			htmlSafe = false
+		case '?':
+			if !inQuery {
+				inQuery = true
+				prevSlash = false
+				continue
+			}
+		case '#':
+			if !inQuery {
+				return false, false
+			}
+		case '%':
+			return false, false
+		}
+		if !inQuery {
+			if c == '/' {
+				if prevSlash {
+					return false, false
+				}
+				prevSlash = true
+			} else {
+				if prevSlash && c == '.' {
+					return false, false
+				}
+				prevSlash = false
+			}
+		}
+	}
+	return true, htmlSafe
+}
+
 // Redirect replies to the request with a redirect to url,
 // which may be a path relative to the request path.
 // Any non-ASCII characters in url will be percent-encoded,
@@ -3365,38 +3429,42 @@ func StripPrefix(prefix string, h Handler) Handler {
 // Setting the Content-Type header to any value, including nil,
 // disables that behavior.
 func Redirect(w ResponseWriter, r *Request, url string, code int) {
-	if u, err := urlpkg.Parse(url); err == nil {
-		// If url was relative, make its path absolute by
-		// combining with request path.
-		// The client would probably do this for us,
-		// but doing it ourselves is more reliable.
-		// See RFC 7231, section 7.1.2
-		if u.Scheme == "" && u.Host == "" {
-			oldpath := r.URL.EscapedPath()
-			if oldpath == "" { // should not happen, but avoid a crash if it does
-				oldpath = "/"
-			}
+	clean, htmlSafe := isCleanRedirectPath(url)
+	if !clean {
+		if u, err := urlpkg.Parse(url); err == nil {
+			// If url was relative, make its path absolute by
+			// combining with request path.
+			// The client would probably do this for us,
+			// but doing it ourselves is more reliable.
+			// See RFC 7231, section 7.1.2
+			if u.Scheme == "" && u.Host == "" {
+				oldpath := r.URL.EscapedPath()
+				if oldpath == "" { // should not happen, but avoid a crash if it does
+					oldpath = "/"
+				}
 
-			// no leading http://server
-			if url == "" || url[0] != '/' {
-				// make relative path absolute
-				olddir, _ := path.Split(oldpath)
-				url = olddir + url
-			}
+				// no leading http://server
+				if url == "" || url[0] != '/' {
+					// make relative path absolute
+					olddir, _ := path.Split(oldpath)
+					url = olddir + url
+				}
 
-			var query string
-			if i := strings.Index(url, "?"); i != -1 {
-				url, query = url[:i], url[i:]
-			}
+				var query string
+				if i := strings.Index(url, "?"); i != -1 {
+					url, query = url[:i], url[i:]
+				}
 
-			// clean up but preserve trailing slash
-			trailing := strings.HasSuffix(url, "/")
-			url = path.Clean(url)
-			if trailing && !strings.HasSuffix(url, "/") {
-				url += "/"
+				// clean up but preserve trailing slash
+				trailing := strings.HasSuffix(url, "/")
+				url = path.Clean(url)
+				if trailing && !strings.HasSuffix(url, "/") {
+					url += "/"
+				}
+				url += query
 			}
-			url += query
 		}
+		url = hexEscapeNonASCII(url)
 	}
 
 	h := w.Header()
@@ -3406,16 +3474,30 @@ func Redirect(w ResponseWriter, r *Request, url string, code int) {
 	// Do it only if the request didn't already have a Content-Type header.
 	_, hadCT := h["Content-Type"]
 
-	h.Set("Location", hexEscapeNonASCII(url))
 	if !hadCT && (r.Method == "GET" || r.Method == "HEAD") {
-		h.Set("Content-Type", "text/html; charset=utf-8")
+		strs := []string{url, "text/html; charset=utf-8"}
+		h["Location"] = strs[:1:1]
+		h["Content-Type"] = strs[1:2:2]
+	} else {
+		h.Set("Location", url)
 	}
 	w.WriteHeader(code)
 
 	// Shouldn't send the body for POST or HEAD; that leaves GET.
 	if !hadCT && r.Method == "GET" {
-		body := "<a href=\"" + htmlEscape(url) + "\">" + StatusText(code) + "</a>.\n\n"
-		io.WriteString(w, body)
+		if !htmlSafe {
+			url = htmlEscape(url)
+		}
+		text := StatusText(code)
+		if sw, ok := w.(io.StringWriter); ok {
+			sw.WriteString(`<a href="`)
+			sw.WriteString(url)
+			sw.WriteString(`">`)
+			sw.WriteString(text)
+			sw.WriteString("</a>.\n\n")
+		} else {
+			io.WriteString(w, "<a href=\""+url+"\">"+text+"</a>.\n\n")
+		}
 	}
 }
 
@@ -3581,10 +3663,12 @@ func RedirectHandler(url string, code int) Handler {
 //     This change mostly affects how paths with %2F escapes adjacent to slashes are treated.
 //     See https://go.dev/issue/21955 for details.
 type ServeMux struct {
-	mu     sync.RWMutex
-	tree   routingNode
-	index  routingIndex
-	mux121 serveMux121 // used only when GODEBUG=httpmuxgo121=1
+	mu        sync.RWMutex
+	tree      routingNode
+	index     routingIndex
+	snap      atomic.Pointer[routingNode]
+	snapReads atomic.Int32
+	mux121    serveMux121 // used only when GODEBUG=httpmuxgo121=1
 }
 
 // NewServeMux allocates and returns a new [ServeMux].
@@ -3662,9 +3746,24 @@ func stripHostPort(h string) string {
 	if strings.IndexByte(h, ':') < 0 {
 		return h
 	}
-	host, _, err := net.SplitHostPort(h)
-	if err != nil {
-		return h // on error, return unchanged
+	i := strings.LastIndexByte(h, ':')
+	var host string
+	j, k := 0, 0
+	if h[0] == '[' {
+		end := strings.IndexByte(h, ']')
+		if end < 0 || end+1 != i {
+			return h
+		}
+		host = h[1:end]
+		j, k = 1, end+1
+	} else {
+		host = h[:i]
+		if strings.IndexByte(host, ':') >= 0 {
+			return h
+		}
+	}
+	if strings.IndexByte(h[j:], '[') >= 0 || strings.IndexByte(h[k:], ']') >= 0 {
+		return h
 	}
 	return host
 }
@@ -3773,16 +3872,19 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 		// We didn't find a match with the request method. To distinguish between
 		// Not Found and Method Not Allowed, see if there is another pattern that
 		// matches except for the method.
-		allowedMethods := mux.matchingMethods(host, path)
-		if len(allowedMethods) > 0 {
-			return HandlerFunc(func(w ResponseWriter, r *Request) {
-				w.Header().Set("Allow", strings.Join(allowedMethods, ", "))
-				Error(w, StatusText(StatusMethodNotAllowed), StatusMethodNotAllowed)
-			}), "", nil, nil
+		if allow := mux.allowHeader(host, path); allow != "" {
+			return methodNotAllowedHandler(allow), "", nil, nil
 		}
 		return NotFoundHandler(), "", nil, nil
 	}
 	return n.handler, n.pattern.String(), n.pattern, matches
+}
+
+type methodNotAllowedHandler string
+
+func (allow methodNotAllowedHandler) ServeHTTP(w ResponseWriter, r *Request) {
+	w.Header()["Allow"] = []string{string(allow)}
+	Error(w, StatusText(StatusMethodNotAllowed), StatusMethodNotAllowed)
 }
 
 // matchOrRedirect looks up a node in the tree that matches the host, method and path.
@@ -3792,23 +3894,56 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 // after appending "/" to the path. If that second match succeeds, the last
 // return value is the escaped path to redirect to.
 func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *routingNode, matches []string, redirectPath string) {
-	mux.mu.RLock()
-	defer mux.mu.RUnlock()
-
-	n, matches := mux.tree.match(host, method, path)
+	tree := mux.snap.Load()
+	if tree == nil {
+		return mux.matchOrRedirectSlow(host, method, path, u)
+	}
+	n, matches := tree.match(host, method, path)
 	// We can terminate here if any of the following is true:
 	// - We have an exact match already.
 	// - We were asked not to try trailing slash redirection.
 	// - The URL already has a trailing slash.
 	// - The URL is an empty string.
-	if u != nil && len(path) > 0 && path[len(path)-1] != '/' && !exactMatch(n, path) {
+	if u != nil && len(path) > 0 && path[len(path)-1] != '/' && (n == nil || n.multiLeaf) {
 		// If there is an exact match with a trailing slash, then redirect.
-		n2, _ := mux.tree.matchTrailingSlash(host, method, path)
-		if exactMatchTrailingSlash(n2, path) {
+		if n2 := tree.matchTrailingSlash(host, method, path); exactMatchTrailingSlash(n2, path) {
 			return n2, nil, path + "/"
 		}
 	}
 	return n, matches, ""
+}
+
+func (mux *ServeMux) matchOrRedirectSlow(host, method, path string, u *url.URL) (_ *routingNode, matches []string, redirectPath string) {
+	mux.mu.RLock()
+	tree := mux.snap.Load()
+	if tree == nil {
+		tree = &mux.tree
+	}
+	n, matches := tree.match(host, method, path)
+	if u != nil && len(path) > 0 && path[len(path)-1] != '/' && (n == nil || n.multiLeaf) {
+		if n2 := tree.matchTrailingSlash(host, method, path); exactMatchTrailingSlash(n2, path) {
+			mux.mu.RUnlock()
+			mux.maybeBuildSnap()
+			return n2, nil, path + "/"
+		}
+	}
+	mux.mu.RUnlock()
+	mux.maybeBuildSnap()
+	return n, matches, ""
+}
+
+func (mux *ServeMux) maybeBuildSnap() {
+	if mux.snap.Load() != nil {
+		return
+	}
+	if mux.snapReads.Add(1) < 4 {
+		return
+	}
+	mux.mu.Lock()
+	defer mux.mu.Unlock()
+	if mux.snap.Load() == nil && mux.snapReads.Load() >= 4 {
+		mux.snap.Store(mux.tree.clone())
+	}
 }
 
 // urlFromEscaped returns the redirect URL string and unescaped path constructed
@@ -3896,7 +4031,7 @@ func exactMatchTrailingSlash(n *routingNode, path string) bool {
 	if n == nil {
 		return false
 	}
-	if !n.pattern.lastSegment().multi {
+	if !n.multiLeaf {
 		return true
 	}
 	return len(n.pattern.segments) == strings.Count(path, "/")+1
@@ -3904,17 +4039,55 @@ func exactMatchTrailingSlash(n *routingNode, path string) bool {
 
 // matchingMethods return a sorted list of all methods that would match with the given host and path.
 func (mux *ServeMux) matchingMethods(host, path string) []string {
-	// Hold the read lock for the entire method so that the two matches are done
-	// on the same set of registered patterns.
-	mux.mu.RLock()
-	defer mux.mu.RUnlock()
-	ms := map[string]bool{}
-	mux.tree.matchingMethods(host, path, ms)
-	// matchOrRedirect will try appending a trailing slash if there is no match.
-	if !strings.HasSuffix(path, "/") {
-		mux.tree.matchingMethods(host, path+"/", ms)
+	var buf [8]string
+	methods := mux.appendMatchingMethods(host, path, buf[:0])
+	if len(methods) == 0 {
+		return nil
 	}
-	return slices.Sorted(maps.Keys(ms))
+	slices.Sort(methods)
+	out := make([]string, len(methods))
+	copy(out, methods)
+	return out
+}
+
+func (mux *ServeMux) allowHeader(host, path string) string {
+	var buf [8]string
+	methods := mux.appendMatchingMethods(host, path, buf[:0])
+	if len(methods) == 0 {
+		return ""
+	}
+	if len(methods) == 1 {
+		return methods[0]
+	}
+	slices.Sort(methods)
+	return strings.Join(methods, ", ")
+}
+
+func (mux *ServeMux) appendMatchingMethods(host, path string, dst []string) []string {
+	hasTrailingSlash := strings.HasSuffix(path, "/")
+	if tree := mux.snap.Load(); tree != nil {
+		dst = tree.appendMatchingMethods(host, path, false, dst)
+		if !hasTrailingSlash {
+			dst = tree.appendMatchingMethods(host, path, true, dst)
+		}
+	} else {
+		// Hold the read lock for the entire method so that the two matches are done
+		// on the same set of registered patterns.
+		mux.mu.RLock()
+		tree := mux.snap.Load()
+		if tree == nil {
+			tree = &mux.tree
+		}
+		dst = tree.appendMatchingMethods(host, path, false, dst)
+		if !hasTrailingSlash {
+			dst = tree.appendMatchingMethods(host, path, true, dst)
+		}
+		mux.mu.RUnlock()
+	}
+	if slices.Contains(dst, "GET") && !slices.Contains(dst, "HEAD") {
+		dst = append(dst, "HEAD")
+	}
+	return dst
 }
 
 // ServeHTTP dispatches the request to the handler whose
@@ -4029,6 +4202,8 @@ func (mux *ServeMux) registerErr(patstr string, handler Handler) error {
 	}); err != nil {
 		return err
 	}
+	mux.snap.Store(nil)
+	mux.snapReads.Store(0)
 	mux.tree.addPattern(pat, handler)
 	mux.index.addPattern(pat)
 	return nil
@@ -4691,6 +4866,9 @@ func (s *Server) HandleRequest(w ResponseWriter, req *Request) error {
 func (s *Server) handleRequest(w ResponseWriter, req *Request, h Handler) (err error) {
 	didPanic := true
 	defer func() {
+		if req.MultipartForm != nil {
+			req.MultipartForm.RemoveAll()
+		}
 		if !didPanic {
 			return
 		}
@@ -4707,25 +4885,28 @@ func (s *Server) handleRequest(w ResponseWriter, req *Request, h Handler) (err e
 		}
 		err = fmt.Errorf("http: panic serving %v: %v", req.RemoteAddr, e)
 	}()
-	s.serveHTTP(w, req, h)
+	s.serveHTTPNoDefer(w, req, h)
 	didPanic = false
 	return nil
 }
 
-func (s *Server) serveHTTP(rw ResponseWriter, req *Request, handler Handler) {
+func (s *Server) serveHTTPNoDefer(rw ResponseWriter, req *Request, handler Handler) {
 	if handler == nil {
 		handler = DefaultServeMux
 	}
 	if !s.DisableGeneralOptionsHandler && req.RequestURI == "*" && req.Method == "OPTIONS" {
 		handler = globalOptionsHandler{}
 	}
+	handler.ServeHTTP(rw, req)
+}
 
+func (s *Server) serveHTTP(rw ResponseWriter, req *Request, handler Handler) {
 	defer func() {
 		if req.MultipartForm != nil {
 			req.MultipartForm.RemoveAll()
 		}
 	}()
-	handler.ServeHTTP(rw, req)
+	s.serveHTTPNoDefer(rw, req, handler)
 }
 
 func (s *Server) protocols() Protocols {

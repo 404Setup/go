@@ -659,27 +659,6 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 	if c.Jar != nil || !knownRoundTripperImpl(c.transport(), req) {
 		copyHeaders = c.makeHeadersCopier(req)
 	}
-	uerr := func(err error) error {
-		// the body may have been closed already by c.send()
-		if !reqBodyClosed {
-			req.closeBody()
-		}
-		var urlStr string
-		if resp != nil && resp.Request != nil {
-			urlStr = stripPassword(resp.Request.URL)
-		} else {
-			urlStr = stripPassword(req.URL)
-		}
-		opReq := firstReq
-		if len(reqs) > 0 {
-			opReq = reqs[0]
-		}
-		return &url.Error{
-			Op:  urlErrorOp(opReq.Method),
-			URL: urlStr,
-			Err: err,
-		}
-	}
 	for {
 		// For all but the first request, create the next
 		// request hop and replace req.
@@ -694,7 +673,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			u, err := req.URL.Parse(loc)
 			if err != nil {
 				resp.closeBody()
-				return nil, uerr(fmt.Errorf("failed to parse Location header %q: %v", loc, err))
+				return nil, clientURLError(fmt.Errorf("failed to parse Location header %q: %v", loc, err), req, firstReq, resp, reqs, reqBodyClosed)
 			}
 			host := ""
 			if req.Host != "" && req.Host != req.URL.Host {
@@ -719,7 +698,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 				req.Body, err = ireq.GetBody()
 				if err != nil {
 					resp.closeBody()
-					return nil, uerr(err)
+					return nil, clientURLError(err, req, firstReq, resp, reqs, reqBodyClosed)
 				}
 				req.GetBody = ireq.GetBody
 				req.ContentLength = ireq.ContentLength
@@ -765,8 +744,8 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 				// and an error if the CheckRedirect function failed.
 				// See https://golang.org/issue/3795
 				// The resp.Body has already been closed.
-				ue := uerr(err)
-				ue.(*url.Error).URL = loc
+				ue := clientURLError(err, req, firstReq, resp, reqs, reqBodyClosed)
+				ue.URL = loc
 				return resp, ue
 			}
 			reqs = append(reqs, req)
@@ -780,7 +759,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			if !deadline.IsZero() && didTimeout {
 				err = &timeoutError{err.Error() + " (Client.Timeout exceeded while awaiting headers)"}
 			}
-			return nil, uerr(err)
+			return nil, clientURLError(err, req, firstReq, resp, reqs, reqBodyClosed)
 		}
 
 		var shouldRedirect, includeBodyOnHop bool
@@ -801,6 +780,28 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 		}
 
 		req.closeBody()
+	}
+}
+
+func clientURLError(err error, req, firstReq *Request, resp *Response, reqs []*Request, reqBodyClosed bool) *url.Error {
+	// the body may have been closed already by c.send()
+	if !reqBodyClosed {
+		req.closeBody()
+	}
+	var urlStr string
+	if resp != nil && resp.Request != nil {
+		urlStr = stripPassword(resp.Request.URL)
+	} else {
+		urlStr = stripPassword(req.URL)
+	}
+	opReq := firstReq
+	if len(reqs) > 0 {
+		opReq = reqs[0]
+	}
+	return &url.Error{
+		Op:  urlErrorOp(opReq.Method),
+		URL: urlStr,
+		Err: err,
 	}
 }
 

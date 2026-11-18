@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"internal/godebug"
+	"internal/synctest"
 	"io"
 	"log"
 	"maps"
@@ -596,15 +597,19 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 	if isHTTP {
 		// Validate the outgoing headers. Permit the :protocol pseudo-header
 		// used by extended CONNECT requests over HTTP/2 and HTTP/3.
-		if err := validateHeadersWithProtocol(req.Header); err != "" {
-			req.closeBody()
-			return nil, fmt.Errorf("net/http: invalid header %s", err)
+		if len(req.Header) > 0 {
+			if err := validateHeadersWithProtocol(req.Header); err != "" {
+				req.closeBody()
+				return nil, fmt.Errorf("net/http: invalid header %s", err)
+			}
 		}
 
 		// Validate the outgoing trailers too.
-		if err := validateTrailers(req.Trailer); err != "" {
-			req.closeBody()
-			return nil, fmt.Errorf("net/http: invalid trailer %s", err)
+		if len(req.Trailer) > 0 {
+			if err := validateTrailers(req.Trailer); err != "" {
+				req.closeBody()
+				return nil, fmt.Errorf("net/http: invalid trailer %s", err)
+			}
 		}
 	}
 
@@ -986,7 +991,7 @@ func resetProxyConfig() {
 
 func (t *Transport) connectMethodForRequest(req *Request) (cm connectMethod, err error) {
 	cm.targetScheme = req.URL.Scheme
-	cm.targetAddr = canonicalAddr(req.URL)
+	cm.targetHost, cm.targetPort, cm.targetAddr = canonicalHostPort(req.URL)
 	if t.Proxy != nil {
 		cm.proxyURL, err = t.Proxy(req)
 	}
@@ -1347,7 +1352,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 			}
 			d.Authenticate = auth.Authenticate
 		}
-		if _, err := d.DialWithConn(ctx, conn, "tcp", cm.targetAddr); err != nil {
+		if _, err := d.DialWithConn(ctx, conn, "tcp", cm.dialAddr()); err != nil {
 			conn.Close()
 			return nil, err
 		}
@@ -1359,11 +1364,12 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 			}
 		}
 	case cm.targetScheme == "https":
+		targetAddr := cm.dialAddr()
 		conn := pconn.conn
 		var hdr Header
 		if t.GetProxyConnectHeader != nil {
 			var err error
-			hdr, err = t.GetProxyConnectHeader(ctx, cm.proxyURL, cm.targetAddr)
+			hdr, err = t.GetProxyConnectHeader(ctx, cm.proxyURL, targetAddr)
 			if err != nil {
 				conn.Close()
 				return nil, err
@@ -1380,8 +1386,8 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 		}
 		connectReq := &Request{
 			Method: "CONNECT",
-			URL:    &url.URL{Opaque: cm.targetAddr},
-			Host:   cm.targetAddr,
+			URL:    &url.URL{Opaque: targetAddr},
+			Host:   targetAddr,
 			Header: hdr,
 		}
 
@@ -1440,7 +1446,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 	}
 
 	if cm.proxyURL != nil && cm.targetScheme == "https" {
-		if err := pconn.addTLS(ctx, cm.targetAddr, trace); err != nil {
+		if err := pconn.addTLS(ctx, cm.dialAddr(), trace); err != nil {
 			return nil, err
 		}
 	}
@@ -1502,7 +1508,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 		if !ok {
 			return nil, errors.New("http: Transport does not support unencrypted HTTP/2")
 		}
-		alt := next(cm.targetAddr, unencryptedTLSConn(pconn.conn))
+		alt := next(cm.dialAddr(), unencryptedTLSConn(pconn.conn))
 		return wrapTLSNextProtoRoundTripper(alt)
 	}
 
@@ -1510,7 +1516,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 		// Encrypted HTTP/2 using the legacy TLSNextProto.
 		tlsConn, tlsConnOK := pconn.conn.(*tls.Conn)
 		if next, ok := t.TLSNextProto[s.NegotiatedProtocol]; tlsConnOK && ok {
-			alt := next(cm.targetAddr, tlsConn)
+			alt := next(cm.dialAddr(), tlsConn)
 			return wrapTLSNextProtoRoundTripper(alt)
 		}
 	}
@@ -1522,8 +1528,17 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 	pconn.resc = make(chan responseAndError)
 	pconn.gone = make(chan struct{})
 	pconn.waitForBodyRead = make(chan bodyReadStatus, 1)
-	pconn.br = bufio.NewReaderSize(pconn, t.readBufferSize())
-	pconn.bw = bufio.NewWriterSize(persistConnWriter{pconn}, t.writeBufferSize())
+	inBubble := synctest.IsInBubble()
+	if rbSize := t.readBufferSize(); rbSize == 4<<10 && !inBubble {
+		pconn.br = newBufioReader(pconn)
+	} else {
+		pconn.br = bufio.NewReaderSize(pconn, rbSize)
+	}
+	if inBubble {
+		pconn.bw = bufio.NewWriterSize(persistConnWriter{pconn}, t.writeBufferSize())
+	} else {
+		pconn.bw = newBufioWriterSize(persistConnWriter{pconn}, t.writeBufferSize())
+	}
 
 	go pconn.readLoop()
 	go pconn.writeLoop()
@@ -1578,25 +1593,49 @@ type connectMethod struct {
 	proxyURL     *url.URL // nil for no proxy, else full proxy URL
 	targetScheme string   // "http" or "https"
 	// If proxyURL specifies an http or https proxy, and targetScheme is http (not https),
-	// then targetAddr is not included in the connect method key, because the socket can
+	// then targetHost/targetPort are not included in the connect method key, because the socket can
 	// be reused for different targetAddr values.
-	targetAddr string
-	onlyH1     bool // whether to disable HTTP/2 and force HTTP/1
+	targetHost string
+	targetPort string
+	targetAddr string // optional pre-joined "host:port"
+	onlyH1     bool   // whether to disable HTTP/2 and force HTTP/1
+}
+
+func (cm *connectMethod) dialAddr() string {
+	if cm.targetAddr != "" {
+		return cm.targetAddr
+	}
+	if cm.targetPort != "" {
+		return cm.targetHost + ":" + cm.targetPort
+	}
+	return cm.targetHost
 }
 
 func (cm *connectMethod) key() connectMethodKey {
 	proxyStr := ""
-	targetAddr := cm.targetAddr
+	host, port := cm.targetHost, cm.targetPort
+	if host == "" && port == "" && cm.targetAddr != "" {
+		if colon := strings.LastIndexByte(cm.targetAddr, ':'); colon > 0 && colon+1 < len(cm.targetAddr) {
+			if hostPart := cm.targetAddr[:colon]; hostPart[0] != '[' || hostPart[len(hostPart)-1] == ']' {
+				host, port = hostPart, cm.targetAddr[colon+1:]
+			} else {
+				host = cm.targetAddr
+			}
+		} else {
+			host = cm.targetAddr
+		}
+	}
 	if cm.proxyURL != nil {
 		proxyStr = cm.proxyURL.String()
 		if (cm.proxyURL.Scheme == "http" || cm.proxyURL.Scheme == "https") && cm.targetScheme == "http" {
-			targetAddr = ""
+			host, port = "", ""
 		}
 	}
 	return connectMethodKey{
 		proxy:  proxyStr,
 		scheme: cm.targetScheme,
-		addr:   targetAddr,
+		host:   host,
+		port:   port,
 		onlyH1: cm.onlyH1,
 	}
 }
@@ -1614,15 +1653,15 @@ func (cm *connectMethod) addr() string {
 	if cm.proxyURL != nil {
 		return canonicalAddr(cm.proxyURL)
 	}
-	return cm.targetAddr
+	return cm.dialAddr()
 }
 
 // connectMethodKey is the map key version of connectMethod, with a
 // stringified proxy URL (or the empty string) instead of a pointer to
 // a URL.
 type connectMethodKey struct {
-	proxy, scheme, addr string
-	onlyH1              bool
+	proxy, scheme, host, port string
+	onlyH1                    bool
 }
 
 func (k connectMethodKey) String() string {
@@ -1631,7 +1670,10 @@ func (k connectMethodKey) String() string {
 	if k.onlyH1 {
 		h1 = ",h1"
 	}
-	return fmt.Sprintf("%s|%s%s|%s", k.proxy, k.scheme, h1, k.addr)
+	if k.port != "" {
+		return fmt.Sprintf("%s|%s%s|%s:%s", k.proxy, k.scheme, h1, k.host, k.port)
+	}
+	return fmt.Sprintf("%s|%s%s|%s", k.proxy, k.scheme, h1, k.host)
 }
 
 // persistConn wraps an HTTP/1 client connection, usually a persistent one
@@ -1799,7 +1841,10 @@ func maybeDrainBody(r io.Reader) bool {
 		// When we drain the body and (hopefully) reach EOF, we might
 		// potentially need to deal with trailers. Make sure they are discarded
 		// so the connection can actually be reused.
-		if b, ok := r.(*body); ok {
+		switch b := r.(type) {
+		case bodyDrainReader:
+			b.b.discardTrailer()
+		case *body:
 			b.discardTrailer()
 		}
 		if _, err := io.CopyN(io.Discard, r, maxPostCloseReadBytes+1); err == io.EOF {
@@ -1826,8 +1871,12 @@ const (
 
 func (pc *persistConn) readLoop() {
 	closeErr := errReadLoopExiting // default value, if not changed below
+	brBorrowed := false
 	defer func() {
 		pc.CloseWithError(closeErr)
+		if !brBorrowed && pc.br != nil && pc.br.Size() == 4<<10 && !synctest.IsInBubble() {
+			putBufioReader(pc.br)
+		}
 		if pc.internalStateHook != nil {
 			pc.internalStateHook()
 		}
@@ -1919,8 +1968,17 @@ func (pc *persistConn) readLoop() {
 			// We send roundTrip a channel to wait on, which we will signal
 			// once the conn is back in the pool (or possibly closed).
 			waitc := eofc // no body, never going to use eofc
+			bodyHoldsBR := false
+			if bodyWritable {
+				if rwc, ok := resp.Body.(*readWriteCloserBody); ok && rwc.br != nil {
+					bodyHoldsBR = true
+				}
+			}
 			select {
 			case rc.ch <- responseAndError{res: resp, waitc: waitc}:
+				if bodyHoldsBR {
+					brBorrowed = true
+				}
 			case <-rc.callerGone:
 				return
 			}
@@ -1951,16 +2009,22 @@ func (pc *persistConn) readLoop() {
 			continue
 		}
 
-		body := &bodyEOFSignal{
-			body:            resp.Body,
-			pc:              pc,
-			waitForBodyRead: pc.waitForBodyRead,
-			eofc:            eofc,
+		rawBody := resp.Body
+		var drainReader io.Reader
+		if b, ok := rawBody.(*body); ok {
+			b.attachEOFSignal(pc, pc.waitForBodyRead, eofc)
+			drainReader = bodyDrainReader{b}
+		} else {
+			resp.Body = &bodyEOFSignal{
+				body:            rawBody,
+				pc:              pc,
+				waitForBodyRead: pc.waitForBodyRead,
+				eofc:            eofc,
+			}
+			drainReader = rawBody
 		}
-
-		resp.Body = body
 		if rc.addedGzip && ascii.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-			resp.Body = &httpcommon.GzipReader{Body: body}
+			resp.Body = &httpcommon.GzipReader{Body: resp.Body}
 			resp.Header.Del("Content-Encoding")
 			resp.Header.Del("Content-Length")
 			resp.ContentLength = -1
@@ -1969,6 +2033,7 @@ func (pc *persistConn) readLoop() {
 
 		select {
 		case rc.ch <- responseAndError{res: resp}:
+			brBorrowed = true
 		case <-rc.callerGone:
 			return
 		}
@@ -1980,6 +2045,7 @@ func (pc *persistConn) readLoop() {
 		case status := <-pc.waitForBodyRead:
 			switch status {
 			case bodyReadEOF:
+				brBorrowed = false
 				if alive {
 					var idleErr error
 					idleErr, alive = pc.finishIdleConn(trace)
@@ -1993,7 +2059,8 @@ func (pc *persistConn) readLoop() {
 				// Close return, and resp belongs to the caller after that.
 				tryDrain := alive && (pc.isClientConn || !pc.t.closeConnsOnIdle()) && resp.ContentLength <= maxPostCloseReadBytes
 				eofc <- struct{}{}
-				if tryDrain && maybeDrainBody(body.body) {
+				if tryDrain && maybeDrainBody(drainReader) {
+					brBorrowed = false
 					var idleErr error
 					idleErr, alive = pc.finishIdleConn(trace)
 					if idleErr != nil {
@@ -2197,7 +2264,12 @@ func (nwe nothingWrittenError) Unwrap() error {
 }
 
 func (pc *persistConn) writeLoop() {
-	defer close(pc.writeLoopDone)
+	defer func() {
+		if !synctest.IsInBubble() {
+			putBufioWriter(pc.bw)
+		}
+		close(pc.writeLoopDone)
+	}()
 	for {
 		select {
 		case wr := <-pc.writech:
@@ -2647,8 +2719,9 @@ func idnaASCIIFromURL(url *url.URL) string {
 	return addr
 }
 
-// canonicalAddr returns url.Host but always with a ":port" suffix.
-func canonicalAddr(url *url.URL) string {
+// canonicalHostPort returns the canonical host, port, and optional pre-joined
+// "host:port" string for url without allocating in common ASCII cases.
+func canonicalHostPort(url *url.URL) (host, port, joined string) {
 	h := url.Host
 	if ascii.Is(h) {
 		if colon := strings.LastIndexByte(h, ':'); colon > 0 && colon+1 < len(h) {
@@ -2663,25 +2736,38 @@ func canonicalAddr(url *url.URL) string {
 				hostPart := h[:colon]
 				if hostPart[0] != '[' {
 					if strings.IndexByte(hostPart, ':') < 0 {
-						return h
+						return hostPart, h[colon+1:], h
 					}
 				} else if len(hostPart) >= 3 && hostPart[len(hostPart)-1] == ']' {
 					if strings.IndexByte(hostPart[1:len(hostPart)-1], ':') >= 0 {
-						return h
+						return hostPart, h[colon+1:], h
 					}
 				}
 			}
 		} else if colon < 0 && len(h) > 0 && h[0] != '[' {
 			if port := schemePort(url.Scheme); port != "" {
-				return h + ":" + port
+				return h, port, ""
 			}
 		}
 	}
-	port := url.Port()
+	port = url.Port()
 	if port == "" {
 		port = schemePort(url.Scheme)
 	}
-	return net.JoinHostPort(idnaASCIIFromURL(url), port)
+	joined = net.JoinHostPort(idnaASCIIFromURL(url), port)
+	if colon := strings.LastIndexByte(joined, ':'); colon >= 0 {
+		return joined[:colon], joined[colon+1:], joined
+	}
+	return joined, "", joined
+}
+
+// canonicalAddr returns url.Host but always with a ":port" suffix.
+func canonicalAddr(url *url.URL) string {
+	host, port, joined := canonicalHostPort(url)
+	if joined != "" {
+		return joined
+	}
+	return host + ":" + port
 }
 
 // bodyEOFSignal is used by the HTTP/1 transport when reading response

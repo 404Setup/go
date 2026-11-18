@@ -1903,3 +1903,81 @@ func BenchmarkServeContent(b *testing.B) {
 	}
 }
 
+type trackingRangeSeeker struct {
+	r          *bytes.Reader
+	seekStarts []int64
+	reads      int
+}
+
+func (ts *trackingRangeSeeker) Read(p []byte) (int, error) {
+	ts.reads++
+	return ts.r.Read(p)
+}
+
+func (ts *trackingRangeSeeker) Seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekStart {
+		ts.seekStarts = append(ts.seekStarts, offset)
+	}
+	return ts.r.Seek(offset, whence)
+}
+
+func TestServeContentMultiRangeHEAD(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 100)
+	mod := time.Unix(1257894000, 0)
+	const rangeHdr = "bytes=10-29, 100-149"
+
+	runCase := func(method, name string) (*httptest.ResponseRecorder, *trackingRangeSeeker) {
+		trk := &trackingRangeSeeker{r: bytes.NewReader(payload)}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(method, "http://example.com/"+name, nil)
+		req.Header.Set("Range", rangeHdr)
+		ServeContent(rec, req, name, mod, trk)
+		return rec, trk
+	}
+
+	// Known extension (.bin): GET reads and seeks both range offsets; HEAD skips all Reads and range Seeks.
+	getRec, getTrk := runCase(MethodGet, "data.bin")
+	headRec, headTrk := runCase(MethodHead, "data.bin")
+
+	if getRec.Code != StatusPartialContent || headRec.Code != StatusPartialContent {
+		t.Fatalf("codes = GET %d / HEAD %d, want 206", getRec.Code, headRec.Code)
+	}
+	getCT := getRec.Header().Get("Content-Type")
+	headCT := headRec.Header().Get("Content-Type")
+	if !strings.HasPrefix(headCT, "multipart/byteranges; boundary=") || !strings.HasPrefix(getCT, "multipart/byteranges; boundary=") {
+		t.Fatalf("Content-Type GET=%q HEAD=%q, want multipart/byteranges", getCT, headCT)
+	}
+	wantLen := strconv.Itoa(getRec.Body.Len())
+	if headRec.Header().Get("Content-Length") != wantLen || getRec.Header().Get("Content-Length") != wantLen {
+		t.Fatalf("Content-Length HEAD=%q GET=%q, want %q", headRec.Header().Get("Content-Length"), getRec.Header().Get("Content-Length"), wantLen)
+	}
+	if headRec.Body.Len() != 0 {
+		t.Fatalf("HEAD body len = %d, want 0", headRec.Body.Len())
+	}
+	if headTrk.reads != 0 {
+		t.Errorf("HEAD with known extension performed %d Read calls, want 0", headTrk.reads)
+	}
+	if len(headTrk.seekStarts) > 1 || (len(headTrk.seekStarts) == 1 && headTrk.seekStarts[0] != 0) {
+		t.Errorf("HEAD seekStarts = %v, expected only initial SeekStart(0)", headTrk.seekStarts)
+	}
+	if !slices.Contains(getTrk.seekStarts, 10) || !slices.Contains(getTrk.seekStarts, 100) {
+		t.Errorf("GET seekStarts = %v, expected offsets 10 and 100", getTrk.seekStarts)
+	}
+
+	// Unknown extension (""): sniffing reads once, then HEAD must not seek/read range parts.
+	getSniffRec, _ := runCase(MethodGet, "")
+	headSniffRec, headSniffTrk := runCase(MethodHead, "")
+	if headSniffRec.Code != StatusPartialContent || headSniffRec.Body.Len() != 0 {
+		t.Fatalf("HEAD sniff code=%d bodyLen=%d", headSniffRec.Code, headSniffRec.Body.Len())
+	}
+	if headSniffRec.Header().Get("Content-Length") != strconv.Itoa(getSniffRec.Body.Len()) {
+		t.Errorf("HEAD sniff Content-Length=%q, want %d", headSniffRec.Header().Get("Content-Length"), getSniffRec.Body.Len())
+	}
+	for _, off := range headSniffTrk.seekStarts {
+		if off != 0 {
+			t.Errorf("HEAD sniff unexpectedly sought to non-zero range offset %d (%v)", off, headSniffTrk.seekStarts)
+		}
+	}
+}
+
+

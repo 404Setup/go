@@ -129,30 +129,36 @@ func ParseCookie(line string) ([]*Cookie, error) {
 // ParseSetCookie parses a Set-Cookie header value and returns a cookie.
 // It returns an error on syntax error.
 func ParseSetCookie(line string) (*Cookie, error) {
+	c := new(Cookie)
+	if err := parseSetCookie(line, c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func parseSetCookie(line string, c *Cookie) error {
 	trimmed := textproto.TrimString(line)
 	if trimmed == "" {
-		return nil, errBlankCookie
+		return errBlankCookie
 	}
 	first, rest, hasMore := strings.Cut(trimmed, ";")
 	first = textproto.TrimString(first)
 	name, value, ok := strings.Cut(first, "=")
 	if !ok {
-		return nil, errEqualNotFoundInCookie
+		return errEqualNotFoundInCookie
 	}
 	name = textproto.TrimString(name)
 	if !isToken(name) {
-		return nil, errInvalidCookieName
+		return errInvalidCookieName
 	}
 	value, quoted, ok := parseCookieValue(value, true)
 	if !ok {
-		return nil, errInvalidCookieValue
+		return errInvalidCookieValue
 	}
-	c := &Cookie{
-		Name:   name,
-		Value:  value,
-		Quoted: quoted,
-		Raw:    line,
-	}
+	c.Name = name
+	c.Value = value
+	c.Quoted = quoted
+	c.Raw = line
 	for hasMore {
 		var part string
 		part, rest, hasMore = strings.Cut(rest, ";")
@@ -161,11 +167,13 @@ func ParseSetCookie(line string) (*Cookie, error) {
 			continue
 		}
 
-		attr, val, _ := strings.Cut(part, "=")
-		val, _, ok = parseCookieValue(val, false)
-		if !ok {
-			c.Unparsed = append(c.Unparsed, part)
-			continue
+		attr, val, hasEq := strings.Cut(part, "=")
+		if hasEq {
+			val, _, ok = parseCookieValue(val, false)
+			if !ok {
+				c.Unparsed = append(c.Unparsed, part)
+				continue
+			}
 		}
 
 		switch len(attr) {
@@ -211,7 +219,27 @@ func ParseSetCookie(line string) (*Cookie, error) {
 				continue
 			}
 			if ascii.EqualFold(attr, "max-age") {
-				secs, err := strconv.Atoi(val)
+				var secs int
+				var err error
+				if len(val) > 0 && len(val) <= 9 && val[0] >= '1' && val[0] <= '9' {
+					v := 0
+					digits := true
+					for i := 0; i < len(val); i++ {
+						d := val[i] - '0'
+						if d > 9 {
+							digits = false
+							break
+						}
+						v = v*10 + int(d)
+					}
+					if digits {
+						secs = v
+					} else {
+						secs, err = strconv.Atoi(val)
+					}
+				} else {
+					secs, err = strconv.Atoi(val)
+				}
 				if err != nil || (secs != 0 && val[0] == '0') {
 					c.Unparsed = append(c.Unparsed, part)
 					continue
@@ -247,7 +275,7 @@ func ParseSetCookie(line string) (*Cookie, error) {
 		}
 		c.Unparsed = append(c.Unparsed, part)
 	}
-	return c, nil
+	return nil
 }
 
 // readSetCookies parses all "Set-Cookie" values from
@@ -257,7 +285,8 @@ func ParseSetCookie(line string) (*Cookie, error) {
 // GODEBUG option is not explicitly turned off, this function will silently
 // fail and return an empty slice.
 func readSetCookies(h Header) []*Cookie {
-	cookieCount := len(h["Set-Cookie"])
+	lines := h["Set-Cookie"]
+	cookieCount := len(lines)
 	if cookieCount == 0 {
 		return []*Cookie{}
 	}
@@ -268,9 +297,21 @@ func readSetCookies(h Header) []*Cookie {
 		return []*Cookie{}
 	}
 	cookies := make([]*Cookie, 0, cookieCount)
-	for _, line := range h["Set-Cookie"] {
-		if cookie, err := ParseSetCookie(line); err == nil {
+	if cookieCount == 1 {
+		if cookie, err := ParseSetCookie(lines[0]); err == nil {
 			cookies = append(cookies, cookie)
+		}
+		return cookies
+	}
+	cookieBuf := make([]Cookie, cookieCount)
+	idx := 0
+	for _, line := range lines {
+		c := &cookieBuf[idx]
+		if parseSetCookie(line, c) == nil {
+			cookies = append(cookies, c)
+			idx++
+		} else {
+			*c = Cookie{}
 		}
 	}
 	return cookies
@@ -293,14 +334,37 @@ func (c *Cookie) String() string {
 	if c == nil || !isToken(c.Name) {
 		return ""
 	}
-	extra := 1 // '='
-	val := sanitizeCookieValue(c.Value, c.Quoted)
-	extra += len(val)
+	val := c.Value
+	quote := c.Quoted
+	valClean := true
+	for i := 0; i < len(val); i++ {
+		b := val[i]
+		if b == ' ' || b == ',' {
+			quote = true
+		}
+		if !validCookieValueByte(b) {
+			valClean = false
+			break
+		}
+	}
+	if !valClean {
+		val = sanitizeOrWarn("Cookie.Value", validCookieValueByte, val)
+		if !quote && strings.ContainsAny(val, " ,") {
+			quote = true
+		}
+	}
+
+	need := len(c.Name) + 1 + len(val)
+	if quote {
+		need += 2
+	}
 
 	var p string
 	if len(c.Path) > 0 {
 		p = sanitizeCookiePath(c.Path)
-		extra += 8 + len(p) // "; Path=" + p
+		if len(p) > 0 {
+			need += 7 + len(p) // "; Path=" + p
+		}
 	}
 	var d string
 	if len(c.Domain) > 0 {
@@ -309,44 +373,109 @@ func (c *Cookie) String() string {
 			if d[0] == '.' {
 				d = d[1:]
 			}
-			extra += 10 + len(d) // "; Domain=" + d
+			if len(d) > 0 {
+				need += 9 + len(d) // "; Domain=" + d
+			}
 		} else {
 			log.Printf("net/http: invalid Cookie.Domain %q; dropping domain attribute", c.Domain)
 		}
 	}
 	hasExpires := validCookieExpires(c.Expires)
 	if hasExpires {
-		extra += 11 + len(TimeFormat) // "; Expires=" + format
+		need += 10 + len(TimeFormat) // "; Expires=" + format
 	}
 	if c.MaxAge > 0 {
-		extra += 22 // "; Max-Age=" + up to 11 digits
+		need += 29 // "; Max-Age=" + up to 19 int64 digits
 	} else if c.MaxAge < 0 {
-		extra += 11 // "; Max-Age=0"
+		need += 11 // "; Max-Age=0"
 	}
 	if c.HttpOnly {
-		extra += 10 // "; HttpOnly"
+		need += 10 // "; HttpOnly"
 	}
 	if c.Secure {
-		extra += 8 // "; Secure"
+		need += 8 // "; Secure"
 	}
 	switch c.SameSite {
 	case SameSiteNoneMode:
-		extra += 15 // "; SameSite=None"
+		need += 15 // "; SameSite=None"
 	case SameSiteLaxMode:
-		extra += 14 // "; SameSite=Lax"
+		need += 14 // "; SameSite=Lax"
 	case SameSiteStrictMode:
-		extra += 17 // "; SameSite=Strict"
+		need += 17 // "; SameSite=Strict"
 	}
 	if c.Partitioned {
-		extra += 13 // "; Partitioned"
+		need += 13 // "; Partitioned"
 	}
 
+	var stack [256]byte
+	if need <= len(stack) {
+		buf := appendCookieBytes(stack[:0], c, val, quote, p, d, hasExpires)
+		return string(buf)
+	}
+	return c.stringLarge(need, val, quote, p, d, hasExpires)
+}
+
+func appendCookieBytes(buf []byte, c *Cookie, val string, quote bool, p, d string, hasExpires bool) []byte {
+	buf = append(buf, c.Name...)
+	buf = append(buf, '=')
+	if quote {
+		buf = append(buf, '"')
+		buf = append(buf, val...)
+		buf = append(buf, '"')
+	} else {
+		buf = append(buf, val...)
+	}
+	if len(p) > 0 {
+		buf = append(buf, "; Path="...)
+		buf = append(buf, p...)
+	}
+	if len(d) > 0 {
+		buf = append(buf, "; Domain="...)
+		buf = append(buf, d...)
+	}
+	if hasExpires {
+		buf = append(buf, "; Expires="...)
+		buf = internal.AppendHTTPDate(buf, c.Expires)
+	}
+	if c.MaxAge > 0 {
+		buf = append(buf, "; Max-Age="...)
+		buf = strconv.AppendInt(buf, int64(c.MaxAge), 10)
+	} else if c.MaxAge < 0 {
+		buf = append(buf, "; Max-Age=0"...)
+	}
+	if c.HttpOnly {
+		buf = append(buf, "; HttpOnly"...)
+	}
+	if c.Secure {
+		buf = append(buf, "; Secure"...)
+	}
+	switch c.SameSite {
+	case SameSiteDefaultMode:
+	case SameSiteNoneMode:
+		buf = append(buf, "; SameSite=None"...)
+	case SameSiteLaxMode:
+		buf = append(buf, "; SameSite=Lax"...)
+	case SameSiteStrictMode:
+		buf = append(buf, "; SameSite=Strict"...)
+	}
+	if c.Partitioned {
+		buf = append(buf, "; Partitioned"...)
+	}
+	return buf
+}
+
+func (c *Cookie) stringLarge(need int, val string, quote bool, p, d string, hasExpires bool) string {
 	var b strings.Builder
-	b.Grow(len(c.Name) + extra)
+	b.Grow(need)
 	b.WriteString(c.Name)
 	b.WriteByte('=')
-	b.WriteString(val)
-
+	if quote {
+		b.WriteByte('"')
+		b.WriteString(val)
+		b.WriteByte('"')
+	} else {
+		b.WriteString(val)
+	}
 	if len(p) > 0 {
 		b.WriteString("; Path=")
 		b.WriteString(p)
@@ -374,7 +503,6 @@ func (c *Cookie) String() string {
 	}
 	switch c.SameSite {
 	case SameSiteDefaultMode:
-		// Skip, default mode is obtained by not emitting the attribute.
 	case SameSiteNoneMode:
 		b.WriteString("; SameSite=None")
 	case SameSiteLaxMode:

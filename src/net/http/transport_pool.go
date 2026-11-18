@@ -646,17 +646,17 @@ func (t *Transport) poolRemoveConn(pconn *poolConn) {
 	})
 }
 
+func getConnCancelCause(ctx context.Context) error {
+	err := context.Cause(ctx)
+	if err == errRequestCanceled {
+		err = errRequestCanceledConn
+	}
+	return err
+}
+
 // poolGetConn gets a usable connection from the pool,
 // dialing a new one if necessary.
 func (t *Transport) poolGetConn(ctx context.Context, cm connectMethod, connClose bool) (*poolConn, httptrace.GotConnInfo, error) {
-	getConnCancelCause := func(ctx context.Context) error {
-		err := context.Cause(ctx)
-		if err == errRequestCanceled {
-			err = errRequestCanceledConn
-		}
-		return err
-	}
-
 	// If the request context is already canceled, don't go looking for a conn.
 	if err := ctx.Err(); err != nil {
 		return nil, {}, getConnCancelCause(ctx)
@@ -735,9 +735,13 @@ func (t *Transport) poolTryGetForEntryLocked(ent *poolEntry, exclusive bool) (*p
 	// If IdleConnTimeout is set, calculate the oldest
 	// poolConn.idleAt time we're willing to use a cached idle
 	// conn.
-	var oldTime time.Time
+	var (
+		now     time.Time
+		oldTime time.Time
+	)
 	if timeout := t.idleConnTimeout(); timeout > 0 {
-		oldTime = time.Now().Add(-timeout)
+		now = time.Now()
+		oldTime = now.Add(-timeout)
 	}
 	pconn := head.availableLink.prev
 	for {
@@ -771,7 +775,10 @@ func (t *Transport) poolTryGetForEntryLocked(ent *poolEntry, exclusive bool) (*p
 				}
 				if !wasIdleAt.IsZero() {
 					info.WasIdle = true
-					info.IdleTime = time.Since(wasIdleAt)
+					if now.IsZero() {
+						now = time.Now()
+					}
+					info.IdleTime = now.Sub(wasIdleAt)
 				}
 				return pconn, info
 			}

@@ -5,12 +5,17 @@
 package http
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"io"
 	"mime"
+	"net/http/httptrace"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -512,3 +517,386 @@ func BenchmarkParseFormPostLargeWithCL(b *testing.B) {
 		r.ParseForm()
 	}
 }
+
+var benchNewReqSink *Request
+
+func TestNewRequestEmptyBodyOptimization(t *testing.T) {
+	t.Run("EmptyAndConsumedReaders", func(t *testing.T) {
+		consumedBuf := bytes.NewBufferString("abc")
+		consumedBuf.Next(3)
+		consumedBR := bytes.NewReader([]byte("abc"))
+		consumedBR.Seek(0, io.SeekEnd)
+		consumedSR := strings.NewReader("abc")
+		consumedSR.Seek(0, io.SeekEnd)
+
+		cases := []struct {
+			name string
+			body func() io.Reader
+		}{
+			{"EmptyBytesBuffer", func() io.Reader { return new(bytes.Buffer) }},
+			{"ConsumedBytesBuffer", func() io.Reader { return consumedBuf }},
+			{"NilBytesReader", func() io.Reader { return bytes.NewReader(nil) }},
+			{"ConsumedBytesReader", func() io.Reader { return consumedBR }},
+			{"EmptyStringsReader", func() io.Reader { return strings.NewReader("") }},
+			{"ConsumedStringsReader", func() io.Reader { return consumedSR }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				req, err := NewRequest("POST", "http://example.com/submit", tc.body())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if req.Body != NoBody {
+					t.Fatalf("Body = %#v, want NoBody", req.Body)
+				}
+				if req.ContentLength != 0 {
+					t.Fatalf("ContentLength = %d, want 0", req.ContentLength)
+				}
+				if req.GetBody == nil {
+					t.Fatal("GetBody = nil, want non-nil getNoBody")
+				}
+				gb, err := req.GetBody()
+				if err != nil || gb != NoBody {
+					t.Fatalf("GetBody() = (%#v, %v), want (NoBody, nil)", gb, err)
+				}
+			})
+		}
+	})
+
+	t.Run("EmptyBodyAllocsParityWithNilBody", func(t *testing.T) {
+		nilAllocs := testing.AllocsPerRun(50, func() {
+			r, err := NewRequest("GET", "http://example.com/submit", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			benchNewReqSink = r
+		})
+		for _, tc := range []struct {
+			name string
+			mk   func() io.Reader
+		}{
+			{"BytesBuffer", func() io.Reader { return &bytes.Buffer{} }},
+			{"BytesReader", func() io.Reader { return &bytes.Reader{} }},
+			{"StringsReader", func() io.Reader { return &strings.Reader{} }},
+		} {
+			var emptyBuf bytes.Buffer
+			var emptyBR bytes.Reader
+			var emptySR strings.Reader
+			allocs := testing.AllocsPerRun(50, func() {
+				var body io.Reader
+				switch tc.name {
+				case "BytesBuffer":
+					body = &emptyBuf
+				case "BytesReader":
+					body = &emptyBR
+				case "StringsReader":
+					body = &emptySR
+				default:
+					body = tc.mk()
+				}
+				r, err := NewRequest("GET", "http://example.com/submit", body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				benchNewReqSink = r
+			})
+			if allocs > nilAllocs {
+				t.Errorf("%s empty body allocs = %v, want <= nil-body allocs (%v)", tc.name, allocs, nilAllocs)
+			}
+		}
+	})
+
+	t.Run("NonEmptySnapshotIsolation", func(t *testing.T) {
+		check := func(name string, r io.Reader) {
+			t.Helper()
+			req, err := NewRequest("POST", "http://example.com/upload", r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.Body == NoBody {
+				t.Fatalf("%s: Body = NoBody, want non-empty body", name)
+			}
+			if req.ContentLength != 5 {
+				t.Fatalf("%s: ContentLength = %d, want 5", name, req.ContentLength)
+			}
+			var part [2]byte
+			if _, err := io.ReadFull(req.Body, part[:]); err != nil {
+				t.Fatal(err)
+			}
+			if string(part[:]) != "he" {
+				t.Fatalf("%s: partial read = %q, want he", name, part[:])
+			}
+			// GetBody snapshot must replay from the initial offset ("hello") independently.
+			gb1, err := req.GetBody()
+			if err != nil {
+				t.Fatal(err)
+			}
+			replay1, err := io.ReadAll(gb1)
+			if err != nil || string(replay1) != "hello" {
+				t.Fatalf("%s: replay1 = (%q, %v), want hello", name, replay1, err)
+			}
+			rest, err := io.ReadAll(req.Body)
+			if err != nil || string(rest) != "llo" {
+				t.Fatalf("%s: rest of Body = (%q, %v), want llo", name, rest, err)
+			}
+			gb2, err := req.GetBody()
+			if err != nil {
+				t.Fatal(err)
+			}
+			replay2, err := io.ReadAll(gb2)
+			if err != nil || string(replay2) != "hello" {
+				t.Fatalf("%s: replay2 = (%q, %v), want hello", name, replay2, err)
+			}
+			// Reusing the now-consumed reader produces NoBody cleanly.
+			reqConsumed, err := NewRequest("POST", "http://example.com/upload", r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reqConsumed.Body != NoBody || reqConsumed.ContentLength != 0 {
+				t.Fatalf("%s consumed reuse: Body=%#v CL=%d", name, reqConsumed.Body, reqConsumed.ContentLength)
+			}
+		}
+
+		bb := bytes.NewBufferString("xxhello")
+		bb.Next(2)
+		check("BytesBuffer", bb)
+
+		br := bytes.NewReader([]byte("xxhello"))
+		br.Seek(2, io.SeekStart)
+		check("BytesReader", br)
+
+		sr := strings.NewReader("xxhello")
+		sr.Seek(2, io.SeekStart)
+		check("StringsReader", sr)
+	})
+}
+
+func BenchmarkNewRequestEmptyBody(b *testing.B) {
+	b.Run("Nil", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			r, err := NewRequest("GET", "http://example.com/api/v1/items", nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchNewReqSink = r
+		}
+	})
+	b.Run("BytesBuffer", func(b *testing.B) {
+		var buf bytes.Buffer
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			r, err := NewRequest("GET", "http://example.com/api/v1/items", &buf)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchNewReqSink = r
+		}
+	})
+	b.Run("BytesReader", func(b *testing.B) {
+		var rd bytes.Reader
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			r, err := NewRequest("GET", "http://example.com/api/v1/items", &rd)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchNewReqSink = r
+		}
+	})
+	b.Run("StringsReader", func(b *testing.B) {
+		var sr strings.Reader
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			r, err := NewRequest("GET", "http://example.com/api/v1/items", &sr)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchNewReqSink = r
+		}
+	})
+}
+
+func TestRequestWritePreambleAndHooks(t *testing.T) {
+	type traceMode int
+	const (
+		traceNone traceMode = iota
+		traceHeadersOnly
+		traceFull
+	)
+	cases := []struct {
+		name         string
+		method       string
+		rawURL       string
+		hdr          Header
+		extraHdr     Header
+		usingProxy   bool
+		addedGzip    bool
+		addedClose   bool
+		wantWireSubs []string
+	}{
+		{
+			name:         "PlainGET",
+			method:       MethodGet,
+			rawURL:       "http://example.com/hello",
+			wantWireSubs: []string{"GET /hello HTTP/1.1\r\nHost: example.com\r\nUser-Agent: " + defaultUserAgent + "\r\n\r\n"},
+		},
+		{
+			name:         "GETWithQuery",
+			method:       MethodGet,
+			rawURL:       "http://example.com/search?a=1&b=two",
+			wantWireSubs: []string{"GET /search?a=1&b=two HTTP/1.1\r\nHost: example.com\r\nUser-Agent: " + defaultUserAgent + "\r\n"},
+		},
+		{
+			name:         "ForceQuery",
+			method:       MethodGet,
+			rawURL:       "http://example.com/search?",
+			wantWireSubs: []string{"GET /search? HTTP/1.1\r\nHost: example.com\r\n"},
+		},
+		{
+			name:         "AddedGzipOnly",
+			method:       MethodGet,
+			rawURL:       "http://example.com/gzip",
+			addedGzip:    true,
+			wantWireSubs: []string{"\r\nAccept-Encoding: gzip\r\n\r\n"},
+		},
+		{
+			name:         "AddedCloseOnly",
+			method:       MethodGet,
+			rawURL:       "http://example.com/close",
+			addedClose:   true,
+			wantWireSubs: []string{"\r\nConnection: close\r\n\r\n"},
+		},
+		{
+			name:         "AddedGzipAndClose",
+			method:       MethodGet,
+			rawURL:       "http://example.com/both",
+			addedGzip:    true,
+			addedClose:   true,
+			wantWireSubs: []string{"Accept-Encoding: gzip\r\nConnection: close\r\n\r\n"},
+		},
+		{
+			name:         "CustomUA",
+			method:       MethodGet,
+			rawURL:       "http://example.com/ua",
+			hdr:          Header{"User-Agent": {"CustomAgent/2.0"}, "X-Test": {"1"}},
+			wantWireSubs: []string{"User-Agent: CustomAgent/2.0\r\n", "X-Test: 1\r\n"},
+		},
+		{
+			name:         "EmptyUA",
+			method:       MethodGet,
+			rawURL:       "http://example.com/no-ua",
+			hdr:          Header{"User-Agent": {""}},
+			wantWireSubs: []string{"GET /no-ua HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"},
+			addedClose:   true,
+		},
+		{
+			name:         "MultilineUA",
+			method:       MethodGet,
+			rawURL:       "http://example.com/ml-ua",
+			hdr:          Header{"User-Agent": {"  Agent\r\nLine2  "}},
+			wantWireSubs: []string{"User-Agent: Agent  Line2\r\n"},
+		},
+		{
+			name:         "ProxyWithExtraHeaders",
+			method:       MethodPost,
+			rawURL:       "http://example.com/proxy?k=v",
+			extraHdr:     Header{"Proxy-Authorization": {"Basic abc"}},
+			usingProxy:   true,
+			addedGzip:    true,
+			wantWireSubs: []string{"POST http://example.com/proxy?k=v HTTP/1.1\r\nHost: example.com\r\n", "Proxy-Authorization: Basic abc\r\nAccept-Encoding: gzip\r\n\r\n"},
+		},
+	}
+
+	runWrite := func(bufSize int, mode traceMode, tc struct {
+		name         string
+		method       string
+		rawURL       string
+		hdr          Header
+		extraHdr     Header
+		usingProxy   bool
+		addedGzip    bool
+		addedClose   bool
+		wantWireSubs []string
+	}) (string, []string) {
+		var events []string
+		ctx := context.Background()
+		switch mode {
+		case traceHeadersOnly:
+			ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+				WroteHeaders: func() { events = append(events, "WroteHeaders") },
+			})
+		case traceFull:
+			ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+				WroteHeaderField: func(k string, v []string) {
+					events = append(events, k+"="+strings.Join(v, ","))
+				},
+				WroteHeaders: func() { events = append(events, "WroteHeaders") },
+				WroteRequest: func(info httptrace.WroteRequestInfo) {
+					if info.Err == nil {
+						events = append(events, "WroteRequest:nil")
+					} else {
+						events = append(events, "WroteRequest:"+info.Err.Error())
+					}
+				},
+			})
+		}
+
+		req, err := NewRequestWithContext(ctx, tc.method, tc.rawURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, vv := range tc.hdr {
+			req.Header[k] = slices.Clone(vv)
+		}
+		var out bytes.Buffer
+		bw := bufio.NewWriterSize(&out, bufSize)
+		if err := req.write(bw, tc.usingProxy, tc.extraHdr, tc.addedGzip, tc.addedClose, nil); err != nil {
+			t.Fatalf("%s (buf=%d mode=%d) write err: %v", tc.name, bufSize, mode, err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String(), events
+	}
+
+	for _, tc := range cases {
+		for _, mode := range []traceMode{traceNone, traceHeadersOnly, traceFull} {
+			fastWire, fastEvents := runWrite(4<<10, mode, tc)
+			slowWire, slowEvents := runWrite(16, mode, tc)
+			if fastWire != slowWire {
+				t.Errorf("%s (mode=%d) wire mismatch:\nfast: %q\nslow: %q", tc.name, mode, fastWire, slowWire)
+			}
+			if !reflect.DeepEqual(fastEvents, slowEvents) {
+				t.Errorf("%s (mode=%d) trace events mismatch:\nfast: %v\nslow: %v", tc.name, mode, fastEvents, slowEvents)
+			}
+			if mode == traceFull {
+				for _, sub := range tc.wantWireSubs {
+					if !strings.Contains(fastWire, sub) {
+						t.Errorf("%s missing expected wire substring %q in %q", tc.name, sub, fastWire)
+					}
+				}
+			}
+		}
+	}
+
+	t.Run("Allocs", func(t *testing.T) {
+		req, err := NewRequest(MethodGet, "http://example.com/api/v1/resource?page=1", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bw := bufio.NewWriterSize(io.Discard, 4<<10)
+		for _, addedGzip := range []bool{false, true} {
+			allocs := testing.AllocsPerRun(100, func() {
+				bw.Reset(io.Discard)
+				if err := req.write(bw, false, nil, addedGzip, false, nil); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if allocs != 0 {
+				t.Errorf("req.write(addedGzip=%v) allocs = %v, want 0", addedGzip, allocs)
+			}
+		}
+	})
+}
+

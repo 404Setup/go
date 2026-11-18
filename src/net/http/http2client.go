@@ -212,7 +212,7 @@ func (t *Transport) http2ExternalDial(ctx context.Context, cm connectMethod, isC
 	if t.h2Config == nil {
 		return nil, errors.ErrUnsupported
 	}
-	nc, err := t.h2Config.DialFromContext(ctx, "tcp", cm.targetAddr)
+	nc, err := t.h2Config.DialFromContext(ctx, "tcp", cm.dialAddr())
 	if err != nil {
 		return nil, err
 	}

@@ -183,6 +183,8 @@ func (t *Transport) NewClientConn(ctx context.Context, scheme, address string) (
 
 	cm := connectMethod{
 		targetScheme: scheme,
+		targetHost:   host,
+		targetPort:   port,
 		targetAddr:   net.JoinHostPort(host, port),
 		proxyURL:     proxyURL,
 	}
@@ -234,12 +236,16 @@ func validateClientConnRequest(req *Request) error {
 		return errors.New("http: nil Request.Header")
 	}
 	// Validate the outgoing headers.
-	if err := validateHeadersWithProtocol(req.Header); err != "" {
-		return fmt.Errorf("http: invalid header %s", err)
+	if len(req.Header) > 0 {
+		if err := validateHeadersWithProtocol(req.Header); err != "" {
+			return fmt.Errorf("http: invalid header %s", err)
+		}
 	}
 	// Validate the outgoing trailers too.
-	if err := validateTrailers(req.Trailer); err != "" {
-		return fmt.Errorf("http: invalid trailer %s", err)
+	if len(req.Trailer) > 0 {
+		if err := validateTrailers(req.Trailer); err != "" {
+			return fmt.Errorf("http: invalid trailer %s", err)
+		}
 	}
 	if req.Method != "" && !validMethod(req.Method) {
 		return fmt.Errorf("http: invalid method %q", req.Method)

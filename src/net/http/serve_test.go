@@ -9211,3 +9211,211 @@ func TestServerKeepAliveDeadlineResetTracking(t *testing.T) {
 	}
 	_ = beforeReadZero
 }
+
+type redirectNoStringWriter struct {
+	hdr  Header
+	code int
+	body bytes.Buffer
+}
+
+func (w *redirectNoStringWriter) Header() Header         { return w.hdr }
+func (w *redirectNoStringWriter) WriteHeader(code int) { w.code = code }
+func (w *redirectNoStringWriter) Write(p []byte) (int, error) {
+	return w.body.Write(p)
+}
+
+type redirectStringWriter struct {
+	hdr  Header
+	code int
+	body bytes.Buffer
+}
+
+func (w *redirectStringWriter) Header() Header         { return w.hdr }
+func (w *redirectStringWriter) WriteHeader(code int) { w.code = code }
+func (w *redirectStringWriter) Write(p []byte) (int, error) {
+	return w.body.Write(p)
+}
+func (w *redirectStringWriter) WriteString(s string) (int, error) {
+	return w.body.WriteString(s)
+}
+
+func TestRedirectOptimizations(t *testing.T) {
+	cases := []struct {
+		name     string
+		method   string
+		target   string
+		presetCT []string // non-nil triggers preset Content-Type
+		wantLoc  string
+		wantBody string
+	}{
+		{
+			name:     "CleanPath",
+			method:   MethodGet,
+			target:   "/next/step",
+			wantLoc:  "/next/step",
+			wantBody: `<a href="/next/step">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "CleanQueryAndFragment",
+			method:   MethodGet,
+			target:   "/search?q=go#results",
+			wantLoc:  "/search?q=go#results",
+			wantBody: `<a href="/search?q=go#results">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "CleanHTMLUnsafeQuery",
+			method:   MethodGet,
+			target:   `/cb?a=1&b=<script>&c='1'&d="2">3`,
+			wantLoc:  `/cb?a=1&b=<script>&c='1'&d="2">3`,
+			wantBody: `<a href="/cb?a=1&amp;b=&lt;script&gt;&amp;c=&#39;1&#39;&amp;d=&#34;2&#34;&gt;3">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "FragmentBeforeQuery",
+			method:   MethodGet,
+			target:   "/foo#bar?a=1&b=<tag>",
+			wantLoc:  "/foo#bar?a=1&b=<tag>",
+			wantBody: `<a href="/foo#bar?a=1&amp;b=&lt;tag&gt;">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "RelativeSubdir",
+			method:   MethodGet,
+			target:   "sub/item",
+			wantLoc:  "/base/sub/item",
+			wantBody: `<a href="/base/sub/item">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "DotSegments",
+			method:   MethodGet,
+			target:   "/base/./other/../dest",
+			wantLoc:  "/base/dest",
+			wantBody: `<a href="/base/dest">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "DoubleSlashLeading",
+			method:   MethodGet,
+			target:   "//example.org/dest",
+			wantLoc:  "//example.org/dest",
+			wantBody: `<a href="//example.org/dest">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "DoubleSlashMiddle",
+			method:   MethodGet,
+			target:   "/a//b/",
+			wantLoc:  "/a/b/",
+			wantBody: `<a href="/a/b/">Found</a>.` + "\n\n",
+		},
+		{
+			name:     "PercentEscaped",
+			method:   MethodGet,
+			target:   "/foo%20bar?q=%26",
+			wantLoc:  "/foo%20bar?q=%26",
+			wantBody: `<a href="/foo%20bar?q=%26">Found</a>.` + "\n\n",
+		},
+		{
+			name:    "HEADMethod",
+			method:  MethodHead,
+			target:  "/clean",
+			wantLoc: "/clean",
+		},
+		{
+			name:    "POSTMethod",
+			method:  MethodPost,
+			target:  "/clean",
+			wantLoc: "/clean",
+		},
+		{
+			name:     "PresetCT",
+			method:   MethodGet,
+			target:   "/clean",
+			presetCT: []string{"application/json"},
+			wantLoc:  "/clean",
+		},
+		{
+			name:     "PresetNilCT",
+			method:   MethodGet,
+			target:   "/clean",
+			presetCT: []string{},
+			wantLoc:  "/clean",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "http://example.com/base/orig", nil)
+
+			sw := &redirectStringWriter{hdr: make(Header)}
+			nw := &redirectNoStringWriter{hdr: make(Header)}
+			if tc.presetCT != nil {
+				sw.hdr["Content-Type"] = slices.Clone(tc.presetCT)
+				nw.hdr["Content-Type"] = slices.Clone(tc.presetCT)
+			}
+
+			Redirect(sw, req, tc.target, StatusFound)
+			Redirect(nw, req, tc.target, StatusFound)
+
+			if sw.code != StatusFound || nw.code != StatusFound {
+				t.Fatalf("codes = %d / %d, want %d", sw.code, nw.code, StatusFound)
+			}
+			if got := sw.hdr.Get("Location"); got != tc.wantLoc {
+				t.Errorf("StringWriter Location = %q, want %q", got, tc.wantLoc)
+			}
+			if got := nw.hdr.Get("Location"); got != tc.wantLoc {
+				t.Errorf("NoStringWriter Location = %q, want %q", got, tc.wantLoc)
+			}
+			if got := sw.body.String(); got != tc.wantBody {
+				t.Errorf("StringWriter body = %q, want %q", got, tc.wantBody)
+			}
+			if got := nw.body.String(); got != tc.wantBody {
+				t.Errorf("NoStringWriter body = %q, want %q", got, tc.wantBody)
+			}
+		})
+	}
+
+	t.Run("Allocs", func(t *testing.T) {
+		req := httptest.NewRequest(MethodGet, "http://example.com/base/orig", nil)
+		w := &redirectStringWriter{hdr: make(Header, 4)}
+		allocs := testing.AllocsPerRun(50, func() {
+			clear(w.hdr)
+			w.body.Reset()
+			Redirect(w, req, "/next/step", StatusFound)
+		})
+		if allocs > 1 {
+			t.Errorf("clean GET Redirect allocs = %v, want <= 1", allocs)
+		}
+	})
+}
+
+func BenchmarkRedirect(b *testing.B) {
+	req := httptest.NewRequest(MethodGet, "http://example.com/base/orig", nil)
+	b.Run("CleanPath", func(b *testing.B) {
+		w := &redirectStringWriter{hdr: make(Header, 4)}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			clear(w.hdr)
+			w.body.Reset()
+			Redirect(w, req, "/next/step", StatusFound)
+		}
+	})
+	b.Run("QueryEscape", func(b *testing.B) {
+		w := &redirectStringWriter{hdr: make(Header, 4)}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			clear(w.hdr)
+			w.body.Reset()
+			Redirect(w, req, "/next/step?a=1&b=2", StatusFound)
+		}
+	})
+	b.Run("Relative", func(b *testing.B) {
+		w := &redirectStringWriter{hdr: make(Header, 4)}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			clear(w.hdr)
+			w.body.Reset()
+			Redirect(w, req, "sub/item", StatusFound)
+		}
+	})
+	b.Run("Server", func(b *testing.B) {
+		benchmarkHandler(b, RedirectHandler("/next/step", StatusFound))
+	})
+}
+

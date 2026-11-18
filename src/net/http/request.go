@@ -837,43 +837,86 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, added
 		w = bw
 	}
 
-	if ruriHasQuery {
-		if err = writeReqLineQuery(w, valueOrDefault(r.Method, "GET"), ruri, ruriQuery); err != nil {
-			return err
+	method := valueOrDefault(r.Method, "GET")
+	hasUA := r.Header.has("User-Agent")
+	wrotePreamble := false
+	if bufw, ok := w.(*bufio.Writer); ok {
+		need := len(method) + 1 + len(ruri) + len(" HTTP/1.1\r\nHost: ") + len(host) + 2
+		if ruriHasQuery {
+			need += 1 + len(ruriQuery)
 		}
-	} else {
-		if err = writeReqLine(w, valueOrDefault(r.Method, "GET"), " ", ruri, " HTTP/1.1\r\n"); err != nil {
-			return err
+		if !hasUA {
+			need += len(defaultUserAgentHeader)
+		}
+		if need <= bufw.Available() {
+			buf := bufw.AvailableBuffer()
+			buf = append(buf, method...)
+			buf = append(buf, ' ')
+			buf = append(buf, ruri...)
+			if ruriHasQuery {
+				buf = append(buf, '?')
+				buf = append(buf, ruriQuery...)
+			}
+			buf = append(buf, " HTTP/1.1\r\nHost: "...)
+			buf = append(buf, host...)
+			buf = append(buf, '\r', '\n')
+			if !hasUA {
+				buf = append(buf, defaultUserAgentHeader...)
+			}
+			if _, err = bufw.Write(buf); err != nil {
+				return err
+			}
+			if trace != nil && trace.WroteHeaderField != nil {
+				trace.WroteHeaderField("Host", []string{host})
+				if !hasUA {
+					trace.WroteHeaderField("User-Agent", []string{defaultUserAgent})
+				}
+			}
+			wrotePreamble = true
 		}
 	}
+	if !wrotePreamble {
+		if ruriHasQuery {
+			if err = writeReqLineQuery(w, method, ruri, ruriQuery); err != nil {
+				return err
+			}
+		} else {
+			if err = writeReqLine(w, method, " ", ruri, " HTTP/1.1\r\n"); err != nil {
+				return err
+			}
+		}
 
-	// Header lines
-	if err = writeReqLine(w, "Host: ", host, "\r\n", ""); err != nil {
-		return err
-	}
-	if trace != nil && trace.WroteHeaderField != nil {
-		trace.WroteHeaderField("Host", []string{host})
-	}
-
-	// Use the defaultUserAgent unless the Header contains one, which
-	// may be blank to not send the header.
-	if !r.Header.has("User-Agent") {
-		if _, err = io.WriteString(w, defaultUserAgentHeader); err != nil {
+		// Header lines
+		if err = writeReqLine(w, "Host: ", host, "\r\n", ""); err != nil {
 			return err
 		}
 		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField("User-Agent", []string{defaultUserAgent})
+			trace.WroteHeaderField("Host", []string{host})
 		}
-	} else if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
-		if strings.IndexByte(userAgent, '\r') >= 0 || strings.IndexByte(userAgent, '\n') >= 0 {
-			userAgent = headerNewlineToSpace.Replace(userAgent)
+
+		// Use the defaultUserAgent unless the Header contains one, which
+		// may be blank to not send the header.
+		if !hasUA {
+			if _, err = io.WriteString(w, defaultUserAgentHeader); err != nil {
+				return err
+			}
+			if trace != nil && trace.WroteHeaderField != nil {
+				trace.WroteHeaderField("User-Agent", []string{defaultUserAgent})
+			}
 		}
-		userAgent = textproto.TrimString(userAgent)
-		if err = writeReqLine(w, "User-Agent: ", userAgent, "\r\n", ""); err != nil {
-			return err
-		}
-		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField("User-Agent", []string{userAgent})
+	}
+	if hasUA {
+		if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
+			if strings.IndexByte(userAgent, '\r') >= 0 || strings.IndexByte(userAgent, '\n') >= 0 {
+				userAgent = headerNewlineToSpace.Replace(userAgent)
+			}
+			userAgent = textproto.TrimString(userAgent)
+			if err = writeReqLine(w, "User-Agent: ", userAgent, "\r\n", ""); err != nil {
+				return err
+			}
+			if trace != nil && trace.WroteHeaderField != nil {
+				trace.WroteHeaderField("User-Agent", []string{userAgent})
+			}
 		}
 	}
 
@@ -898,26 +941,33 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, added
 			return err
 		}
 	}
-	if addedGzip {
-		if _, err = io.WriteString(w, "Accept-Encoding: gzip\r\n"); err != nil {
+	if addedGzip && !addedClose && (trace == nil || trace.WroteHeaderField == nil) {
+		_, err = io.WriteString(w, "Accept-Encoding: gzip\r\n\r\n")
+		if err != nil {
 			return err
 		}
-		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField("Accept-Encoding", []string{"gzip"})
+	} else {
+		if addedGzip {
+			if _, err = io.WriteString(w, "Accept-Encoding: gzip\r\n"); err != nil {
+				return err
+			}
+			if trace != nil && trace.WroteHeaderField != nil {
+				trace.WroteHeaderField("Accept-Encoding", []string{"gzip"})
+			}
 		}
-	}
-	if addedClose {
-		if _, err = io.WriteString(w, "Connection: close\r\n"); err != nil {
-			return err
+		if addedClose {
+			if _, err = io.WriteString(w, "Connection: close\r\n"); err != nil {
+				return err
+			}
+			if trace != nil && trace.WroteHeaderField != nil {
+				trace.WroteHeaderField("Connection", []string{"close"})
+			}
 		}
-		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField("Connection", []string{"close"})
-		}
-	}
 
-	_, err = io.WriteString(w, "\r\n")
-	if err != nil {
-		return err
+		_, err = io.WriteString(w, "\r\n")
+		if err != nil {
+			return err
+		}
 	}
 
 	if trace != nil && trace.WroteHeaders != nil {
@@ -1054,6 +1104,8 @@ func NewRequest(method, url string, body io.Reader) (*Request, error) {
 	return NewRequestWithContext(context.Background(), method, url, body)
 }
 
+func getNoBody() (io.ReadCloser, error) { return NoBody, nil }
+
 // NewRequestWithContext returns a new [Request] given a method, URL, and
 // optional body.
 //
@@ -1094,65 +1146,76 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 	if err != nil {
 		return nil, err
 	}
-	rc, ok := body.(io.ReadCloser)
-	if !ok && body != nil {
-		rc = io.NopCloser(body)
-	}
-	// The host's colon:port should be normalized. See Issue 14836.
-	u.Host = strings.TrimSuffix(u.Host, ":")
-	req := &Request{
-		ctx:        ctx,
-		Method:     method,
-		URL:        u,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     make(Header),
-		Body:       rc,
-		Host:       u.Host,
-	}
+	var rc io.ReadCloser
+	var contentLength int64
+	var getBody func() (io.ReadCloser, error)
 	if body != nil {
 		switch v := body.(type) {
 		case *bytes.Buffer:
-			req.ContentLength = int64(v.Len())
-			buf := v.Bytes()
-			req.GetBody = func() (io.ReadCloser, error) {
-				r := bytes.NewReader(buf)
-				return io.NopCloser(r), nil
+			contentLength = int64(v.Len())
+			if contentLength == 0 {
+				rc = NoBody
+				getBody = getNoBody
+			} else {
+				rc = io.NopCloser(body)
+				buf := v.Bytes()
+				getBody = func() (io.ReadCloser, error) {
+					r := bytes.NewReader(buf)
+					return io.NopCloser(r), nil
+				}
 			}
 		case *bytes.Reader:
-			req.ContentLength = int64(v.Len())
-			snapshot := *v
-			req.GetBody = func() (io.ReadCloser, error) {
-				r := snapshot
-				return io.NopCloser(&r), nil
+			contentLength = int64(v.Len())
+			if contentLength == 0 {
+				rc = NoBody
+				getBody = getNoBody
+			} else {
+				rc = io.NopCloser(body)
+				snapshot := *v
+				getBody = func() (io.ReadCloser, error) {
+					r := snapshot
+					return io.NopCloser(&r), nil
+				}
 			}
 		case *strings.Reader:
-			req.ContentLength = int64(v.Len())
-			snapshot := *v
-			req.GetBody = func() (io.ReadCloser, error) {
-				r := snapshot
-				return io.NopCloser(&r), nil
+			contentLength = int64(v.Len())
+			if contentLength == 0 {
+				rc = NoBody
+				getBody = getNoBody
+			} else {
+				rc = io.NopCloser(body)
+				snapshot := *v
+				getBody = func() (io.ReadCloser, error) {
+					r := snapshot
+					return io.NopCloser(&r), nil
+				}
 			}
 		default:
+			var ok bool
+			if rc, ok = body.(io.ReadCloser); !ok {
+				rc = io.NopCloser(body)
+			}
 			// This is where we'd set it to -1 (at least
 			// if body != NoBody) to mean unknown, but
 			// that broke people during the Go 1.8 testing
 			// period. People depend on it being 0 I
 			// guess. Maybe retry later. See Issue 18117.
 		}
-		// For client requests, Request.ContentLength of 0
-		// means either actually 0, or unknown. The only way
-		// to explicitly say that the ContentLength is zero is
-		// to set the Body to nil. But turns out too much code
-		// depends on NewRequest returning a non-nil Body,
-		// so we use a well-known ReadCloser variable instead
-		// and have the http package also treat that sentinel
-		// variable to mean explicitly zero.
-		if req.GetBody != nil && req.ContentLength == 0 {
-			req.Body = NoBody
-			req.GetBody = func() (io.ReadCloser, error) { return NoBody, nil }
-		}
+	}
+	// The host's colon:port should be normalized. See Issue 14836.
+	u.Host = strings.TrimSuffix(u.Host, ":")
+	req := &Request{
+		ctx:           ctx,
+		Method:        method,
+		URL:           u,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        make(Header),
+		Body:          rc,
+		ContentLength: contentLength,
+		GetBody:       getBody,
+		Host:          u.Host,
 	}
 
 	return req, nil

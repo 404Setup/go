@@ -1042,3 +1042,109 @@ func BenchmarkParseSetCookie(b *testing.B) {
 	}
 }
 
+var (
+	benchCookieSink    *Cookie
+	benchCookieStrSink string
+)
+
+func TestCookieAllocs(t *testing.T) {
+	const setLine = "NID=99=YsDT5i3E-CXax-; expires=Wed, 23-Nov-2011 01:05:03 GMT; path=/; domain=.google.ch; Secure; HttpOnly; SameSite=Lax; Max-Age=3600"
+	// ParseSetCookie returns *Cookie which allocates at most 1 Cookie object (0 if stack-allocated).
+	if allocs := testing.AllocsPerRun(50, func() {
+		c, err := ParseSetCookie(setLine)
+		if err != nil {
+			t.Fatal(err)
+		}
+		benchCookieSink = c
+	}); allocs > 1 {
+		t.Errorf("ParseSetCookie allocs = %v, want <= 1", allocs)
+	}
+	if allocs := testing.AllocsPerRun(50, func() {
+		if _, err := ParseSetCookie("invalid-cookie"); err == nil {
+			t.Fatal("expected error")
+		}
+	}); allocs != 0 {
+		t.Errorf("ParseSetCookie error allocs = %v, want 0", allocs)
+	}
+
+	// readSetCookies with 4 Set-Cookie lines batches Cookie structs into 1 slab + []*Cookie slice (<= 2 allocs total).
+	hdr := Header{
+		"Set-Cookie": {
+			"a=1; Path=/; HttpOnly",
+			"b=2; Path=/api; Secure",
+			"c=3; Expires=Wed, 23-Nov-2011 01:05:03 GMT; SameSite=Lax",
+			"d=4; Max-Age=600; Partitioned",
+		},
+	}
+	if allocs := testing.AllocsPerRun(50, func() {
+		cs := readSetCookies(hdr)
+		if len(cs) != 4 {
+			t.Fatalf("len = %d, want 4", len(cs))
+		}
+	}); allocs > 2 {
+		t.Errorf("readSetCookies(4) allocs = %v, want <= 2", allocs)
+	}
+
+	// Stack-sized (*Cookie).String() (<= 256 bytes) allocates at most 1 returned string.
+	smallCookie := &Cookie{
+		Name:     "cookie-9",
+		Value:    "i3e01nf61b6t23bvfmplnanol3",
+		Expires:  time.Unix(1257894000, 0),
+		Path:     "/restricted/",
+		Domain:   ".example.com",
+		MaxAge:   3600,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: SameSiteStrictMode,
+	}
+	if allocs := testing.AllocsPerRun(50, func() {
+		benchCookieStrSink = smallCookie.String()
+	}); allocs > 1 {
+		t.Errorf("small (*Cookie).String() allocs = %v, want <= 1", allocs)
+	}
+
+	// Verify stringLarge (> 256 bytes) matches exact expected formatting including quotes & attributes.
+	largeVal := strings.Repeat("v", 240)
+	for _, tc := range []struct {
+		name   string
+		maxAge int
+		wantMA string
+	}{
+		{"PositiveMaxAge", 7200, "; Max-Age=7200"},
+		{"NegativeMaxAge", -1, "; Max-Age=0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lc := &Cookie{
+				Name:        "big",
+				Value:       largeVal,
+				Quoted:      true,
+				Path:        "/long/path/segment",
+				Domain:      ".sub.example.com",
+				Expires:     time.Unix(1257894000, 0),
+				MaxAge:      tc.maxAge,
+				HttpOnly:    true,
+				Secure:      true,
+				SameSite:    SameSiteStrictMode,
+				Partitioned: true,
+			}
+			want := `big="` + largeVal + `"; Path=/long/path/segment; Domain=sub.example.com; Expires=Tue, 10 Nov 2009 23:00:00 GMT` + tc.wantMA + `; HttpOnly; Secure; SameSite=Strict; Partitioned`
+			if got := lc.String(); got != want {
+				t.Errorf("large Cookie.String() mismatch:\n got: %q\nwant: %q", got, want)
+			}
+		})
+	}
+}
+
+func BenchmarkCookieParseAndFormat(b *testing.B) {
+	const line = "sid=i3e01nf61b6t23bvfmplnanol3; Path=/app; Domain=example.com; Expires=Tue, 10 Nov 2009 23:00:00 GMT; Max-Age=3600; HttpOnly; Secure; SameSite=Lax"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		c, err := ParseSetCookie(line)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchCookieStrSink = c.String()
+	}
+}
+
+

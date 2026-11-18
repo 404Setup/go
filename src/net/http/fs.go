@@ -7,6 +7,7 @@
 package http
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"internal/godebug"
@@ -258,12 +259,91 @@ var errSeeker = errors.New("seeker can't seek")
 // all of the byte-range-spec values is greater than the content size.
 var errNoOverlap = errors.New("invalid range: failed to overlap")
 
+type headerSlab struct {
+	s *[5]string
+	i int
+}
+
+func (hs *headerSlab) one(v string) []string {
+	if hs.s == nil {
+		hs.s = new([5]string)
+	}
+	if hs.i < len(hs.s) {
+		i := hs.i
+		hs.i = i + 1
+		hs.s[i] = v
+		return hs.s[i : i+1 : i+1]
+	}
+	return []string{v}
+}
+
+func serveContentWrite(w ResponseWriter, src io.Reader, n int64, toEOF bool) {
+	if n <= 0 {
+		return
+	}
+	if toEOF {
+		if br, ok := src.(*bytes.Reader); ok && int64(br.Len()) == n {
+			_, _ = br.WriteTo(w)
+			return
+		}
+		if sr, ok := src.(*strings.Reader); ok && int64(sr.Len()) == n {
+			_, _ = sr.WriteTo(w)
+			return
+		}
+	}
+	if rf, ok := w.(io.ReaderFrom); ok {
+		lr := io.LimitedReader{R: src, N: n}
+		_, _ = rf.ReadFrom(&lr)
+		return
+	}
+	buf := getCopyBuf()
+	_, _ = copyNWithBuf(w, src, n, buf)
+	putCopyBuf(buf)
+}
+
+func copyNWithBuf(dst io.Writer, src io.Reader, n int64, buf []byte) (written int64, err error) {
+	for n > 0 {
+		chunk := buf
+		if int64(len(chunk)) > n {
+			chunk = chunk[:n]
+		}
+		nr, er := src.Read(chunk)
+		if nr > 0 {
+			nw, ew := dst.Write(chunk[:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errors.New("invalid write result")
+				}
+			}
+			written += int64(nw)
+			n -= int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
 // if name is empty, filename is unknown. (used for mime type, before sniffing)
 // if modtime.IsZero(), modtime is unknown.
 // content must be seeked to the beginning of the file.
 // If seekSize is true, content is seeked to determine size instead of using size.
 func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, size int64, seekSize bool, content io.ReadSeeker) {
-	setLastModified(w, modtime)
+	var slab headerSlab
+	setLastModifiedWithSlab(w, modtime, &slab)
 	done, rangeReq := checkPreconditions(w, r, modtime)
 	if done {
 		return
@@ -289,7 +369,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 				return
 			}
 		}
-		hdr["Content-Type"] = []string{ctype}
+		hdr["Content-Type"] = slab.one(ctype)
 	} else if len(ctypes) > 0 {
 		ctype = ctypes[0]
 	}
@@ -331,7 +411,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		var crBuf [64]byte
 		cr := append(crBuf[:0], "bytes */"...)
 		cr = strconv.AppendInt(cr, size, 10)
-		hdr["Content-Range"] = []string{string(cr)}
+		hdr["Content-Range"] = slab.one(string(cr))
 		fallthrough
 	default:
 		serveError(w, err.Error(), StatusRequestedRangeNotSatisfiable)
@@ -345,6 +425,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		// dumb client. Ignore the range request.
 		ranges = nil
 	}
+	toEOF := len(ranges) == 0
 	switch {
 	case len(ranges) == 1:
 		// RFC 7233, Section 4.1:
@@ -364,39 +445,47 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 			return
 		}
 		sendSize = ra.length
+		toEOF = ra.start+ra.length == size
 		code = StatusPartialContent
-		hdr["Content-Range"] = []string{ra.contentRange(size)}
+		hdr["Content-Range"] = slab.one(ra.contentRange(size))
 	case len(ranges) > 1:
 		sendSize = rangesMIMESize(ranges, ctype, size)
 		code = StatusPartialContent
 
-		pr, pw := io.Pipe()
-		mw := multipart.NewWriter(pw)
-		hdr["Content-Type"] = []string{"multipart/byteranges; boundary=" + mw.Boundary()}
-		sendContent = pr
-		defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
-		go func() {
-			for _, ra := range ranges {
-				part, err := mw.CreatePart(ra.mimeHeader(ctype, size))
-				if err != nil {
-					pw.CloseWithError(err)
-					return
+		if r.Method == "HEAD" {
+			mw := multipart.NewWriter(io.Discard)
+			hdr["Content-Type"] = slab.one("multipart/byteranges; boundary=" + mw.Boundary())
+		} else {
+			pr, pw := io.Pipe()
+			mw := multipart.NewWriter(pw)
+			hdr["Content-Type"] = slab.one("multipart/byteranges; boundary=" + mw.Boundary())
+			sendContent = pr
+			defer pr.Close() // cause writing goroutine to fail and exit if copy doesn't finish.
+			go func() {
+				buf := getCopyBuf()
+				defer putCopyBuf(buf)
+				for _, ra := range ranges {
+					part, err := mw.CreatePart(ra.mimeHeader(ctype, size))
+					if err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+					if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+					if _, err := copyNWithBuf(part, content, ra.length, buf); err != nil {
+						pw.CloseWithError(err)
+						return
+					}
 				}
-				if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
-					pw.CloseWithError(err)
-					return
-				}
-				if _, err := io.CopyN(part, content, ra.length); err != nil {
-					pw.CloseWithError(err)
-					return
-				}
-			}
-			mw.Close()
-			pw.Close()
-		}()
+				mw.Close()
+				pw.Close()
+			}()
+		}
 	}
 
-	hdr["Accept-Ranges"] = []string{"bytes"}
+	hdr["Accept-Ranges"] = slab.one("bytes")
 
 	// We should be able to unconditionally set the Content-Length here.
 	//
@@ -424,12 +513,12 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 	// of the ResponseWriter, and always set Content-Length if it's one
 	// that we recognize.
 	if len(ranges) > 0 || hdr.get("Content-Encoding") == "" {
-		hdr["Content-Length"] = []string{strconv.FormatInt(sendSize, 10)}
+		hdr["Content-Length"] = slab.one(strconv.FormatInt(sendSize, 10))
 	}
 	w.WriteHeader(code)
 
 	if r.Method != "HEAD" {
-		io.CopyN(w, sendContent, sendSize)
+		serveContentWrite(w, sendContent, sendSize, toEOF)
 	}
 }
 
@@ -625,6 +714,13 @@ func setLastModified(w ResponseWriter, modtime time.Time) {
 	if !isZeroTime(modtime) {
 		var buf [len(TimeFormat)]byte
 		w.Header()["Last-Modified"] = []string{string(internal.AppendHTTPDate(buf[:0], modtime))}
+	}
+}
+
+func setLastModifiedWithSlab(w ResponseWriter, modtime time.Time, slab *headerSlab) {
+	if !isZeroTime(modtime) {
+		var buf [len(TimeFormat)]byte
+		w.Header()["Last-Modified"] = slab.one(string(internal.AppendHTTPDate(buf[:0], modtime)))
 	}
 }
 

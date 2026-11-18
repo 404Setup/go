@@ -18,6 +18,8 @@
 
 package http
 
+import "slices"
+
 // A routingNode is a node in the decision tree.
 // The same struct is used for leaf and interior nodes.
 type routingNode struct {
@@ -33,6 +35,36 @@ type routingNode struct {
 	children   mapping[string, *routingNode]
 	multiChild *routingNode // child with multi wildcard
 	emptyChild *routingNode // optimization: child with key ""
+	namedMulti bool
+	multiLeaf  bool
+}
+
+// clone returns an independent immutable snapshot of the subtree rooted at n,
+// sharing only immutable pattern metadata and handler values.
+func (n *routingNode) clone() *routingNode {
+	if n == nil {
+		return nil
+	}
+	c := &routingNode{
+		pattern:    n.pattern,
+		handler:    n.handler,
+		multiChild: n.multiChild.clone(),
+		emptyChild: n.emptyChild.clone(),
+		namedMulti: n.namedMulti,
+		multiLeaf:  n.multiLeaf,
+	}
+	if len(n.children.s) > 0 {
+		c.children.s = make([]entry[string, *routingNode], len(n.children.s))
+		for i, e := range n.children.s {
+			c.children.s[i] = entry[string, *routingNode]{key: e.key, value: e.value.clone()}
+		}
+	} else if len(n.children.m) > 0 {
+		c.children.m = make(map[string]*routingNode, len(n.children.m))
+		for k, v := range n.children.m {
+			c.children.m[k] = v.clone()
+		}
+	}
+	return c
 }
 
 // addPattern adds a pattern and its associated Handler to the tree
@@ -77,6 +109,11 @@ func (n *routingNode) set(p *pattern, h Handler) {
 	}
 	n.pattern = p
 	n.handler = h
+	if len(p.segments) > 0 {
+		last := p.lastSegment()
+		n.multiLeaf = last.multi
+		n.namedMulti = last.multi && last.s != ""
+	}
 }
 
 // addChild adds a child node with the given key to n
@@ -102,8 +139,53 @@ func (n *routingNode) findChild(key string) *routingNode {
 	if key == "" {
 		return n.emptyChild
 	}
+	if len(n.children.s) == 0 && n.children.m == nil {
+		return nil
+	}
 	r, _ := n.children.find(key)
 	return r
+}
+
+type matchBuf struct {
+	buf   [8]string
+	extra []string
+	n     int
+}
+
+func (mb *matchBuf) push(s string) int {
+	mark := mb.n
+	if mb.extra == nil {
+		if mb.n < len(mb.buf) {
+			mb.buf[mb.n] = s
+			mb.n++
+			return mark
+		}
+		mb.extra = make([]string, len(mb.buf), len(mb.buf)*2)
+		copy(mb.extra, mb.buf[:])
+	}
+	mb.extra = append(mb.extra, s)
+	mb.n++
+	return mark
+}
+
+func (mb *matchBuf) rollback(mark int) {
+	mb.n = mark
+	if mb.extra != nil {
+		mb.extra = mb.extra[:mark]
+	}
+}
+
+func (mb *matchBuf) result() []string {
+	if mb.n == 0 {
+		return nil
+	}
+	res := make([]string, mb.n)
+	if mb.extra != nil {
+		copy(res, mb.extra)
+	} else {
+		copy(res, mb.buf[:mb.n])
+	}
+	return res
 }
 
 // match returns the leaf node under root that matches the arguments, and a list
@@ -126,76 +208,73 @@ func (root *routingNode) match(host, method, path string) (*routingNode, []strin
 
 // matchTrailingSlash is like match, but matches as if path had a trailing slash.
 // It avoids allocating path + "/" when checking for trailing slash redirection.
-func (root *routingNode) matchTrailingSlash(host, method, path string) (*routingNode, []string) {
+func (root *routingNode) matchTrailingSlash(host, method, path string) *routingNode {
 	if host != "" {
 		if c := root.findChild(host); c != nil {
-			if l, m := c.matchMethodAndPathTrailingSlash(method, path); l != nil {
-				return l, m
+			if l := c.matchMethodAndPathTrailingSlash(method, path); l != nil {
+				return l
 			}
 		}
 	}
 	return root.emptyChild.matchMethodAndPathTrailingSlash(method, path)
 }
 
-func (n *routingNode) matchMethodAndPathTrailingSlash(method, path string) (*routingNode, []string) {
+func (n *routingNode) matchMethodAndPathTrailingSlash(method, path string) *routingNode {
 	if n == nil {
-		return nil, nil
+		return nil
 	}
-	if c := n.findChild(method); c != nil {
-		if l, m := c.matchPathTrailingSlash(path, nil); l != nil {
-			return l, m
+	if len(n.children.s) > 0 || n.children.m != nil {
+		if c := n.findChild(method); c != nil {
+			if l := c.matchPathTrailingSlash(path); l != nil {
+				return l
+			}
 		}
-	}
-	if method == "HEAD" {
-		if c := n.findChild("GET"); c != nil {
-			if l, m := c.matchPathTrailingSlash(path, nil); l != nil {
-				return l, m
+		if method == "HEAD" {
+			if c := n.findChild("GET"); c != nil {
+				if l := c.matchPathTrailingSlash(path); l != nil {
+					return l
+				}
 			}
 		}
 	}
 	if n.emptyChild == nil {
-		return nil, nil
+		return nil
 	}
-	return n.emptyChild.matchPathTrailingSlash(path, nil)
+	return n.emptyChild.matchPathTrailingSlash(path)
 }
 
-func (n *routingNode) matchPathTrailingSlash(path string, matches []string) (*routingNode, []string) {
+func (n *routingNode) matchPathTrailingSlash(path string) *routingNode {
 	if n == nil {
-		return nil, nil
+		return nil
 	}
 	if path == "" {
 		// All path segments matched; now match the virtual trailing slash.
-		if c := n.findChild("/"); c != nil && c.pattern != nil {
-			return c, matches
+		if len(n.children.s) > 0 || n.children.m != nil {
+			if c := n.findChild("/"); c != nil && c.pattern != nil {
+				return c
+			}
 		}
 		if c := n.multiChild; c != nil {
-			if c.pattern.lastSegment().s != "" {
-				matches = append(matches, "")
-			}
-			return c, matches
+			return c
 		}
-		return nil, nil
+		return nil
 	}
-	if n.children.s != nil || n.children.m != nil || n.emptyChild != nil {
+	if len(n.children.s) > 0 || n.children.m != nil || n.emptyChild != nil {
 		seg, rest := firstSegment(path)
-		if c := n.findChild(seg); c != nil {
-			if leaf, m := c.matchPathTrailingSlash(rest, matches); leaf != nil {
-				return leaf, m
+		if len(n.children.s) > 0 || n.children.m != nil {
+			if c := n.findChild(seg); c != nil {
+				if leaf := c.matchPathTrailingSlash(rest); leaf != nil {
+					return leaf
+				}
 			}
 		}
 		if seg != "/" && n.emptyChild != nil {
-			if leaf, m := n.emptyChild.matchPathTrailingSlash(rest, append(matches, seg)); leaf != nil {
-				return leaf, m
+			if leaf := n.emptyChild.matchPathTrailingSlash(rest); leaf != nil {
+				return leaf
 			}
 		}
 	}
-	if c := n.multiChild; c != nil {
-		if c.pattern.lastSegment().s != "" {
-			matches = append(matches, pathUnescape(path[1:])+"/")
-		}
-		return c, matches
-	}
-	return nil, nil
+	return n.multiChild
 }
 
 // matchMethodAndPath matches the method and path.
@@ -205,17 +284,22 @@ func (n *routingNode) matchMethodAndPath(method, path string) (*routingNode, []s
 	if n == nil {
 		return nil, nil
 	}
-	if c := n.findChild(method); c != nil {
-		if l, m := c.matchPath(path, nil); l != nil {
-			// Exact match of method name.
-			return l, m
+	var mb matchBuf
+	if len(n.children.s) > 0 || n.children.m != nil {
+		if c := n.findChild(method); c != nil {
+			if l := c.matchPath(path, &mb); l != nil {
+				// Exact match of method name.
+				return l, mb.result()
+			}
+			mb.rollback(0)
 		}
-	}
-	if method == "HEAD" {
-		// GET matches HEAD too.
-		if c := n.findChild("GET"); c != nil {
-			if l, m := c.matchPath(path, nil); l != nil {
-				return l, m
+		if method == "HEAD" {
+			// GET matches HEAD too.
+			if c := n.findChild("GET"); c != nil {
+				if l := c.matchPath(path, &mb); l != nil {
+					return l, mb.result()
+				}
+				mb.rollback(0)
 			}
 		}
 	}
@@ -223,16 +307,18 @@ func (n *routingNode) matchMethodAndPath(method, path string) (*routingNode, []s
 	if n.emptyChild == nil {
 		return nil, nil
 	}
-	return n.emptyChild.matchPath(path, nil)
+	if l := n.emptyChild.matchPath(path, &mb); l != nil {
+		return l, mb.result()
+	}
+	return nil, nil
 }
 
 // matchPath matches a path.
 // Its return values are the same as [routingNode.match].
-// matchPath calls itself recursively. The matches argument holds the wildcard matches
-// found so far.
-func (n *routingNode) matchPath(path string, matches []string) (*routingNode, []string) {
+// matchPath calls itself recursively. Matched wildcard values are recorded into mb.
+func (n *routingNode) matchPath(path string, mb *matchBuf) *routingNode {
 	if n == nil {
-		return nil, nil
+		return nil
 	}
 	// If path is empty, then we are done.
 	// If n is a leaf node, we found a match; return it.
@@ -240,34 +326,50 @@ func (n *routingNode) matchPath(path string, matches []string) (*routingNode, []
 	// then we failed to match.
 	if path == "" {
 		if n.pattern == nil {
-			return nil, nil
+			return nil
 		}
-		return n, matches
+		return n
 	}
-	if n.children.s != nil || n.children.m != nil || n.emptyChild != nil {
-		// Get the first segment of path.
-		seg, rest := firstSegment(path)
-		// First try matching against patterns that have a literal for this position.
-		// We know by construction that such patterns are more specific than those
-		// with a wildcard at this position (they are either more specific, equivalent,
-		// or overlap, and we ruled out the first two when the patterns were registered).
-		if c := n.findChild(seg); c != nil {
-			if n, m := c.matchPath(rest, matches); n != nil {
-				return n, m
+	if len(n.children.s) > 0 || n.children.m != nil || n.emptyChild != nil {
+		if path == "/" {
+			if len(n.children.s) > 0 || n.children.m != nil {
+				if c := n.findChild("/"); c != nil {
+					if l := c.matchPath("", mb); l != nil {
+						return l
+					}
+				}
 			}
-		}
-		// If matching a literal fails, try again with patterns that have a single
-		// wildcard (represented by an empty string in the child mapping).
-		// Again, by construction, patterns with a single wildcard must be more specific than
-		// those with a multi wildcard.
-		// We skip this step if the segment is a trailing slash, because single wildcards
-		// don't match trailing slashes.
-		if seg != "/" && n.emptyChild != nil {
-			// Only build the extended matches slice when there is a single-wildcard
-			// child to try; otherwise append would allocate a slice that is
-			// immediately discarded.
-			if n, m := n.emptyChild.matchPath(rest, append(matches, seg)); n != nil {
-				return n, m
+		} else {
+			// Get the first segment of path.
+			seg, rest := firstSegment(path)
+			// First try matching against patterns that have a literal for this position.
+			// We know by construction that such patterns are more specific than those
+			// with a wildcard at this position (they are either more specific, equivalent,
+			// or overlap, and we ruled out the first two when the patterns were registered).
+			if len(n.children.s) > 0 || n.children.m != nil {
+				if c := n.findChild(seg); c != nil {
+					if l := c.matchPath(rest, mb); l != nil {
+						return l
+					}
+				}
+			}
+			// If matching a literal fails, try again with patterns that have a single
+			// wildcard (represented by an empty string in the child mapping).
+			// Again, by construction, patterns with a single wildcard must be more specific than
+			// those with a multi wildcard.
+			// We skip this step if the segment is a trailing slash, because single wildcards
+			// don't match trailing slashes.
+			if seg != "/" && n.emptyChild != nil {
+				var mark int
+				if mb != nil {
+					mark = mb.push(seg)
+				}
+				if l := n.emptyChild.matchPath(rest, mb); l != nil {
+					return l
+				}
+				if mb != nil {
+					mb.rollback(mark)
+				}
 			}
 		}
 	}
@@ -276,12 +378,12 @@ func (n *routingNode) matchPath(path string, matches []string) (*routingNode, []
 	if c := n.multiChild; c != nil {
 		// Don't record a match for a nameless wildcard (which arises from a
 		// trailing slash in the pattern).
-		if c.pattern.lastSegment().s != "" {
-			matches = append(matches, pathUnescape(path[1:])) // remove initial slash
+		if c.namedMulti && mb != nil {
+			mb.push(pathUnescape(path[1:])) // remove initial slash
 		}
-		return c, matches
+		return c
 	}
-	return nil, nil
+	return nil
 }
 
 // firstSegment splits path into its first segment, and the rest.
@@ -329,7 +431,7 @@ func (n *routingNode) matchingMethodsPath(path string, set map[string]bool) {
 		return
 	}
 	n.children.eachPair(func(method string, c *routingNode) bool {
-		if p, _ := c.matchPath(path, nil); p != nil {
+		if p := c.matchPath(path, nil); p != nil {
 			set[method] = true
 		}
 		return true
@@ -337,4 +439,44 @@ func (n *routingNode) matchingMethodsPath(path string, set map[string]bool) {
 	// Don't look at the empty child. If there were an empty
 	// child, it would match on any method, but we only
 	// call this when we fail to match on a method.
+}
+
+func (root *routingNode) appendMatchingMethods(host, path string, trailingSlash bool, dst []string) []string {
+	if host != "" {
+		dst = root.findChild(host).appendMatchingMethodsPath(path, trailingSlash, dst)
+	}
+	dst = root.emptyChild.appendMatchingMethodsPath(path, trailingSlash, dst)
+	return dst
+}
+
+func (n *routingNode) appendMatchingMethodsPath(path string, trailingSlash bool, dst []string) []string {
+	if n == nil {
+		return dst
+	}
+	if n.children.m != nil {
+		for method, c := range n.children.m {
+			var p *routingNode
+			if trailingSlash {
+				p = c.matchPathTrailingSlash(path)
+			} else {
+				p = c.matchPath(path, nil)
+			}
+			if p != nil && !slices.Contains(dst, method) {
+				dst = append(dst, method)
+			}
+		}
+	} else {
+		for _, e := range n.children.s {
+			var p *routingNode
+			if trailingSlash {
+				p = e.value.matchPathTrailingSlash(path)
+			} else {
+				p = e.value.matchPath(path, nil)
+			}
+			if p != nil && !slices.Contains(dst, e.key) {
+				dst = append(dst, e.key)
+			}
+		}
+	}
+	return dst
 }

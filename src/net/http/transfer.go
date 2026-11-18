@@ -148,8 +148,10 @@ func newTransferWriter(r any) (t transferWriter, err error) {
 	// Validate Trailer names and values. The names are later written
 	// unmodified on the "Trailer:" line of the header, so invalid bytes
 	// (in particular CR and LF) would permit header injection. (Issue 78775.)
-	if err := validateTrailers(t.Trailer); err != "" {
-		return t, fmt.Errorf("net/http: invalid trailer %s", err)
+	if len(t.Trailer) > 0 {
+		if err := validateTrailers(t.Trailer); err != "" {
+			return t, fmt.Errorf("net/http: invalid trailer %s", err)
+		}
 	}
 
 	return t, nil
@@ -967,6 +969,48 @@ type body struct {
 	closed      bool
 	dropTrailer bool        // if true, do not populate hdr.Trailer
 	onHitEOF    eofListener // if non-nil, listener to notify when EOF is Read
+
+	// Optional EOF/close signaling state when attached by HTTP/1 persistConn.readLoop.
+	// Lock ordering: holders of sigMu MUST NOT acquire mu except in closeInner
+	// after EOF; Read always releases mu before acquiring sigMu.
+	sigAttached        bool
+	sigMu              sync.Mutex
+	sigClosed          bool
+	sigDone            bool
+	sigRerr            error
+	sigPC              *persistConn
+	sigWaitForBodyRead chan bodyReadStatus
+	sigEOFC            chan struct{}
+}
+
+func (b *body) attachEOFSignal(pc *persistConn, waitForBodyRead chan bodyReadStatus, eofc chan struct{}) {
+	b.sigAttached = true
+	b.sigPC = pc
+	b.sigWaitForBodyRead = waitForBodyRead
+	b.sigEOFC = eofc
+}
+
+// caller must hold b.sigMu.
+func (b *body) sigCondfnLocked(err error) error {
+	if b.sigDone {
+		return err
+	}
+	b.sigDone = true
+	if b.sigWaitForBodyRead == nil {
+		return err
+	}
+	if err == io.EOF {
+		b.sigWaitForBodyRead <- bodyReadEOF
+		<-b.sigEOFC // see comment above eofc declaration in transport.go
+	} else {
+		b.sigWaitForBodyRead <- bodyReadError
+		if err != nil && b.sigPC != nil {
+			if cerr := b.sigPC.canceled(); cerr != nil {
+				return cerr
+			}
+		}
+	}
+	return err
 }
 
 // ErrBodyReadAfterClose is returned when reading a [Request] or [Response]
@@ -978,6 +1022,35 @@ var ErrBodyReadAfterClose = errors.New("http: invalid Read on closed Body")
 func (b *body) Read(p []byte) (n int, err error) {
 	if b == nil {
 		return 0, io.EOF
+	}
+	if b.sigAttached {
+		b.sigMu.Lock()
+		closed, rerr := b.sigClosed, b.sigRerr
+		b.sigMu.Unlock()
+		if closed {
+			return 0, errReadOnClosedResBody
+		}
+		if rerr != nil {
+			return 0, rerr
+		}
+		b.mu.Lock()
+		var sawErr error
+		if b.closed {
+			err = ErrBodyReadAfterClose
+		} else {
+			n, err = b.readLocked(p)
+			sawErr = err
+		}
+		b.mu.Unlock()
+		if sawErr != nil {
+			b.sigMu.Lock()
+			if b.sigRerr == nil {
+				b.sigRerr = sawErr
+			}
+			err = b.sigCondfnLocked(sawErr)
+			b.sigMu.Unlock()
+		}
+		return n, err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1158,6 +1231,38 @@ func (b *body) Close() error {
 	if b == nil {
 		return nil
 	}
+	if b.sigAttached {
+		b.sigMu.Lock()
+		if b.sigClosed {
+			b.sigMu.Unlock()
+			return nil
+		}
+		b.sigClosed = true
+		if !b.sigDone && b.sigRerr == nil {
+			b.sigDone = true
+			waitCh, eofc := b.sigWaitForBodyRead, b.sigEOFC
+			b.sigMu.Unlock()
+			if waitCh != nil {
+				waitCh <- bodyReadClosedEarly
+				<-eofc // will be closed by deferred call at the end of readLoop
+			}
+			return nil
+		}
+		if b.sigRerr != nil && b.sigRerr != io.EOF {
+			// Read already returned this error and readLoop gave up the
+			// connection. Draining would only read the same error again.
+			b.sigMu.Unlock()
+			return nil
+		}
+		err := b.closeInner()
+		err = b.sigCondfnLocked(err)
+		b.sigMu.Unlock()
+		return err
+	}
+	return b.closeInner()
+}
+
+func (b *body) closeInner() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
@@ -1224,6 +1329,22 @@ func (b *body) registerOnHitEOF(fn eofListener) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.onHitEOF = fn
+}
+
+// bodyDrainReader reads from the underlying *body during transport body draining,
+// bypassing HTTP/1 transport close/EOF signaling.
+type bodyDrainReader struct {
+	b *body
+}
+
+func (bd bodyDrainReader) Read(p []byte) (int, error) {
+	b := bd.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, ErrBodyReadAfterClose
+	}
+	return b.readLocked(p)
 }
 
 // bodyLocked is an io.Reader reading from a *body when its mutex is
