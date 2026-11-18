@@ -8828,3 +8828,386 @@ func TestServerConnWorkerPoolPruning(t *testing.T) {
 	t.Fatalf("worker pools not pruned after GC: connWorkers=%d (max %d), bgWorkers=%d (max %d)",
 		nConn, maxConn, nBg, maxBg)
 }
+
+func TestServerFlatHeaderSnapshotEdgeCases(t *testing.T) {
+	t.Parallel()
+	var errLog bytes.Buffer
+	var mu sync.Mutex
+	largeHeaderVal := strings.Repeat("x", 4000)
+
+	mux := NewServeMux()
+	mux.HandleFunc("/many-large", func(w ResponseWriter, r *Request) {
+		h := w.Header()
+		for i := range 20 {
+			h.Set(fmt.Sprintf("X-K-%02d", i), fmt.Sprintf("v-%02d", i))
+		}
+		h.Add("X-Multi", "m1")
+		h.Add("X-Multi", "m2")
+		h["X-Nil"] = nil
+		h.Set("X-Sanitize", "a\r\nb\nc")
+		h.Set("X-Large", largeHeaderVal)
+		w.WriteHeader(StatusOK)
+		// Mutations after WriteHeader must not affect wire headers.
+		h.Set("X-After", "mutated")
+		h.Set("X-K-00", "mutated")
+		io.WriteString(w, "many-ok")
+	})
+	mux.HandleFunc("/next-pooled", func(w ResponseWriter, r *Request) {
+		w.Header().Set("X-Clean", "yes")
+		io.WriteString(w, "clean")
+	})
+	mux.HandleFunc("/empty-before-wh", func(w ResponseWriter, r *Request) {
+		h := w.Header()
+		w.WriteHeader(StatusOK)
+		h.Set("X-Post-Empty", "mutated")
+		io.WriteString(w, strings.Repeat("y", 3000))
+	})
+	mux.HandleFunc("/unaccessed-before-wh", func(w ResponseWriter, r *Request) {
+		w.WriteHeader(StatusOK)
+		w.Header().Set("X-Post-Unaccessed", "mutated")
+		NewResponseController(w).Flush()
+		io.WriteString(w, "ok")
+	})
+	mux.HandleFunc("/trailer", func(w ResponseWriter, r *Request) {
+		h := w.Header()
+		h.Set("Trailer", "X-Tr-Decl")
+		h.Set("Trailer:X-Tr-Pref", "orig")
+		w.WriteHeader(StatusOK)
+		h.Set("Trailer:X-Tr-Pref", "updated")
+		io.WriteString(w, strings.Repeat("t", 3000))
+		h.Set("X-Tr-Decl", "decl-val")
+	})
+	mux.HandleFunc("/304", func(w ResponseWriter, r *Request) {
+		h := w.Header()
+		h.Set("Content-Type", "text/html")
+		h.Set("Content-Length", "100")
+		h.Set("Transfer-Encoding", "chunked")
+		h.Set("X-Keep", "yes")
+		w.WriteHeader(StatusNotModified)
+	})
+	mux.HandleFunc("/101", func(w ResponseWriter, r *Request) {
+		h := w.Header()
+		h.Set("Upgrade", "websocket")
+		h.Set("Connection", "Upgrade")
+		w.WriteHeader(StatusSwitchingProtocols)
+	})
+	mux.HandleFunc("/invalid-cl", func(w ResponseWriter, r *Request) {
+		w.Header().Set("Content-Length", "notanumber")
+		w.WriteHeader(StatusOK)
+		io.WriteString(w, "inv")
+	})
+
+	ts := httptest.NewUnstartedServer(mux)
+	ts.Config.ErrorLog = log.New(&syncWriter{mu: &mu, w: &errLog}, "", 0)
+	ts.Start()
+	defer ts.Close()
+
+	client := ts.Client()
+
+	// Sequential requests on a single keep-alive connection verify pool hygiene.
+	res, err := client.Get(ts.URL + "/many-large")
+	if err != nil {
+		t.Fatalf("GET /many-large: %v", err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if string(body) != "many-ok" {
+		t.Fatalf("/many-large body = %q, want many-ok", body)
+	}
+	for i := range 20 {
+		key := fmt.Sprintf("X-K-%02d", i)
+		want := fmt.Sprintf("v-%02d", i)
+		if got := res.Header.Get(key); got != want {
+			t.Errorf("/many-large %s = %q, want %q", key, got, want)
+		}
+	}
+	if got := res.Header.Values("X-Multi"); len(got) != 2 || got[0] != "m1" || got[1] != "m2" {
+		t.Errorf("/many-large X-Multi = %v, want [m1 m2]", got)
+	}
+	if _, ok := res.Header["X-Nil"]; ok {
+		t.Errorf("/many-large X-Nil unexpectedly present")
+	}
+	if got := res.Header.Get("X-Sanitize"); got != "a  b c" {
+		t.Errorf("/many-large X-Sanitize = %q, want \"a  b c\"", got)
+	}
+	if got := res.Header.Get("X-Large"); got != largeHeaderVal {
+		t.Errorf("/many-large X-Large len = %d, want %d", len(got), len(largeHeaderVal))
+	}
+	if got := res.Header.Get("X-After"); got != "" {
+		t.Errorf("/many-large X-After leaked: %q", got)
+	}
+
+	res2, err := client.Get(ts.URL + "/next-pooled")
+	if err != nil {
+		t.Fatalf("GET /next-pooled: %v", err)
+	}
+	body2, _ := io.ReadAll(res2.Body)
+	res2.Body.Close()
+	if string(body2) != "clean" || res2.Header.Get("X-Clean") != "yes" {
+		t.Fatalf("/next-pooled got (%q, %q)", body2, res2.Header.Get("X-Clean"))
+	}
+	for i := range 20 {
+		if got := res2.Header.Get(fmt.Sprintf("X-K-%02d", i)); got != "" {
+			t.Errorf("/next-pooled leaked X-K-%02d = %q", i, got)
+		}
+	}
+
+	for _, path := range []string{"/empty-before-wh", "/unaccessed-before-wh"} {
+		r, err := client.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+		if got := r.Header.Get("X-Post-Empty"); got != "" {
+			t.Errorf("%s leaked X-Post-Empty=%q", path, got)
+		}
+		if got := r.Header.Get("X-Post-Unaccessed"); got != "" {
+			t.Errorf("%s leaked X-Post-Unaccessed=%q", path, got)
+		}
+	}
+
+	rTr, err := client.Get(ts.URL + "/trailer")
+	if err != nil {
+		t.Fatalf("GET /trailer: %v", err)
+	}
+	if _, ok := rTr.Trailer[CanonicalHeaderKey("X-Tr-Decl")]; !ok {
+		t.Errorf("/trailer response Trailer missing pre-declared X-Tr-Decl")
+	}
+	if _, ok := rTr.Header["Trailer:X-Tr-Pref"]; ok {
+		t.Errorf("/trailer leaked Trailer:X-Tr-Pref into response headers")
+	}
+	io.Copy(io.Discard, rTr.Body)
+	rTr.Body.Close()
+	if got := rTr.Trailer.Get("X-Tr-Decl"); got != "decl-val" {
+		t.Errorf("/trailer X-Tr-Decl = %q, want decl-val", got)
+	}
+	if got := rTr.Trailer.Get("X-Tr-Pref"); got != "updated" {
+		t.Errorf("/trailer X-Tr-Pref = %q, want updated", got)
+	}
+
+	r304, err := client.Get(ts.URL + "/304")
+	if err != nil {
+		t.Fatalf("GET /304: %v", err)
+	}
+	r304.Body.Close()
+	if r304.StatusCode != StatusNotModified {
+		t.Errorf("/304 status = %d, want 304", r304.StatusCode)
+	}
+	if r304.Header.Get("X-Keep") != "yes" {
+		t.Errorf("/304 X-Keep = %q, want yes", r304.Header.Get("X-Keep"))
+	}
+	for _, suppressed := range []string{"Content-Type", "Content-Length", "Transfer-Encoding"} {
+		if _, ok := r304.Header[suppressed]; ok {
+			t.Errorf("/304 unexpectedly sent %s", suppressed)
+		}
+	}
+
+	rawConn, err := net.Dial("tcp", strings.TrimPrefix(ts.URL, "http://"))
+	if err != nil {
+		t.Fatalf("Dial /101: %v", err)
+	}
+	defer rawConn.Close()
+	if _, err := io.WriteString(rawConn, "GET /101 HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	rawResp, err := ReadResponse(bufio.NewReader(rawConn), nil)
+	if err != nil {
+		t.Fatalf("ReadResponse /101: %v", err)
+	}
+	rawResp.Body.Close()
+	if rawResp.StatusCode != StatusSwitchingProtocols {
+		t.Errorf("/101 status = %d, want 101", rawResp.StatusCode)
+	}
+	if got := rawResp.Header.Get("Connection"); !strings.EqualFold(got, "Upgrade") {
+		t.Errorf("/101 Connection = %q, want Upgrade", got)
+	}
+	if got := rawResp.Header.Get("Upgrade"); got != "websocket" {
+		t.Errorf("/101 Upgrade = %q, want websocket", got)
+	}
+
+	rInv, err := client.Get(ts.URL + "/invalid-cl")
+	if err != nil {
+		t.Fatalf("GET /invalid-cl: %v", err)
+	}
+	bInv, _ := io.ReadAll(rInv.Body)
+	rInv.Body.Close()
+	if string(bInv) != "inv" {
+		t.Errorf("/invalid-cl body = %q, want inv", bInv)
+	}
+	mu.Lock()
+	logOut := errLog.String()
+	mu.Unlock()
+	if !strings.Contains(logOut, "invalid Content-Length") {
+		t.Errorf("/invalid-cl error log = %q, want invalid Content-Length", logOut)
+	}
+}
+
+type syncWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (sw *syncWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
+type deadlineTrackingConn struct {
+	net.Conn
+	readZero     atomic.Int64
+	readNonZero  atomic.Int64
+	writeZero    atomic.Int64
+	writeNonZero atomic.Int64
+}
+
+func (c *deadlineTrackingConn) SetReadDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.readZero.Add(1)
+	} else {
+		c.readNonZero.Add(1)
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *deadlineTrackingConn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.writeZero.Add(1)
+	} else {
+		c.writeNonZero.Add(1)
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
+type presetDeadlineListener struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []*deadlineTrackingConn
+}
+
+func (l *presetDeadlineListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	// Pre-set short deadlines before handing conn to http.Server to verify
+	// request #1 clears listener-inherited deadlines.
+	dl := time.Now().Add(25 * time.Millisecond)
+	_ = c.SetReadDeadline(dl)
+	_ = c.SetWriteDeadline(dl)
+	tc := &deadlineTrackingConn{Conn: c}
+	l.mu.Lock()
+	l.conns = append(l.conns, tc)
+	l.mu.Unlock()
+	return tc, nil
+}
+
+func TestServerKeepAliveDeadlineResetTracking(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pdl := &presetDeadlineListener{Listener: ln}
+	srv := &Server{
+		Handler: HandlerFunc(func(w ResponseWriter, r *Request) {
+			switch r.URL.Path {
+			case "/set":
+				rc := NewResponseController(w)
+				dl := time.Now().Add(20 * time.Millisecond)
+				if err := rc.SetReadDeadline(dl); err != nil {
+					t.Errorf("SetReadDeadline: %v", err)
+				}
+				if err := rc.SetWriteDeadline(dl); err != nil {
+					t.Errorf("SetWriteDeadline: %v", err)
+				}
+				io.WriteString(w, "set-ok")
+			case "/wait":
+				io.Copy(io.Discard, r.Body)
+				time.Sleep(35 * time.Millisecond)
+				io.WriteString(w, "wait-ok")
+			default:
+				io.WriteString(w, "fast-ok")
+			}
+		}),
+	}
+	errc := make(chan error, 1)
+	go func() {
+		errc <- srv.Serve(pdl)
+	}()
+	defer func() {
+		srv.Close()
+		<-errc
+	}()
+
+	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawConn.Close()
+	br := bufio.NewReader(rawConn)
+
+	// 1) Handler sets short read/write deadlines; server must clear both after request 1
+	//    and also clear the listener's pre-set deadlines.
+	if _, err := io.WriteString(rawConn, "GET /set HTTP/1.1\r\nHost: example.com\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	r1, err := ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("ReadResponse 1: %v", err)
+	}
+	b1, _ := io.ReadAll(r1.Body)
+	r1.Body.Close()
+	if string(b1) != "set-ok" {
+		t.Fatalf("resp1 = %q, want set-ok", b1)
+	}
+
+	// Sleep past both listener pre-set deadline (25ms) and /set handler deadline (20ms),
+	// then send request 2 whose handler also sleeps 35ms before writing.
+	time.Sleep(35 * time.Millisecond)
+	if _, err := io.WriteString(rawConn, "POST /wait HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello"); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("ReadResponse 2: %v", err)
+	}
+	b2, _ := io.ReadAll(r2.Body)
+	r2.Body.Close()
+	if string(b2) != "wait-ok" {
+		t.Fatalf("resp2 = %q, want wait-ok", b2)
+	}
+
+	pdl.mu.Lock()
+	tc := pdl.conns[0]
+	pdl.mu.Unlock()
+	beforeReadZero := tc.readZero.Load()
+	beforeWriteZero := tc.writeZero.Load()
+
+	// 3) Pipeline 3 requests in a single write so c.bufr.Buffered() >= 4 between them.
+	//    With no ReadTimeout/WriteTimeout/idle-wait, zero extra Set*Deadline(zero) calls should run.
+	if _, err := io.WriteString(rawConn,
+		"GET /fast HTTP/1.1\r\nHost: example.com\r\n\r\n"+
+			"GET /fast HTTP/1.1\r\nHost: example.com\r\n\r\n"+
+			"GET /fast HTTP/1.1\r\nHost: example.com\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		rp, err := ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("pipelined ReadResponse %d: %v", i, err)
+		}
+		bp, _ := io.ReadAll(rp.Body)
+		rp.Body.Close()
+		if string(bp) != "fast-ok" {
+			t.Fatalf("pipelined resp %d = %q, want fast-ok", i, bp)
+		}
+	}
+	// Note the idle wait after the 1st of the 3 or end of pipeline may clear once if not buffered yet,
+	// so verify the final 2 pipelined iterations did not each call SetWriteDeadline(zero).
+	afterWriteZero := tc.writeZero.Load()
+	if afterWriteZero != beforeWriteZero {
+		t.Errorf("SetWriteDeadline(zero) called %d extra times on steady-state keep-alive requests; want 0", afterWriteZero-beforeWriteZero)
+	}
+	_ = beforeReadZero
+}

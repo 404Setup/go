@@ -654,6 +654,36 @@ func writeReqLine(w io.Writer, a, b, c, d string) error {
 	return err
 }
 
+func writeReqLineQuery(w io.Writer, method, path, query string) error {
+	total := len(method) + 1 + len(path) + 1 + len(query) + len(" HTTP/1.1\r\n")
+	if bufw, ok := w.(*bufio.Writer); ok {
+		if total <= bufw.Available() {
+			buf := bufw.AvailableBuffer()
+			buf = append(buf, method...)
+			buf = append(buf, ' ')
+			buf = append(buf, path...)
+			buf = append(buf, '?')
+			buf = append(buf, query...)
+			buf = append(buf, " HTTP/1.1\r\n"...)
+			_, err := bufw.Write(buf)
+			return err
+		}
+	}
+	var stack [256]byte
+	buf := stack[:0]
+	if total > len(stack) {
+		buf = make([]byte, 0, total)
+	}
+	buf = append(buf, method...)
+	buf = append(buf, ' ')
+	buf = append(buf, path...)
+	buf = append(buf, '?')
+	buf = append(buf, query...)
+	buf = append(buf, " HTTP/1.1\r\n"...)
+	_, err := w.Write(buf)
+	return err
+}
+
 // Write writes an HTTP/1.1 request, which is the header and body, in wire format.
 // This method consults the following fields of the request:
 //
@@ -674,7 +704,7 @@ func writeReqLine(w io.Writer, a, b, c, d string) error {
 // If the Header does not contain a User-Agent value, Write uses
 // "Go-http-client/1.1".
 func (r *Request) Write(w io.Writer) error {
-	return r.write(w, false, nil, nil)
+	return r.write(w, false, nil, false, false, nil)
 }
 
 // WriteProxy is like [Request.Write] but writes the request in the form
@@ -684,7 +714,7 @@ func (r *Request) Write(w io.Writer) error {
 // In either case, WriteProxy also writes a Host header, using
 // either r.Host or r.URL.Host.
 func (r *Request) WriteProxy(w io.Writer) error {
-	return r.write(w, true, nil, nil)
+	return r.write(w, true, nil, false, false, nil)
 }
 
 // errMissingHost is returned by Write when there is no Host or URL present in
@@ -694,7 +724,7 @@ var errMissingHost = errors.New("http: Request.Write on Request with no Host or 
 // extraHeaders may be nil
 // waitForContinue may be nil
 // always closes body
-func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitForContinue func() bool) (err error) {
+func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, addedGzip, addedClose bool, waitForContinue func() bool) (err error) {
 	trace := httptrace.ContextClientTrace(r.Context())
 	if trace != nil && trace.WroteRequest != nil {
 		defer func() {
@@ -758,18 +788,32 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	// to an outgoing URI.
 	host = removeZone(host)
 
-	ruri := r.URL.RequestURI()
-	if usingProxy && r.URL.Scheme != "" && r.URL.Opaque == "" {
-		ruri = r.URL.Scheme + "://" + host + ruri
-	} else if r.Method == "CONNECT" && r.URL.Path == "" {
-		// CONNECT requests normally give just the host and port, not a full URL.
-		ruri = host
-		if r.URL.Opaque != "" {
-			ruri = r.URL.Opaque
+	var ruri, ruriQuery string
+	var ruriHasQuery bool
+	if !(usingProxy && r.URL.Scheme != "" && r.URL.Opaque == "") && !(r.Method == "CONNECT" && r.URL.Path == "") && r.URL.Opaque == "" {
+		ruri = r.URL.EscapedPath()
+		if ruri == "" {
+			ruri = "/"
 		}
-	}
-	if stringContainsCTLByte(ruri) {
-		return errors.New("net/http: can't write control character in Request.URL")
+		ruriHasQuery = r.URL.ForceQuery || r.URL.RawQuery != ""
+		ruriQuery = r.URL.RawQuery
+		if stringContainsCTLByte(ruri) || (ruriQuery != "" && stringContainsCTLByte(ruriQuery)) {
+			return errors.New("net/http: can't write control character in Request.URL")
+		}
+	} else {
+		ruri = r.URL.RequestURI()
+		if usingProxy && r.URL.Scheme != "" && r.URL.Opaque == "" {
+			ruri = r.URL.Scheme + "://" + host + ruri
+		} else if r.Method == "CONNECT" && r.URL.Path == "" {
+			// CONNECT requests normally give just the host and port, not a full URL.
+			ruri = host
+			if r.URL.Opaque != "" {
+				ruri = r.URL.Opaque
+			}
+		}
+		if stringContainsCTLByte(ruri) {
+			return errors.New("net/http: can't write control character in Request.URL")
+		}
 	}
 
 	// :protocol is only valid in HTTP/2 and HTTP/3. Transport allows it through
@@ -793,8 +837,14 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		w = bw
 	}
 
-	if err = writeReqLine(w, valueOrDefault(r.Method, "GET"), " ", ruri, " HTTP/1.1\r\n"); err != nil {
-		return err
+	if ruriHasQuery {
+		if err = writeReqLineQuery(w, valueOrDefault(r.Method, "GET"), ruri, ruriQuery); err != nil {
+			return err
+		}
+	} else {
+		if err = writeReqLine(w, valueOrDefault(r.Method, "GET"), " ", ruri, " HTTP/1.1\r\n"); err != nil {
+			return err
+		}
 	}
 
 	// Header lines
@@ -846,6 +896,22 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		err = extraHeaders.write(w, trace)
 		if err != nil {
 			return err
+		}
+	}
+	if addedGzip {
+		if _, err = io.WriteString(w, "Accept-Encoding: gzip\r\n"); err != nil {
+			return err
+		}
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("Accept-Encoding", []string{"gzip"})
+		}
+	}
+	if addedClose {
+		if _, err = io.WriteString(w, "Connection: close\r\n"); err != nil {
+			return err
+		}
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("Connection", []string{"close"})
 		}
 	}
 
@@ -1190,6 +1256,9 @@ func ReadRequest(b *bufio.Reader) (*Request, error) {
 //go:linkname readMIMEHeader net/textproto.readMIMEHeader
 func readMIMEHeader(r *textproto.Reader, maxMemory, maxHeaders int64) (textproto.MIMEHeader, error)
 
+//go:linkname readMIMEHeaderFast net/textproto.readMIMEHeaderFast
+func readMIMEHeaderFast(b *bufio.Reader, maxMemory, maxHeaders int64, skipHost bool) (m textproto.MIMEHeader, haveHost bool, hostHeader string, hostCount int, handled bool, err error)
+
 // readRequest should be an internal detail,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
@@ -1212,8 +1281,7 @@ type requestWithURL struct {
 }
 
 var cleanPathTable = [256]bool{
-	'!': true, '$': true, '&': true, '\'': true, '(': true, ')': true,
-	'*': true, '+': true, ',': true, '-': true, '.': true, '/': true,
+	'$': true, '&': true, '+': true, ',': true, '-': true, '.': true, '/': true,
 	'0': true, '1': true, '2': true, '3': true, '4': true, '5': true,
 	'6': true, '7': true, '8': true, '9': true, ':': true, ';': true,
 	'=': true, '@': true,
@@ -1229,13 +1297,24 @@ var cleanPathTable = [256]bool{
 	'y': true, 'z': true, '~': true,
 }
 
-func isCleanRequestPath(b []byte) bool {
-	for _, c := range b {
+// scanCleanOriginURI checks whether b is a clean unescaped origin-form path
+// (matching net/url.encodePath bytes) optionally followed by '?' and a query
+// without control characters.
+func scanCleanOriginURI(b []byte) (qIdx int, ok bool) {
+	for i, c := range b {
 		if !cleanPathTable[c] {
-			return false
+			if c == '?' && i > 0 {
+				for _, qc := range b[i+1:] {
+					if qc < ' ' || qc == 0x7f {
+						return -1, false
+					}
+				}
+				return i, true
+			}
+			return -1, false
 		}
 	}
-	return true
+	return -1, true
 }
 
 func tryReadHostOnlyHeader(b *bufio.Reader, maxHeaders int64) (host string, haveHost, ok bool) {
@@ -1408,10 +1487,27 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64, deleteHost bool) (req *
 		req.RequestURI = "/"
 		ru.url.Path = "/"
 		req.URL = &ru.url
-	} else if len(uriBytes) > 1 && uriBytes[0] == '/' && uriBytes[1] != '/' && isCleanRequestPath(uriBytes) {
-		req.RequestURI = string(uriBytes)
-		ru.url.Path = req.RequestURI
-		req.URL = &ru.url
+	} else if len(uriBytes) > 1 && uriBytes[0] == '/' && uriBytes[1] != '/' {
+		if qIdx, ok := scanCleanOriginURI(uriBytes); ok {
+			s := string(uriBytes)
+			req.RequestURI = s
+			if qIdx < 0 {
+				ru.url.Path = s
+			} else {
+				ru.url.Path = s[:qIdx]
+				if qIdx == len(s)-1 {
+					ru.url.ForceQuery = true
+				} else {
+					ru.url.RawQuery = s[qIdx+1:]
+				}
+			}
+			req.URL = &ru.url
+		} else {
+			req.RequestURI = string(uriBytes)
+			if req.URL, err = url.ParseRequestURI(req.RequestURI); err != nil {
+				return nil, false, "", err
+			}
+		}
 	} else {
 		req.RequestURI = string(uriBytes)
 		rawurl := req.RequestURI
@@ -1448,9 +1544,12 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64, deleteHost bool) (req *
 	}
 
 	// Subsequent lines: Key: value.
-	tp := newTextprotoReader(b)
-	mimeHeader, err := readMIMEHeader(tp, math.MaxInt64, maxHeaders)
-	putTextprotoReader(tp)
+	mimeHeader, hdrHaveHost, hdrHostVal, hostCount, handled, err := readMIMEHeaderFast(b, math.MaxInt64, maxHeaders, deleteHost)
+	if !handled {
+		tp := newTextprotoReader(b)
+		mimeHeader, err = readMIMEHeader(tp, math.MaxInt64, maxHeaders)
+		putTextprotoReader(tp)
+	}
 	if err != nil {
 		if err == io.EOF {
 			return nil, false, "", io.ErrUnexpectedEOF
@@ -1462,13 +1561,21 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64, deleteHost bool) (req *
 		return nil, false, "", err
 	}
 	req.Header = Header(mimeHeader)
-	hosts := req.Header["Host"]
-	if len(hosts) > 1 {
-		return nil, false, "", fmt.Errorf("too many Host headers")
-	}
-	if len(hosts) > 0 {
-		haveHost = true
-		hostHeader = hosts[0]
+	if handled && deleteHost {
+		if hostCount > 1 {
+			return nil, false, "", fmt.Errorf("too many Host headers")
+		}
+		haveHost = hdrHaveHost
+		hostHeader = hdrHostVal
+	} else {
+		hosts := req.Header["Host"]
+		if len(hosts) > 1 {
+			return nil, false, "", fmt.Errorf("too many Host headers")
+		}
+		if len(hosts) > 0 {
+			haveHost = true
+			hostHeader = hosts[0]
+		}
 	}
 
 	// RFC 7230, section 5.3: Must treat
@@ -1482,7 +1589,7 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64, deleteHost bool) (req *
 	if req.Host == "" {
 		req.Host = hostHeader
 	}
-	if deleteHost && haveHost {
+	if deleteHost && haveHost && !handled {
 		delete(req.Header, "Host")
 	}
 

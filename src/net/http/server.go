@@ -321,13 +321,18 @@ type conn struct {
 
 	curState atomic.Uint64 // packed (unixtime<<8|uint8(ConnState))
 
-	// mu guards hijackedv
+	// mu guards Hijack calls.
 	mu sync.Mutex
 
 	// hijackedv is whether this connection has been hijacked
 	// by a Handler with the Hijacker interface.
-	// It is guarded by mu.
-	hijackedv bool
+	hijackedv atomic.Bool
+
+	// readDeadlineSet and writeDeadlineSet track whether a non-zero
+	// deadline may be active on rwc so keep-alive loops can skip redundant
+	// SetReadDeadline(zero) / SetWriteDeadline(zero) calls.
+	readDeadlineSet  atomic.Bool
+	writeDeadlineSet atomic.Bool
 
 	// http2HandedOff is whether the connection has been handed off to
 	// the HTTP/2 server, which then owns closing the connection and
@@ -342,21 +347,46 @@ type conn struct {
 }
 
 func (c *conn) hijacked() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.hijackedv
+	return c.hijackedv.Load()
+}
+
+func (c *conn) setReadDeadline(d time.Time) error {
+	err := c.rwc.SetReadDeadline(d)
+	c.readDeadlineSet.Store(!d.IsZero() || err != nil)
+	return err
+}
+
+func (c *conn) clearReadDeadline() {
+	if c.readDeadlineSet.Load() {
+		c.setReadDeadline(time.Time{})
+	}
+}
+
+func (c *conn) setWriteDeadline(d time.Time) error {
+	err := c.rwc.SetWriteDeadline(d)
+	c.writeDeadlineSet.Store(!d.IsZero() || err != nil)
+	return err
+}
+
+func (c *conn) clearWriteDeadline() {
+	if c.writeDeadlineSet.Load() {
+		c.setWriteDeadline(time.Time{})
+	}
 }
 
 // c.mu must be held.
 func (c *conn) hijackLocked() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
-	if c.hijackedv {
+	if c.hijackedv.Load() {
 		return nil, nil, ErrHijacked
 	}
 	c.r.abortPendingRead()
 
-	c.hijackedv = true
+	c.hijackedv.Store(true)
 	rwc = c.rwc
-	rwc.SetDeadline(time.Time{})
+	if rwc.SetDeadline(time.Time{}) == nil {
+		c.readDeadlineSet.Store(false)
+		c.writeDeadlineSet.Store(false)
+	}
 
 	if c.r.hasByte {
 		if _, err := c.bufr.Peek(c.bufr.Buffered() + 1); err != nil {
@@ -386,11 +416,11 @@ const bufferBeforeChunkingSize = 2048
 type chunkWriter struct {
 	res *response
 
-	// header is either nil or a deep clone of res.handlerHeader
-	// at the time of res.writeHeader, if res.writeHeader is
-	// called and extra buffering is being done to calculate
-	// Content-Type and/or Content-Length.
-	header Header
+	// snap is a flat copy of res.handlerHeader taken by snapshotHeader when
+	// WriteHeader (or Header after WriteHeader) was called while headers
+	// remain buffered. hasSnap reports whether snapshotHeader populated snap.
+	snap    []keyValues
+	hasSnap bool
 
 	// wroteHeader tells whether the header's been written to "the
 	// wire" (or rather: w.conn.buf). this is unlike
@@ -499,12 +529,14 @@ type response struct {
 
 	// handlerHeader is the Header that Handlers get access to,
 	// which may be retained and mutated even after WriteHeader.
-	// handlerHeader is copied into cw.header at WriteHeader
-	// time, and privately mutated thereafter.
+	// handlerHeader is snapshotted into cw.snap at WriteHeader
+	// time, leaving handlerHeader untouched.
 	handlerHeader Header
 	calledHeader  bool // handler accessed handlerHeader via Header
-	cwHeader      Header
-	cwHeaderStrs  []string
+	cwSnap        []keyValues
+	cwSnapBuf     [8]keyValues
+	cwSnapStrs    []string
+	cwStrBuf      [16]string
 
 	written       int64 // number of bytes written in body
 	contentLength int64 // explicitly-declared Content-Length; or -1
@@ -551,11 +583,11 @@ type response struct {
 }
 
 func (c *response) SetReadDeadline(deadline time.Time) error {
-	return c.conn.rwc.SetReadDeadline(deadline)
+	return c.conn.setReadDeadline(deadline)
 }
 
 func (c *response) SetWriteDeadline(deadline time.Time) error {
-	return c.conn.rwc.SetWriteDeadline(deadline)
+	return c.conn.setWriteDeadline(deadline)
 }
 
 func (c *response) EnableFullDuplex() error {
@@ -727,10 +759,13 @@ func (s *Server) newConn(rwc net.Conn) *conn {
 	if debugServerConnections {
 		rwc = newLoggingConn("server", rwc)
 	}
-	return &conn{
+	c := &conn{
 		server: s,
 		rwc:    rwc,
 	}
+	c.readDeadlineSet.Store(true)
+	c.writeDeadlineSet.Store(true)
+	return c
 }
 
 const (
@@ -1041,7 +1076,7 @@ func (cr *connReader) startBackgroundReadLocked() {
 		return
 	}
 	cr.inRead = true
-	cr.rwc.SetReadDeadline(time.Time{})
+	cr.conn.clearReadDeadline()
 	startBgRead(cr)
 }
 
@@ -1143,11 +1178,19 @@ func (cr *connReader) abortPendingRead() {
 		cr.cond = sync.NewCond(&cr.mu)
 	}
 	cr.aborted = true
-	cr.rwc.SetReadDeadline(aLongTimeAgo)
+	if cr.conn != nil {
+		cr.conn.setReadDeadline(aLongTimeAgo)
+	} else {
+		cr.rwc.SetReadDeadline(aLongTimeAgo)
+	}
 	for cr.inRead {
 		cr.cond.Wait()
 	}
-	cr.rwc.SetReadDeadline(time.Time{})
+	if cr.conn != nil {
+		cr.conn.setReadDeadline(time.Time{})
+	} else {
+		cr.rwc.SetReadDeadline(time.Time{})
+	}
 }
 
 func (cr *connReader) setProbing(v bool) {
@@ -1205,7 +1248,7 @@ func (cr *connReader) handleReadErrorLocked(err error) {
 	// so a handler blocked writing a large response would otherwise block
 	// forever. See go.dev/issue/78438.
 	if err != io.EOF && !isNetTimeoutError(err) {
-		cr.conn.rwc.SetWriteDeadline(aLongTimeAgo)
+		cr.conn.setWriteDeadline(aLongTimeAgo)
 	}
 	cr.conn.cancelConnCtxLocked()
 	if res := cr.conn.curReq.Load(); res != nil {
@@ -1441,6 +1484,12 @@ func putResponse(w *response) {
 		}
 		return
 	}
+	if w.cw.snap != nil {
+		w.cw.clearSnap(w.cw.snap)
+	}
+	w.cw.hasSnap = false
+	w.cw.wroteHeader = false
+	w.cw.chunking = false
 	w.conn = nil
 	w.req = nil
 	w.reqBody = nil
@@ -1448,21 +1497,18 @@ func putResponse(w *response) {
 	w.wants10KeepAlive = false
 	w.wantsClose = false
 	w.canWriteContinue.Store(false)
-	w.cw.header = nil
-	w.cw.wroteHeader = false
-	w.cw.chunking = false
 	if len(w.handlerHeader) <= 16 {
 		clear(w.handlerHeader)
 	} else {
 		w.handlerHeader = nil
 	}
 	w.calledHeader = false
-	if len(w.cwHeader) <= 16 {
-		clear(w.cwHeader)
-	} else {
-		w.cwHeader = nil
+	if cap(w.cwSnap) > 64 {
+		w.cwSnap = nil
 	}
-	clear(w.cwHeaderStrs)
+	if cap(w.cwSnapStrs) > 128 {
+		w.cwSnapStrs = nil
+	}
 	w.written = 0
 	w.contentLength = -1
 	w.status = 0
@@ -1477,39 +1523,52 @@ func putResponse(w *response) {
 func (w *response) snapshotHeader() {
 	h := w.handlerHeader
 	if len(h) == 0 {
-		if w.cwHeader == nil {
-			w.cwHeader = make(Header)
-		} else {
-			clear(w.cwHeader)
-		}
-		w.cw.header = w.cwHeader
+		w.cw.snap = nil
+		w.cw.hasSnap = true
 		return
 	}
 	nv := 0
 	for _, vv := range h {
 		nv += len(vv)
 	}
-	if w.cwHeader == nil {
-		w.cwHeader = make(Header, len(h))
+	var snap []keyValues
+	if len(h) <= len(w.cwSnapBuf) {
+		snap = w.cwSnapBuf[:0]
 	} else {
-		clear(w.cwHeader)
+		if cap(w.cwSnap) < len(h) {
+			w.cwSnap = make([]keyValues, 0, len(h))
+		} else {
+			w.cwSnap = w.cwSnap[:0]
+		}
+		snap = w.cwSnap
 	}
-	if cap(w.cwHeaderStrs) < nv {
-		w.cwHeaderStrs = make([]string, nv)
-	} else {
-		w.cwHeaderStrs = w.cwHeaderStrs[:nv]
+	var sv []string
+	if nv > 0 {
+		if nv <= len(w.cwStrBuf) {
+			sv = w.cwStrBuf[:nv]
+		} else {
+			if cap(w.cwSnapStrs) < nv {
+				w.cwSnapStrs = make([]string, nv)
+			} else {
+				w.cwSnapStrs = w.cwSnapStrs[:nv]
+			}
+			sv = w.cwSnapStrs
+		}
 	}
-	sv := w.cwHeaderStrs
 	for k, vv := range h {
 		if vv == nil {
-			w.cwHeader[k] = nil
+			snap = append(snap, keyValues{key: k, values: nil})
 			continue
 		}
 		n := copy(sv, vv)
-		w.cwHeader[k] = sv[:n:n]
+		snap = append(snap, keyValues{key: k, values: sv[:n:n]})
 		sv = sv[n:]
 	}
-	w.cw.header = w.cwHeader
+	if len(h) > len(w.cwSnapBuf) {
+		w.cwSnap = snap
+	}
+	w.cw.snap = snap
+	w.cw.hasSnap = true
 }
 
 // Read next request from connection.
@@ -1524,7 +1583,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	}
 	if d := c.server.WriteTimeout; d > 0 {
 		defer func() {
-			c.rwc.SetWriteDeadline(time.Now().Add(d))
+			c.setWriteDeadline(time.Now().Add(d))
 		}()
 	}
 
@@ -1578,7 +1637,11 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		panic(fmt.Errorf("http: unexpected request body type %T", req.Body))
 	}
 
-	c.rwc.SetReadDeadline(wholeReqDeadline)
+	if wholeReqDeadline.IsZero() {
+		c.clearReadDeadline()
+	} else {
+		c.setReadDeadline(wholeReqDeadline)
+	}
 
 	w = responsePool.Get()
 	if w == nil {
@@ -1624,7 +1687,7 @@ func (w *response) Header() Header {
 	if w.handlerHeader == nil {
 		w.handlerHeader = make(Header)
 	}
-	if w.cw.header == nil && w.wroteHeader && !w.cw.wroteHeader {
+	if !w.cw.hasSnap && w.wroteHeader && !w.cw.wroteHeader {
 		// Accessing the header between logically writing it
 		// and physically writing it means we need to allocate
 		// a clone to snapshot the logically written state.
@@ -1722,7 +1785,7 @@ func (w *response) WriteHeader(code int) {
 	w.wroteHeader = true
 	w.status = code
 
-	if w.calledHeader && w.cw.header == nil {
+	if w.calledHeader && !w.cw.hasSnap {
 		w.snapshotHeader()
 	}
 
@@ -1848,6 +1911,69 @@ func (h extraHeader) writeSlow(w *bufio.Writer) {
 	}
 }
 
+const (
+	exclConnection uint8 = 1 << iota
+	exclContentType
+	exclContentLength
+	exclTransferEncoding
+)
+
+func (cw *chunkWriter) clearSnap(fullSnap []keyValues) {
+	clear(fullSnap)
+	cw.snap = nil
+	w := cw.res
+	if len(w.cwSnap) > 0 {
+		clear(w.cwSnap)
+		w.cwSnap = w.cwSnap[:0]
+	}
+	if len(w.cwSnapStrs) > 0 {
+		clear(w.cwSnapStrs)
+		w.cwSnapStrs = w.cwSnapStrs[:0]
+	} else {
+		clear(w.cwStrBuf[:])
+	}
+}
+
+func writeHeaderKeyValues(bw *bufio.Writer, kvs []keyValues) {
+	buf := bw.AvailableBuffer()
+	avail := cap(buf)
+	for _, kv := range kvs {
+		for _, v := range kv.values {
+			v = formatHeaderValue(v)
+			rem := avail - len(buf)
+			if rem >= 4 && len(kv.key) <= rem-4 && len(v) <= rem-4-len(kv.key) {
+				buf = append(buf, kv.key...)
+				buf = append(buf, ':', ' ')
+				buf = append(buf, v...)
+				buf = append(buf, '\r', '\n')
+				continue
+			}
+			if len(buf) > 0 {
+				if _, err := bw.Write(buf); err != nil {
+					return
+				}
+				buf = bw.AvailableBuffer()
+				avail = cap(buf)
+				if avail >= 4 && len(kv.key) <= avail-4 && len(v) <= avail-4-len(kv.key) {
+					buf = append(buf, kv.key...)
+					buf = append(buf, ':', ' ')
+					buf = append(buf, v...)
+					buf = append(buf, '\r', '\n')
+					continue
+				}
+			}
+			if err := writeHeaderLine(bw, kv.key, v); err != nil {
+				return
+			}
+			buf = bw.AvailableBuffer()
+			avail = cap(buf)
+		}
+	}
+	if len(buf) > 0 {
+		bw.Write(buf)
+	}
+}
+
 // writeHeader finalizes the header sent to the client and writes it
 // to cw.res.conn.bufw.
 //
@@ -1870,60 +1996,64 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	isHEAD := w.conn.lastMethod == "HEAD"
 	isCONNECT := w.conn.lastMethod == "CONNECT"
 
-	// header is written out to w.conn.buf below. Depending on the
-	// state of the handler, we either own the map or not. If we
-	// don't own it, the exclude map is created lazily for
-	// WriteSubset to remove headers. The setHeader struct holds
-	// headers we need to add.
-	header := cw.header
-	owned := header != nil
-	if !owned {
-		header = w.handlerHeader
+	// Ensure handler headers have been snapshotted into cw.snap if any were
+	// populated without calling Header() or WriteHeader() explicitly.
+	if !cw.hasSnap && len(w.handlerHeader) > 0 {
+		w.snapshotHeader()
 	}
-	hasHeader := len(header) > 0
-	var excludeHeader map[string]bool
-	delHeader := func(key string) {
-		if !hasHeader {
-			return
-		}
-		if owned {
-			header.Del(key)
-			return
-		}
-		if _, ok := header[key]; !ok {
-			return
-		}
-		if excludeHeader == nil {
-			excludeHeader = make(map[string]bool)
-		}
-		excludeHeader[key] = true
-	}
-	var setHeader extraHeader
+	snap := cw.snap
+	fullSnap := snap
 
-	// Don't write out the fake "Trailer:foo" keys. See TrailerPrefix.
-	trailers := false
-	if len(cw.header) > 0 {
-		for k := range cw.header {
-			if strings.HasPrefix(k, TrailerPrefix) {
-				if excludeHeader == nil {
-					excludeHeader = make(map[string]bool)
-				}
-				excludeHeader[k] = true
+	var (
+		trailers bool
+		te       string
+		hasTE    bool
+		hasCLHdr bool
+		hasConn  bool
+		connVals []string
+		hasCType bool
+		hasCE    bool
+		hasDate  bool
+		hasUpg   bool
+	)
+	for i := range snap {
+		kv := &snap[i]
+		k := kv.key
+		switch {
+		case strings.HasPrefix(k, TrailerPrefix):
+			trailers = true
+		case k == "Trailer":
+			for _, v := range kv.values {
 				trailers = true
+				foreachHeaderElement(v, w.declareTrailer)
+			}
+		case k == "Transfer-Encoding":
+			if len(kv.values) > 0 {
+				te = kv.values[0]
+				hasTE = te != ""
+			}
+		case k == "Content-Length":
+			hasCLHdr = true
+		case k == "Connection":
+			hasConn = true
+			connVals = kv.values
+		case k == "Content-Type":
+			hasCType = true
+		case k == "Content-Encoding":
+			if len(kv.values) > 0 && kv.values[0] != "" {
+				hasCE = true
+			}
+		case k == "Date":
+			hasDate = true
+		case k == "Upgrade":
+			if len(kv.values) > 0 && kv.values[0] != "" {
+				hasUpg = true
 			}
 		}
-		for _, v := range cw.header["Trailer"] {
-			trailers = true
-			foreachHeaderElement(v, cw.res.declareTrailer)
-		}
 	}
 
-	var te string
-	var hasTE bool
-	if hasHeader {
-		te = header.get("Transfer-Encoding")
-		hasTE = te != ""
-	}
+	var exclMask uint8
+	var setHeader extraHeader
 
 	// If the handler is done but never sent a Content-Length
 	// response header and this is our first (and last) write, set
@@ -1939,7 +2069,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	// send a Content-Length header.
 	// Further, we don't send an automatic Content-Length if they
 	// set a Transfer-Encoding, because they're generally incompatible.
-	if w.handlerDone.Load() && !trailers && !hasTE && bodyAllowedForStatus(w.status) && (!hasHeader || !header.has("Content-Length")) && (!isHEAD || len(p) > 0) {
+	if w.handlerDone.Load() && !trailers && !hasTE && bodyAllowedForStatus(w.status) && !hasCLHdr && (!isHEAD || len(p) > 0) {
 		w.contentLength = int64(len(p))
 		setHeader.contentLength = strconv.AppendInt(cw.res.clenBuf[:0], int64(len(p)), 10)
 	}
@@ -1948,18 +2078,14 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	hasCL := w.contentLength != -1
 
 	if w.wants10KeepAlive && !w.wantsClose && (isHEAD || hasCL || !bodyAllowedForStatus(w.status)) {
-		var connectionHeaderSet bool
-		if hasHeader {
-			_, connectionHeaderSet = header["Connection"]
-		}
-		if !connectionHeaderSet {
+		if !hasConn {
 			setHeader.connection = "keep-alive"
 		}
 	} else if !w.req.ProtoAtLeast(1, 1) || w.wantsClose {
 		w.closeAfterReply = true
 	}
 
-	if !keepAlivesEnabled || (hasHeader && httpguts.HeaderValuesContainsToken(header["Connection"], "close")) {
+	if !keepAlivesEnabled || (hasConn && httpguts.HeaderValuesContainsToken(connVals, "close")) {
 		w.closeAfterReply = true
 	}
 
@@ -2031,7 +2157,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		}
 		if tooBig {
 			w.requestTooLarge()
-			delHeader("Connection")
+			exclMask |= exclConnection
 			setHeader.connection = "close"
 		}
 	}
@@ -2039,25 +2165,17 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	code := w.status
 	if bodyAllowedForStatus(code) {
 		// If no content type, apply sniffing algorithm to body.
-		var haveType, hasCE bool
-		if hasHeader {
-			_, haveType = header["Content-Type"]
-			if !haveType {
-				// If the Content-Encoding was set and is non-blank,
-				// we shouldn't sniff the body. See Issue 31753.
-				hasCE = len(header.get("Content-Encoding")) > 0
-			}
-		}
-		if !hasCE && !haveType && !hasTE && len(p) > 0 {
+		if !hasCE && !hasCType && !hasTE && len(p) > 0 {
 			setHeader.contentType = DetectContentType(p)
 		}
 	} else {
-		for _, k := range suppressedHeaders(code) {
-			delHeader(k)
+		exclMask |= exclContentLength | exclTransferEncoding
+		if code == StatusNotModified {
+			exclMask |= exclContentType
 		}
 	}
 
-	if !hasHeader || !header.has("Date") {
+	if !hasDate {
 		setHeader.date = internal.AppendHTTPDateNow(cw.res.dateBuf[:0])
 	}
 
@@ -2066,22 +2184,21 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		// For now just ignore the Content-Length.
 		w.conn.server.logf("http: WriteHeader called with both Transfer-Encoding of %q and a Content-Length of %d",
 			te, w.contentLength)
-		delHeader("Content-Length")
+		exclMask |= exclContentLength
 		hasCL = false
 	}
 
 	isSuccessfulCONNECT := isCONNECT && code >= 200 && code < 300
 	if isSuccessfulCONNECT {
 		// Tunnel established, connection is no longer HTTP.
-		delHeader("Transfer-Encoding")
-		delHeader("Content-Length")
+		exclMask |= exclTransferEncoding | exclContentLength
 		setHeader.contentLength = nil
 	} else if isHEAD || !bodyAllowedForStatus(code) || code == StatusNoContent {
 		// Response has no body.
-		delHeader("Transfer-Encoding")
+		exclMask |= exclTransferEncoding
 	} else if hasCL {
 		// Content-Length has been provided, so no chunking is to be done.
-		delHeader("Transfer-Encoding")
+		exclMask |= exclTransferEncoding
 	} else if w.req.ProtoAtLeast(1, 1) {
 		// HTTP/1.1 or greater: Transfer-Encoding has been set to identity, and no
 		// content-length has been provided. The connection must be closed after the
@@ -2091,7 +2208,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		if hasTE && te == "identity" {
 			cw.chunking = false
 			w.closeAfterReply = true
-			delHeader("Transfer-Encoding")
+			exclMask |= exclTransferEncoding
 		} else {
 			// HTTP/1.1 or greater: use chunked transfer encoding
 			// to avoid closing the connection at EOF.
@@ -2099,7 +2216,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 			setHeader.transferEncoding = "chunked"
 			if hasTE && te == "chunked" {
 				// We will send the chunked Transfer-Encoding header later.
-				delHeader("Transfer-Encoding")
+				exclMask |= exclTransferEncoding
 			}
 		}
 	} else {
@@ -2107,14 +2224,17 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		// encoding and we don't know the Content-Length so
 		// signal EOF by closing connection.
 		w.closeAfterReply = true
-		delHeader("Transfer-Encoding") // in case already set
+		exclMask |= exclTransferEncoding // in case already set
 	}
 
 	// Cannot use Content-Length with non-identity Transfer-Encoding.
 	if cw.chunking {
-		delHeader("Content-Length")
+		exclMask |= exclContentLength
 	}
 	if !w.req.ProtoAtLeast(1, 0) {
+		if len(fullSnap) > 0 {
+			cw.clearSnap(fullSnap)
+		}
 		return
 	}
 
@@ -2130,11 +2250,15 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	// Only override the Connection header if it is not a successful
 	// protocol switch response and if KeepAlives are not enabled.
 	// See https://golang.org/issue/36381.
+	connNotExcluded := exclMask&exclConnection == 0
+	isProtocolSwitch := w.status == StatusSwitchingProtocols &&
+		hasUpg && connNotExcluded &&
+		httpguts.HeaderValuesContainsToken(connVals, "Upgrade")
 	delConnectionHeader := w.closeAfterReply &&
-		(!keepAlivesEnabled || len(cw.header) == 0 || !httpguts.HeaderValuesContainsToken(cw.header["Connection"], "close")) &&
-		!isProtocolSwitchResponse(w.status, header)
+		(!keepAlivesEnabled || !connNotExcluded || !httpguts.HeaderValuesContainsToken(connVals, "close")) &&
+		!isProtocolSwitch
 	if delConnectionHeader {
-		delHeader("Connection")
+		exclMask |= exclConnection
 		// Don't set Connection: close on a 2xx CONNECT response,
 		// even though we will close the connection if the handler doesn't hijack it.
 		// If the handler does hijack the connection, the Connection: close is confusing.
@@ -2145,16 +2269,132 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		}
 	}
 
-	writeStatusLine(w.conn.bufw, w.req.ProtoAtLeast(1, 1), code, w.statusBuf[:])
-	if len(cw.header) > 0 {
-		cw.header.WriteSubset(w.conn.bufw, excludeHeader)
-		if w.cwHeader != nil {
-			clear(w.cwHeader)
-			clear(w.cwHeaderStrs)
+	bw := w.conn.bufw
+	is11 := w.req.ProtoAtLeast(1, 1)
+	if len(snap) > 0 {
+		n := 0
+		for i := range snap {
+			kv := &snap[i]
+			k := kv.key
+			if len(kv.values) == 0 || !httpguts.ValidHeaderFieldName(k) || strings.HasPrefix(k, TrailerPrefix) {
+				continue
+			}
+			if exclMask != 0 {
+				if (k == "Connection" && exclMask&exclConnection != 0) ||
+					(k == "Content-Type" && exclMask&exclContentType != 0) ||
+					(k == "Content-Length" && exclMask&exclContentLength != 0) ||
+					(k == "Transfer-Encoding" && exclMask&exclTransferEncoding != 0) {
+					continue
+				}
+			}
+			snap[n] = *kv
+			n++
+		}
+		snap = snap[:n]
+		if n > 1 {
+			if n <= 16 {
+				for i := 1; i < n; i++ {
+					cur := snap[i]
+					j := i - 1
+					for j >= 0 && snap[j].key > cur.key {
+						snap[j+1] = snap[j]
+						j--
+					}
+					snap[j+1] = cur
+				}
+			} else {
+				slices.SortFunc(snap, func(a, b keyValues) int {
+					return strings.Compare(a.key, b.key)
+				})
+			}
 		}
 	}
-	setHeader.Write(w.conn.bufw)
-	w.conn.bufw.Write(crlf)
+
+	extraNeed := 2
+	if setHeader.date != nil {
+		extraNeed += 8 + len(setHeader.date)
+	}
+	if setHeader.contentLength != nil {
+		extraNeed += 18 + len(setHeader.contentLength)
+	}
+	if setHeader.contentType != "" {
+		extraNeed += 16 + len(setHeader.contentType)
+	}
+	if setHeader.connection != "" {
+		extraNeed += 14 + len(setHeader.connection)
+	}
+	if setHeader.transferEncoding != "" {
+		extraNeed += 21 + len(setHeader.transferEncoding)
+	}
+
+	sl := statusLine(is11, code)
+	avail := bw.Available()
+	if sl != "" && len(sl)+extraNeed <= avail {
+		buf := bw.AvailableBuffer()
+		buf = append(buf, sl...)
+		fit := true
+		for i := range snap {
+			k := snap[i].key
+			for _, v := range snap[i].values {
+				v = formatHeaderValue(v)
+				rem := avail - extraNeed - len(buf)
+				if rem < 4 || len(k) > rem-4 || len(v) > rem-4-len(k) {
+					fit = false
+					break
+				}
+				buf = append(buf, k...)
+				buf = append(buf, ':', ' ')
+				buf = append(buf, v...)
+				buf = append(buf, '\r', '\n')
+			}
+			if !fit {
+				break
+			}
+		}
+		if fit {
+			if setHeader.date != nil {
+				buf = append(buf, "Date: "...)
+				buf = append(buf, setHeader.date...)
+				buf = append(buf, '\r', '\n')
+			}
+			if setHeader.contentLength != nil {
+				buf = append(buf, "Content-Length: "...)
+				buf = append(buf, setHeader.contentLength...)
+				buf = append(buf, '\r', '\n')
+			}
+			if setHeader.contentType != "" {
+				buf = append(buf, "Content-Type: "...)
+				buf = append(buf, setHeader.contentType...)
+				buf = append(buf, '\r', '\n')
+			}
+			if setHeader.connection != "" {
+				buf = append(buf, "Connection: "...)
+				buf = append(buf, setHeader.connection...)
+				buf = append(buf, '\r', '\n')
+			}
+			if setHeader.transferEncoding != "" {
+				buf = append(buf, "Transfer-Encoding: "...)
+				buf = append(buf, setHeader.transferEncoding...)
+				buf = append(buf, '\r', '\n')
+			}
+			buf = append(buf, '\r', '\n')
+			bw.Write(buf)
+			if len(fullSnap) > 0 {
+				cw.clearSnap(fullSnap)
+			}
+			return
+		}
+	}
+
+	writeStatusLine(bw, is11, code, w.statusBuf[:])
+	if len(snap) > 0 {
+		writeHeaderKeyValues(bw, snap)
+	}
+	setHeader.Write(bw)
+	bw.Write(crlf)
+	if len(fullSnap) > 0 {
+		cw.clearSnap(fullSnap)
+	}
 }
 
 // foreachHeaderElement splits v according to the "#rule" construction
@@ -2486,7 +2726,12 @@ func (c *conn) setState(nc net.Conn, state ConnState, runHook bool) {
 	if state > 0xff || state < 0 {
 		panic("internal error")
 	}
-	packedState := uint64(time.Now().Unix()<<8) | uint64(state)
+	var packedState uint64
+	if state == StateNew {
+		packedState = uint64(time.Now().Unix()<<8) | uint64(state)
+	} else {
+		packedState = uint64(1<<8) | uint64(state)
+	}
 	c.curState.Store(packedState)
 	if !runHook {
 		return
@@ -2575,8 +2820,8 @@ func (c *conn) serve(ctx context.Context) {
 		tlsTO := c.server.tlsHandshakeTimeout()
 		if tlsTO > 0 {
 			dl := time.Now().Add(tlsTO)
-			c.rwc.SetReadDeadline(dl)
-			c.rwc.SetWriteDeadline(dl)
+			c.setReadDeadline(dl)
+			c.setWriteDeadline(dl)
 		}
 		var err error
 		if handshaker, ok := c.rwc.(handshakeContexter); ok {
@@ -2599,8 +2844,8 @@ func (c *conn) serve(ctx context.Context) {
 		}
 		// Restore Conn-level deadlines.
 		if tlsTO > 0 {
-			c.rwc.SetReadDeadline(time.Time{})
-			c.rwc.SetWriteDeadline(time.Time{})
+			c.setReadDeadline(time.Time{})
+			c.setWriteDeadline(time.Time{})
 		}
 		c.tlsState = new(tls.ConnectionState)
 		*c.tlsState = connStater.ConnectionState()
@@ -2648,7 +2893,7 @@ func (c *conn) serve(ctx context.Context) {
 	c.bufr = newBufioReader(c.r)
 
 	if d := c.server.readHeaderTimeout(); d > 0 {
-		c.rwc.SetReadDeadline(time.Now().Add(d))
+		c.setReadDeadline(time.Now().Add(d))
 	}
 
 	protos := c.server.protocols()
@@ -2767,7 +3012,7 @@ func (c *conn) serve(ctx context.Context) {
 		}
 		w.finishRequest()
 		c.curReq.Store(nil)
-		c.rwc.SetWriteDeadline(time.Time{})
+		c.clearWriteDeadline()
 		if !w.shouldReuseConnection() {
 			// On some platforms, closing a socket with data in the read buffer
 			// sends a RST. If we do this with data sent by us in flight, the client
@@ -2792,58 +3037,60 @@ func (c *conn) serve(ctx context.Context) {
 		}
 		putResponse(w)
 
-		var idleDeadline time.Time
-		if d := c.server.idleTimeout(); d > 0 {
-			idleDeadline = time.Now().Add(d)
-		}
-
-		// Wait for the connection to become readable again before trying to
-		// read the next request. This prevents a ReadHeaderTimeout or
-		// ReadTimeout from starting until the first bytes of the next request
-		// have been received.
-		//
-		// The wait runs in two phases. First wait briefly with the
-		// connection's bufio buffers still attached: on a busy
-		// connection the next request typically arrives almost
-		// immediately, and this keeps the buffer release below off the
-		// hot path. If the connection then still has nothing buffered,
-		// it has gone idle, possibly for a long time, so release its
-		// bufio.Reader and Writer (~8 kB of per-connection memory
-		// holding no data) to their pools for the rest of the wait.
-		// The byte read by waitReadable is stashed in the connReader
-		// and yielded by its next Read after fresh buffers are
-		// acquired.
-		shortDeadline := time.Now().Add(idleBufsReleaseDelay)
-		if !idleDeadline.IsZero() && idleDeadline.Before(shortDeadline) {
-			shortDeadline = idleDeadline
-		}
-		c.rwc.SetReadDeadline(shortDeadline)
-		c.r.setProbing(true)
-		_, peekErr := c.bufr.Peek(4)
-		c.r.setProbing(false)
-		if isNetTimeoutError(peekErr) && (idleDeadline.IsZero() || time.Now().Before(idleDeadline)) {
-			c.rwc.SetReadDeadline(idleDeadline)
-			if c.bufr.Buffered() == 0 && c.bufw.Buffered() == 0 {
-				putBufioReader(c.bufr)
-				c.bufr = nil
-				putBufioWriter(c.bufw)
-				c.bufw = nil
-				if !c.r.waitReadable() {
-					return
-				}
-				c.bufr = newBufioReader(c.r)
-				c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
+		if c.bufr.Buffered() < 4 {
+			var idleDeadline time.Time
+			if d := c.server.idleTimeout(); d > 0 {
+				idleDeadline = time.Now().Add(d)
 			}
-			_, peekErr = c.bufr.Peek(4)
-		}
-		if peekErr != nil {
-			return
+
+			// Wait for the connection to become readable again before trying to
+			// read the next request. This prevents a ReadHeaderTimeout or
+			// ReadTimeout from starting until the first bytes of the next request
+			// have been received.
+			//
+			// The wait runs in two phases. First wait briefly with the
+			// connection's bufio buffers still attached: on a busy
+			// connection the next request typically arrives almost
+			// immediately, and this keeps the buffer release below off the
+			// hot path. If the connection then still has nothing buffered,
+			// it has gone idle, possibly for a long time, so release its
+			// bufio.Reader and Writer (~8 kB of per-connection memory
+			// holding no data) to their pools for the rest of the wait.
+			// The byte read by waitReadable is stashed in the connReader
+			// and yielded by its next Read after fresh buffers are
+			// acquired.
+			shortDeadline := time.Now().Add(idleBufsReleaseDelay)
+			if !idleDeadline.IsZero() && idleDeadline.Before(shortDeadline) {
+				shortDeadline = idleDeadline
+			}
+			c.setReadDeadline(shortDeadline)
+			c.r.setProbing(true)
+			_, peekErr := c.bufr.Peek(4)
+			c.r.setProbing(false)
+			if isNetTimeoutError(peekErr) && (idleDeadline.IsZero() || time.Now().Before(idleDeadline)) {
+				c.setReadDeadline(idleDeadline)
+				if c.bufr.Buffered() == 0 && c.bufw.Buffered() == 0 {
+					putBufioReader(c.bufr)
+					c.bufr = nil
+					putBufioWriter(c.bufw)
+					c.bufw = nil
+					if !c.r.waitReadable() {
+						return
+					}
+					c.bufr = newBufioReader(c.r)
+					c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
+				}
+				_, peekErr = c.bufr.Peek(4)
+			}
+			if peekErr != nil {
+				return
+			}
 		}
 
 		if d := c.server.readHeaderTimeout(); d > 0 {
-			c.rwc.SetReadDeadline(time.Now().Add(d))
+			c.setReadDeadline(time.Now().Add(d))
 		} else {
-			c.rwc.SetReadDeadline(time.Time{})
+			c.clearReadDeadline()
 		}
 	}
 }
@@ -2915,8 +3162,8 @@ func (c *conn) maybeServeUnencryptedHTTP2(ctx context.Context) bool {
 		const sawClientPreface = true
 		c.serveHTTP2(ctx, sawClientPreface)
 	} else {
-		c.rwc.SetReadDeadline(time.Time{})
-		c.rwc.SetWriteDeadline(time.Time{})
+		c.setReadDeadline(time.Time{})
+		c.setWriteDeadline(time.Time{})
 		h := unencryptedHTTP2Request{ctx, c.rwc, c.server}
 		nextFunc(c.server, unencryptedTLSConn(c.rwc), h)
 	}

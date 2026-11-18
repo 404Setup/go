@@ -346,3 +346,42 @@ func TestExtraHeaderWriteAndChunkWriter(t *testing.T) {
 	}
 }
 
+func TestWriteReqLineQueryAndNoBody(t *testing.T) {
+	u, err := url.Parse("http://example.com/foo/bar?baz=123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := NewRequest(MethodGet, u.String(), NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bb bytes.Buffer
+	bw := bufio.NewWriterSize(&bb, 512)
+	if allocs := testing.AllocsPerRun(50, func() {
+		bb.Reset()
+		bw.Reset(&bb)
+		if err := req.Write(bw); err != nil {
+			t.Fatal(err)
+		}
+		bw.Flush()
+	}); allocs > 2 {
+		t.Errorf("req.Write(NoBody) allocs = %v, want <= 2", allocs)
+	}
+	wantPrefix := "GET /foo/bar?baz=123 HTTP/1.1\r\nHost: example.com\r\n"
+	if !strings.HasPrefix(bb.String(), wantPrefix) {
+		t.Fatalf("got %q, want prefix %q", bb.String(), wantPrefix)
+	}
+
+	// Verify ForceQuery writes trailing '?'.
+	reqFQ, err := NewRequest(MethodGet, "http://example.com/search?", NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb.Reset()
+	if err := reqFQ.Write(&bb); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(bb.String(), "GET /search? HTTP/1.1\r\n") {
+		t.Fatalf("ForceQuery write got %q", bb.String())
+	}
+}

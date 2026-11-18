@@ -7443,3 +7443,93 @@ func testTransportResponseWriteAfterEarlyClose(t *testing.T, mode testMode) {
 	}
 	res.ContentLength = 0
 }
+
+func TestClientTimeoutWithLegacyCancel(t *testing.T) {
+	runSynctest(t, testClientTimeoutWithLegacyCancel, []testMode{http1Mode})
+}
+
+func testClientTimeoutWithLegacyCancel(t *testing.T, mode testMode) {
+	unblock := make(chan struct{})
+	defer close(unblock)
+
+	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		if r.URL.Path == "/body" {
+			w.Write([]byte("head"))
+			w.(Flusher).Flush()
+			<-unblock
+			return
+		}
+		<-unblock
+	}), optQuietLog)
+
+	cst.c.Timeout = 20 * time.Millisecond
+
+	cancelCh := make(chan struct{})
+	reqHdr, _ := NewRequest("GET", cst.ts.URL+"/hdr", nil)
+	reqHdr.Cancel = cancelCh
+	if res, err := cst.c.Do(reqHdr); err == nil {
+		res.Body.Close()
+		t.Fatal("expected header timeout error")
+	} else if !strings.Contains(err.Error(), "Client.Timeout") {
+		t.Errorf("header timeout err = %v, want Client.Timeout", err)
+	}
+
+	reqBody, _ := NewRequest("GET", cst.ts.URL+"/body", nil)
+	reqBody.Cancel = cancelCh
+	res, err := cst.c.Do(reqBody)
+	if err != nil {
+		t.Fatalf("body request err = %v", err)
+	}
+	defer res.Body.Close()
+	if _, err := io.ReadAll(res.Body); err == nil {
+		t.Fatal("expected body timeout error")
+	} else if !strings.Contains(err.Error(), "Client.Timeout") {
+		t.Errorf("body timeout err = %v, want Client.Timeout", err)
+	}
+}
+
+func TestPersistConnChannelReuseAfterAbortAndIdle(t *testing.T) {
+	runSynctest(t, testPersistConnChannelReuseAfterAbortAndIdle, []testMode{http1Mode})
+}
+
+func testPersistConnChannelReuseAfterAbortAndIdle(t *testing.T, mode testMode) {
+	block := make(chan struct{})
+	defer close(block)
+
+	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		if r.URL.Path == "/slow" {
+			<-block
+			return
+		}
+		w.Write([]byte("pong"))
+	}), func(tr *Transport) {
+		tr.ResponseHeaderTimeout = 200 * time.Millisecond
+	}, optQuietLog)
+
+	for i := range 6 {
+		method := "GET"
+		if i%2 == 1 {
+			method = "HEAD"
+		}
+		req, _ := NewRequest(method, cst.ts.URL+"/ok", nil)
+		res, err := cst.c.Do(req)
+		if err != nil {
+			t.Fatalf("iter %d: Do err = %v", i, err)
+		}
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			t.Fatalf("iter %d: ReadAll err = %v", i, err)
+		}
+		if method == "GET" && string(body) != "pong" {
+			t.Fatalf("iter %d: body = %q, want pong", i, body)
+		}
+	}
+
+	cst.tr.ResponseHeaderTimeout = 15 * time.Millisecond
+	reqSlow, _ := NewRequest("GET", cst.ts.URL+"/slow", nil)
+	if res, err := cst.c.Do(reqSlow); err == nil {
+		res.Body.Close()
+		t.Fatal("expected timeout on /slow")
+	}
+}

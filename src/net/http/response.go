@@ -230,9 +230,12 @@ func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 	}
 
 	// Parse the response headers.
-	tp := newTextprotoReader(r)
-	mimeHeader, err := tp.ReadMIMEHeader()
-	putTextprotoReader(tp)
+	mimeHeader, _, _, _, handled, err := readMIMEHeaderFast(r, math.MaxInt64, math.MaxInt64, false)
+	if !handled {
+		tp := newTextprotoReader(r)
+		mimeHeader, err = tp.ReadMIMEHeader()
+		putTextprotoReader(tp)
+	}
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF

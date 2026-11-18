@@ -205,6 +205,10 @@ func (t *Transport) withPoolLock(f func()) {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	f()
+	t.poolReconcileAndTrimLocked()
+}
+
+func (t *Transport) poolReconcileAndTrimLocked() {
 	// Reconcile dirty pool entries.
 	//
 	// Most pool operations are on a single entry,
@@ -242,6 +246,9 @@ func (t *Transport) poolReconcileEntryLocked(ent *poolEntry) {
 		if t.pool.ents[ent.key] == ent {
 			delete(t.pool.ents, ent.key)
 		}
+		return
+	}
+	if ent.waiters.size == 0 {
 		return
 	}
 	canGet := true
@@ -444,14 +451,14 @@ func (t *Transport) poolCloseIdleConnections() {
 // poolConnStateHook is called when the state of a pooled connection changes.
 func (t *Transport) poolConnStateHook(pconn *poolConn) error {
 	var closeErr error
-	t.withPoolLock(func() {
-		if pconn.state == poolConnUnknown || pconn.state == poolConnBroken {
-			// State hook invoked before pconn was added to the pool,
-			// or after it was removed.
-			return
-		}
+	t.pool.mu.Lock()
+	if pconn.state != poolConnUnknown && pconn.state != poolConnBroken {
 		closeErr = t.poolConnStateChangedLocked(pconn)
-	})
+		if t.pool.dirty.head != nil || (t.MaxIdleConns != 0 && t.pool.lru.size > max(t.MaxIdleConns, 0)) {
+			t.poolReconcileAndTrimLocked()
+		}
+	}
+	t.pool.mu.Unlock()
 	if closeErr != nil {
 		pconn.cc.CloseWithError(closeErr)
 	}
@@ -574,7 +581,9 @@ func (t *Transport) poolConnStateChangedLocked(pconn *poolConn) (closeErr error)
 		}
 	}
 
-	t.poolMarkDirtyLocked(ent)
+	if ent.waiters.size > 0 || (ent.numConns == 0 && ent.dials.size == 0 && ent.availableConns.size == 0 && ent.altConn == nil) {
+		t.poolMarkDirtyLocked(ent)
+	}
 	return closeErr
 }
 
@@ -662,18 +671,16 @@ func (t *Transport) poolGetConn(ctx context.Context, cm connectMethod, connClose
 		info   httptrace.GotConnInfo
 		waiter *poolWaiter
 	)
-	t.withPoolLock(func() {
-		t.pool.closeIdle = false
-		ent = t.poolGetEntryLocked(cm.key())
-		if ent.waiters.size == 0 {
-			// Fast path: If we can get an entry without waiting, do so.
-			pconn, info = t.poolTryGetForEntryLocked(ent, exclusive)
-			if pconn != nil {
-				return
-			}
-		}
+	t.pool.mu.Lock()
+	t.pool.closeIdle = false
+	ent = t.poolGetEntryLocked(cm.key())
+	if ent.waiters.size == 0 {
+		// Fast path: If we can get an entry without waiting, do so.
+		pconn, info = t.poolTryGetForEntryLocked(ent, exclusive)
+	}
+	if pconn == nil {
 		// Enqueue for a conn.
-		// When withPoolLock returns, it will start a dial for us if possible.
+		// When poolReconcileAndTrimLocked returns, it will start a dial for us if possible.
 		// (It would also deliver an available conn if one existed,
 		// but we just checked for one above and found nothing.)
 		waiter = &poolWaiter{
@@ -683,7 +690,11 @@ func (t *Transport) poolGetConn(ctx context.Context, cm connectMethod, connClose
 			donec:     make(chan struct{}, 1),
 		}
 		t.poolAddWaiterLocked(ent, waiter)
-	})
+	}
+	if t.pool.dirty.head != nil || (t.MaxIdleConns != 0 && t.pool.lru.size > max(t.MaxIdleConns, 0)) {
+		t.poolReconcileAndTrimLocked()
+	}
+	t.pool.mu.Unlock()
 	if pconn != nil {
 		return pconn, info, nil
 	}
@@ -714,6 +725,13 @@ func (t *Transport) poolGetConn(ctx context.Context, cm connectMethod, connClose
 // poolTryGetForEntryLocked attempts to fetch an idle connection from ent.
 // It returns nil if no usable connection was found.
 func (t *Transport) poolTryGetForEntryLocked(ent *poolEntry, exclusive bool) (*poolConn, httptrace.GotConnInfo) {
+	if ent.altConn != nil {
+		return ent.altConn, {} // altConn will call GotConnInfo itself
+	}
+	head := ent.availableConns.head
+	if head == nil {
+		return nil, {}
+	}
 	// If IdleConnTimeout is set, calculate the oldest
 	// poolConn.idleAt time we're willing to use a cached idle
 	// conn.
@@ -721,10 +739,10 @@ func (t *Transport) poolTryGetForEntryLocked(ent *poolEntry, exclusive bool) (*p
 	if timeout := t.idleConnTimeout(); timeout > 0 {
 		oldTime = time.Now().Add(-timeout)
 	}
-	if ent.altConn != nil {
-		return ent.altConn, {} // altConn will call GotConnInfo itself
-	}
-	for pconn := range ent.availableConns.backward() {
+	pconn := head.availableLink.prev
+	for {
+		prev := pconn.availableLink.prev
+		last := pconn == head
 		// See whether this connection has been idle too long, considering
 		// only the wall time (the Round(0)), in case this is a laptop or VM
 		// coming out of suspend with previously cached idle connections.
@@ -732,38 +750,36 @@ func (t *Transport) poolTryGetForEntryLocked(ent *poolEntry, exclusive bool) (*p
 			// Async cleanup. Launch in its own goroutine (as if a
 			// time.AfterFunc called it).
 			t.poolCloseConnLocked(pconn, errIdleConnTimeout)
-			continue
-		}
-		if exclusive && pconn.state != poolConnIdle {
+		} else if exclusive && pconn.state != poolConnIdle {
 			// Exclusive requests can't share a conn, so they need an Idle conn.
-			continue
-		}
-		wasIdleAt := pconn.idleAt
-		reserved := pconn.cc.Reserve() == nil
-		if reserved && exclusive && !pconn.isAlt() {
-			pconn.exclusive = true
-		}
-		if closeErr := t.poolConnStateChangedLocked(pconn); closeErr != nil {
-			// Unexpectedly broken connection.
-			if reserved {
-				pconn.cc.Release()
+		} else {
+			wasIdleAt := pconn.idleAt
+			reserved := pconn.cc.Reserve() == nil
+			if reserved && exclusive && !pconn.isAlt() {
+				pconn.exclusive = true
 			}
-			go pconn.cc.CloseWithError(closeErr)
-			continue
+			if closeErr := t.poolConnStateChangedLocked(pconn); closeErr != nil {
+				// Unexpectedly broken connection.
+				if reserved {
+					pconn.cc.Release()
+				}
+				go pconn.cc.CloseWithError(closeErr)
+			} else if reserved {
+				// We found a usable connection.
+				info := httptrace.GotConnInfo{
+					Conn: pconn.cc.NetConn(),
+				}
+				if !wasIdleAt.IsZero() {
+					info.WasIdle = true
+					info.IdleTime = time.Since(wasIdleAt)
+				}
+				return pconn, info
+			}
 		}
-		if !reserved {
-			// We couldn't reserve a slot, despite this conn being on
-			// the available list. We're probably racing a state change.
-			continue
+		if last {
+			break
 		}
-		info := httptrace.GotConnInfo{
-			Conn: pconn.cc.NetConn(),
-		}
-		if !wasIdleAt.IsZero() {
-			info.WasIdle = true
-			info.IdleTime = time.Since(wasIdleAt)
-		}
-		return pconn, info
+		pconn = prev
 	}
 	return nil, {}
 }

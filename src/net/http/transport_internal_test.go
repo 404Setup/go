@@ -13,9 +13,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http/httptrace"
 	"net/http/internal"
 	"net/http/internal/http2"
 	"net/http/internal/testcert"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -283,4 +285,219 @@ func TestTransportBodyAltRewind(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+}
+
+func TestCanonicalAddr(t *testing.T) {
+	ref := func(u *url.URL) string {
+		port := u.Port()
+		if port == "" {
+			port = schemePort(u.Scheme)
+		}
+		return net.JoinHostPort(idnaASCIIFromURL(u), port)
+	}
+
+	cases := []struct {
+		scheme string
+		host   string
+		want   string
+	}{
+		{"http", "127.0.0.1:8080", "127.0.0.1:8080"},
+		{"https", "example.com:8443", "example.com:8443"},
+		{"http", "[::1]:8080", "[::1]:8080"},
+		{"http", "[fe80::1%25eth0]:8080", "[fe80::1%25eth0]:8080"},
+		{"http", "[::1]", "[::1]:80"},
+		{"https", "example.com", "example.com:443"},
+		{"socks5", "proxy.example", "proxy.example:1080"},
+		{"ftp", "example.com", "example.com:"},
+		{"http", "[127.0.0.1]:8080", "127.0.0.1:8080"},
+		{"http", "a:b:8080", "[a:b]:8080"},
+		{"http", "[[::1]]:8080", "[[::1]]:8080"},
+		{"http", "[foo]:8080", "foo:8080"},
+		{"http", "example.com:", "example.com:80"},
+		{"http", "example.com:abc", "[example.com:abc]:80"},
+		{"http", "b\u00fccher.example:8080", "xn--bcher-kva.example:8080"},
+		{"http", ":8080", ":8080"},
+	}
+
+	for _, tc := range cases {
+		u := &url.URL{Scheme: tc.scheme, Host: tc.host}
+		got := canonicalAddr(u)
+		wantRef := ref(u)
+		if got != wantRef || got != tc.want {
+			t.Errorf("canonicalAddr(%q://%q) = %q, ref=%q, want=%q", tc.scheme, tc.host, got, wantRef, tc.want)
+		}
+	}
+
+	uIPv4 := &url.URL{Scheme: "http", Host: "127.0.0.1:8080"}
+	if allocs := testing.AllocsPerRun(50, func() {
+		if got := canonicalAddr(uIPv4); got != "127.0.0.1:8080" {
+			t.Fatalf("unexpected %q", got)
+		}
+	}); allocs != 0 {
+		t.Errorf("canonicalAddr(%q) allocs = %v, want 0", uIPv4.Host, allocs)
+	}
+
+	uIPv6 := &url.URL{Scheme: "http", Host: "[::1]:8080"}
+	if allocs := testing.AllocsPerRun(50, func() {
+		if got := canonicalAddr(uIPv6); got != "[::1]:8080" {
+			t.Fatalf("unexpected %q", got)
+		}
+	}); allocs != 0 {
+		t.Errorf("canonicalAddr(%q) allocs = %v, want 0", uIPv6.Host, allocs)
+	}
+}
+
+func TestRequestWriteAddedGzipAndClose(t *testing.T) {
+	var traced []string
+	trace := &httptrace.ClientTrace{
+		WroteHeaderField: func(key string, value []string) {
+			traced = append(traced, key+"="+strings.Join(value, ","))
+		},
+	}
+	ctx := httptrace.WithClientTrace(context.Background(), trace)
+	req, err := NewRequestWithContext(ctx, "GET", "http://example.com/hello", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := req.write(&buf, false, nil, true, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	wire := buf.String()
+	if !strings.Contains(wire, "Accept-Encoding: gzip\r\n") {
+		t.Errorf("missing Accept-Encoding: gzip in %q", wire)
+	}
+	if !strings.Contains(wire, "Connection: close\r\n") {
+		t.Errorf("missing Connection: close in %q", wire)
+	}
+	var gotGzipTrace, gotCloseTrace bool
+	for _, entry := range traced {
+		if entry == "Accept-Encoding=gzip" {
+			gotGzipTrace = true
+		}
+		if entry == "Connection=close" {
+			gotCloseTrace = true
+		}
+	}
+	if !gotGzipTrace || !gotCloseTrace {
+		t.Errorf("missing WroteHeaderField traces: got %v", traced)
+	}
+}
+
+type fakeBodyReadCloser struct {
+	data   string
+	off    int
+	err    error
+	closed bool
+}
+
+func (f *fakeBodyReadCloser) Read(p []byte) (int, error) {
+	if f.off < len(f.data) {
+		n := copy(p, f.data[f.off:])
+		f.off += n
+		if f.off == len(f.data) {
+			if f.err != nil {
+				return n, f.err
+			}
+			return n, io.EOF
+		}
+		return n, nil
+	}
+	if f.err != nil {
+		return 0, f.err
+	}
+	return 0, io.EOF
+}
+
+func (f *fakeBodyReadCloser) Close() error {
+	f.closed = true
+	return nil
+}
+
+func TestBodyEOFSignalDirect(t *testing.T) {
+	t.Run("EOFAndClose", func(t *testing.T) {
+		waitCh := make(chan bodyReadStatus, 1)
+		eofc := make(chan struct{})
+		close(eofc)
+		inner := &fakeBodyReadCloser{data: "ok"}
+		es := &bodyEOFSignal{
+			body:            inner,
+			waitForBodyRead: waitCh,
+			eofc:            eofc,
+		}
+		buf := make([]byte, 8)
+		n, err := es.Read(buf)
+		if n != 2 || err != io.EOF {
+			t.Fatalf("Read = (%d, %v), want (2, EOF)", n, err)
+		}
+		if st := <-waitCh; st != bodyReadEOF {
+			t.Fatalf("status = %v, want bodyReadEOF", st)
+		}
+		if n2, err2 := es.Read(buf); n2 != 0 || err2 != io.EOF {
+			t.Fatalf("second Read = (%d, %v), want (0, EOF)", n2, err2)
+		}
+		if err := es.Close(); err != nil {
+			t.Fatalf("Close err = %v", err)
+		}
+		if !inner.closed {
+			t.Fatalf("inner body not closed")
+		}
+		if n3, err3 := es.Read(buf); n3 != 0 || err3 != errReadOnClosedResBody {
+			t.Fatalf("Read after close = (%d, %v), want errReadOnClosedResBody", n3, err3)
+		}
+	})
+
+	t.Run("EarlyClose", func(t *testing.T) {
+		waitCh := make(chan bodyReadStatus, 1)
+		eofc := make(chan struct{})
+		close(eofc)
+		inner := &fakeBodyReadCloser{data: "abcdef"}
+		es := &bodyEOFSignal{
+			body:            inner,
+			waitForBodyRead: waitCh,
+			eofc:            eofc,
+		}
+		if err := es.Close(); err != nil {
+			t.Fatalf("early Close err = %v", err)
+		}
+		if st := <-waitCh; st != bodyReadClosedEarly {
+			t.Fatalf("status = %v, want bodyReadClosedEarly", st)
+		}
+		if err := es.Close(); err != nil {
+			t.Fatalf("duplicate Close err = %v", err)
+		}
+		if n, err := es.Read(make([]byte, 4)); n != 0 || err != errReadOnClosedResBody {
+			t.Fatalf("Read after early close = (%d, %v)", n, err)
+		}
+	})
+
+	t.Run("ReadErrorWithCanceledPC", func(t *testing.T) {
+		waitCh := make(chan bodyReadStatus, 1)
+		eofc := make(chan struct{})
+		pc := &persistConn{
+			canceledErr: errRequestCanceled,
+			closech:     make(chan struct{}),
+		}
+		readErr := errors.New("boom")
+		inner := &fakeBodyReadCloser{err: readErr}
+		es := &bodyEOFSignal{
+			body:            inner,
+			pc:              pc,
+			waitForBodyRead: waitCh,
+			eofc:            eofc,
+		}
+		_, err := es.Read(make([]byte, 4))
+		if err != errRequestCanceled {
+			t.Fatalf("Read err = %v, want %v", err, errRequestCanceled)
+		}
+		if st := <-waitCh; st != bodyReadError {
+			t.Fatalf("status = %v, want bodyReadError", st)
+		}
+		if err := es.Close(); err != nil {
+			t.Fatalf("Close after error = %v, want nil", err)
+		}
+		if inner.closed {
+			t.Fatalf("inner body unexpectedly closed after non-EOF Read error")
+		}
+	})
 }

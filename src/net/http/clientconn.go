@@ -411,16 +411,19 @@ func (pc *persistConn) RoundTrip(req *Request) (*Response, error) {
 	ctx := req.Context()
 	trace := httptrace.ContextClientTrace(ctx)
 
-	// Convert Request.Cancel into context cancellation.
-	ctx, cancel := context.WithCancelCause(req.Context())
+	// Convert Request.Cancel into context cancellation when set.
+	var cancel context.CancelCauseFunc
 	if req.Cancel != nil {
+		ctx, cancel = context.WithCancelCause(ctx)
 		go awaitLegacyCancel(ctx, cancel, req)
 	}
 
 	treq := &transportRequest{Request: req, trace: trace, ctx: ctx, cancel: cancel}
 	resp, err := pc.roundTrip(treq)
 	if err != nil {
-		cancel(err)
+		if cancel != nil {
+			cancel(err)
+		}
 		return nil, err
 	}
 	resp.Request = req

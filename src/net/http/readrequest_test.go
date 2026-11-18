@@ -567,6 +567,8 @@ func TestReadRequestHostOnlyFastPath(t *testing.T) {
 		"GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n",
 		"GET / HTTP/1.1\r\nHost: bad\x00host\r\n\r\n",
 		"GET / HTTP/1.1\r\nHost: bad\x7fhost\r\n\r\n",
+		"GET /foo?bar\x00baz HTTP/1.1\r\nHost: a.com\r\n\r\n",
+		"GET /foo?bar\x7fbaz HTTP/1.1\r\nHost: a.com\r\n\r\n",
 	}
 	for _, raw := range badCases {
 		if _, err := ReadRequest(bufio.NewReader(strings.NewReader(raw))); err == nil {
@@ -575,3 +577,36 @@ func TestReadRequestHostOnlyFastPath(t *testing.T) {
 	}
 }
 
+func TestReadRequestOriginQueryAndRawPathParity(t *testing.T) {
+	uris := []string{
+		"/foo/bar?baz=123&k=v",
+		"/?a=1",
+		"/foo?",
+		"/foo??",
+		"/foo?a=1?",
+		"/(foo)",
+		"/(foo)?bar=1",
+		"/a!b'c*d",
+		"/a%20b?c=1",
+	}
+	for _, uri := range uris {
+		raw := "GET " + uri + " HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n"
+		req, err := ReadRequest(bufio.NewReader(strings.NewReader(raw)))
+		if err != nil {
+			t.Fatalf("ReadRequest(%q) failed: %v", uri, err)
+		}
+		wantURL, err := url.ParseRequestURI(uri)
+		if err != nil {
+			t.Fatalf("url.ParseRequestURI(%q) failed: %v", uri, err)
+		}
+		if req.URL.Path != wantURL.Path || req.URL.RawPath != wantURL.RawPath || req.URL.ForceQuery != wantURL.ForceQuery || req.URL.RawQuery != wantURL.RawQuery {
+			t.Errorf("URI %q URL = %+v, want %+v", uri, *req.URL, *wantURL)
+		}
+		if req.RequestURI != uri {
+			t.Errorf("RequestURI = %q, want %q", req.RequestURI, uri)
+		}
+		if _, ok := req.Header["Host"]; ok {
+			t.Errorf("Header[Host] should not be present for URI %q", uri)
+		}
+	}
+}

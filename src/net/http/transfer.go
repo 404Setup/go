@@ -409,6 +409,15 @@ func (t *transferWriter) writeBody(w io.Writer) (err error) {
 	// OS-level optimizations in the event that the body is an
 	// *os.File.
 	if !t.ResponseToHEAD && t.Body != nil {
+		if t.Body == NoBody && !chunked(t.TransferEncoding) && t.ContentLength == 0 {
+			closed = true
+			if t.BodyCloser != nil && t.BodyCloser != NoBody {
+				if err := t.BodyCloser.Close(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		var body = t.unwrapBody()
 		if chunked(t.TransferEncoding) {
 			if bw, ok := w.(*bufio.Writer); ok && !t.IsResponse {
@@ -425,6 +434,10 @@ func (t *transferWriter) writeBody(w io.Writer) (err error) {
 				dst = bufioFlushWriter{dst}
 			}
 			ncopy, err = t.doBodyCopy(dst, body)
+		} else if t.ContentLength == 0 {
+			if body != NoBody {
+				ncopy, err = t.doBodyCopy(io.Discard, body)
+			}
 		} else {
 			ncopy, err = t.doBodyCopy(w, io.LimitReader(body, t.ContentLength))
 			if err != nil {

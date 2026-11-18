@@ -493,9 +493,11 @@ func ProxyURL(fixedURL *url.URL) func(*Request) (*url.URL, error) {
 // optional extra headers to write and stores any error to return
 // from roundTrip.
 type transportRequest struct {
-	*Request                        // original request, not to be mutated
-	extra    Header                 // extra headers to write, or nil
-	trace    *httptrace.ClientTrace // optional
+	*Request                          // original request, not to be mutated
+	extra      Header                 // extra headers to write, or nil
+	trace      *httptrace.ClientTrace // optional
+	addedGzip  bool
+	addedClose bool
 
 	ctx    context.Context // canceled when we are done with the request
 	cancel context.CancelCauseFunc
@@ -634,30 +636,25 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 
 	// Transport request context.
 	//
-	// RoundTrip cancels this context before returning.
-	// On the HTTP/1 path, persistConn.RoundTrip creates its own context
-	// that persistConn.readLoop cancels after reading the response body.
-	ctx, cancel := context.WithCancelCause(req.Context())
-
-	// Convert Request.Cancel into context cancellation.
+	// RoundTrip cancels this context before returning when Request.Cancel is set.
+	// On the HTTP/1 path, persistConn.RoundTrip manages its own request context.
 	if origReq.Cancel != nil {
+		var cancel context.CancelCauseFunc
+		ctx, cancel = context.WithCancelCause(ctx)
 		go awaitLegacyCancel(ctx, cancel, origReq)
+		defer func() {
+			if err != nil {
+				cancel(err)
+			} else {
+				cancel(errRequestDone)
+			}
+		}()
 	}
 
-	defer func() {
-		if err != nil {
-			cancel(err)
-		} else {
-			cancel(errRequestDone)
-		}
-	}()
-
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			req.closeBody()
 			return nil, context.Cause(ctx)
-		default:
 		}
 
 		cm, err := t.connectMethodForRequest(req)
@@ -1054,47 +1051,60 @@ func (t *Transport) maxIdleConnsPerHost() int {
 	return DefaultMaxIdleConnsPerHost
 }
 
+func (pc *persistConn) putIdleTrace(trace *httptrace.ClientTrace, err error) {
+	if !pc.isClientConn && trace != nil && trace.PutIdleConn != nil && err != errKeepAlivesDisabled && err != errCloseIdle && !pc.t.closeConnsOnIdle() {
+		trace.PutIdleConn(err)
+	}
+}
+
 // roundTripDone records that an in-flight request has completed.
 // It returns an error if the connection should now be closed.
 func (pc *persistConn) roundTripDone(trace *httptrace.ClientTrace) error {
-	putIdle := func(err error) {
-		if !pc.isClientConn && trace != nil && trace.PutIdleConn != nil && err != errKeepAlivesDisabled && err != errCloseIdle && !pc.t.closeConnsOnIdle() {
-			trace.PutIdleConn(err)
-		}
+	pc.mu.Lock()
+	if pc.closed != nil {
+		pc.mu.Unlock()
+		pc.putIdleTrace(trace, errConnBroken)
+		return errConnBroken
 	}
-	if err := func() error {
-		pc.mu.Lock()
-		defer pc.mu.Unlock()
-		if pc.closed != nil {
-			return errConnBroken
-		}
-		if !pc.inFlight {
-			panic("pconn is not in flight")
-		}
-		pc.inFlight = false
-		select {
-		case pc.availch <- struct{}{}:
-		default:
-			panic("unable to make pconn available")
-		}
-		return nil
-	}(); err != nil {
-		putIdle(err)
-		return err
+	if !pc.inFlight {
+		pc.mu.Unlock()
+		panic("pconn is not in flight")
 	}
+	pc.inFlight = false
+	select {
+	case pc.availch <- struct{}{}:
+	default:
+		pc.mu.Unlock()
+		panic("unable to make pconn available")
+	}
+	pc.mu.Unlock()
+
 	var err error
 	if pc.internalStateHook != nil {
 		err = pc.internalStateHook()
 	}
-	putIdle(err)
+	if trace != nil {
+		pc.putIdleTrace(trace, err)
+	}
 	if err != nil {
 		return err
 	}
 	// The state hook (or another request reusing pc while PutIdleConn ran)
 	// could have closed the conn. If it did, return an error so readLoop can exit quickly.
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	return pc.closed
+	closed := pc.closed
+	pc.mu.Unlock()
+	return closed
+}
+
+func (pc *persistConn) finishIdleConn(trace *httptrace.ClientTrace) (err error, ok bool) {
+	if pc.sawEOF || !pc.wroteRequest() {
+		return nil, false
+	}
+	if err := pc.roundTripDone(trace); err != nil {
+		return err, false
+	}
+	return nil, true
 }
 
 var zeroDialer net.Dialer
@@ -1508,6 +1518,10 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn
 	// All HTTP/1 connections.
 	pconn.availch = make(chan struct{}, 1)
 	pconn.availch <- struct{}{}
+	pconn.roundTripWriteCh = make(chan error, 1)
+	pconn.resc = make(chan responseAndError)
+	pconn.gone = make(chan struct{})
+	pconn.waitForBodyRead = make(chan bodyReadStatus, 1)
 	pconn.br = bufio.NewReaderSize(pconn, t.readBufferSize())
 	pconn.bw = bufio.NewWriterSize(persistConnWriter{pconn}, t.writeBufferSize())
 
@@ -1623,21 +1637,25 @@ func (k connectMethodKey) String() string {
 // persistConn wraps an HTTP/1 client connection, usually a persistent one
 // (but may be used for non-keep-alive requests as well).
 type persistConn struct {
-	t            *Transport
-	cacheKey     connectMethodKey
-	conn         net.Conn
-	tlsState     *tls.ConnectionState
-	br           *bufio.Reader       // from conn
-	bw           *bufio.Writer       // to conn
-	nwrite       int64               // bytes written
-	reqch        chan requestAndChan // written by roundTrip; read by readLoop
-	writech      chan writeRequest   // written by roundTrip; read by writeLoop
-	closech      chan struct{}       // closed when conn closed
-	availch      chan struct{}       // contains a value when conn is usable
-	isProxy      bool
-	isClientConn bool
-	sawEOF       bool  // whether we've seen EOF from conn; owned by readLoop
-	readLimit    int64 // bytes allowed to be read; owned by readLoop
+	t                *Transport
+	cacheKey         connectMethodKey
+	conn             net.Conn
+	tlsState         *tls.ConnectionState
+	br               *bufio.Reader       // from conn
+	bw               *bufio.Writer       // to conn
+	nwrite           int64               // bytes written
+	reqch            chan requestAndChan // written by roundTrip; read by readLoop
+	writech          chan writeRequest   // written by roundTrip; read by writeLoop
+	closech          chan struct{}       // closed when conn closed
+	availch          chan struct{}       // contains a value when conn is usable
+	roundTripWriteCh chan error          // buffered(1); reused by serialized roundTrip calls
+	resc             chan responseAndError
+	gone             chan struct{}       // closed by aborted roundTrip via closeGone
+	waitForBodyRead  chan bodyReadStatus // buffered(1); reused by serialized response bodies
+	isProxy          bool
+	isClientConn     bool
+	sawEOF           bool  // whether we've seen EOF from conn; owned by readLoop
+	readLimit        int64 // bytes allowed to be read; owned by readLoop
 	// writeErrCh passes the request write error (usually nil)
 	// from the writeLoop goroutine to the readLoop which passes
 	// it off to the res.Body reader, which then uses it to decide
@@ -1652,6 +1670,7 @@ type persistConn struct {
 	canceledErr          error        // set non-nil if conn is canceled
 	reserved             bool         // concurrency slot reserved
 	inFlight             bool         // request is in flight
+	goneClosed           bool         // whether gone has been closed
 	internalStateHook    func() error // called when connection state changes
 
 	// mutateHeaderFunc is an optional func to modify extra
@@ -1814,14 +1833,6 @@ func (pc *persistConn) readLoop() {
 		}
 	}()
 
-	tryPutIdleConn := func(trace *httptrace.ClientTrace) bool {
-		if err := pc.roundTripDone(trace); err != nil {
-			closeErr = err
-			return false
-		}
-		return true
-	}
-
 	// eofc is used to block caller goroutines reading from Response.Body
 	// at EOF until this goroutines has (potentially) added the connection
 	// back to the idle pool.
@@ -1916,14 +1927,19 @@ func (pc *persistConn) readLoop() {
 
 			// Put the idle conn back into the pool before roundTrip returns the
 			// response to its caller.
-			alive = alive &&
-				!pc.sawEOF &&
-				pc.wroteRequest() &&
-				tryPutIdleConn(trace)
+			if alive {
+				var idleErr error
+				idleErr, alive = pc.finishIdleConn(trace)
+				if idleErr != nil {
+					closeErr = idleErr
+				}
+			}
 			if bodyWritable {
 				closeErr = errCallerOwnsConn
 			}
-			rc.treq.cancel(errRequestDone)
+			if rc.treq.cancel != nil {
+				rc.treq.cancel(errRequestDone)
+			}
 
 			// Tell roundTrip that we've put the conn back into the pool.
 			waitc <- struct{}{}
@@ -1935,28 +1951,11 @@ func (pc *persistConn) readLoop() {
 			continue
 		}
 
-		waitForBodyRead := make(chan bodyReadStatus, 1)
 		body := &bodyEOFSignal{
-			body: resp.Body,
-			earlyCloseFn: func() error {
-				waitForBodyRead <- bodyReadClosedEarly
-				<-eofc // will be closed by deferred call at the end of the function
-				return nil
-			},
-			fn: func(err error) error {
-				if err == io.EOF {
-					waitForBodyRead <- bodyReadEOF
-					<-eofc // see comment above eofc declaration
-				} else {
-					waitForBodyRead <- bodyReadError
-					if err != nil {
-						if cerr := pc.canceled(); cerr != nil {
-							return cerr
-						}
-					}
-				}
-				return err
-			},
+			body:            resp.Body,
+			pc:              pc,
+			waitForBodyRead: pc.waitForBodyRead,
+			eofc:            eofc,
 		}
 
 		resp.Body = body
@@ -1978,16 +1977,16 @@ func (pc *persistConn) readLoop() {
 		// the bufio.Reader, wait for the caller goroutine to finish
 		// reading the response body. (or for cancellation or death)
 		select {
-		case status := <-waitForBodyRead:
-			tryPutIdle := func() {
-				alive = alive &&
-					!pc.sawEOF &&
-					pc.wroteRequest() &&
-					tryPutIdleConn(trace)
-			}
+		case status := <-pc.waitForBodyRead:
 			switch status {
 			case bodyReadEOF:
-				tryPutIdle()
+				if alive {
+					var idleErr error
+					idleErr, alive = pc.finishIdleConn(trace)
+					if idleErr != nil {
+						closeErr = idleErr
+					}
+				}
 				eofc <- struct{}{}
 			case bodyReadClosedEarly:
 				// Read resp before signaling eofc: the send lets the caller's
@@ -1995,7 +1994,11 @@ func (pc *persistConn) readLoop() {
 				tryDrain := alive && (pc.isClientConn || !pc.t.closeConnsOnIdle()) && resp.ContentLength <= maxPostCloseReadBytes
 				eofc <- struct{}{}
 				if tryDrain && maybeDrainBody(body.body) {
-					tryPutIdle()
+					var idleErr error
+					idleErr, alive = pc.finishIdleConn(trace)
+					if idleErr != nil {
+						closeErr = idleErr
+					}
 				} else {
 					alive = false
 				}
@@ -2009,7 +2012,9 @@ func (pc *persistConn) readLoop() {
 			alive = false
 		}
 
-		rc.treq.cancel(errRequestDone)
+		if rc.treq.cancel != nil {
+			rc.treq.cancel(errRequestDone)
+		}
 		testHookReadLoopBeforeNextRead()
 	}
 }
@@ -2197,7 +2202,7 @@ func (pc *persistConn) writeLoop() {
 		select {
 		case wr := <-pc.writech:
 			startBytesWritten := pc.nwrite
-			err := wr.req.Request.write(pc.bw, pc.isProxy, wr.req.extra, pc.waitForContinue(wr.continueCh))
+			err := wr.req.Request.write(pc.bw, pc.isProxy, wr.req.extra, wr.req.addedGzip, wr.req.addedClose, pc.waitForContinue(wr.continueCh))
 			if bre, ok := err.(requestBodyReadError); ok {
 				err = bre.error
 				// Errors reading from the user's
@@ -2217,8 +2222,8 @@ func (pc *persistConn) writeLoop() {
 					err = nothingWrittenError{err}
 				}
 			}
+			wr.ch <- err         // to the roundTrip function (before writeErrCh so readLoop drain synchronizes)
 			pc.writeErrCh <- err // to the body reader, which might recycle us
-			wr.ch <- err         // to the roundTrip function
 			if err != nil {
 				// The conn will be closed by either roundTrip or readLoop.
 				return
@@ -2244,7 +2249,14 @@ func (pc *persistConn) wroteRequest() bool {
 	case err := <-pc.writeErrCh:
 		// Common case: the write happened well before the response, so
 		// avoid creating a timer.
-		return err == nil
+		if err == nil {
+			select {
+			case <-pc.roundTripWriteCh:
+			default:
+			}
+			return true
+		}
+		return false
 	default:
 		// Rare case: the request was written in writeLoop above but
 		// before it could send to pc.writeErrCh, the reader read it
@@ -2260,7 +2272,14 @@ func (pc *persistConn) wroteRequest() bool {
 		defer t.Stop()
 		select {
 		case err := <-pc.writeErrCh:
-			return err == nil
+			if err == nil {
+				select {
+				case <-pc.roundTripWriteCh:
+				default:
+				}
+				return true
+			}
+			return false
 		case <-t.C:
 			return false
 		}
@@ -2356,6 +2375,19 @@ func (pc *persistConn) waitForAvailability(ctx context.Context) error {
 
 const postRequestWriteErrorWaitTime = 50 * time.Millisecond
 
+func (pc *persistConn) handleResponse(req *transportRequest, startBytesWritten int64, re responseAndError) (*Response, error) {
+	if (re.res == nil) == (re.err == nil) {
+		panic(fmt.Sprintf("internal error: exactly one of res or err should be set; nil=%v", re.res == nil))
+	}
+	if re.waitc != nil {
+		<-re.waitc
+	}
+	if re.err != nil {
+		return nil, pc.mapRoundTripError(req, startBytesWritten, re.err)
+	}
+	return re.res, nil
+}
+
 func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
 	testHookEnterRoundTrip()
 
@@ -2403,7 +2435,11 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 		// auto-decoding a portion of a gzipped document will just fail
 		// anyway. See https://golang.org/issue/8923
 		requestedGzip = true
-		req.extraHeaders()["Accept-Encoding"] = []string{"gzip"}
+		if req.extra != nil {
+			req.extra["Accept-Encoding"] = []string{"gzip"}
+		} else {
+			req.addedGzip = true
+		}
 	}
 
 	var continueCh chan struct{}
@@ -2415,11 +2451,12 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 		!req.wantsClose() &&
 		!isProtocolSwitchHeader(req.Header) &&
 		!pc.isClientConn {
-		req.extraHeaders()["Connection"] = []string{"close"}
+		if req.extra != nil {
+			req.extra["Connection"] = []string{"close"}
+		} else {
+			req.addedClose = true
+		}
 	}
-
-	gone := make(chan struct{})
-	defer close(gone)
 
 	const debugRoundTrip = false
 
@@ -2427,42 +2464,36 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	// in case the server decides to reply before reading our full
 	// request body.
 	startBytesWritten := pc.nwrite
-	writeErrCh := make(chan error, 1)
-	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+	gotResp := false
+	var respHeaderTimer *time.Timer
+	defer func() {
+		if respHeaderTimer != nil {
+			respHeaderTimer.Stop()
+		}
+		if !gotResp {
+			pc.CloseWithError(errReadLoopExiting)
+			pc.closeGone()
+		}
+	}()
 
-	resc := make(chan responseAndError)
+	pc.writech <- writeRequest{req, pc.roundTripWriteCh, continueCh}
+
 	pc.reqch <- requestAndChan{
 		treq:       req,
-		ch:         resc,
+		ch:         pc.resc,
 		addedGzip:  requestedGzip,
 		continueCh: continueCh,
-		callerGone: gone,
-	}
-
-	handleResponse := func(re responseAndError) (*Response, error) {
-		if (re.res == nil) == (re.err == nil) {
-			panic(fmt.Sprintf("internal error: exactly one of res or err should be set; nil=%v", re.res == nil))
-		}
-		if debugRoundTrip {
-			req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
-		}
-		if re.waitc != nil {
-			<-re.waitc
-		}
-		if re.err != nil {
-			return nil, pc.mapRoundTripError(req, startBytesWritten, re.err)
-		}
-		return re.res, nil
+		callerGone: pc.gone,
 	}
 
 	var writeErr error
-	var respHeaderTimer <-chan time.Time
+	var respHeaderTimerCh <-chan time.Time
 	ctxDoneChan := req.ctx.Done()
 	pcClosed := pc.closech
 	for {
 		testHookWaitResLoop()
 		select {
-		case err := <-writeErrCh:
+		case err := <-pc.roundTripWriteCh:
 			if debugRoundTrip {
 				req.logf("writeErrCh recv: %T/%#v", err, err)
 			}
@@ -2492,23 +2523,30 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 				if debugRoundTrip {
 					req.logf("starting timer for %v", timeout)
 				}
-				timer := time.NewTimer(timeout)
-				respHeaderTimer = timer.C
+				if respHeaderTimer != nil {
+					respHeaderTimer.Stop()
+				}
+				respHeaderTimer = time.NewTimer(timeout)
+				respHeaderTimerCh = respHeaderTimer.C
 			}
 		case <-pcClosed:
 			select {
-			case re := <-resc:
+			case re := <-pc.resc:
 				// The pconn closing raced with the response to the request,
 				// probably after the server wrote a response and immediately
 				// closed the connection. Use the response.
-				return handleResponse(re)
+				gotResp = true
+				if debugRoundTrip {
+					req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
+				}
+				return pc.handleResponse(req, startBytesWritten, re)
 			default:
 			}
 			if debugRoundTrip {
 				req.logf("closech recv: %T %#v", pc.closed, pc.closed)
 			}
 			return nil, pc.mapRoundTripError(req, startBytesWritten, pc.closed)
-		case <-respHeaderTimer:
+		case <-respHeaderTimerCh:
 			if debugRoundTrip {
 				req.logf("timeout waiting for response headers.")
 			}
@@ -2520,15 +2558,23 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 			}
 			pc.CloseWithError(errTimeout)
 			return nil, errTimeout
-		case re := <-resc:
-			return handleResponse(re)
+		case re := <-pc.resc:
+			gotResp = true
+			if debugRoundTrip {
+				req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
+			}
+			return pc.handleResponse(req, startBytesWritten, re)
 		case <-ctxDoneChan:
 			select {
-			case re := <-resc:
+			case re := <-pc.resc:
 				// readLoop is responsible for canceling req.ctx after
 				// it reads the response body. Check for a response racing
 				// the context close, and use the response if available.
-				return handleResponse(re)
+				gotResp = true
+				if debugRoundTrip {
+					req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
+				}
+				return pc.handleResponse(req, startBytesWritten, re)
 			default:
 			}
 			pc.cancelRequest(context.Cause(req.ctx))
@@ -2571,6 +2617,15 @@ func (pc *persistConn) closeLocked(err error) {
 	pc.mutateHeaderFunc = nil
 }
 
+func (pc *persistConn) closeGone() {
+	pc.mu.Lock()
+	if !pc.goneClosed {
+		pc.goneClosed = true
+		close(pc.gone)
+	}
+	pc.mu.Unlock()
+}
+
 func schemePort(scheme string) string {
 	switch scheme {
 	case "http":
@@ -2594,6 +2649,34 @@ func idnaASCIIFromURL(url *url.URL) string {
 
 // canonicalAddr returns url.Host but always with a ":port" suffix.
 func canonicalAddr(url *url.URL) string {
+	h := url.Host
+	if ascii.Is(h) {
+		if colon := strings.LastIndexByte(h, ':'); colon > 0 && colon+1 < len(h) {
+			portValid := true
+			for i := colon + 1; i < len(h); i++ {
+				if h[i] < '0' || h[i] > '9' {
+					portValid = false
+					break
+				}
+			}
+			if portValid {
+				hostPart := h[:colon]
+				if hostPart[0] != '[' {
+					if strings.IndexByte(hostPart, ':') < 0 {
+						return h
+					}
+				} else if len(hostPart) >= 3 && hostPart[len(hostPart)-1] == ']' {
+					if strings.IndexByte(hostPart[1:len(hostPart)-1], ':') >= 0 {
+						return h
+					}
+				}
+			}
+		} else if colon < 0 && len(h) > 0 && h[0] != '[' {
+			if port := schemePort(url.Scheme); port != "" {
+				return h + ":" + port
+			}
+		}
+	}
 	port := url.Port()
 	if port == "" {
 		port = schemePort(url.Scheme)
@@ -2605,20 +2688,18 @@ func canonicalAddr(url *url.URL) string {
 // bodies to make sure we see the end of a response body before
 // proceeding and reading on the connection again.
 //
-// It wraps a ReadCloser but runs fn (if non-nil) at most
-// once, right before its final (error-producing) Read or Close call
-// returns. fn should return the new error to return from Read or Close.
-//
-// If earlyCloseFn is non-nil and Close is called before any final error from
-// Read is seen, earlyCloseFn is called instead of fn, and its return value is
-// the return value from Close.
+// It wraps a ReadCloser and notifies readLoop via waitForBodyRead at most
+// once, right before its final (error-producing) Read or Close call returns,
+// waiting on eofc when appropriate before returning from Read or Close.
 type bodyEOFSignal struct {
-	body         io.ReadCloser
-	mu           sync.Mutex        // guards following 4 fields
-	closed       bool              // whether Close has been called
-	rerr         error             // sticky Read error
-	fn           func(error) error // called on final body.Read non-nil error (or body.Close if earlyCloseFn is not run)
-	earlyCloseFn func() error      // called if body.Close is called before body.Read ever returns a non-nil error
+	body            io.ReadCloser
+	pc              *persistConn
+	waitForBodyRead chan bodyReadStatus
+	eofc            chan struct{}
+	mu              sync.Mutex // guards following 3 fields
+	closed          bool       // whether Close has been called
+	rerr            error      // sticky Read error
+	done            bool       // whether readLoop has been notified via waitForBodyRead
 }
 
 var errReadOnClosedResBody = errors.New("http: read on closed response body")
@@ -2637,11 +2718,11 @@ func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
 	n, err = es.body.Read(p)
 	if err != nil {
 		es.mu.Lock()
-		defer es.mu.Unlock()
 		if es.rerr == nil {
 			es.rerr = err
 		}
 		err = es.condfn(err)
+		es.mu.Unlock()
 	}
 	return
 }
@@ -2653,11 +2734,13 @@ func (es *bodyEOFSignal) Close() error {
 		return nil
 	}
 	es.closed = true
-	if es.earlyCloseFn != nil && es.rerr == nil {
-		earlyCloseFn := es.earlyCloseFn
-		es.earlyCloseFn = nil
-		es.fn = nil
-		return earlyCloseFn()
+	if !es.done && es.rerr == nil {
+		es.done = true
+		if es.waitForBodyRead != nil {
+			es.waitForBodyRead <- bodyReadClosedEarly
+			<-es.eofc // will be closed by deferred call at the end of readLoop
+		}
+		return nil
 	}
 	if es.rerr != nil && es.rerr != io.EOF {
 		// Read already returned this error and readLoop gave up the
@@ -2670,13 +2753,25 @@ func (es *bodyEOFSignal) Close() error {
 
 // caller must hold es.mu.
 func (es *bodyEOFSignal) condfn(err error) error {
-	if es.fn == nil {
+	if es.done {
 		return err
 	}
-	fn := es.fn
-	es.fn = nil
-	es.earlyCloseFn = nil
-	return fn(err)
+	es.done = true
+	if es.waitForBodyRead == nil {
+		return err
+	}
+	if err == io.EOF {
+		es.waitForBodyRead <- bodyReadEOF
+		<-es.eofc // see comment above eofc declaration
+	} else {
+		es.waitForBodyRead <- bodyReadError
+		if err != nil && es.pc != nil {
+			if cerr := es.pc.canceled(); cerr != nil {
+				return cerr
+			}
+		}
+	}
+	return err
 }
 
 type tlsHandshakeTimeoutError struct{}

@@ -167,14 +167,15 @@ func refererForURL(lastReq, newReq *url.URL, explicitRef string) string {
 	return referer
 }
 
-// didTimeout is non-nil only if err != nil.
-func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
-	cookieURL := req.URL
-	if req.Host != "" {
-		cookieURL = cloneURL(cookieURL)
-		cookieURL.Host = req.Host
-	}
+// didTimeout is meaningful only if err != nil.
+func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout bool, err error) {
+	var cookieURL *url.URL
 	if c.Jar != nil {
+		cookieURL = req.URL
+		if req.Host != "" {
+			cookieURL = cloneURL(cookieURL)
+			cookieURL.Host = req.Host
+		}
 		for _, cookie := range c.Jar.Cookies(cookieURL) {
 			req.AddCookie(cookie)
 		}
@@ -188,7 +189,7 @@ func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTime
 			c.Jar.SetCookies(cookieURL, rc)
 		}
 	}
-	return resp, nil, nil
+	return resp, false, nil
 }
 
 func (c *Client) deadline() time.Time {
@@ -210,22 +211,22 @@ var ErrSchemeMismatch = errors.New("http: server gave HTTP response to HTTPS cli
 
 // send issues an HTTP request.
 // Caller should close resp.Body when done reading from it.
-func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout bool, err error) {
 	req := ireq // req is either the original request, or a modified fork
 
 	if rt == nil {
 		req.closeBody()
-		return nil, alwaysFalse, errors.New("http: no Client.Transport or DefaultTransport")
+		return nil, false, errors.New("http: no Client.Transport or DefaultTransport")
 	}
 
 	if req.URL == nil {
 		req.closeBody()
-		return nil, alwaysFalse, errors.New("http: nil Request.URL")
+		return nil, false, errors.New("http: nil Request.URL")
 	}
 
 	if req.RequestURI != "" {
 		req.closeBody()
-		return nil, alwaysFalse, errors.New("http: Request.RequestURI can't be set in client requests")
+		return nil, false, errors.New("http: Request.RequestURI can't be set in client requests")
 	}
 
 	// forkReq forks req into a shallow clone of ireq the first
@@ -256,11 +257,16 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 	if !deadline.IsZero() {
 		forkReq()
 	}
-	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
+	stopTimer, timeoutCtx, didTimeoutFn := setRequestCancel(req, rt, deadline)
 
 	resp, err = rt.RoundTrip(req)
 	if err != nil {
 		stopTimer()
+		if didTimeoutFn != nil {
+			didTimeout = didTimeoutFn()
+		} else if timeoutCtx != nil {
+			didTimeout = timeoutCtx.Err() == context.DeadlineExceeded
+		}
 		if resp != nil {
 			log.Printf("RoundTripper returned a response & error; ignoring response")
 		}
@@ -275,7 +281,7 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 		return nil, didTimeout, err
 	}
 	if resp == nil {
-		return nil, didTimeout, fmt.Errorf("http: RoundTripper implementation (%T) returned a nil *Response with a nil error", rt)
+		return nil, false, fmt.Errorf("http: RoundTripper implementation (%T) returned a nil *Response with a nil error", rt)
 	}
 	if resp.Body == nil {
 		// The documentation on the Body field says “The http Client and Transport
@@ -289,18 +295,19 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 		// If the ContentLength allows the Body to be empty, fill in an empty one
 		// here to ensure that it is non-nil.
 		if resp.ContentLength > 0 && req.Method != "HEAD" {
-			return nil, didTimeout, fmt.Errorf("http: RoundTripper implementation (%T) returned a *Response with content length %d but a nil Body", rt, resp.ContentLength)
+			return nil, false, fmt.Errorf("http: RoundTripper implementation (%T) returned a *Response with content length %d but a nil Body", rt, resp.ContentLength)
 		}
 		resp.Body = io.NopCloser(strings.NewReader(""))
 	}
-	if !deadline.IsZero() {
+	if !deadline.IsZero() && stopTimer != nil {
 		resp.Body = &cancelTimerBody{
 			stop:          stopTimer,
 			rc:            resp.Body,
-			reqDidTimeout: didTimeout,
+			timeoutCtx:    timeoutCtx,
+			reqDidTimeout: didTimeoutFn,
 		}
 	}
-	return resp, nil, nil
+	return resp, false, nil
 }
 
 // timeBeforeContextDeadline reports whether the non-zero Time t is
@@ -348,9 +355,9 @@ func knownRoundTripperImpl(rt RoundTripper, req *Request) bool {
 // Third was Request.Context.
 //
 // This function populates Request.Cancel and Request.Context.
-func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTimer func(), didTimeout func() bool) {
+func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTimer func(), timeoutCtx context.Context, didTimeout func() bool) {
 	if deadline.IsZero() {
-		return nop, alwaysFalse
+		return nop, nil, nil
 	}
 	knownTransport := knownRoundTripperImpl(rt, req)
 	oldCtx := req.Context()
@@ -359,12 +366,12 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 		// If they already had a Request.Context that's
 		// expiring sooner, do nothing:
 		if !timeBeforeContextDeadline(deadline, oldCtx) {
-			return nop, alwaysFalse
+			return nop, nil, nil
 		}
 
 		ctx, cancelCtx := context.WithDeadline(oldCtx, deadline)
 		req.ctx = ctx
-		return cancelCtx, func() bool { return ctx.Err() == context.DeadlineExceeded }
+		return cancelCtx, ctx, nil
 	}
 	initialReqCancel := req.Cancel // the user's original Request.Cancel, if any
 
@@ -400,7 +407,7 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 		}
 	}()
 
-	return stopTimer, timedOut.Load
+	return stopTimer, nil, timedOut.Load
 }
 
 // See 2 (end of page 4) https://www.ietf.org/rfc/rfc2617.txt
@@ -614,8 +621,9 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 	var (
 		deadline      = c.deadline()
 		reqs          []*Request
+		firstReq      = req
 		resp          *Response
-		copyHeaders   = c.makeHeadersCopier(req)
+		copyHeaders   func(req *Request, stripSensitiveHeaders, stripBodyHeaders bool)
 		reqBodyClosed = false // have we closed the current req.Body?
 
 		// Redirect behavior:
@@ -623,6 +631,9 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 		includeBody           = true
 		stripSensitiveHeaders = false
 	)
+	if c.Jar != nil || !knownRoundTripperImpl(c.transport(), req) {
+		copyHeaders = c.makeHeadersCopier(req)
+	}
 	uerr := func(err error) error {
 		// the body may have been closed already by c.send()
 		if !reqBodyClosed {
@@ -634,8 +645,12 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 		} else {
 			urlStr = stripPassword(req.URL)
 		}
+		opReq := firstReq
+		if len(reqs) > 0 {
+			opReq = reqs[0]
+		}
 		return &url.Error{
-			Op:  urlErrorOp(reqs[0].Method),
+			Op:  urlErrorOp(opReq.Method),
 			URL: urlStr,
 			Err: err,
 		}
@@ -729,24 +744,30 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 				ue.(*url.Error).URL = loc
 				return resp, ue
 			}
+			reqs = append(reqs, req)
 		}
 
-		reqs = append(reqs, req)
 		var err error
-		var didTimeout func() bool
+		var didTimeout bool
 		if resp, didTimeout, err = c.send(req, deadline); err != nil {
 			// c.send() always closes req.Body
 			reqBodyClosed = true
-			if !deadline.IsZero() && didTimeout() {
+			if !deadline.IsZero() && didTimeout {
 				err = &timeoutError{err.Error() + " (Client.Timeout exceeded while awaiting headers)"}
 			}
 			return nil, uerr(err)
 		}
 
 		var shouldRedirect, includeBodyOnHop bool
-		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, reqs[0])
+		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, firstReq)
 		if !shouldRedirect {
 			return resp, nil
+		}
+		if copyHeaders == nil {
+			copyHeaders = c.makeHeadersCopier(firstReq)
+		}
+		if reqs == nil {
+			reqs = []*Request{firstReq}
 		}
 		if !includeBodyOnHop {
 			// Once a hop drops the body, we never send it again
@@ -983,6 +1004,7 @@ func (c *Client) CloseIdleConnections() {
 type cancelTimerBody struct {
 	stop          func() // stops the time.Timer waiting to cancel the request
 	rc            io.ReadCloser
+	timeoutCtx    context.Context
 	reqDidTimeout func() bool
 }
 
@@ -994,7 +1016,13 @@ func (b *cancelTimerBody) Read(p []byte) (n int, err error) {
 	if err == io.EOF {
 		return n, err
 	}
-	if b.reqDidTimeout() {
+	var timedOut bool
+	if b.reqDidTimeout != nil {
+		timedOut = b.reqDidTimeout()
+	} else if b.timeoutCtx != nil {
+		timedOut = b.timeoutCtx.Err() == context.DeadlineExceeded
+	}
+	if timedOut {
 		err = &timeoutError{err.Error() + " (Client.Timeout or context cancellation while reading body)"}
 	}
 	return n, err
