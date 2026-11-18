@@ -10,16 +10,16 @@ This fork is a personal Go branch maintained by 404Setup.
 > This fork does not modify language syntax or break existing standard library APIs.
 
 ### Standard Library & Runtime
-- **`io`**: Tiered chunk pooling (`4 KiB`–`256 KiB` via `sync/v2.Pool`) and exact-sized `bytealg.MakeNoZero` final buffer allocation in `ReadAll` overflow paths.
-- **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with online `Shrink()`), with standard library internal usages migrated from `sync`.
+- **`io`**: Pooled overflow buffers and exact-sized final allocations in `ReadAll`.
+- **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with online `Shrink()`), used across standard library internals.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
-- **`net`**: Built-in TTL-aware DNS response cache (RFC 1035 / RFC 2308 negative caching, lock-free lookup, RFC 6724 route cache; disable with `GODEBUG=netdnscache=0`), DNS address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting for zone-less IPv4/IPv6 addresses.
-- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations, goroutine churn, and parsing/formatting overhead across HTTP/1.1 request/response header readers (`requestWithURL` combined allocation, `Host`-only and buffered two-pass `readMIMEHeaderBuffered` fast paths, header key/value interning, `CanonicalMIMEHeaderKey` common-key switch and ASCII validation, contiguous value buffer slicing), server connection and request lifecycle (`connWorkerPool` and `bgReadWorkerPool` with GC-driven pruning, on-demand `backgroundRead` for synchronous handlers, embedded `connReader` and `serverConnContext`, `responsePool`, flat-slice header snapshotting via `snapshotHeader`, atomic hijack and read/write deadline tracking, lazy connection/request context creation, direct `conn.bufw` write bypass), client `Transport` paths (`NoBody` write bypass, closure-free `setRequestCancel`/`bodyEOFSignal`, reusable `persistConn` channels, inline `addedGzip`/`addedClose` flags, ASCII `canonicalAddr` fast path, lock-closure removal in `poolGetConn`/`poolConnStateHook`), clean origin-form URL/query parsing (`scanCleanOriginURI`), cookies, status lines, and `ServeMux` routing.
-- **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys` (chunked key copies), and struct field introspection.
-- **`runtime`**: Synchronous unmarked span reclamation before heap growth (`reclaimBeforeGrow`), fused 64-bit word-wide zombie check and allocation counting during span sweep (`countAllocAndCheckZombies`), `TrailingZeros8`/`TrailingZeros32` bit scanning in `reclaimChunk`, `scanblock`, `markrootSpans`, and `typeBitsBulkBarrier`, `tp.nextFast` and `nil`-pointer filtering in bulk write barriers, consecutive pointer deduplication in `wbBufFlush1` and GreenTeaGC span/object scanners, empty `spanSet.reset` STW fast path, `workbuf`/`wbBuf` bounds checks, and zero-size fast paths in `makeslice`, `makeslicecopy`, `rawbyteslice`, and `rawruneslice`.
-- **`cmd/compile`**: Tiered stack small-buffer optimization (SBO) for non-escaping dynamic `make` and `make+copy` (`128 B` pointerless / `64 B` pointer-bearing), inlining budget promotion for dynamic `make` helpers, and static constant propagation for `make` and `[]byte(s)`.
-- **`crypto/fips140`**: Compile-time and link-time dead code elimination of FIPS 140 integrity checks and self-tests when `GOFIPS140=off`.
+- **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
+- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and goroutine churn across HTTP/1.1 request/response parsing, header canonicalization/interning, server connection and worker pooling, client `Transport` pooling, URL/cookie parsing, and `ServeMux` routing.
+- **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
+- **`runtime`**: Faster span reclamation, GC bit-scanning and sweep, write-barrier pointer deduplication, and zero-size slice fast paths.
+- **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
+- **`crypto/fips140`**: Dead code elimination of FIPS 140 integrity checks and self-tests when `GOFIPS140=off`.
 - **`cmd/go`**: Terminal progress indicator (`Building [====   ] x/y`) for `go build` and `go install`.
 
 ### Compiler & Linker Flags
