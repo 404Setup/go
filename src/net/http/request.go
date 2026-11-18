@@ -28,7 +28,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"sync/v2"
-	_ "unsafe" // for linkname
+	"unsafe" // for linkname and zero-copy string conversions
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
@@ -1187,16 +1187,33 @@ func parseBasicAuth(auth string) (username, password string, ok bool) {
 	if len(auth) < len(prefix) || !ascii.EqualFold(auth[:len(prefix)], prefix) {
 		return "", "", false
 	}
-	c, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	enc := auth[len(prefix):]
+	if base64.StdEncoding.DecodedLen(len(enc)) <= maxStackBasicAuth {
+		// Decode into a stack buffer so that valid credentials cost a
+		// single allocation. Decode does not modify its source, so
+		// viewing enc as bytes without a copy is safe.
+		var buf [maxStackBasicAuth]byte
+		n, err := base64.StdEncoding.Decode(buf[:], unsafe.Slice(unsafe.StringData(enc), len(enc)))
+		if err != nil {
+			return "", "", false
+		}
+		colon := bytes.IndexByte(buf[:n], ':')
+		if colon < 0 {
+			return "", "", false
+		}
+		cs := string(buf[:n])
+		return cs[:colon], cs[colon+1:], true
+	}
+	c, err := base64.StdEncoding.DecodeString(enc)
 	if err != nil {
 		return "", "", false
 	}
-	cs := string(c)
-	username, password, ok = strings.Cut(cs, ":")
-	if !ok {
+	colon := bytes.IndexByte(c, ':')
+	if colon < 0 {
 		return "", "", false
 	}
-	return username, password, true
+	cs := string(c)
+	return cs[:colon], cs[colon+1:], true
 }
 
 // SetBasicAuth sets the request's Authorization header to use HTTP
@@ -1211,7 +1228,7 @@ func parseBasicAuth(auth string) (username, password string, ok bool) {
 // password. For instance, when used with OAuth2, both arguments must
 // be URL encoded first with [url.QueryEscape].
 func (r *Request) SetBasicAuth(username, password string) {
-	r.Header.Set("Authorization", "Basic "+basicAuth(username, password))
+	r.Header.Set("Authorization", basicAuthHeader(username, password))
 }
 
 // parseRequestLine parses "GET /foo HTTP/1.1" into its three parts.
@@ -1738,48 +1755,102 @@ func copyValues(dst, src url.Values) {
 	}
 }
 
+const maxSmallPostFormSize = 4096
+
+func readPostFormBody(r *Request, maxFormSize int64, isMaxBytes bool) ([]byte, error) {
+	if cl := r.ContentLength; 0 < cl && cl < maxSmallPostFormSize && cl <= maxFormSize {
+		// Read small bodies of known length into a closely sized slice, leaving
+		// room for one extra byte so readers that return (n, nil) before EOF
+		// still finish in a single allocation.
+		b := make([]byte, 0, int(cl)+1)
+		for {
+			n, err := r.Body.Read(b[len(b):cap(b)])
+			b = b[:len(b)+n]
+			if err != nil {
+				if err == io.EOF {
+					err = nil
+				}
+				return b, err
+			}
+			if len(b) == cap(b) {
+				var reader io.Reader = r.Body
+				if !isMaxBytes {
+					reader = io.LimitReader(r.Body, maxFormSize-int64(len(b))+1)
+				}
+				rest, err := io.ReadAll(reader)
+				b = append(b, rest...)
+				return b, err
+			}
+		}
+	}
+	var reader io.Reader = r.Body
+	if !isMaxBytes {
+		reader = io.LimitReader(r.Body, maxFormSize+1)
+	}
+	return io.ReadAll(reader)
+}
+
 func parsePostForm(r *Request) (vs url.Values, err error) {
 	if r.Body == nil {
 		err = errors.New("missing form body")
 		return
 	}
 	ct := r.Header.Get("Content-Type")
-	// RFC 7231, section 3.1.1.5 - empty type
-	//   MAY be treated as application/octet-stream
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	ct, _, err = mime.ParseMediaType(ct)
-	switch {
-	case ct == "application/x-www-form-urlencoded":
-		var reader io.Reader = r.Body
-		maxFormSize := int64(1<<63 - 1)
-		if _, ok := r.Body.(*maxBytesReader); !ok {
-			maxFormSize = int64(10 << 20) // 10 MB is a lot of text.
-			reader = io.LimitReader(r.Body, maxFormSize+1)
-		}
-		b, e := io.ReadAll(reader)
-		if e != nil {
-			if err == nil {
-				err = e
-			}
-			break
-		}
-		if int64(len(b)) > maxFormSize {
-			err = errors.New("http: POST too large")
-			return
-		}
-		vs, e = url.ParseQuery(string(b))
-		if err == nil {
-			err = e
-		}
-	case ct == "multipart/form-data":
+	switch ct {
+	case "":
+		// RFC 7231, section 3.1.1.5 - empty type
+		//   MAY be treated as application/octet-stream
+		return
+	case "multipart/form-data":
 		// handled by ParseMultipartForm (which is calling us, or should be)
 		// TODO(bradfitz): there are too many possible
 		// orders to call too many functions here.
 		// Clean this up and write more tests.
 		// request_test.go contains the start of this,
 		// in TestParseMultipartFormOrder and others.
+		return
+	case "application/x-www-form-urlencoded":
+	default:
+		ct, _, err = mime.ParseMediaType(ct)
+	}
+	if ct != "application/x-www-form-urlencoded" {
+		return
+	}
+	if r.Body == NoBody {
+		return make(url.Values), err
+	}
+	maxFormSize := int64(1<<63 - 1)
+	_, isMaxBytes := r.Body.(*maxBytesReader)
+	if !isMaxBytes {
+		maxFormSize = int64(10 << 20) // 10 MB is a lot of text.
+	}
+	b, e := readPostFormBody(r, maxFormSize, isMaxBytes)
+	if e != nil {
+		if err == nil {
+			err = e
+		}
+		return
+	}
+	if int64(len(b)) > maxFormSize {
+		err = errors.New("http: POST too large")
+		return
+	}
+	if len(b) == 0 {
+		return make(url.Values), err
+	}
+	var s string
+	if cap(b)-len(b) <= len(b) {
+		// b is owned by this function and has bounded spare capacity,
+		// so the parsed values may safely alias it.
+		s = unsafe.String(unsafe.SliceData(b), len(b))
+	} else {
+		// Copy small bodies read into a larger io.ReadAll buffer so
+		// long-lived map entries do not pin the spare capacity.
+		s = string(b)
+	}
+	vs, e = url.ParseQuery(s)
+	if err == nil {
+		err = e
 	}
 	return
 }

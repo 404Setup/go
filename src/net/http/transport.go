@@ -1003,7 +1003,7 @@ func (cm *connectMethod) proxyAuth() string {
 	if u := cm.proxyURL.User; u != nil {
 		username := u.Username()
 		password, _ := u.Password()
-		return "Basic " + basicAuth(username, password)
+		return basicAuthHeader(username, password)
 	}
 	return ""
 }

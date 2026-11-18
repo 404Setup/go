@@ -251,7 +251,7 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 		password, _ := u.Password()
 		forkReq()
 		req.Header = cloneOrMakeHeader(ireq.Header)
-		req.Header["Authorization"] = []string{"Basic " + basicAuth(username, password)}
+		req.Header["Authorization"] = []string{basicAuthHeader(username, password)}
 	}
 
 	if !deadline.IsZero() {
@@ -418,6 +418,31 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 func basicAuth(username, password string) string {
 	auth := username + ":" + password
 	return base64.StdEncoding.EncodeToString([]byte(auth))
+}
+
+// maxStackBasicAuth is the largest Basic credential size, in bytes before
+// base64 encoding, that basicAuthHeader and parseBasicAuth handle without
+// an intermediate heap buffer.
+const maxStackBasicAuth = 128
+
+// basicAuthHeader returns the Authorization header value
+// "Basic " + basicAuth(username, password). Common credential sizes cost a
+// single allocation.
+func basicAuthHeader(username, password string) string {
+	const prefix = "Basic "
+	if len(username) >= maxStackBasicAuth || len(password) >= maxStackBasicAuth-len(username) {
+		return prefix + basicAuth(username, password)
+	}
+	var raw [maxStackBasicAuth]byte
+	m := copy(raw[:], username)
+	raw[m] = ':'
+	m++
+	m += copy(raw[m:], password)
+
+	var out [len(prefix) + (maxStackBasicAuth+2)/3*4]byte
+	copy(out[:], prefix)
+	base64.StdEncoding.Encode(out[len(prefix):], raw[:m])
+	return string(out[:len(prefix)+base64.StdEncoding.EncodedLen(m)])
 }
 
 // Get issues a GET to the specified URL. If the response is one of
