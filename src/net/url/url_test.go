@@ -2647,3 +2647,66 @@ func TestValuesClone(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCleanOriginFormFastPath(t *testing.T) {
+	cases := []struct {
+		raw       string
+		wantPath  string
+		wantQuery string
+	}{
+		{"/", "/", ""},
+		{"/index.html", "/index.html", ""},
+		{"/api/v1/users/42?active=true&limit=10", "/api/v1/users/42", "active=true&limit=10"},
+		{"/a+b/c@d:e!f$g&h'i(j)k*l,m;n=o~p_q-r.s", "/a+b/c@d:e!f$g&h'i(j)k*l,m;n=o~p_q-r.s", ""},
+		{"/a%20b/c%2fd", "/a b/c/d", ""},
+	}
+	for _, tc := range cases {
+		u, err := ParseRequestURI(tc.raw)
+		if err != nil {
+			t.Fatalf("ParseRequestURI(%q): %v", tc.raw, err)
+		}
+		if u.Path != tc.wantPath || u.RawQuery != tc.wantQuery {
+			t.Errorf("ParseRequestURI(%q) = (Path=%q, RawQuery=%q), want (%q, %q)",
+				tc.raw, u.Path, u.RawQuery, tc.wantPath, tc.wantQuery)
+		}
+		u2, err := Parse(tc.raw)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.raw, err)
+		}
+		if u2.Path != tc.wantPath || u2.RawQuery != tc.wantQuery {
+			t.Errorf("Parse(%q) = (Path=%q, RawQuery=%q), want (%q, %q)",
+				tc.raw, u2.Path, u2.RawQuery, tc.wantPath, tc.wantQuery)
+		}
+		if ep := u.EscapedPath(); ep == "" {
+			t.Errorf("EscapedPath(%q) returned empty string", tc.raw)
+		}
+	}
+
+	// Verify "//example.com/path" is not intercepted by the single-slash fast path.
+	if u, err := Parse("//example.com/path"); err != nil || u.Host != "example.com" || u.Path != "/path" {
+		t.Errorf("Parse(\"//example.com/path\") = (%v, %v), want Host=example.com Path=/path", u, err)
+	}
+	if u, err := ParseRequestURI("//example.com/path"); err != nil || u.Host != "" || u.Path != "//example.com/path" {
+		t.Errorf("ParseRequestURI(\"//example.com/path\") = (%v, %v), want Host=\"\" Path=//example.com/path", u, err)
+	}
+}
+
+func BenchmarkParseRequestURIClean(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := ParseRequestURI("/api/v1/users/12345/profile?format=json"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkEscapedPathClean(b *testing.B) {
+	b.ReportAllocs()
+	u := &URL{Path: "/api/v1/users/12345/profile"}
+	for b.Loop() {
+		if p := u.EscapedPath(); p != "/api/v1/users/12345/profile" {
+			b.Fatal(p)
+		}
+	}
+}
+

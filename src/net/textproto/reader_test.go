@@ -564,3 +564,93 @@ func BenchmarkUncommon(b *testing.B) {
 		}
 	}
 }
+
+func TestCanonicalMIMEHeaderKeyFastPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"Host", "Host"},
+		{"host", "Host"},
+		{"HOST", "Host"},
+		{"Content-Type", "Content-Type"},
+		{"content-type", "Content-Type"},
+		{"Content-Length", "Content-Length"},
+		{"content-length", "Content-Length"},
+		{"Connection", "Connection"},
+		{"User-Agent", "User-Agent"},
+		{"Accept", "Accept"},
+		{"Accept-Encoding", "Accept-Encoding"},
+		{"Accept-Language", "Accept-Language"},
+		{"Authorization", "Authorization"},
+		{"Cache-Control", "Cache-Control"},
+		{"Cookie", "Cookie"},
+		{"Set-Cookie", "Set-Cookie"},
+		{"Transfer-Encoding", "Transfer-Encoding"},
+		{"X-Forwarded-For", "X-Forwarded-For"},
+		{"X-Forwarded-Proto", "X-Forwarded-Proto"},
+		{"X-Real-Ip", "X-Real-Ip"},
+		{"x-custom-key", "X-Custom-Key"},
+		{"bad key", "bad key"},
+	}
+	for _, tc := range cases {
+		if got := CanonicalMIMEHeaderKey(tc.in); got != tc.want {
+			t.Errorf("CanonicalMIMEHeaderKey(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		_ = CanonicalMIMEHeaderKey("Content-Type")
+		_ = CanonicalMIMEHeaderKey("Content-Length")
+		_ = CanonicalMIMEHeaderKey("X-Forwarded-For")
+	}); n > 0 {
+		t.Errorf("CanonicalMIMEHeaderKey canonical allocs = %v, want 0", n)
+	}
+}
+
+func TestReadMIMEHeaderValueInterning(t *testing.T) {
+	raw := "Host: localhost:8080\r\n" +
+		"Connection: keep-alive\r\n" +
+		"Accept: */*\r\n" +
+		"Accept-Encoding: gzip, deflate, br\r\n" +
+		"Cache-Control: no-cache\r\n" +
+		"Content-Type: application/json; charset=utf-8\r\n" +
+		"Content-Length: 0\r\n" +
+		"X-Custom-1: first-non-interned-value-1234567890\r\n" +
+		"X-Custom-2: second-non-interned-value-0987654321\r\n" +
+		"X-Custom-3: third-non-interned-value-abcdef\r\n\r\n"
+
+	r := NewReader(bufio.NewReader(strings.NewReader(raw)))
+	h, err := r.ReadMIMEHeader()
+	if err != nil {
+		t.Fatalf("ReadMIMEHeader: %v", err)
+	}
+	want := map[string]string{
+		"Host":            "localhost:8080",
+		"Connection":      "keep-alive",
+		"Accept":          "*/*",
+		"Accept-Encoding": "gzip, deflate, br",
+		"Cache-Control":   "no-cache",
+		"Content-Type":    "application/json; charset=utf-8",
+		"Content-Length":  "0",
+		"X-Custom-1":      "first-non-interned-value-1234567890",
+		"X-Custom-2":      "second-non-interned-value-0987654321",
+		"X-Custom-3":      "third-non-interned-value-abcdef",
+	}
+	for k, wv := range want {
+		if got := h.Get(k); got != wv {
+			t.Errorf("h.Get(%q) = %q, want %q", k, got, wv)
+		}
+	}
+}
+
+func BenchmarkCanonicalMIMEHeaderKey(b *testing.B) {
+	b.ReportAllocs()
+	keys := []string{"Content-Type", "Content-Length", "Host", "Connection", "User-Agent", "Accept-Encoding"}
+	for b.Loop() {
+		for _, k := range keys {
+			_ = CanonicalMIMEHeaderKey(k)
+		}
+	}
+}
+

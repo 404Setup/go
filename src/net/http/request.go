@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"mime"
 	"mime/multipart"
@@ -24,8 +23,10 @@ import (
 	"net/textproto"
 	"net/url"
 	urlpkg "net/url"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"sync/v2"
 	_ "unsafe" // for linkname
 
@@ -222,7 +223,8 @@ type Request struct {
 	// For client requests, setting this field prevents re-use of
 	// TCP connections between requests to the same hosts, as if
 	// Transport.DisableKeepAlives were set.
-	Close bool
+	Close    bool
+	ctxState uint32
 
 	// For server requests, Host specifies the host on which the
 	// URL is sought. For HTTP/1 (per RFC 7230, section 5.4), this
@@ -338,9 +340,58 @@ type Request struct {
 	ctx context.Context
 
 	// The following fields are for requests matched by ServeMux.
-	pat         *pattern          // the pattern that matched
-	matches     []string          // values for the matching wildcards in pat
-	otherValues map[string]string // for calls to SetPathValue that don't match a wildcard
+	pat       *pattern           // the pattern that matched
+	matches   []string           // values for the matching wildcards in pat, followed by SetPathValue key/value pairs
+	cancelCtx context.CancelFunc // for lazy server request context cancellation
+}
+
+const (
+	ctxStateLazy     = 1 << 0
+	ctxStateLocked   = 1 << 1
+	ctxStateCreated  = 1 << 2
+	ctxStateCanceled = 1 << 3
+)
+
+func (r *Request) lazyContext() context.Context {
+	for {
+		s := atomic.LoadUint32(&r.ctxState)
+		if s&ctxStateLocked == 0 && atomic.CompareAndSwapUint32(&r.ctxState, s, s|ctxStateLocked) {
+			if s&ctxStateCreated == 0 {
+				base := r.ctx
+				if base == nil {
+					base = context.Background()
+				}
+				ctx, cancel := context.WithCancel(base)
+				if s&ctxStateCanceled != 0 {
+					cancel()
+				} else {
+					r.cancelCtx = cancel
+				}
+				r.ctx = ctx
+				s |= ctxStateCreated
+			}
+			ctx := r.ctx
+			atomic.StoreUint32(&r.ctxState, s)
+			return ctx
+		}
+		runtime.Gosched()
+	}
+}
+
+func (r *Request) cancelServerCtx() {
+	for {
+		s := atomic.LoadUint32(&r.ctxState)
+		if s&ctxStateLocked == 0 && atomic.CompareAndSwapUint32(&r.ctxState, s, s|ctxStateLocked) {
+			cancel := r.cancelCtx
+			r.cancelCtx = nil
+			atomic.StoreUint32(&r.ctxState, s|ctxStateCanceled)
+			if cancel != nil {
+				cancel()
+			}
+			return
+		}
+		runtime.Gosched()
+	}
 }
 
 // Context returns the request's context. To change the context, use
@@ -355,6 +406,9 @@ type Request struct {
 // client's connection closes, the request is canceled (with HTTP/2),
 // or when the ServeHTTP method returns.
 func (r *Request) Context() context.Context {
+	if atomic.LoadUint32(&r.ctxState) != 0 {
+		return r.lazyContext()
+	}
 	if r.ctx != nil {
 		return r.ctx
 	}
@@ -377,6 +431,8 @@ func (r *Request) WithContext(ctx context.Context) *Request {
 	r2 := new(Request)
 	*r2 = *r
 	r2.ctx = ctx
+	r2.ctxState = 0
+	r2.cancelCtx = nil
 	return r2
 }
 
@@ -395,6 +451,8 @@ func (r *Request) Clone(ctx context.Context) *Request {
 	r2 := new(Request)
 	*r2 = *r
 	r2.ctx = ctx
+	r2.ctxState = 0
+	r2.cancelCtx = nil
 	r2.URL = cloneURL(r.URL)
 	r2.Header = r.Header.Clone()
 	r2.Trailer = r.Trailer.Clone()
@@ -407,13 +465,12 @@ func (r *Request) Clone(ctx context.Context) *Request {
 	r2.PostForm = cloneURLValues(r.PostForm)
 	r2.MultipartForm = cloneMultipartForm(r.MultipartForm)
 
-	// Copy matches and otherValues. See issue 61410.
+	// Copy matches and SetPathValue entries. See issue 61410.
 	if s := r.matches; s != nil {
 		s2 := make([]string, len(s))
 		copy(s2, s)
 		r2.matches = s2
 	}
-	r2.otherValues = maps.Clone(r.otherValues)
 	return r2
 }
 
@@ -1105,13 +1162,8 @@ func putTextprotoReader(r *textproto.Reader) {
 // requests and handle them via the [Handler] interface. ReadRequest
 // only supports HTTP/1.x requests. For HTTP/2, use golang.org/x/net/http2.
 func ReadRequest(b *bufio.Reader) (*Request, error) {
-	req, err := readRequest(b)
-	if err != nil {
-		return nil, err
-	}
-
-	delete(req.Header, "Host")
-	return req, nil
+	req, _, _, err := readRequestLimit(b, math.MaxInt64, true)
+	return req, err
 }
 
 // readMIMEHeader is defined in package [net/textproto].
@@ -1131,7 +1183,103 @@ func readMIMEHeader(r *textproto.Reader, maxMemory, maxHeaders int64) (textproto
 //
 //go:linkname readRequest
 func readRequest(b *bufio.Reader) (req *Request, err error) {
-	return readRequestLimit(b, math.MaxInt64)
+	req, _, _, err = readRequestLimit(b, math.MaxInt64, false)
+	return req, err
+}
+
+type requestWithURL struct {
+	req Request
+	url url.URL
+}
+
+var cleanPathTable = [256]bool{
+	'!': true, '$': true, '&': true, '\'': true, '(': true, ')': true,
+	'*': true, '+': true, ',': true, '-': true, '.': true, '/': true,
+	'0': true, '1': true, '2': true, '3': true, '4': true, '5': true,
+	'6': true, '7': true, '8': true, '9': true, ':': true, ';': true,
+	'=': true, '@': true,
+	'A': true, 'B': true, 'C': true, 'D': true, 'E': true, 'F': true,
+	'G': true, 'H': true, 'I': true, 'J': true, 'K': true, 'L': true,
+	'M': true, 'N': true, 'O': true, 'P': true, 'Q': true, 'R': true,
+	'S': true, 'T': true, 'U': true, 'V': true, 'W': true, 'X': true,
+	'Y': true, 'Z': true, '_': true,
+	'a': true, 'b': true, 'c': true, 'd': true, 'e': true, 'f': true,
+	'g': true, 'h': true, 'i': true, 'j': true, 'k': true, 'l': true,
+	'm': true, 'n': true, 'o': true, 'p': true, 'q': true, 'r': true,
+	's': true, 't': true, 'u': true, 'v': true, 'w': true, 'x': true,
+	'y': true, 'z': true, '~': true,
+}
+
+func isCleanRequestPath(b []byte) bool {
+	for _, c := range b {
+		if !cleanPathTable[c] {
+			return false
+		}
+	}
+	return true
+}
+
+func tryReadHostOnlyHeader(b *bufio.Reader, maxHeaders int64) (host string, haveHost, ok bool) {
+	n := b.Buffered()
+	if n < 2 {
+		return "", false, false
+	}
+	peek, err := b.Peek(n)
+	if err != nil {
+		return "", false, false
+	}
+	if peek[0] == '\r' && peek[1] == '\n' {
+		b.Discard(2)
+		return "", false, true
+	}
+	if maxHeaders < 1 || len(peek) < 8 {
+		return "", false, false
+	}
+	if (peek[0] != 'H' && peek[0] != 'h') ||
+		(peek[1] != 'o' && peek[1] != 'O') ||
+		(peek[2] != 's' && peek[2] != 'S') ||
+		(peek[3] != 't' && peek[3] != 'T') ||
+		peek[4] != ':' {
+		return "", false, false
+	}
+	nlIdx := bytes.IndexByte(peek[5:], '\n')
+	if nlIdx < 0 {
+		return "", false, false
+	}
+	lineEnd := 5 + nlIdx
+	if len(peek) < lineEnd+3 || peek[lineEnd+1] != '\r' || peek[lineEnd+2] != '\n' {
+		return "", false, false
+	}
+	v := peek[5:lineEnd]
+	if len(v) > 0 && v[len(v)-1] == '\r' {
+		v = v[:len(v)-1]
+	}
+	for len(v) > 0 && (v[0] == ' ' || v[0] == '\t') {
+		v = v[1:]
+	}
+	for len(v) > 0 && (v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
+		v = v[:len(v)-1]
+	}
+	for _, c := range v {
+		if (c < ' ' || c == 0x7f) && c != '\t' {
+			return "", false, false
+		}
+	}
+	b.Discard(lineEnd + 3)
+	switch string(v) {
+	case "":
+		return "", true, true
+	case "golang.org":
+		return "golang.org", true, true
+	case "localhost":
+		return "localhost", true, true
+	case "localhost:8080":
+		return "localhost:8080", true, true
+	case "127.0.0.1":
+		return "127.0.0.1", true, true
+	default:
+		return string(v), true, true
+	}
 }
 
 func readLineBytes(b *bufio.Reader) ([]byte, error) {
@@ -1152,22 +1300,22 @@ func readLineBytes(b *bufio.Reader) ([]byte, error) {
 	return line, nil
 }
 
-func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err error) {
+func readRequestLimit(b *bufio.Reader, maxHeaders int64, deleteHost bool) (req *Request, haveHost bool, hostHeader string, err error) {
 	// First line: GET /index.html HTTP/1.0
 	line, err := readLineBytes(b)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 
 	i1 := bytes.IndexByte(line, ' ')
 	if i1 < 0 {
-		return nil, badStringError("malformed HTTP request", string(line))
+		return nil, false, "", badStringError("malformed HTTP request", string(line))
 	}
 	methodBytes := line[:i1]
 	rest := line[i1+1:]
 	i2 := bytes.IndexByte(rest, ' ')
 	if i2 < 0 {
-		return nil, badStringError("malformed HTTP request", string(line))
+		return nil, false, "", badStringError("malformed HTTP request", string(line))
 	}
 	uriBytes := rest[:i2]
 	protoBytes := rest[i2+1:]
@@ -1195,7 +1343,7 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 	default:
 		method = string(methodBytes)
 		if !validMethod(method) {
-			return nil, badStringError("invalid method", method)
+			return nil, false, "", badStringError("invalid method", method)
 		}
 	}
 
@@ -1214,16 +1362,19 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 		proto = string(protoBytes)
 		var ok bool
 		if protoMajor, protoMinor, ok = ParseHTTPVersion(proto); !ok {
-			return nil, badStringError("malformed HTTP version", proto)
+			return nil, false, "", badStringError("malformed HTTP version", proto)
 		}
 	}
 
-	req = &Request{
-		Method:     method,
-		Proto:      proto,
-		ProtoMajor: protoMajor,
-		ProtoMinor: protoMinor,
+	ru := &requestWithURL{
+		req: Request{
+			Method:     method,
+			Proto:      proto,
+			ProtoMajor: protoMajor,
+			ProtoMinor: protoMinor,
+		},
 	}
+	req = &ru.req
 
 	// CONNECT requests are used two different ways, and neither uses a full URL:
 	// The standard use is to tunnel HTTPS through an HTTP proxy.
@@ -1236,7 +1387,12 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 	// RPC to work.
 	if len(uriBytes) == 1 && uriBytes[0] == '/' {
 		req.RequestURI = "/"
-		req.URL = &url.URL{Path: "/"}
+		ru.url.Path = "/"
+		req.URL = &ru.url
+	} else if len(uriBytes) > 1 && uriBytes[0] == '/' && uriBytes[1] != '/' && isCleanRequestPath(uriBytes) {
+		req.RequestURI = string(uriBytes)
+		ru.url.Path = req.RequestURI
+		req.URL = &ru.url
 	} else {
 		req.RequestURI = string(uriBytes)
 		rawurl := req.RequestURI
@@ -1246,12 +1402,29 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 		}
 
 		if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
-			return nil, err
+			return nil, false, "", err
 		}
 
 		if justAuthority {
 			// Strip the bogus "http://" back off.
 			req.URL.Scheme = ""
+		}
+	}
+
+	if deleteHost {
+		if host, hasHost, ok := tryReadHostOnlyHeader(b, maxHeaders); ok {
+			req.Header = make(Header)
+			req.Host = req.URL.Host
+			if req.Host == "" {
+				req.Host = host
+			}
+			req.Close = req.ProtoMajor < 1 || (req.ProtoMajor == 1 && req.ProtoMinor == 0)
+			req.Body = NoBody
+			if req.Method == "PRI" && req.isH2Upgrade() {
+				req.ContentLength = -1
+				req.Close = true
+			}
+			return req, hasHost, host, nil
 		}
 	}
 
@@ -1261,17 +1434,22 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 	putTextprotoReader(tp)
 	if err != nil {
 		if err == io.EOF {
-			return nil, io.ErrUnexpectedEOF
+			return nil, false, "", io.ErrUnexpectedEOF
 		}
 		// TODO: Add a distinguishable error to net/textproto.
 		if err.Error() == "message too large" {
-			return nil, errTooLarge
+			return nil, false, "", errTooLarge
 		}
-		return nil, err
+		return nil, false, "", err
 	}
 	req.Header = Header(mimeHeader)
-	if len(req.Header["Host"]) > 1 {
-		return nil, fmt.Errorf("too many Host headers")
+	hosts := req.Header["Host"]
+	if len(hosts) > 1 {
+		return nil, false, "", fmt.Errorf("too many Host headers")
+	}
+	if len(hosts) > 0 {
+		haveHost = true
+		hostHeader = hosts[0]
 	}
 
 	// RFC 7230, section 5.3: Must treat
@@ -1283,7 +1461,20 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 	// the same. In the second case, any Host line is ignored.
 	req.Host = req.URL.Host
 	if req.Host == "" {
-		req.Host = req.Header.get("Host")
+		req.Host = hostHeader
+	}
+	if deleteHost && haveHost {
+		delete(req.Header, "Host")
+	}
+
+	if len(req.Header) == 0 {
+		req.Close = req.ProtoMajor < 1 || (req.ProtoMajor == 1 && req.ProtoMinor == 0)
+		req.Body = NoBody
+		if req.Method == "PRI" && req.isH2Upgrade() {
+			req.ContentLength = -1
+			req.Close = true
+		}
+		return req, haveHost, hostHeader, nil
 	}
 
 	fixPragmaCacheControl(req.Header)
@@ -1293,9 +1484,9 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 	err = readTransfer(req, b, maxHeaders)
 	if err != nil {
 		if err == io.EOF {
-			return nil, io.ErrUnexpectedEOF
+			return nil, false, "", io.ErrUnexpectedEOF
 		}
-		return nil, err
+		return nil, false, "", err
 	}
 
 	if req.isH2Upgrade() {
@@ -1308,7 +1499,7 @@ func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err erro
 		// hijacked. Set Close to ensure that:
 		req.Close = true
 	}
-	return req, nil
+	return req, haveHost, hostHeader, nil
 }
 
 // MaxBytesReader is similar to [io.LimitReader] but is intended for
@@ -1634,7 +1825,12 @@ func (r *Request) PathValue(name string) string {
 	if i := r.patIndex(name); i >= 0 {
 		return r.matches[i]
 	}
-	return r.otherValues[name]
+	for i := r.patWildcardCount(); i+1 < len(r.matches); i += 2 {
+		if r.matches[i] == name {
+			return r.matches[i+1]
+		}
+	}
+	return ""
 }
 
 // SetPathValue sets name to value, so that subsequent calls to r.PathValue(name)
@@ -1643,12 +1839,28 @@ func (r *Request) PathValue(name string) string {
 func (r *Request) SetPathValue(name, value string) {
 	if i := r.patIndex(name); i >= 0 {
 		r.matches[i] = value
-	} else {
-		if r.otherValues == nil {
-			r.otherValues = map[string]string{}
-		}
-		r.otherValues[name] = value
+		return
 	}
+	for i := r.patWildcardCount(); i+1 < len(r.matches); i += 2 {
+		if r.matches[i] == name {
+			r.matches[i+1] = value
+			return
+		}
+	}
+	r.matches = append(r.matches, name, value)
+}
+
+func (r *Request) patWildcardCount() int {
+	if r.pat == nil {
+		return 0
+	}
+	n := 0
+	for _, seg := range r.pat.segments {
+		if seg.wild && seg.s != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // patIndex returns the index of name in the list of named wildcards of the

@@ -450,12 +450,11 @@ func (cw *chunkWriter) close() {
 // A response represents the server side of an HTTP response.
 type response struct {
 	conn             *conn
-	req              *Request           // request for this response
-	reqBody          *body              // nil when NoBody
-	cancelCtx        context.CancelFunc // when ServeHTTP exits
-	wroteHeader      bool               // a non-1xx header has been (logically) written
-	wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
-	wantsClose       bool               // HTTP request has Connection "close"
+	req              *Request // request for this response
+	reqBody          *body    // nil when NoBody
+	wroteHeader      bool     // a non-1xx header has been (logically) written
+	wants10KeepAlive bool     // HTTP/1.0 w/ Connection "keep-alive"
+	wantsClose       bool     // HTTP request has Connection "close"
 	ecReader         *expectContinueReader
 
 	// canWriteContinue is an atomic boolean that says whether or
@@ -477,6 +476,8 @@ type response struct {
 	// time, and privately mutated thereafter.
 	handlerHeader Header
 	calledHeader  bool // handler accessed handlerHeader via Header
+	cwHeader      Header
+	cwHeaderStrs  []string
 
 	written       int64 // number of bytes written in body
 	contentLength int64 // explicitly-declared Content-Length; or -1
@@ -736,9 +737,6 @@ type connReader struct {
 
 func (cr *connReader) lock() {
 	cr.mu.Lock()
-	if cr.cond == nil {
-		cr.cond = sync.NewCond(&cr.mu)
-	}
 }
 
 func (cr *connReader) unlock() { cr.mu.Unlock() }
@@ -799,8 +797,11 @@ func (cr *connReader) backgroundRead() {
 	}
 	cr.aborted = false
 	cr.inRead = false
+	cond := cr.cond
 	cr.unlock()
-	cr.cond.Broadcast()
+	if cond != nil {
+		cond.Broadcast()
+	}
 }
 
 // idleBufsReleaseDelay is how long a keep-alive connection waits for
@@ -838,8 +839,11 @@ func (cr *connReader) waitReadable() (readable bool) {
 	if err != nil {
 		cr.handleReadErrorLocked(err)
 	}
+	cond := cr.cond
 	cr.unlock()
-	cr.cond.Broadcast()
+	if cond != nil {
+		cond.Broadcast()
+	}
 	return n == 1 && err == nil
 }
 
@@ -848,6 +852,9 @@ func (cr *connReader) abortPendingRead() {
 	defer cr.unlock()
 	if !cr.inRead {
 		return
+	}
+	if cr.cond == nil {
+		cr.cond = sync.NewCond(&cr.mu)
 	}
 	cr.aborted = true
 	cr.rwc.SetReadDeadline(aLongTimeAgo)
@@ -961,9 +968,12 @@ func (cr *connReader) Read(p []byte) (n int, err error) {
 		cr.handleReadErrorLocked(err)
 	}
 	cr.remain -= int64(n)
+	cond := cr.cond
 	cr.unlock()
 
-	cr.cond.Broadcast()
+	if cond != nil {
+		cond.Broadcast()
+	}
 	return n, err
 }
 
@@ -1128,6 +1138,91 @@ const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
 
 var errTooLarge = errors.New("http: request too large")
 
+var responsePool sync.Pool[*response]
+
+func (w *response) cancelCtx() {
+	w.req.cancelServerCtx()
+}
+
+func putResponse(w *response) {
+	if w.w == nil || w.closeNotifyCh != nil || w.ecReader != nil || w.requestBodyLimitHit.Load() {
+		if w.w != nil {
+			putBufioWriter(w.w)
+			w.w = nil
+		}
+		return
+	}
+	w.conn = nil
+	w.req = nil
+	w.reqBody = nil
+	w.wroteHeader = false
+	w.wants10KeepAlive = false
+	w.wantsClose = false
+	w.canWriteContinue.Store(false)
+	w.cw.header = nil
+	w.cw.wroteHeader = false
+	w.cw.chunking = false
+	if len(w.handlerHeader) <= 16 {
+		clear(w.handlerHeader)
+	} else {
+		w.handlerHeader = nil
+	}
+	w.calledHeader = false
+	if len(w.cwHeader) <= 16 {
+		clear(w.cwHeader)
+	} else {
+		w.cwHeader = nil
+	}
+	clear(w.cwHeaderStrs)
+	w.written = 0
+	w.contentLength = -1
+	w.status = 0
+	w.closeAfterReply = false
+	w.fullDuplex = false
+	w.trailers = nil
+	w.handlerDone.Store(false)
+	w.closeNotifyTriggered = false
+	responsePool.Put(w)
+}
+
+func (w *response) snapshotHeader() {
+	h := w.handlerHeader
+	if len(h) == 0 {
+		if w.cwHeader == nil {
+			w.cwHeader = make(Header)
+		} else {
+			clear(w.cwHeader)
+		}
+		w.cw.header = w.cwHeader
+		return
+	}
+	nv := 0
+	for _, vv := range h {
+		nv += len(vv)
+	}
+	if w.cwHeader == nil {
+		w.cwHeader = make(Header, len(h))
+	} else {
+		clear(w.cwHeader)
+	}
+	if cap(w.cwHeaderStrs) < nv {
+		w.cwHeaderStrs = make([]string, nv)
+	} else {
+		w.cwHeaderStrs = w.cwHeaderStrs[:nv]
+	}
+	sv := w.cwHeaderStrs
+	for k, vv := range h {
+		if vv == nil {
+			w.cwHeader[k] = nil
+			continue
+		}
+		n := copy(sv, vv)
+		w.cwHeader[k] = sv[:n:n]
+		sv = sv[n:]
+	}
+	w.cw.header = w.cwHeader
+}
+
 // Read next request from connection.
 func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if c.hijacked() {
@@ -1150,7 +1245,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
 		c.bufr.Discard(numLeadingCRorLF(peek))
 	}
-	req, err := readRequestLimit(c.bufr, int64(c.server.maxHeaderValueCount()))
+	req, haveHost, hostHeader, err := readRequestLimit(c.bufr, int64(c.server.maxHeaderValueCount()), true)
 	if err != nil {
 		if c.r.hitReadLimit() {
 			return nil, errTooLarge
@@ -1165,23 +1260,23 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	c.lastMethod = req.Method
 	c.r.setInfiniteReadLimit()
 
-	hosts, haveHost := req.Header["Host"]
 	isH2Upgrade := req.isH2Upgrade()
-	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
-		return nil, badRequestError("missing required Host header")
-	}
-	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
-		return nil, badRequestError("malformed Host header")
-	}
-	for k := range req.Header {
-		if strings.IndexByte(k, ' ') >= 0 {
-			return nil, badRequestError("invalid header name")
+	if len(req.Header) > 0 {
+		for k := range req.Header {
+			if strings.IndexByte(k, ' ') >= 0 {
+				return nil, badRequestError("invalid header name")
+			}
 		}
 	}
-	delete(req.Header, "Host")
+	if req.ProtoAtLeast(1, 1) && !haveHost && !isH2Upgrade && req.Method != "CONNECT" {
+		return nil, badRequestError("missing required Host header")
+	}
+	if haveHost && !httpguts.ValidHostHeader(hostHeader) {
+		return nil, badRequestError("malformed Host header")
+	}
 
-	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
+	req.ctxState = ctxStateLazy
 	req.RemoteAddr = c.remoteAddr
 	req.TLS = c.tlsState
 	var reqBody *body
@@ -1196,24 +1291,26 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 
 	c.rwc.SetReadDeadline(wholeReqDeadline)
 
-	w = &response{
-		conn:          c,
-		cancelCtx:     cancelCtx,
-		req:           req,
-		reqBody:       reqBody,
-		contentLength: -1,
-
-		// We populate these ahead of time so we're not
-		// reading from req.Header after their Handler starts
-		// and maybe mutates it (Issue 14940)
-		wants10KeepAlive: req.wantsHttp10KeepAlive(),
-		wantsClose:       req.wantsClose(),
+	w = responsePool.Get()
+	if w == nil {
+		w = &response{}
+		w.cw.res = w
+		w.w = newBufioWriterSize(&w.cw, bufferBeforeChunkingSize)
+	} else {
+		w.w.Reset(&w.cw)
 	}
+	w.conn = c
+	w.req = req
+	w.reqBody = reqBody
+	w.contentLength = -1
+	// We populate these ahead of time so we're not
+	// reading from req.Header after their Handler starts
+	// and maybe mutates it (Issue 14940)
+	w.wants10KeepAlive = req.wantsHttp10KeepAlive()
+	w.wantsClose = req.Close
 	if isH2Upgrade {
 		w.closeAfterReply = true
 	}
-	w.cw.res = w
-	w.w = newBufioWriterSize(&w.cw, bufferBeforeChunkingSize)
 	return w, nil
 }
 
@@ -1242,7 +1339,7 @@ func (w *response) Header() Header {
 		// Accessing the header between logically writing it
 		// and physically writing it means we need to allocate
 		// a clone to snapshot the logically written state.
-		w.cw.header = w.handlerHeader.Clone()
+		w.snapshotHeader()
 	}
 	w.calledHeader = true
 	return w.handlerHeader
@@ -1337,16 +1434,18 @@ func (w *response) WriteHeader(code int) {
 	w.status = code
 
 	if w.calledHeader && w.cw.header == nil {
-		w.cw.header = w.handlerHeader.Clone()
+		w.snapshotHeader()
 	}
 
-	if cl := w.handlerHeader.get("Content-Length"); cl != "" {
-		v, err := strconv.ParseInt(cl, 10, 64)
-		if err == nil && v >= 0 {
-			w.contentLength = v
-		} else {
-			w.conn.server.logf("http: invalid Content-Length of %q", cl)
-			w.handlerHeader.Del("Content-Length")
+	if len(w.handlerHeader) > 0 {
+		if cl := w.handlerHeader.get("Content-Length"); cl != "" {
+			v, err := strconv.ParseInt(cl, 10, 64)
+			if err == nil && v >= 0 {
+				w.contentLength = v
+			} else {
+				w.conn.server.logf("http: invalid Content-Length of %q", cl)
+				w.handlerHeader.Del("Content-Length")
+			}
 		}
 	}
 }
@@ -1492,8 +1591,12 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	if !owned {
 		header = w.handlerHeader
 	}
+	hasHeader := len(header) > 0
 	var excludeHeader map[string]bool
 	delHeader := func(key string) {
+		if !hasHeader {
+			return
+		}
 		if owned {
 			header.Del(key)
 			return
@@ -1510,22 +1613,28 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 
 	// Don't write out the fake "Trailer:foo" keys. See TrailerPrefix.
 	trailers := false
-	for k := range cw.header {
-		if strings.HasPrefix(k, TrailerPrefix) {
-			if excludeHeader == nil {
-				excludeHeader = make(map[string]bool)
+	if len(cw.header) > 0 {
+		for k := range cw.header {
+			if strings.HasPrefix(k, TrailerPrefix) {
+				if excludeHeader == nil {
+					excludeHeader = make(map[string]bool)
+				}
+				excludeHeader[k] = true
+				trailers = true
 			}
-			excludeHeader[k] = true
+		}
+		for _, v := range cw.header["Trailer"] {
 			trailers = true
+			foreachHeaderElement(v, cw.res.declareTrailer)
 		}
 	}
-	for _, v := range cw.header["Trailer"] {
-		trailers = true
-		foreachHeaderElement(v, cw.res.declareTrailer)
-	}
 
-	te := header.get("Transfer-Encoding")
-	hasTE := te != ""
+	var te string
+	var hasTE bool
+	if hasHeader {
+		te = header.get("Transfer-Encoding")
+		hasTE = te != ""
+	}
 
 	// If the handler is done but never sent a Content-Length
 	// response header and this is our first (and last) write, set
@@ -1541,7 +1650,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	// send a Content-Length header.
 	// Further, we don't send an automatic Content-Length if they
 	// set a Transfer-Encoding, because they're generally incompatible.
-	if w.handlerDone.Load() && !trailers && !hasTE && bodyAllowedForStatus(w.status) && !header.has("Content-Length") && (!isHEAD || len(p) > 0) {
+	if w.handlerDone.Load() && !trailers && !hasTE && bodyAllowedForStatus(w.status) && (!hasHeader || !header.has("Content-Length")) && (!isHEAD || len(p) > 0) {
 		w.contentLength = int64(len(p))
 		setHeader.contentLength = strconv.AppendInt(cw.res.clenBuf[:0], int64(len(p)), 10)
 	}
@@ -1550,7 +1659,10 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	hasCL := w.contentLength != -1
 
 	if w.wants10KeepAlive && !w.wantsClose && (isHEAD || hasCL || !bodyAllowedForStatus(w.status)) {
-		_, connectionHeaderSet := header["Connection"]
+		var connectionHeaderSet bool
+		if hasHeader {
+			_, connectionHeaderSet = header["Connection"]
+		}
 		if !connectionHeaderSet {
 			setHeader.connection = "keep-alive"
 		}
@@ -1558,7 +1670,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		w.closeAfterReply = true
 	}
 
-	if httpguts.HeaderValuesContainsToken(header["Connection"], "close") || !keepAlivesEnabled {
+	if !keepAlivesEnabled || (hasHeader && httpguts.HeaderValuesContainsToken(header["Connection"], "close")) {
 		w.closeAfterReply = true
 	}
 
@@ -1638,12 +1750,15 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	code := w.status
 	if bodyAllowedForStatus(code) {
 		// If no content type, apply sniffing algorithm to body.
-		_, haveType := header["Content-Type"]
-
-		// If the Content-Encoding was set and is non-blank,
-		// we shouldn't sniff the body. See Issue 31753.
-		ce := header.get("Content-Encoding")
-		hasCE := len(ce) > 0
+		var haveType, hasCE bool
+		if hasHeader {
+			_, haveType = header["Content-Type"]
+			if !haveType {
+				// If the Content-Encoding was set and is non-blank,
+				// we shouldn't sniff the body. See Issue 31753.
+				hasCE = len(header.get("Content-Encoding")) > 0
+			}
+		}
 		if !hasCE && !haveType && !hasTE && len(p) > 0 {
 			setHeader.contentType = DetectContentType(p)
 		}
@@ -1653,7 +1768,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		}
 	}
 
-	if !header.has("Date") {
+	if !hasHeader || !header.has("Date") {
 		setHeader.date = internal.AppendHTTPDateNow(cw.res.dateBuf[:0])
 	}
 
@@ -1727,7 +1842,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	// protocol switch response and if KeepAlives are not enabled.
 	// See https://golang.org/issue/36381.
 	delConnectionHeader := w.closeAfterReply &&
-		(!keepAlivesEnabled || !httpguts.HeaderValuesContainsToken(cw.header["Connection"], "close")) &&
+		(!keepAlivesEnabled || len(cw.header) == 0 || !httpguts.HeaderValuesContainsToken(cw.header["Connection"], "close")) &&
 		!isProtocolSwitchResponse(w.status, header)
 	if delConnectionHeader {
 		delHeader("Connection")
@@ -1742,7 +1857,13 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	}
 
 	writeStatusLine(w.conn.bufw, w.req.ProtoAtLeast(1, 1), code, w.statusBuf[:])
-	cw.header.WriteSubset(w.conn.bufw, excludeHeader)
+	if len(cw.header) > 0 {
+		cw.header.WriteSubset(w.conn.bufw, excludeHeader)
+		if w.cwHeader != nil {
+			clear(w.cwHeader)
+			clear(w.cwHeaderStrs)
+		}
+	}
 	setHeader.Write(w.conn.bufw)
 	w.conn.bufw.Write(crlf)
 }
@@ -1882,6 +2003,17 @@ func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err er
 	if w.contentLength != -1 && w.written > w.contentLength {
 		return 0, ErrContentLength
 	}
+	if w.w.Buffered() == 0 && w.cw.wroteHeader && !w.cw.chunking && w.req.Method != "HEAD" {
+		if dataB != nil {
+			n, err = w.conn.bufw.Write(dataB)
+		} else {
+			n, err = w.conn.bufw.WriteString(dataS)
+		}
+		if err != nil {
+			w.conn.rwc.Close()
+		}
+		return n, err
+	}
 	if dataB != nil {
 		return w.w.Write(dataB)
 	} else {
@@ -1896,8 +2028,9 @@ func (w *response) finishRequest() {
 		w.WriteHeader(StatusOK)
 	}
 
-	w.w.Flush()
-	putBufioWriter(w.w)
+	if w.w.Buffered() > 0 || !w.cw.wroteHeader {
+		w.w.Flush()
+	}
 	w.cw.close()
 	w.conn.bufw.Flush()
 
@@ -2292,16 +2425,20 @@ func (c *conn) serve(ctx context.Context) {
 
 		// Expect 100 Continue support
 		req := w.req
-		if req.expectsContinue() {
-			if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
-				// Wrap the Body reader with one that replies on the connection
-				w.ecReader = &expectContinueReader{readCloser: req.Body, resp: w}
-				w.canWriteContinue.Store(true)
-				req.Body = w.ecReader
+		if len(req.Header) > 0 {
+			if ex := req.Header["Expect"]; len(ex) > 0 {
+				if httpguts.HeaderValuesContainsToken(ex, "100-continue") {
+					if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
+						// Wrap the Body reader with one that replies on the connection
+						w.ecReader = &expectContinueReader{readCloser: req.Body, resp: w}
+						w.canWriteContinue.Store(true)
+						req.Body = w.ecReader
+					}
+				} else if ex[0] != "" {
+					w.sendExpectationFailed()
+					return
+				}
 			}
-		} else if req.Header.get("Expect") != "" {
-			w.sendExpectationFailed()
-			return
 		}
 
 		c.curReq.Store(w)
@@ -2333,6 +2470,7 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		w.finishRequest()
+		c.curReq.Store(nil)
 		c.rwc.SetWriteDeadline(time.Time{})
 		if !w.shouldReuseConnection() {
 			// On some platforms, closing a socket with data in the read buffer
@@ -2343,18 +2481,20 @@ func (c *conn) serve(ctx context.Context) {
 			if w.requestBodyLimitHit.Load() || !w.reqBody.consumedEntireBody() {
 				c.closeWriteAndWait()
 			}
+			putResponse(w)
 			return
 		}
 		c.setState(c.rwc, StateIdle, runHooks)
-		c.curReq.Store(nil)
 
 		if !w.conn.server.doKeepAlives() {
 			// We're in shutdown mode. We might've replied
 			// to the user without "Connection: close" and
 			// they might think they can send another
 			// request, but such is life with HTTP/1.1.
+			putResponse(w)
 			return
 		}
+		putResponse(w)
 
 		var idleDeadline time.Time
 		if d := c.server.idleTimeout(); d > 0 {
@@ -3012,6 +3152,25 @@ func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
 	return h, p
 }
 
+func isCleanEscapedMuxPath(p string) bool {
+	if len(p) == 0 || p[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if !cleanPathTable[c] {
+			return false
+		}
+		if c == '/' && i+1 < len(p) {
+			next := p[i+1]
+			if next == '/' || next == '.' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // findHandler finds a handler for a request.
 // If there is a matching handler, it returns it and the pattern that matched.
 // Otherwise it returns a Redirect or NotFound handler with the path that would match
@@ -3019,10 +3178,11 @@ func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
 func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *pattern, matches []string) {
 	var n *routingNode
 	host := r.URL.Host
-	escapedPath := r.URL.EscapedPath()
-	path := escapedPath
+	var escapedPath, path string
 	// CONNECT requests are not canonicalized.
 	if r.Method == "CONNECT" {
+		escapedPath = r.URL.EscapedPath()
+		path = escapedPath
 		// If r.URL.Path is /tree and its handler is not registered,
 		// the /tree -> /tree/ redirect applies to CONNECT requests
 		// but the path canonicalization does not.
@@ -3038,7 +3198,13 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 		// All other requests have any port stripped and path cleaned
 		// before passing to mux.handler.
 		host = stripHostPort(r.Host)
-		path = cleanPath(path)
+		if r.URL.RawPath == "" && isCleanEscapedMuxPath(r.URL.Path) {
+			escapedPath = r.URL.Path
+			path = escapedPath
+		} else {
+			escapedPath = r.URL.EscapedPath()
+			path = cleanPath(escapedPath)
+		}
 
 		// If the given path is /tree and its handler is not registered,
 		// redirect for /tree/.

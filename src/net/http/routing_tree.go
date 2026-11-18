@@ -18,10 +18,6 @@
 
 package http
 
-import (
-	"strings"
-)
-
 // A routingNode is a node in the decision tree.
 // The same struct is used for leaf and interior nodes.
 type routingNode struct {
@@ -297,11 +293,23 @@ func firstSegment(path string) (seg, rest string) {
 		return "/", ""
 	}
 	path = path[1:] // drop initial slash
-	i := strings.IndexByte(path, '/')
-	if i < 0 {
-		i = len(path)
+	hasPercent := false
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '/' {
+			if hasPercent {
+				return pathUnescape(path[:i]), path[i:]
+			}
+			return path[:i], path[i:]
+		}
+		if c == '%' {
+			hasPercent = true
+		}
 	}
-	return pathUnescape(path[:i]), path[i:]
+	if hasPercent {
+		return pathUnescape(path), ""
+	}
+	return path, ""
 }
 
 // matchingMethods adds to methodSet all the methods that would result in a

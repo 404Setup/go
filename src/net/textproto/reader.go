@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	_ "unsafe" // for linkname
+	"unsafe" // for linkname and string slicing
 )
 
 // TODO: This should be a distinguishable error (ErrMessageTooLarge)
@@ -529,7 +529,7 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 	// large one ahead of time which we'll cut up into smaller
 	// slices. If this isn't big enough later, we allocate small ones.
 	var strs []string
-	hint := r.upcomingHeaderKeys()
+	hint, valBytes := r.upcomingHeaderInfo()
 	if hint > 0 {
 		if hint > 1000 {
 			hint = 1000 // set a cap to avoid overallocation
@@ -549,11 +549,16 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 		return m, ProtocolError(fmt.Sprintf("malformed MIME header initial line: %q", line))
 	}
 
+	var valBuf []byte
+	remKeys := hint
+
 	for {
 		kv, err := r.readContinuedLineSlice(maxMemory, mustHaveFieldNameColon)
 		if len(kv) == 0 {
 			return m, err
 		}
+		remKeys--
+		valBytes -= len(kv)
 
 		// Key ends at first colon.
 		k, v, ok := bytes.Cut(kv, colon)
@@ -576,7 +581,26 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 		}
 
 		// Skip initial spaces in value.
-		value := string(bytes.TrimLeft(v, " \t"))
+		v = bytes.TrimLeft(v, " \t")
+		value, interned := internHeaderValue(v)
+		if !interned {
+			if len(valBuf) < len(v) {
+				if remVal := valBytes - remKeys*18; remKeys > 0 && remVal > 16 && int64(len(v)+remVal) <= maxMemory {
+					allocSize := len(v) + remVal
+					if allocSize > 4096 {
+						allocSize = max(len(v), 4096)
+					}
+					valBuf = make([]byte, allocSize)
+				}
+			}
+			if len(valBuf) >= len(v) {
+				copy(valBuf, v)
+				value = unsafe.String(&valBuf[0], len(v))
+				valBuf = valBuf[len(v):]
+			} else {
+				value = string(v)
+			}
+		}
 
 		vv := m[key]
 		if vv == nil {
@@ -628,6 +652,13 @@ var nl = []byte("\n")
 // upcomingHeaderKeys returns an approximation of the number of keys
 // that will be in this header. If it gets confused, it returns 0.
 func (r *Reader) upcomingHeaderKeys() (n int) {
+	n, _ = r.upcomingHeaderInfo()
+	return n
+}
+
+// upcomingHeaderInfo returns an approximation of the number of keys
+// that will be in this header and the total byte length of the header lines.
+func (r *Reader) upcomingHeaderInfo() (n, valBytes int) {
 	// Try to determine the 'hint' size.
 	r.R.Peek(1) // force a buffer load if empty
 	s := r.R.Buffered()
@@ -642,13 +673,14 @@ func (r *Reader) upcomingHeaderKeys() (n int) {
 			// Blank line separating headers from the body.
 			break
 		}
+		valBytes += len(line)
 		if line[0] == ' ' || line[0] == '\t' {
 			// Folded continuation of the previous line.
 			continue
 		}
 		n++
 	}
-	return n
+	return n, valBytes
 }
 
 // CanonicalMIMEHeaderKey returns the canonical format of the
@@ -660,6 +692,70 @@ func (r *Reader) upcomingHeaderKeys() (n int) {
 // If s contains a space or invalid header field bytes as
 // defined by RFC 9112, it is returned without modifications.
 func CanonicalMIMEHeaderKey(s string) string {
+	switch s {
+	case "Accept",
+		"Accept-Charset",
+		"Accept-Encoding",
+		"Accept-Language",
+		"Accept-Ranges",
+		"Authorization",
+		"Cache-Control",
+		"Connection",
+		"Content-Disposition",
+		"Content-Encoding",
+		"Content-Language",
+		"Content-Length",
+		"Content-Location",
+		"Content-Range",
+		"Content-Security-Policy",
+		"Content-Type",
+		"Cookie",
+		"Date",
+		"Etag",
+		"Expect",
+		"Expires",
+		"Forwarded",
+		"From",
+		"Host",
+		"If-Match",
+		"If-Modified-Since",
+		"If-None-Match",
+		"If-Range",
+		"If-Unmodified-Since",
+		"Last-Modified",
+		"Link",
+		"Location",
+		"Max-Forwards",
+		"Origin",
+		"Pragma",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Range",
+		"Referer",
+		"Retry-After",
+		"Server",
+		"Set-Cookie",
+		"Strict-Transport-Security",
+		"Te",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+		"User-Agent",
+		"Vary",
+		"Via",
+		"Warning",
+		"Www-Authenticate",
+		"X-Content-Type-Options",
+		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+		"X-Frame-Options",
+		"X-Powered-By",
+		"X-Real-Ip",
+		"X-Request-Id",
+		"X-Requested-With":
+		return s
+	}
 	// Quick check for canonical encoding.
 	upper := true
 	for i := 0; i < len(s); i++ {
@@ -731,17 +827,7 @@ func validHeaderFieldByte(c byte) bool {
 //	SP             =  %x20
 //	VCHAR          =  %x21-7E
 func validHeaderValueByte(c byte) bool {
-	// mask is a 128-bit bitmap with 1s for allowed bytes,
-	// so that the byte c can be tested with a shift and an and.
-	// If c >= 128, then 1<<c and 1<<(c-64) will both be zero.
-	// Since this is the obs-text range, we invert the mask to
-	// create a bitmap with 1s for disallowed bytes.
-	const mask = 0 |
-		(1<<(0x7f-0x21)-1)<<0x21 | // VCHAR: %x21-7E
-		1<<0x20 | // SP: %x20
-		1<<0x09 // HTAB: %x09
-	return ((uint64(1)<<c)&^(mask&(1<<64-1)) |
-		(uint64(1)<<(c-64))&^(mask>>64)) == 0
+	return (c >= ' ' && c != 0x7f) || c == '\t'
 }
 
 // canonicalMIMEHeaderKey is like CanonicalMIMEHeaderKey but is
@@ -761,8 +847,18 @@ func canonicalMIMEHeaderKey(a []byte) (_ string, ok bool) {
 
 	// See if a looks like a header key. If not, return it unchanged.
 	noCanon := false
+	needCanon := false
+	upper := true
 	for _, c := range a {
 		if validHeaderFieldByte(c) {
+			if upper {
+				if 'a' <= c && c <= 'z' {
+					needCanon = true
+				}
+			} else if 'A' <= c && c <= 'Z' {
+				needCanon = true
+			}
+			upper = c == '-'
 			continue
 		}
 		// Don't canonicalize.
@@ -779,19 +875,24 @@ func canonicalMIMEHeaderKey(a []byte) (_ string, ok bool) {
 		return string(a), true
 	}
 
-	upper := true
-	for i, c := range a {
-		// Canonicalize: first letter upper case
-		// and upper case after each dash.
-		// (Host, User-Agent, If-Modified-Since).
-		// MIME headers are ASCII only, so no Unicode issues.
-		if upper && 'a' <= c && c <= 'z' {
-			c -= toLower
-		} else if !upper && 'A' <= c && c <= 'Z' {
-			c += toLower
+	if needCanon {
+		upper = true
+		for i, c := range a {
+			// Canonicalize: first letter upper case
+			// and upper case after each dash.
+			// (Host, User-Agent, If-Modified-Since).
+			// MIME headers are ASCII only, so no Unicode issues.
+			if upper && 'a' <= c && c <= 'z' {
+				c -= toLower
+			} else if !upper && 'A' <= c && c <= 'Z' {
+				c += toLower
+			}
+			a[i] = c
+			upper = c == '-' // for next time
 		}
-		a[i] = c
-		upper = c == '-' // for next time
+	}
+	if v := lookupCommonHeader(a); v != "" {
+		return v, true
 	}
 	commonHeaderOnce.Do(initCommonHeader)
 	// The compiler recognizes m[string(byteSlice)] as a special
@@ -801,6 +902,222 @@ func canonicalMIMEHeaderKey(a []byte) (_ string, ok bool) {
 		return v, true
 	}
 	return string(a), true
+}
+
+func lookupCommonHeader(a []byte) string {
+	switch len(a) {
+	case 2:
+		if string(a) == "Cc" {
+			return "Cc"
+		}
+		if string(a) == "To" {
+			return "To"
+		}
+	case 3:
+		if string(a) == "Via" {
+			return "Via"
+		}
+	case 4:
+		switch string(a) {
+		case "Host":
+			return "Host"
+		case "Date":
+			return "Date"
+		case "Etag":
+			return "Etag"
+		case "From":
+			return "From"
+		}
+	case 6:
+		switch string(a) {
+		case "Accept":
+			return "Accept"
+		case "Cookie":
+			return "Cookie"
+		case "Server":
+			return "Server"
+		case "Pragma":
+			return "Pragma"
+		}
+	case 7:
+		switch string(a) {
+		case "Expires":
+			return "Expires"
+		case "Referer":
+			return "Referer"
+		case "Subject":
+			return "Subject"
+		}
+	case 8:
+		switch string(a) {
+		case "Location":
+			return "Location"
+		case "Received":
+			return "Received"
+		}
+	case 10:
+		switch string(a) {
+		case "Connection":
+			return "Connection"
+		case "User-Agent":
+			return "User-Agent"
+		case "Set-Cookie":
+			return "Set-Cookie"
+		case "Content-Id":
+			return "Content-Id"
+		case "Message-Id":
+			return "Message-Id"
+		}
+	case 11:
+		switch string(a) {
+		case "In-Reply-To":
+			return "In-Reply-To"
+		case "Return-Path":
+			return "Return-Path"
+		}
+	case 12:
+		switch string(a) {
+		case "Content-Type":
+			return "Content-Type"
+		case "Mime-Version":
+			return "Mime-Version"
+		case "X-Powered-By":
+			return "X-Powered-By"
+		case "X-Imforwards":
+			return "X-Imforwards"
+		}
+	case 13:
+		switch string(a) {
+		case "Cache-Control":
+			return "Cache-Control"
+		case "If-None-Match":
+			return "If-None-Match"
+		case "Last-Modified":
+			return "Last-Modified"
+		case "Accept-Ranges":
+			return "Accept-Ranges"
+		}
+	case 14:
+		switch string(a) {
+		case "Content-Length":
+			return "Content-Length"
+		case "Accept-Charset":
+			return "Accept-Charset"
+		case "Dkim-Signature":
+			return "Dkim-Signature"
+		}
+	case 15:
+		switch string(a) {
+		case "Accept-Encoding":
+			return "Accept-Encoding"
+		case "Accept-Language":
+			return "Accept-Language"
+		case "X-Forwarded-For":
+			return "X-Forwarded-For"
+		}
+	case 16:
+		if string(a) == "Content-Language" {
+			return "Content-Language"
+		}
+	case 17:
+		if string(a) == "If-Modified-Since" {
+			return "If-Modified-Since"
+		}
+	case 25:
+		if string(a) == "Content-Transfer-Encoding" {
+			return "Content-Transfer-Encoding"
+		}
+	}
+	return ""
+}
+
+func internHeaderValue(v []byte) (string, bool) {
+	switch len(v) {
+	case 0:
+		return "", true
+	case 1:
+		if v[0] == '0' {
+			return "0", true
+		}
+	case 3:
+		if string(v) == "*/*" {
+			return "*/*", true
+		}
+	case 4:
+		if string(v) == "gzip" {
+			return "gzip", true
+		}
+	case 5:
+		switch string(v) {
+		case "close":
+			return "close", true
+		case "Close":
+			return "Close", true
+		}
+	case 7:
+		switch string(v) {
+		case "chunked":
+			return "chunked", true
+		case "private":
+			return "private", true
+		}
+	case 8:
+		if string(v) == "no-cache" {
+			return "no-cache", true
+		}
+	case 9:
+		switch string(v) {
+		case "max-age=0":
+			return "max-age=0", true
+		case "localhost":
+			return "localhost", true
+		case "text/html":
+			return "text/html", true
+		}
+	case 10:
+		switch string(v) {
+		case "keep-alive":
+			return "keep-alive", true
+		case "Keep-Alive":
+			return "Keep-Alive", true
+		case "text/plain":
+			return "text/plain", true
+		case "golang.org":
+			return "golang.org", true
+		}
+	case 12:
+		if string(v) == "gzip,deflate" {
+			return "gzip,deflate", true
+		}
+	case 13:
+		if string(v) == "gzip, deflate" {
+			return "gzip, deflate", true
+		}
+	case 14:
+		switch string(v) {
+		case "localhost:8080":
+			return "localhost:8080", true
+		case "en-US,en;q=0.8":
+			return "en-US,en;q=0.8", true
+		}
+	case 16:
+		if string(v) == "application/json" {
+			return "application/json", true
+		}
+	case 17:
+		if string(v) == "gzip,deflate,sdch" {
+			return "gzip,deflate,sdch", true
+		}
+	case 24:
+		if string(v) == "text/html; charset=utf-8" {
+			return "text/html; charset=utf-8", true
+		}
+	case 25:
+		if string(v) == "text/plain; charset=utf-8" {
+			return "text/plain; charset=utf-8", true
+		}
+	}
+	return "", false
 }
 
 // commonHeader interns common header strings.

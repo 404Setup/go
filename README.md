@@ -14,7 +14,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
 - **`net`**: Built-in TTL-aware DNS response cache (RFC 1035 / RFC 2308 negative caching, lock-free lookup, RFC 6724 route cache; disable with `GODEBUG=netdnscache=0`) and DNS address shuffling before RFC 6724 sorting.
-- **`net/http`**: Reduced allocations and faster parsing/formatting for cookies, status lines, headers, and `ServeMux` routing.
+- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and faster parsing/formatting across HTTP/1.1 request/header readers (`requestWithURL` combined allocation, `Host`-only fast path, header key/value interning, contiguous value buffer slicing), server response lifecycle (`responsePool`, zero-alloc `snapshotHeader`, lazy request context creation, direct `conn.bufw` write bypass), clean origin-form URL parsing, cookies, status lines, and `ServeMux` routing.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys` (chunked key copies), and struct field introspection.
 - **`runtime`**: Synchronous unmarked span reclamation before heap growth (`reclaimBeforeGrow`), fused 64-bit word-wide zombie check and allocation counting during span sweep (`countAllocAndCheckZombies`), `TrailingZeros8`/`TrailingZeros32` bit scanning in `reclaimChunk`, `scanblock`, `markrootSpans`, and `typeBitsBulkBarrier`, `tp.nextFast` and `nil`-pointer filtering in bulk write barriers, consecutive pointer deduplication in `wbBufFlush1` and GreenTeaGC span/object scanners, empty `spanSet.reset` STW fast path, `workbuf`/`wbBuf` bounds checks, and zero-size fast paths in `makeslice`, `makeslicecopy`, `rawbyteslice`, and `rawruneslice`.
 - **`cmd/compile`**: Tiered stack small-buffer optimization (SBO) for non-escaping dynamic `make` and `make+copy` (`128 B` pointerless / `64 B` pointer-bearing), inlining budget promotion for dynamic `make` helpers, and static constant propagation for `make` and `[]byte(s)`.
@@ -71,15 +71,15 @@ xychart-beta
 
 ---
 
-### 2. `net/http` Optimizations
+### 2. `net/http`, `net/textproto`, and `net/url` Optimizations
 
 ```mermaid
 xychart-beta
     title "net/http: Upstream (left bar) vs Illium (right bar) — Latency (ns/op, lower is better)"
-    x-axis ["ParseHTTPDate (RFC850)", "CookieString", "ResponseWrite", "ServerMatch", "ReadRequest (Wrk)", "ParseSetCookie", "ReadSetCookies"]
-    y-axis "Latency (ns/op)" 0 --> 1900
-    bar [431.8, 431.4, 682.5, 895.5, 989.1, 1081.0, 1810.5]
-    bar [26.0, 195.5, 340.7, 528.4, 741.6, 361.7, 590.7]
+    x-axis ["ReadRequest (Wrk)", "ServerMatch", "ReadRequest (Chrome)", "ReadMIMEHeader", "ServerKeepAliveLite", "ServerHandlerNoLen", "ServerHandlerTypeLen", "ServerKeepAlive"]
+    y-axis "Latency (ns/op)" 0 --> 6600
+    bar [989.1, 895.5, 2790, 2704, 3383, 4796, 5278, 6496]
+    bar [238.4, 528.4, 1954, 1913, 1619, 2335, 2477, 4134]
 ```
 
 | Benchmark | Upstream Go | Illium | Latency Delta | Allocs (`Upstream` → `Illium`) |
@@ -98,6 +98,7 @@ xychart-beta
 | `ResponseStatusLine404` | 15.93 ns/op | **3.23 ns/op** | **-79.7%** (4.93×) | 0 → 0 |
 | `ChunkedWriter/BufioSmall` (`internal`) | 68.55 ns/op | **16.20 ns/op** | **-76.4%** (4.23×) | 0 → 0 |
 | `ChunkedWriter/Unbuffered` (`internal`) | 67.94 ns/op | **21.71 ns/op** | **-68.0%** (3.13×) | 0 → 0 |
+| `ReadRequest/Wrk` | 989.1 ns/op | **238.4 ns/op** | **-75.9%** (4.15×) | 7 (912 B) → **2 (496 B)** |
 | `AppendHTTPDate` (`internal`) | 130.4 ns/op | **31.47 ns/op** | **-75.9%** (4.14×) | 0 → 0 |
 | `HTTPDateNowString` (`internal`) | 220.4 ns/op | **61.20 ns/op** | **-72.2%** (3.60×) | 1 (32 B) → **0 (0 B)** |
 | `ReadSetCookies` | 1,811 ns/op | **590.7 ns/op** | **-67.4%** (3.07×) | 21 (1,168 B) → **3 (400 B)** |
@@ -106,18 +107,29 @@ xychart-beta
 | `CanonicalHeader/Known` (`httpcommon`) | 8.86 ns/op | **5.39 ns/op** | **-39.1%** (1.64×) | 0 → 0 |
 | `StreamWriteVarint` (`http3`) | 312.6 ns/op | **128.7 ns/op** | **-58.9%** (2.43×) | 0 (15 B) → 0 (15 B) |
 | `CookieString` | 431.4 ns/op | **195.5 ns/op** | **-54.7%** (2.21×) | 1 (176 B) → **1 (144 B)** |
+| `ServerHandlerTypeLen` | 5,278 ns/op | **2,477 ns/op** | **-53.1%** (2.13×) | 19 (2,129 B) → **6 (548 B)** |
+| `ServerFakeConnWithKeepAliveLite` | 3,383 ns/op | **1,619 ns/op** | **-52.1%** (2.09×) | 10 (1,248 B) → **3 (512 B)** |
 | `ResponseRecorderResult` (`httptest`) | 401.0 ns/op | **194.6 ns/op** | **-51.5%** (2.06×) | 5 (232 B) → **3 (208 B)** |
+| `ServerHandlerNoLen` | 4,796 ns/op | **2,335 ns/op** | **-51.3%** (2.05×) | 16 (2,080 B) → **4 (528 B)** |
+| `ServerHandlerNoType` | 4,888 ns/op | **2,430 ns/op** | **-50.3%** (2.01×) | 17 (2,080 B) → **5 (532 B)** |
 | `ResponseWrite` | 682.5 ns/op | **340.7 ns/op** | **-50.1%** (2.00×) | 4 (201 B) → **1 (24 B)** |
+| `ServerHandlerNoHeader` | 3,398 ns/op | **1,722 ns/op** | **-49.3%** (1.97×) | 10 (1,248 B) → **3 (512 B)** |
 | `HeaderWriteSubsetBuilder` | 458.6 ns/op | **257.0 ns/op** | **-44.0%** (1.78×) | 4 (240 B) → **1 (112 B)** |
-| `HeaderWriteSubsetBufio` | 294.3 ns/op | **204.1 ns/op** | **-30.7%** (1.44×) | 0 → 0 |
+| `ServeMux` (end-to-end) | 45.24 µs/op | **25.95 µs/op** | **-42.6%** (1.74×) | 360 → 360 |
 | `ServerMatch` (`ServeMux`) | 895.5 ns/op | **528.4 ns/op** | **-41.0%** (1.69×) | 10 (791 B) → **5 (568 B)** |
-| `ServeMux` (end-to-end) | 45.24 µs/op | **30.41 µs/op** | **-32.8%** (1.49×) | 360 → 360 |
+| `ServerFakeConnWithKeepAlive` | 6,496 ns/op | **4,134 ns/op** | **-36.4%** (1.57×) | 21 (2,424 B) → **7 (1,216 B)** |
+| `ServerFakeConnNoKeepAlive` | 12,721 ns/op | **8,578 ns/op** | **-32.6%** (1.48×) | 46 (4,689 B) → **28 (3,176 B)** |
+| `HeaderWriteSubsetBufio` | 294.3 ns/op | **204.1 ns/op** | **-30.7%** (1.44×) | 0 → 0 |
+| `ReadRequest/Chrome` | 2,790 ns/op | **1,954 ns/op** | **-30.0%** (1.43×) | 13 (1,512 B) → **5 (1,424 B)** |
+| `ReadMIMEHeader/client_headers` (`textproto`) | 2,704 ns/op | **1,913 ns/op** | **-29.3%** (1.41×) | 16 (1,552 B) → **7 (1,480 B)** |
 | `QPACKPrefixedString/EncoderHeaders` (`http3`) | 476.0 ns/op | **356.7 ns/op** | **-25.1%** (1.33×) | 7 (176 B) → **4 (184 B)** |
-| `ReadRequest/Wrk` | 989.1 ns/op | **741.6 ns/op** | **-25.0%** (1.33×) | 7 (912 B) → **6 (896 B)** |
-| `ServerHandlerTypeLen` | 5,278 ns/op | **3,997 ns/op** | **-24.3%** (1.32×) | 19 (2,129 B) → **18 (2,113 B)** |
+| `ServeMux_SkipServe` | 16.51 µs/op | **12.47 µs/op** | **-24.4%** (1.32×) | 0 → 0 |
+| `ReadRequest/Curl` | 1,156 ns/op | **924.8 ns/op** | **-20.0%** (1.25×) | 8 (944 B) → **5 (912 B)** |
 | `ClientRequestHeaders/1000` (`http2`) | 1,114 µs/op | **893.8 µs/op** | **-19.8%** (1.25×) | 4,074 (324 KB) → **3,054 (230 KB)** |
+| `ReadRequest/Siege` | 1,568 ns/op | **1,267 ns/op** | **-19.2%** (1.24×) | 10 (1,029 B) → **5 (976 B)** |
+| `ReadRequest/Apachebench` | 1,179 ns/op | **954.2 ns/op** | **-19.1%** (1.24×) | 8 (947 B) → **5 (912 B)** |
 | `ParseRange` | 267.7 ns/op | **219.1 ns/op** | **-18.2%** (1.22×) | 3 (112 B) → **1 (64 B)** |
-| `ClientServer/h1` | 19.58 µs/op | **16.52 µs/op** | **-15.6%** (1.19×) | 61 (5,420 B) → **52 (5,123 B)** |
+| `ClientServer/h1` | 19.58 µs/op | **16.27 µs/op** | **-16.9%** (1.20×) | 61 (5,420 B) → **44 (4,765 B)** |
 | `ServeContent` | 3,016 ns/op | **2,585 ns/op** | **-14.3%** (1.17×) | 16 (5,244 B) → 16 (5,244 B) |
 
 ---

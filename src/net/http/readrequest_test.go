@@ -490,3 +490,88 @@ func TestReadRequest_Bad(t *testing.T) {
 		}
 	}
 }
+
+func TestReadRequestHostOnlyFastPath(t *testing.T) {
+	cases := []struct {
+		name      string
+		raw       string
+		wantHost  string
+		wantPath  string
+		wantClose bool
+		wantCL    int64
+	}{
+		{
+			name:      "http11_golang_org",
+			raw:       "GET / HTTP/1.1\r\nHost: golang.org\r\n\r\n",
+			wantHost:  "golang.org",
+			wantPath:  "/",
+			wantClose: false,
+		},
+		{
+			name:      "http11_case_insensitive_host_with_whitespace",
+			raw:       "GET /api/v1/items HTTP/1.1\r\nhOsT: \t localhost:8080 \t \r\n\r\n",
+			wantHost:  "localhost:8080",
+			wantPath:  "/api/v1/items",
+			wantClose: false,
+		},
+		{
+			name:      "http10_empty_headers",
+			raw:       "GET /hello HTTP/1.0\r\n\r\n",
+			wantHost:  "",
+			wantPath:  "/hello",
+			wantClose: true,
+		},
+		{
+			name:      "http11_absolute_uri_overrides_host_header",
+			raw:       "GET http://example.com/test HTTP/1.1\r\nHost: ignored.example.org\r\n\r\n",
+			wantHost:  "example.com",
+			wantPath:  "/test",
+			wantClose: false,
+		},
+		{
+			name:      "h2_pri_upgrade",
+			raw:       "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+			wantHost:  "",
+			wantPath:  "*",
+			wantClose: true,
+			wantCL:    -1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := ReadRequest(bufio.NewReader(strings.NewReader(tc.raw)))
+			if err != nil {
+				t.Fatalf("ReadRequest(%q) error = %v", tc.raw, err)
+			}
+			if req.Host != tc.wantHost {
+				t.Errorf("Host = %q, want %q", req.Host, tc.wantHost)
+			}
+			if req.URL.Path != tc.wantPath {
+				t.Errorf("URL.Path = %q, want %q", req.URL.Path, tc.wantPath)
+			}
+			if req.Close != tc.wantClose {
+				t.Errorf("Close = %v, want %v", req.Close, tc.wantClose)
+			}
+			if req.ContentLength != tc.wantCL {
+				t.Errorf("ContentLength = %d, want %d", req.ContentLength, tc.wantCL)
+			}
+			if _, ok := req.Header["Host"]; ok {
+				t.Errorf("Header[\"Host\"] should be deleted, got %v", req.Header["Host"])
+			}
+		})
+	}
+
+	// Duplicate Host headers and invalid control bytes in Host value must fail.
+	badCases := []string{
+		"GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: bad\x00host\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: bad\x7fhost\r\n\r\n",
+	}
+	for _, raw := range badCases {
+		if _, err := ReadRequest(bufio.NewReader(strings.NewReader(raw))); err == nil {
+			t.Errorf("ReadRequest(%q) succeeded, want error", raw)
+		}
+	}
+}
+

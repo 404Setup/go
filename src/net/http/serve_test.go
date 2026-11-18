@@ -8599,3 +8599,150 @@ func TestServerReadRequestHeaderValidation(t *testing.T) {
 	})
 }
 
+func TestServerLazyRequestContext(t *testing.T) {
+	t.Parallel()
+	type ctxKey string
+	const baseKey ctxKey = "base-key"
+
+	var (
+		capturedCtx   context.Context
+		uncalledReq   *Request
+		handlerDoneCh = make(chan struct{}, 2)
+	)
+
+	ts := httptest.NewUnstartedServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		if r.URL.Path == "/no-ctx" {
+			uncalledReq = r
+			w.WriteHeader(StatusOK)
+			handlerDoneCh <- struct{}{}
+			return
+		}
+		// Concurrent calls to r.Context() must return the same context and be race-free.
+		const goroutines = 8
+		ctxs := make([]context.Context, goroutines)
+		var wg sync.WaitGroup
+		wg.Add(goroutines)
+		for i := range goroutines {
+			go func(idx int) {
+				defer wg.Done()
+				ctxs[idx] = r.Context()
+			}(i)
+		}
+		wg.Wait()
+		for i := 1; i < goroutines; i++ {
+			if ctxs[i] != ctxs[0] {
+				t.Errorf("concurrent r.Context() mismatch at %d", i)
+			}
+		}
+		capturedCtx = ctxs[0]
+		if got := capturedCtx.Value(baseKey); got != "base-val" {
+			t.Errorf("BaseContext value = %v, want %q", got, "base-val")
+		}
+		if capturedCtx.Err() != nil {
+			t.Errorf("r.Context().Err() inside handler = %v, want nil", capturedCtx.Err())
+		}
+		r2 := r.WithContext(context.WithValue(capturedCtx, baseKey, "override"))
+		if got := r2.Context().Value(baseKey); got != "override" {
+			t.Errorf("WithContext value = %v, want %q", got, "override")
+		}
+		w.WriteHeader(StatusOK)
+		handlerDoneCh <- struct{}{}
+	}))
+	ts.Config.BaseContext = func(net.Listener) context.Context {
+		return context.WithValue(context.Background(), baseKey, "base-val")
+	}
+	ts.Start()
+	defer ts.Close()
+
+	res, err := ts.Client().Get(ts.URL + "/with-ctx")
+	if err != nil {
+		t.Fatalf("GET /with-ctx: %v", err)
+	}
+	res.Body.Close()
+	<-handlerDoneCh
+
+	select {
+	case <-capturedCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("captured request context was not canceled after ServeHTTP returned")
+	}
+	if err := capturedCtx.Err(); err != context.Canceled {
+		t.Errorf("capturedCtx.Err() = %v, want %v", err, context.Canceled)
+	}
+
+	res2, err := ts.Client().Get(ts.URL + "/no-ctx")
+	if err != nil {
+		t.Fatalf("GET /no-ctx: %v", err)
+	}
+	res2.Body.Close()
+	<-handlerDoneCh
+
+	if uncalledReq == nil {
+		t.Fatal("uncalledReq not captured")
+	}
+	if err := uncalledReq.Context().Err(); err != context.Canceled {
+		t.Errorf("uncalledReq.Context().Err() after handler exit = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestServerResponsePoolHeaderReuse(t *testing.T) {
+	t.Parallel()
+	largeBody := strings.Repeat("abcd", 1024) // 4KB (> 2KB bufferBeforeChunkingSize)
+	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		switch r.URL.Path {
+		case "/first":
+			w.Header().Set("X-First", "1")
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Length", strconv.Itoa(len(largeBody)))
+			w.WriteHeader(StatusOK)
+			// Mutate Header map after WriteHeader; must not affect current or subsequent responses.
+			w.Header().Set("X-Post-WriteHeader", "mutated")
+			w.Header().Set("X-First", "mutated")
+			io.WriteString(w, largeBody)
+		case "/second":
+			w.Header().Set("X-Second", "2")
+			io.WriteString(w, "ok")
+		}
+	}))
+	defer ts.Close()
+
+	client := ts.Client()
+	for range 5 {
+		r1, err := client.Get(ts.URL + "/first")
+		if err != nil {
+			t.Fatalf("GET /first: %v", err)
+		}
+		b1, _ := io.ReadAll(r1.Body)
+		r1.Body.Close()
+		if string(b1) != largeBody {
+			t.Fatalf("body length = %d, want %d", len(b1), len(largeBody))
+		}
+		if got := r1.Header.Get("X-First"); got != "1" {
+			t.Errorf("X-First = %q, want \"1\"", got)
+		}
+		if got := r1.Header.Get("X-Post-WriteHeader"); got != "" {
+			t.Errorf("X-Post-WriteHeader leaked into response: %q", got)
+		}
+
+		r2, err := client.Get(ts.URL + "/second")
+		if err != nil {
+			t.Fatalf("GET /second: %v", err)
+		}
+		b2, _ := io.ReadAll(r2.Body)
+		r2.Body.Close()
+		if string(b2) != "ok" {
+			t.Fatalf("body = %q, want \"ok\"", string(b2))
+		}
+		if got := r2.Header.Get("X-First"); got != "" {
+			t.Errorf("X-First leaked across pooled response: %q", got)
+		}
+		if got := r2.Header.Get("X-Post-WriteHeader"); got != "" {
+			t.Errorf("X-Post-WriteHeader leaked across pooled response: %q", got)
+		}
+		if got := r2.Header.Get("X-Second"); got != "2" {
+			t.Errorf("X-Second = %q, want \"2\"", got)
+		}
+	}
+}
+
+

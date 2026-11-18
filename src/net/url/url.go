@@ -440,6 +440,19 @@ func ParseRequestURI(rawURL string) (*URL, error) {
 // in which case only absolute URLs or path-absolute relative URLs are allowed.
 // If viaRequest is false, all forms of relative URLs are allowed.
 func parse(rawURL string, viaRequest bool) (*URL, error) {
+	if len(rawURL) > 0 && rawURL[0] == '/' && (len(rawURL) == 1 || rawURL[1] != '/') {
+		clean := true
+		for i := 0; i < len(rawURL); i++ {
+			if table[rawURL[i]]&encodePath == 0 {
+				clean = false
+				break
+			}
+		}
+		if clean {
+			return &URL{Path: rawURL}, nil
+		}
+	}
+
 	var rest string
 	var err error
 
@@ -457,12 +470,16 @@ func parse(rawURL string, viaRequest bool) (*URL, error) {
 		return url, nil
 	}
 
-	// Split off possible leading "http:", "mailto:", etc.
-	// Cannot contain escaped characters.
-	if url.Scheme, rest, err = getScheme(rawURL); err != nil {
-		return nil, err
+	if rawURL != "" && rawURL[0] == '/' {
+		rest = rawURL
+	} else {
+		// Split off possible leading "http:", "mailto:", etc.
+		// Cannot contain escaped characters.
+		if url.Scheme, rest, err = getScheme(rawURL); err != nil {
+			return nil, err
+		}
+		url.Scheme = strings.ToLower(url.Scheme)
 	}
-	url.Scheme = strings.ToLower(url.Scheme)
 
 	if strings.HasSuffix(rest, "?") && strings.Count(rest, "?") == 1 {
 		url.ForceQuery = true
@@ -668,6 +685,18 @@ func parseHost(scheme, host string) (string, error) {
 //
 //go:linkname badSetPath net/url.(*URL).setPath
 func (u *URL) setPath(p string) error {
+	clean := true
+	for i := 0; i < len(p); i++ {
+		if table[p[i]]&encodePath == 0 {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		u.Path = p
+		u.RawPath = ""
+		return nil
+	}
 	path, err := unescape(p, encodePath)
 	if err != nil {
 		return err
@@ -704,7 +733,12 @@ func (u *URL) EscapedPath() string {
 	if u.Path == "*" {
 		return "*" // don't escape (Issue 11202)
 	}
-	return escape(u.Path, encodePath)
+	for i := 0; i < len(u.Path); i++ {
+		if table[u.Path[i]]&encodePath == 0 {
+			return escape(u.Path, encodePath)
+		}
+	}
+	return u.Path
 }
 
 // validEncoded reports whether s is a valid encoded path or fragment,
