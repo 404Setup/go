@@ -265,6 +265,14 @@ func (s *serverConnContext) Value(key any) any {
 	return s.Context.Value(key)
 }
 
+func (s *serverConnContext) lazyServerRequestContext() (context.Context, context.CancelFunc, bool) {
+	if s.cr == nil {
+		return nil, nil, false
+	}
+	ctx, cancel := s.cr.lazyServerRequestContext(s)
+	return ctx, cancel, true
+}
+
 // A conn represents the server side of an HTTP connection.
 type conn struct {
 	// server is the server on which the connection arrived.

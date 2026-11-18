@@ -933,6 +933,10 @@ func fixTrailer(header Header, chunked bool, maxHeaders int64) (Header, error) {
 	return trailer, nil
 }
 
+type eofListener interface {
+	onBodyHitEOF()
+}
+
 // body turns a Reader into a ReadCloser.
 // Close ensures that the body has been fully read
 // and then reads the trailer if necessary.
@@ -949,7 +953,7 @@ type body struct {
 	sawEOF      bool
 	closed      bool
 	dropTrailer bool        // if true, do not populate hdr.Trailer
-	onHitEOF    *connReader // if non-nil, connReader to notify when EOF is Read
+	onHitEOF    eofListener // if non-nil, listener to notify when EOF is Read
 }
 
 // ErrBodyReadAfterClose is returned when reading a [Request] or [Response]
@@ -1200,13 +1204,13 @@ func (b *body) bodyRemains() bool {
 	return !b.sawEOF
 }
 
-func (b *body) registerOnHitEOF(cr *connReader) {
+func (b *body) registerOnHitEOF(fn eofListener) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.onHitEOF = cr
+	b.onHitEOF = fn
 }
 
 // bodyLocked is an io.Reader reading from a *body when its mutex is

@@ -352,19 +352,24 @@ const (
 	ctxStateCanceled = 1 << 3
 )
 
+type serverReqContextProvider interface {
+	lazyServerRequestContext() (context.Context, context.CancelFunc, bool)
+}
+
 func (r *Request) lazyContext() context.Context {
 	for {
 		s := atomic.LoadUint32(&r.ctxState)
 		if s&ctxStateLocked == 0 && atomic.CompareAndSwapUint32(&r.ctxState, s, s|ctxStateLocked) {
 			if s&ctxStateCreated == 0 {
 				base := r.ctx
-				if scc, ok := base.(*serverConnContext); ok && scc.cr != nil && s&ctxStateCanceled == 0 {
-					ctx, cancel := scc.cr.lazyServerRequestContext(scc)
-					r.cancelCtx = cancel
-					r.ctx = ctx
-					s |= ctxStateCreated
-					atomic.StoreUint32(&r.ctxState, s)
-					return ctx
+				if p, ok := base.(serverReqContextProvider); ok && s&ctxStateCanceled == 0 {
+					if ctx, cancel, ok := p.lazyServerRequestContext(); ok {
+						r.cancelCtx = cancel
+						r.ctx = ctx
+						s |= ctxStateCreated
+						atomic.StoreUint32(&r.ctxState, s)
+						return ctx
+					}
 				}
 				if base == nil {
 					base = context.Background()
