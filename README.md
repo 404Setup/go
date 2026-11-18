@@ -136,29 +136,29 @@ xychart-beta
 
 #### `valyala/fasthttp` Suite (`-cpu=2`)
 
-| Benchmark | `fasthttp` | Upstream `net/http` | Illium `net/http` | Illium vs Upstream | Ratio (`net/http` / `fasthttp`) | Allocs (`Upstream` → `Illium`) |
+| Benchmark | `fasthttp` | Upstream `net/http` | Illium `net/http` | Illium vs Upstream | Ratio (`net/http` / `fasthttp`) | Allocs (`fasthttp` / `Upstream` → `Illium`) |
 | :--- | ---: | ---: | ---: | ---: | ---: | :---: |
-| Server GET (`NumCPU` clients, 1 req/conn) | 1,936 ns/op | 6,547 ns/op | **3,734 ns/op** | **-43.0%** (1.75×) | **1.93×** (upstream 3.38×) | 34 (3,176 B) → **10 (1,408 B)** |
-| Server GET (`NumCPU` clients, 2 req/conn) | 1,395 ns/op | 4,617 ns/op | **2,615 ns/op** | **-43.4%** (1.77×) | **1.87×** (upstream 3.31×) | 26 (2,720 B) → **8 (1,240 B)** |
-| Server GET (`NumCPU` clients, 10 req/conn) | 658.9 ns/op | 3,125 ns/op | **1,675 ns/op** | **-46.4%** (1.87×) | **2.54×** (upstream 4.74×) | 21 (2,380 B) → **7 (1,118 B)** |
-| Server GET (`NumCPU` clients, 10K req/conn) | 439.0 ns/op | 2,770 ns/op | **1,471 ns/op** | **-46.9%** (1.88×) | **3.35×** (upstream 6.31×) | 19 (2,280 B) → **7 (1,089 B)** |
-| Server POST (`NumCPU` clients, 1 req/conn) | 2,124 ns/op | 6,850 ns/op | **4,356 ns/op** | **-36.4%** (1.57×) | **2.05×** (upstream 3.23×) | 40 (3,864 B) → **12 (2,064 B)** |
-| Server POST (`NumCPU` clients, 2 req/conn) | 1,532 ns/op | 5,048 ns/op | **3,140 ns/op** | **-37.8%** (1.61×) | **2.05×** (upstream 3.30×) | 32 (3,408 B) → **10 (1,896 B)** |
-| Server POST (`NumCPU` clients, 10 req/conn) | 719.8 ns/op | 3,702 ns/op | **2,307 ns/op** | **-37.7%** (1.60×) | **3.21×** (upstream 5.14×) | 27 (3,068 B) → **9 (1,774 B)** |
-| Server POST (`NumCPU` clients, 10K req/conn) | 538.0 ns/op | 3,269 ns/op | **2,097 ns/op** | **-35.9%** (1.56×) | **3.90×** (upstream 6.08×) | 25 (2,969 B) → **9 (1,746 B)** |
-| Server GET (10K clients, 1 req/conn) | 2,063 ns/op | 5,159 ns/op | **3,641 ns/op** | **-29.4%** (1.42×) | **1.76×** (upstream 2.50×) | 34 (3,186 B) → **10 (1,483 B)** |
-| Server GET (10K clients, 2 req/conn) | 1,278 ns/op | 4,050 ns/op | **2,537 ns/op** | **-37.4%** (1.60×) | **1.99×** (upstream 3.17×) | 26 (2,729 B) → **8 (1,267 B)** |
-| Server GET (10K clients, 10 req/conn) | 606.0 ns/op | 3,171 ns/op | **1,708 ns/op** | **-46.1%** (1.86×) | **2.82×** (upstream 5.23×) | 21 (2,389 B) → **7 (1,128 B)** |
-| Server GET (10K clients, 100 req/conn) | 460.1 ns/op | 2,674 ns/op | **1,560 ns/op** | **-41.7%** (1.71×) | **3.39×** (upstream 5.81×) | 19 (2,298 B) → **7 (1,106 B)** |
-| Client+Server E2E GET (TCP, p=1) | 9,272 ns/op | 21,399 ns/op | **15,675 ns/op** | **-26.7%** (1.37×) | **1.69×** (upstream 2.31×) | 70 (6,381 B) → **20 (2,913 B)** |
-| Client+Server E2E GET (TCP, p=10) | 7,606 ns/op | 17,646 ns/op | **14,737 ns/op** | **-16.5%** (1.20×) | **1.94×** (upstream 2.32×) | 70 (6,393 B) → **20 (2,921 B)** |
-| Client+Server E2E GET (TCP, p=100) | 7,548 ns/op | 19,177 ns/op | **14,373 ns/op** | **-25.1%** (1.33×) | **1.90×** (upstream 2.54×) | 70 (6,522 B) → **20 (3,034 B)** |
-| Client+Server E2E GET (Inmemory, p=1) | 2,169 ns/op | 10,848 ns/op | **7,480 ns/op** | **-31.0%** (1.45×) | **3.45×** (upstream 5.00×) | 70 (6,313 B) → **21 (2,929 B)** |
-| Client+Server E2E GET (Inmemory, p=10) | 2,597 ns/op | 11,733 ns/op | **7,458 ns/op** | **-36.4%** (1.57×) | **2.87×** (upstream 4.52×) | 69 (6,304 B) → **21 (2,933 B)** |
-| Client+Server E2E GET (Inmemory, p=100) | 2,688 ns/op | 12,921 ns/op | **8,697 ns/op** | **-32.7%** (1.49×) | **3.24×** (upstream 4.81×) | 69 (6,405 B) → **21 (2,992 B)** |
-| Client+Server E2E GET (Inmemory, p=1000) | 2,468 ns/op | 14,472 ns/op | **10,928 ns/op** | **-24.5%** (1.32×) | **4.43×** (upstream 5.86×) | 71 (7,150 B) → **23 (3,724 B)** |
-| Client+Server E2E 1MB Body (Inmemory, p=1) | 455.4 µs/op | 782.9 µs/op | **315.2 µs/op** | **-59.7%** (2.48×) | **0.69×** (upstream 1.72×) | 103 (2.13 MiB) → **30 (1.00 MiB)** |
-| Client+Server E2E 1MB Body (Inmemory, p=10) | 365.3 µs/op | 757.8 µs/op | **453.7 µs/op** | **-40.1%** (1.67×) | **1.24×** (upstream 2.07×) | 103 (2.14 MiB) → **31 (1.01 MiB)** |
+| Server GET (`NumCPU` clients, 1 req/conn) | 1,936 ns/op | 6,547 ns/op | **3,734 ns/op** | **-43.0%** (1.75×) | **1.93×** (upstream 3.38×) | 0 / 34 (3,176 B) → **10 (1,408 B)** |
+| Server GET (`NumCPU` clients, 2 req/conn) | 1,395 ns/op | 4,617 ns/op | **2,615 ns/op** | **-43.4%** (1.77×) | **1.87×** (upstream 3.31×) | 0 / 26 (2,720 B) → **8 (1,240 B)** |
+| Server GET (`NumCPU` clients, 10 req/conn) | 658.9 ns/op | 3,125 ns/op | **1,675 ns/op** | **-46.4%** (1.87×) | **2.54×** (upstream 4.74×) | 0 / 21 (2,380 B) → **7 (1,118 B)** |
+| Server GET (`NumCPU` clients, 10K req/conn) | 439.0 ns/op | 2,770 ns/op | **1,471 ns/op** | **-46.9%** (1.88×) | **3.35×** (upstream 6.31×) | 0 / 19 (2,280 B) → **7 (1,089 B)** |
+| Server POST (`NumCPU` clients, 1 req/conn) | 2,124 ns/op | 6,850 ns/op | **4,356 ns/op** | **-36.4%** (1.57×) | **2.05×** (upstream 3.23×) | 0 / 40 (3,864 B) → **12 (2,064 B)** |
+| Server POST (`NumCPU` clients, 2 req/conn) | 1,532 ns/op | 5,048 ns/op | **3,140 ns/op** | **-37.8%** (1.61×) | **2.05×** (upstream 3.30×) | 0 / 32 (3,408 B) → **10 (1,896 B)** |
+| Server POST (`NumCPU` clients, 10 req/conn) | 719.8 ns/op | 3,702 ns/op | **2,307 ns/op** | **-37.7%** (1.60×) | **3.21×** (upstream 5.14×) | 0 / 27 (3,068 B) → **9 (1,774 B)** |
+| Server POST (`NumCPU` clients, 10K req/conn) | 538.0 ns/op | 3,269 ns/op | **2,097 ns/op** | **-35.9%** (1.56×) | **3.90×** (upstream 6.08×) | 0 / 25 (2,969 B) → **9 (1,746 B)** |
+| Server GET (10K clients, 1 req/conn) | 2,063 ns/op | 5,159 ns/op | **3,641 ns/op** | **-29.4%** (1.42×) | **1.76×** (upstream 2.50×) | 0 (12 B) / 34 (3,186 B) → **10 (1,483 B)** |
+| Server GET (10K clients, 2 req/conn) | 1,278 ns/op | 4,050 ns/op | **2,537 ns/op** | **-37.4%** (1.60×) | **1.99×** (upstream 3.17×) | 0 (8 B) / 26 (2,729 B) → **8 (1,267 B)** |
+| Server GET (10K clients, 10 req/conn) | 606.0 ns/op | 3,171 ns/op | **1,708 ns/op** | **-46.1%** (1.86×) | **2.82×** (upstream 5.23×) | 0 (4 B) / 21 (2,389 B) → **7 (1,128 B)** |
+| Server GET (10K clients, 100 req/conn) | 460.1 ns/op | 2,674 ns/op | **1,560 ns/op** | **-41.7%** (1.71×) | **3.39×** (upstream 5.81×) | 0 (2 B) / 19 (2,298 B) → **7 (1,106 B)** |
+| Client+Server E2E GET (TCP, p=1) | 9,272 ns/op | 21,399 ns/op | **15,675 ns/op** | **-26.7%** (1.37×) | **1.69×** (upstream 2.31×) | 0 / 70 (6,381 B) → **20 (2,913 B)** |
+| Client+Server E2E GET (TCP, p=10) | 7,606 ns/op | 17,646 ns/op | **14,737 ns/op** | **-16.5%** (1.20×) | **1.94×** (upstream 2.32×) | 0 (4 B) / 70 (6,393 B) → **20 (2,921 B)** |
+| Client+Server E2E GET (TCP, p=100) | 7,548 ns/op | 19,177 ns/op | **14,373 ns/op** | **-25.1%** (1.33×) | **1.90×** (upstream 2.54×) | 0 (49 B) / 70 (6,522 B) → **20 (3,034 B)** |
+| Client+Server E2E GET (Inmemory, p=1) | 2,169 ns/op | 10,848 ns/op | **7,480 ns/op** | **-31.0%** (1.45×) | **3.45×** (upstream 5.00×) | 0 / 70 (6,313 B) → **21 (2,929 B)** |
+| Client+Server E2E GET (Inmemory, p=10) | 2,597 ns/op | 11,733 ns/op | **7,458 ns/op** | **-36.4%** (1.57×) | **2.87×** (upstream 4.52×) | 0 (1 B) / 69 (6,304 B) → **21 (2,933 B)** |
+| Client+Server E2E GET (Inmemory, p=100) | 2,688 ns/op | 12,921 ns/op | **8,697 ns/op** | **-32.7%** (1.49×) | **3.24×** (upstream 4.81×) | 0 (9 B) / 69 (6,405 B) → **21 (2,992 B)** |
+| Client+Server E2E GET (Inmemory, p=1000) | 2,468 ns/op | 14,472 ns/op | **10,928 ns/op** | **-24.5%** (1.32×) | **4.43×** (upstream 5.86×) | 0 (26 B) / 71 (7,150 B) → **23 (3,724 B)** |
+| Client+Server E2E 1MB Body (Inmemory, p=1) | 455.4 µs/op | 782.9 µs/op | **315.2 µs/op** | **-59.7%** (2.48×) | **0.69×** (upstream 1.72×) | 3 (1.00 MiB) / 103 (2.13 MiB) → **30 (1.00 MiB)** |
+| Client+Server E2E 1MB Body (Inmemory, p=10) | 365.3 µs/op | 757.8 µs/op | **453.7 µs/op** | **-40.1%** (1.67×) | **1.24×** (upstream 2.07×) | 3 (1.02 MiB) / 103 (2.14 MiB) → **31 (1.01 MiB)** |
 
 ---
 
