@@ -995,9 +995,23 @@ func (vs Values) Clone() Values {
 // Settings containing a non-URL-encoded semicolon are considered invalid.
 func ParseQuery(query string) (Values, error) {
 	m := make(Values)
-	err := parseQuery(m, query)
+	m, err := parseQuery(m, query)
 	return m, err
 }
+
+const (
+	// maxQueryMapHint bounds the map preallocation performed after a query
+	// outgrows its initial single-group map.
+	maxQueryMapHint = 256
+
+	// maxQueryValBatch bounds each shared value array allocated by parseLargeQuery.
+	maxQueryValBatch = 64
+
+	// smallQueryDistinctKeys is the threshold of distinct keys (one SwissTable
+	// group holds up to 7 entries before growing) after which parseQuery checks
+	// whether to switch to a presized map and batched value slices.
+	smallQueryDistinctKeys = 7
+)
 
 var urlmaxqueryparams = godebug.New("urlmaxqueryparams")
 
@@ -1020,10 +1034,30 @@ func urlParamsWithinMax(params int) bool {
 	return withinCustomMax
 }
 
-func parseQuery(m Values, query string) (err error) {
-	if !urlParamsWithinMax(strings.Count(query, "&") + 1) {
-		return errors.New("number of URL query parameters exceeded limit")
+func countNonEmptySettings(query string) int {
+	n := 0
+	nonEmpty := false
+	for i := 0; i < len(query); i++ {
+		if query[i] == '&' {
+			if nonEmpty {
+				n++
+				nonEmpty = false
+			}
+		} else {
+			nonEmpty = true
+		}
 	}
+	if nonEmpty {
+		n++
+	}
+	return n
+}
+
+func parseQuery(m Values, query string) (Values, error) {
+	if !urlParamsWithinMax(strings.Count(query, "&") + 1) {
+		return m, errors.New("number of URL query parameters exceeded limit")
+	}
+	var err error
 	for query != "" {
 		var key string
 		key, query, _ = strings.Cut(query, "&")
@@ -1050,8 +1084,67 @@ func parseQuery(m Values, query string) (err error) {
 			continue
 		}
 		m[key] = append(m[key], value)
+		if len(m) == smallQueryDistinctKeys && query != "" {
+			if rem := countNonEmptySettings(query); rem > 4 {
+				return parseLargeQuery(m, query, rem, err)
+			}
+		}
 	}
-	return err
+	return m, err
+}
+
+func parseLargeQuery(small Values, query string, rem int, err error) (Values, error) {
+	m := make(Values, smallQueryDistinctKeys+min(rem, maxQueryMapHint))
+	for k, v := range small {
+		m[k] = v
+	}
+	var vals []string
+	for query != "" {
+		var key string
+		key, query, _ = strings.Cut(query, "&")
+		if strings.Contains(key, ";") {
+			err = fmt.Errorf("invalid semicolon separator in query")
+			continue
+		}
+		if key == "" {
+			continue
+		}
+		rem--
+		key, value, _ := strings.Cut(key, "=")
+		key, err1 := QueryUnescape(key)
+		if err1 != nil {
+			if err == nil {
+				err = err1
+			}
+			continue
+		}
+		value, err1 = QueryUnescape(value)
+		if err1 != nil {
+			if err == nil {
+				err = err1
+			}
+			continue
+		}
+		if vs, ok := m[key]; ok {
+			m[key] = append(vs, value)
+		} else {
+			if len(vals) == cap(vals) {
+				if left := rem + 1; left > 1 {
+					vals = make([]string, 0, min(left, maxQueryValBatch))
+				} else {
+					vals = nil
+				}
+			}
+			if len(vals) < cap(vals) {
+				vals = append(vals, value)
+				i := len(vals) - 1
+				m[key] = vals[i : i+1 : i+1]
+			} else {
+				m[key] = []string{value}
+			}
+		}
+	}
+	return m, err
 }
 
 // Encode encodes the values into “URL encoded” form
