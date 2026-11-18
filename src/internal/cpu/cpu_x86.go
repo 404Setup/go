@@ -65,6 +65,9 @@ const (
 	cpuid_FSRM = 1 << 4
 	// edx bits for CPUID 0x80000001
 	cpuid_RDTSCP = 1 << 27
+
+	// eax bits for CPUID 0x0d, 1
+	cpuid_XGETBV1 = 1 << 2
 )
 
 var maxExtendedFunctionInformation uint32
@@ -79,6 +82,7 @@ func doinit() {
 		{Name: "rdtscp", Feature: &X86.HasRDTSCP},
 		{Name: "sha", Feature: &X86.HasSHA},
 		{Name: "vpclmulqdq", Feature: &X86.HasAVX512VPCLMULQDQ},
+		{Name: "xgetbv1", Feature: &X86.HasXGETBV1},
 	}
 	level := getGOAMD64level()
 	if level < 2 {
@@ -111,6 +115,55 @@ func doinit() {
 			option{Name: "avx512dq", Feature: &X86.HasAVX512DQ},
 			option{Name: "avx512vl", Feature: &X86.HasAVX512VL},
 		)
+	}
+
+	doDerived = func() {
+		// Cascade GODEBUG cpu.*=off settings (applied by processOptions after
+		// doinit) so that disabling a prerequisite feature like cpu.aes=off,
+		// cpu.pclmulqdq=off, cpu.avx=off, cpu.avx2=off, or cpu.avx512f=off also
+		// disables all dependent ISA extensions and composite flags (such as
+		// HasAVX512).
+		if !X86.HasAES {
+			X86.HasVAES = false
+			X86.HasAVX512VAES = false
+		}
+		if !X86.HasPCLMULQDQ {
+			X86.HasVPCLMULQDQ = false
+			X86.HasAVX512VPCLMULQDQ = false
+		}
+		if !X86.HasAVX {
+			X86.HasAVX2 = false
+			X86.HasFMA = false
+			X86.HasVAES = false
+			X86.HasVPCLMULQDQ = false
+		}
+		if !X86.HasAVX2 {
+			X86.HasAVXVNNI = false
+			X86.HasAVX512F = false
+		}
+		// Rather than carefully gating on fundamental AVX-512 features, we have
+		// a virtual "AVX512" feature that captures F+CD+BW+DQ+VL. BW, DQ, and
+		// VL have a huge effect on which AVX-512 instructions are available,
+		// and these have all been supported on everything except the earliest
+		// Phi chips with AVX-512. No CPU has had CD without F, so we include
+		// it. GOAMD64=v4 also implies exactly this set, and these are all
+		// included in AVX10.1.
+		X86.HasAVX512 = X86.HasAVX && X86.HasAVX2 && X86.HasAVX512F && X86.HasAVX512CD && X86.HasAVX512BW && X86.HasAVX512DQ && X86.HasAVX512VL
+		if !X86.HasAVX512 {
+			X86.HasAVX512F = false
+			X86.HasAVX512CD = false
+			X86.HasAVX512BW = false
+			X86.HasAVX512DQ = false
+			X86.HasAVX512VL = false
+			X86.HasAVX512GFNI = false
+			X86.HasAVX512BITALG = false
+			X86.HasAVX512VPOPCNTDQ = false
+			X86.HasAVX512VBMI = false
+			X86.HasAVX512VBMI2 = false
+			X86.HasAVX512VAES = false
+			X86.HasAVX512VNNI = false
+			X86.HasAVX512VPCLMULQDQ = false
+		}
 	}
 
 	maxID, _, _, _ := cpuid(0, 0)
@@ -150,6 +203,14 @@ func doinit() {
 		//
 		// Check if opmask, ZMMhi256 and Hi16_ZMM have OS support.
 		osSupportsAVX512 = osSupportsAVX && isSet(eax, 1<<5) && isSet(eax, 1<<6) && isSet(eax, 1<<7)
+
+		// Check if CPU supports XGETBV with ECX=1 (returns XINUSE in EAX, the
+		// bitmap of XSAVE state components currently not in INIT state).
+		// Gated on HasOSXSAVE because executing XGETBV requires CR4.OSXSAVE=1.
+		if maxID >= 0x0d {
+			eax0d1, _, _, _ := cpuid(0x0d, 1)
+			X86.HasXGETBV1 = isSet(eax0d1, cpuid_XGETBV1)
+		}
 	}
 
 	X86.HasAVX = isSet(ecx1, cpuid_AVX) && osSupportsAVX
@@ -209,17 +270,6 @@ func doinit() {
 
 	_, _, _, edxExt1 := cpuid(0x80000001, 0)
 	X86.HasRDTSCP = isSet(edxExt1, cpuid_RDTSCP)
-
-	doDerived = func() {
-		// Rather than carefully gating on fundamental AVX-512 features, we have
-		// a virtual "AVX512" feature that captures F+CD+BW+DQ+VL. BW, DQ, and
-		// VL have a huge effect on which AVX-512 instructions are available,
-		// and these have all been supported on everything except the earliest
-		// Phi chips with AVX-512. No CPU has had CD without F, so we include
-		// it. GOAMD64=v4 also implies exactly this set, and these are all
-		// included in AVX10.1.
-		X86.HasAVX512 = X86.HasAVX512F && X86.HasAVX512CD && X86.HasAVX512BW && X86.HasAVX512DQ && X86.HasAVX512VL
-	}
 
 	if eax7 >= 1 {
 		eax71, _, _, _ := cpuid(7, 1)

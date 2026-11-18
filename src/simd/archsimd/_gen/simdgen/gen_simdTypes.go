@@ -16,6 +16,7 @@ import (
 
 	"simd/archsimd/_gen/sgutil"
 	"simd/archsimd/_gen/simdgen/types"
+	"simd/archsimd/_gen/specgen"
 	"simd/archsimd/_gen/specgen/specexpr"
 )
 
@@ -303,11 +304,17 @@ func compareSimdTypePairs(x, y simdTypePair) int {
 }
 
 func simdPackageHeader() string {
+	return simdPackageHeaderFor("simd")
+}
+
+// simdPackageHeaderFor returns the header for a generated archsimd file that is
+// enabled by GOEXPERIMENT=experiment (either "simd" or "simdstable").
+func simdPackageHeaderFor(experiment string) string {
 	// A shared-package target's Go API files (SVE: types_sve.go, ops_sve.go) carry a
 	// "sve" name suffix, which is not a GOARCH, so unlike types_arm64.go they get
 	// no implicit build constraint. Add the GOARCH explicitly so they only build
 	// on their host arch and don't clash with other arches' tag types (e.g. v256).
-	constraint := "goexperiment.simd"
+	constraint := "goexperiment." + experiment
 	if a := CurrentArch(); a.sharesBackendPackage() {
 		constraint += " && " + a.Arch
 	}
@@ -517,22 +524,24 @@ func (x {{.Name}}) String() string {
 
 const simdFeaturesTemplate = `
 import "internal/cpu"
-
+{{if .DeclareVar}}
 type X86Features struct {}
 
 var X86 X86Features
-
-{{range .}}
+{{end}}
+{{range .Features}}
 {{$f := .}}
+// {{.Feature}} returns whether the CPU supports {{.Doc}}.
+{{- if ne .CPUIDDoc ""}}
+//
+// {{.CPUIDDoc}}
+{{- end}}
 {{- if eq .Feature "AVX512"}}
-// {{.Feature}} returns whether the CPU supports the AVX512F+CD+BW+DQ+VL features.
 //
 // These five CPU features are bundled together, and no use of AVX-512
 // is allowed unless all of these features are supported together.
 // Nearly every CPU that has shipped with any support for AVX-512 has
 // supported all five of these features.
-{{- else -}}
-// {{.Feature}} returns whether the CPU supports the {{.Feature}} feature.
 {{- end}}
 {{- if ne .ImpliesAll ""}}
 //
@@ -543,7 +552,7 @@ var X86 X86Features
 // GOARCH {{.GoArch}}.
 func ({{.FeatureVar}}Features) {{.Feature}}() bool {
 {{- if .Virtual}}
-	return {{range $i, $dep := .Implies}}{{if $i}} && {{end}}cpu.{{$f.FeatureVar}}.Has{{$dep}}{{end}}
+	return {{range $i, $dep := .Virtual}}{{if $i}} && {{end}}cpu.{{$f.FeatureVar}}.Has{{$dep}}{{end}}
 {{- else}}
 	return cpu.{{.FeatureVar}}.Has{{.Feature}}
 {{- end}}
@@ -821,6 +830,22 @@ func ({{.Op1NameAndType "x"}}) {{.Go}}({{.Op2NameAndType "y"}}, {{.ImmName}} {{.
 //
 // Asm: {{.Asm}}{{if .CPUFeature}}, CPU Feature: {{.CPUFeature}}{{end}}
 func ({{.Op1NameAndType "x"}}) {{.Go}}({{.Op2NameAndType "y"}}, {{.ImmName}} {{.ImmType}}) {{.GoType}}`)
+
+	// The _21I templates are like _2I, but the receiver is the instruction's
+	// second vector operand and the argument is its first.
+	st.Add("op2Imm8_21I", `{{if .Documentation}}{{.Documentation}}
+//{{end}}
+// Performance: A non-constant value of {{.ImmName}} may result in significantly worse performance for this operation.
+//
+// Asm: {{.Asm}}{{if .CPUFeature}}, CPU Feature: {{.CPUFeature}}{{end}}
+func ({{.Op2NameAndType "x"}}) {{.Go}}({{.Op1NameAndType "y"}}, {{.ImmName}} {{.ImmType}}) {{.GoType}}`)
+
+	st.Add("op2Imm_21I", `{{if .Documentation}}{{.Documentation}}
+//{{end}}
+// Performance: A non-constant value of {{.ImmName}} may result in significantly worse performance for this operation.
+//
+// Asm: {{.Asm}}{{if .CPUFeature}}, CPU Feature: {{.CPUFeature}}{{end}}
+func ({{.Op2NameAndType "x"}}) {{.Go}}({{.Op1NameAndType "y"}}, {{.ImmName}} {{.ImmType}}) {{.GoType}}`)
 
 	st.Add("op2Imm8_II", `{{if .Documentation}}{{.Documentation}}
 //{{end}}
@@ -1129,19 +1154,41 @@ type goarchFeatures struct {
 
 	// features records per-feature information.
 	features map[string]featureInfo
+
+	// flagCPUID maps internal/cpu flags to the CPUID features they check, for
+	// documentation. Flags not in this map check the CPUID feature with the
+	// same name as the flag.
+	flagCPUID map[cpuFlag][]string
 }
 
+// A cpuFlag names an internal/cpu feature flag, without the "Has" prefix (for
+// example, "AVX2" for cpu.X86.HasAVX2). Many SIMD features are named after the
+// internal/cpu flag they check, but the two are separate namespaces.
+type cpuFlag string
+
 type featureInfo struct {
-	// Implies is a list of other CPU features that are required for this
-	// feature. These are allowed to chain.
+	// Implies is a list of other features that are required for this
+	// feature. These are SIMD feature names, like this feature's name, and
+	// must name features that have their own feature checks. These are
+	// allowed to chain.
 	//
 	// For example, if the Frob feature lists "Baz", then if X.Frob() returns
-	// true, it must also be true that the CPU has feature Baz.
+	// true, it must also be true that X.Baz() returns true.
 	Implies []string
 
-	// Virtual means this feature is not represented directly in internal/cpu,
-	// but is instead the logical AND of the features in Implies.
-	Virtual bool
+	// Virtual, if non-empty, means this feature is not represented directly
+	// by an internal/cpu flag, but is instead the logical AND of these
+	// internal/cpu flags. Virtual must be at least as strict as every feature
+	// in Implies.
+	//
+	// If Virtual is empty, this feature's check is the internal/cpu flag with
+	// the same name as the feature.
+	Virtual []cpuFlag
+
+	// Doc, if non-empty, describes what this feature supports, completing the
+	// sentence "X returns whether the CPU supports ...". The default is "the X
+	// feature".
+	Doc string
 }
 
 // goarchFeatureInfo maps from GOARCH to CPU feature to additional information
@@ -1153,21 +1200,58 @@ func registerFeatureInfo(goArch string, features goarchFeatures) {
 }
 
 func featureImplies(goarch string, base string) string {
-	// Compute the transitive closure of base.
+	// Compute the transitive closure of base, in dependency order.
 	var list []string
+	seen := map[string]bool{base: true}
 	var visit func(f string)
 	visit = func(f string) {
-		list = append(list, f)
 		for _, dep := range goarchFeatureInfo[goarch].features[f].Implies {
-			visit(dep)
+			if !seen[dep] {
+				seen[dep] = true
+				visit(dep)
+				list = append(list, dep)
+			}
 		}
 	}
 	visit(base)
-	// Drop base
-	list = list[1:]
-	// Put in "nice" order
-	slices.Reverse(list)
-	// Combine into a comment-ready form
+	return andList(list)
+}
+
+// featureCPUIDDoc returns a sentence documenting the CPUID features checked by
+// feature, or "" if feature checks just the CPUID feature of the same name.
+func featureCPUIDDoc(goarch, feature string) string {
+	info := goarchFeatureInfo[goarch]
+	flags := info.features[feature].Virtual
+	if len(flags) == 0 {
+		// A non-virtual feature checks the internal/cpu flag of the same name.
+		flags = []cpuFlag{cpuFlag(feature)}
+	}
+	// Collect the CPUID features checked by all of these internal/cpu flags.
+	var cpuid []string
+	for _, flag := range flags {
+		flagCPUID := info.flagCPUID[flag]
+		if flagCPUID == nil {
+			// The CPUID feature name matches the internal/cpu flag name.
+			flagCPUID = []string{string(flag)}
+		}
+		for _, c := range flagCPUID {
+			if !slices.Contains(cpuid, c) {
+				cpuid = append(cpuid, c)
+			}
+		}
+	}
+	if len(cpuid) == 1 && cpuid[0] == feature {
+		return ""
+	}
+	noun := "feature"
+	if len(cpuid) > 1 {
+		noun = "features"
+	}
+	return fmt.Sprintf("This corresponds to the %s CPUID %s.", andList(cpuid), noun)
+}
+
+// andList combines list into a comment-ready form, such as "A, B, and C".
+func andList(list []string) string {
 	switch len(list) {
 	case 0:
 		return ""
@@ -1176,27 +1260,34 @@ func featureImplies(goarch string, base string) string {
 	case 2:
 		return list[0] + " and " + list[1]
 	default:
-		list[len(list)-1] = "and " + list[len(list)-1]
-		return strings.Join(list, ", ")
+		return strings.Join(list[:len(list)-1], ", ") + ", and " + list[len(list)-1]
 	}
 }
 
-func writeSIMDFeatures(buffer *bytes.Buffer, ops []Operation) {
+// writeSIMDFeatures writes the CPU feature checks required by ops. Each
+// feature check goes in the file for the most stable phase of any op that
+// requires it, and the feature check type and variable go in the phaseStable
+// file. files maps from each phase to its file.
+func writeSIMDFeatures(files map[phase]*bytes.Buffer, ops []Operation, specIdx *specgen.Index) {
 	// Gather all features
 	type featureKey struct {
 		GoArch  string
 		Feature string
 	}
-	featureSet := make(map[featureKey]struct{})
+	// featurePhase maps each feature to the most stable phase of an op that
+	// requires it.
+	featurePhase := make(map[featureKey]phase)
 	for _, op := range ops {
+		p := opPhase(op, specIdx)
 		// Generate a feature check for each independant feature in a
 		// composite feature.
 		for feature := range strings.SplitSeq(op.CPUFeature, ",") {
 			feature = strings.TrimSpace(feature)
-			featureSet[featureKey{op.GOARCH, feature}] = struct{}{}
+			k := featureKey{op.GOARCH, feature}
+			featurePhase[k] = max(featurePhase[k], p)
 		}
 	}
-	featureKeys := slices.SortedFunc(maps.Keys(featureSet), func(a, b featureKey) int {
+	featureKeys := slices.SortedFunc(maps.Keys(featurePhase), func(a, b featureKey) int {
 		if c := cmp.Compare(a.GoArch, b.GoArch); c != 0 {
 			return c
 		}
@@ -1209,19 +1300,35 @@ func writeSIMDFeatures(buffer *bytes.Buffer, ops []Operation) {
 	type feature struct {
 		featureKey
 		FeatureVar string
-		Virtual    bool
-		Implies    []string
+		Virtual    []cpuFlag
+		Doc        string
+		CPUIDDoc   string
 		ImpliesAll string
 	}
-	var features []feature
+	features := make(map[phase][]feature)
 	for _, k := range featureKeys {
+		p := featurePhase[k]
 		featureVar := goarchFeatureInfo[k.GoArch].featureVar
 		fi := goarchFeatureInfo[k.GoArch].features[k.Feature]
-		features = append(features, feature{
+		for _, dep := range fi.Implies {
+			depPhase := featurePhase[featureKey{k.GoArch, dep}]
+			if depPhase == 0 {
+				panic(fmt.Errorf("feature %s implies %s, which has no feature check", k.Feature, dep))
+			}
+			if depPhase < p {
+				panic(fmt.Errorf("feature %s is in %s, but implies %s, which is in %s", k.Feature, p, dep, depPhase))
+			}
+		}
+		doc := fi.Doc
+		if doc == "" {
+			doc = "the " + k.Feature + " feature"
+		}
+		features[p] = append(features[p], feature{
 			featureKey: k,
 			FeatureVar: featureVar,
 			Virtual:    fi.Virtual,
-			Implies:    fi.Implies,
+			Doc:        doc,
+			CPUIDDoc:   featureCPUIDDoc(k.GoArch, k.Feature),
 			ImpliesAll: featureImplies(k.GoArch, k.Feature),
 		})
 	}
@@ -1230,11 +1337,60 @@ func writeSIMDFeatures(buffer *bytes.Buffer, ops []Operation) {
 	// to be more careful about this.
 	t := templateOf(simdFeaturesTemplate, "features")
 
-	buffer.WriteString(simdPackageHeader())
-
-	if err := t.Execute(buffer, features); err != nil {
-		panic(fmt.Errorf("failed to execute features template: %w", err))
+	type data struct {
+		DeclareVar bool
+		Features   []feature
 	}
+	for p := range features {
+		if files[p] == nil {
+			panic(fmt.Errorf("no feature check file for %s", p))
+		}
+	}
+	for _, p := range slices.Sorted(maps.Keys(files)) {
+		f := files[p]
+		f.WriteString(simdPackageHeaderFor(p.experiment()))
+		if err := t.Execute(f, data{p == phaseStable, features[p]}); err != nil {
+			panic(fmt.Errorf("failed to execute features template: %w", err))
+		}
+	}
+}
+
+// opStub returns the Go stub declaration for op, or false if op has no Go
+// declaration.
+func opStub(op Operation) ([]byte, bool) {
+	if op.NoTypes != nil && *op.NoTypes == "true" {
+		return nil, false
+	}
+	if op.SkipMaskedMethod() {
+		return nil, false
+	}
+	idxVecAsScalar, err := checkVecAsScalar(op)
+	if err != nil {
+		panic(err)
+	}
+	s, op, err := classifyOp(op)
+	if err != nil {
+		panic(fmt.Errorf("failed to classify op %v: %w", op.Go, err))
+	}
+	if op.NoGenericOps != nil && *op.NoGenericOps == "true" {
+		return nil, false
+	}
+	if idxVecAsScalar != -1 {
+		if s == "op2" || s == "op3" || s == "op2Imm" {
+			s += "VecAsScalar"
+		} else {
+			panic(fmt.Errorf("simdgen only supports op2, op2Imm or op3, not %s with TreatLikeAScalarOfSize", s))
+		}
+	}
+	tpl := stubTemplates.Get(s)
+	if tpl == nil {
+		panic(fmt.Errorf("template %s not found", s))
+	}
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, op); err != nil {
+		panic(fmt.Errorf("failed to execute template %s for op %v: %w", s, op, err))
+	}
+	return buf.Bytes(), true
 }
 
 // writeSIMDStubs returns two bytes.Buffers containing the declarations for the public
@@ -1246,50 +1402,18 @@ func writeSIMDStubs(f, fI *bytes.Buffer, ops []Operation, typeMap simdTypeMap, d
 	slices.SortFunc(ops, compareOperations)
 
 	for i, op := range ops {
-		if op.NoTypes != nil && *op.NoTypes == "true" {
+		stub, ok := opStub(op)
+		if !ok {
 			continue
 		}
-		if op.SkipMaskedMethod() {
-			continue
+		out := fI
+		if unicode.IsUpper([]rune(op.Go)[0]) {
+			out = f
 		}
-		idxVecAsScalar, err := checkVecAsScalar(op)
-		if err != nil {
-			panic(err)
+		if i == 0 || op.Go != ops[i-1].Go {
+			fmt.Fprintf(out, "\n/* %s */\n", op.Go)
 		}
-		if s, op, err := classifyOp(op); err == nil {
-			if op.NoGenericOps != nil && *op.NoGenericOps == "true" {
-				continue
-			}
-			if idxVecAsScalar != -1 {
-				if s == "op2" || s == "op3" || s == "op2Imm" {
-					s += "VecAsScalar"
-				} else {
-					panic(fmt.Errorf("simdgen only supports op2, op2Imm or op3, not %s with TreatLikeAScalarOfSize", s))
-				}
-			}
-			if i == 0 || op.Go != ops[i-1].Go {
-				if unicode.IsUpper([]rune(op.Go)[0]) {
-					fmt.Fprintf(f, "\n/* %s */\n", op.Go)
-				} else {
-					fmt.Fprintf(fI, "\n/* %s */\n", op.Go)
-				}
-			}
-			tpl := stubTemplates.Get(s)
-			if tpl == nil {
-				panic(fmt.Errorf("template %s not found", s))
-			}
-			if unicode.IsUpper([]rune(op.Go)[0]) {
-				if err := tpl.Execute(f, op); err != nil {
-					panic(fmt.Errorf("failed to execute template %s for op %v: %w", s, op, err))
-				}
-			} else {
-				if err := tpl.Execute(fI, op); err != nil {
-					panic(fmt.Errorf("failed to execute template %s for op %v: %w", s, op, err))
-				}
-			}
-		} else {
-			panic(fmt.Errorf("failed to classify op %v: %w", op.Go, err))
-		}
+		out.Write(stub)
 	}
 
 	vectorConversions := vConvertFromTypeMap(typeMap)
