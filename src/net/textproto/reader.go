@@ -524,6 +524,11 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 	if maxMemory < 0 {
 		return nil, errMessageTooLarge
 	}
+	r.closeDot()
+
+	if m, _, _, _, handled, err := readMIMEHeaderBuffered(r.R, maxMemory, maxHeaders, false); handled {
+		return m, err
+	}
 
 	// Avoid lots of small slice allocations later by allocating one
 	// large one ahead of time which we'll cut up into smaller
@@ -558,7 +563,6 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 			return m, err
 		}
 		remKeys--
-		valBytes -= len(kv)
 
 		// Key ends at first colon.
 		k, v, ok := bytes.Cut(kv, colon)
@@ -582,11 +586,12 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 
 		// Skip initial spaces in value.
 		v = bytes.TrimLeft(v, " \t")
+		valBytes -= len(v)
 		value, interned := internHeaderValue(v)
 		if !interned {
 			if len(valBuf) < len(v) {
-				if remVal := valBytes - remKeys*18; remKeys > 0 && remVal > 16 && int64(len(v)+remVal) <= maxMemory {
-					allocSize := len(v) + remVal
+				if remKeys > 0 && valBytes > 0 && int64(len(v)+valBytes) <= maxMemory {
+					allocSize := len(v) + valBytes
 					if allocSize > 4096 {
 						allocSize = max(len(v), 4096)
 					}
@@ -633,6 +638,223 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 	}
 }
 
+//go:linkname readMIMEHeaderFast
+func readMIMEHeaderFast(b *bufio.Reader, maxMemory, maxHeaders int64, skipHost bool) (m MIMEHeader, haveHost bool, hostHeader string, hostCount int, handled bool, err error) {
+	return readMIMEHeaderBuffered(b, maxMemory, maxHeaders, skipHost)
+}
+
+type hdrSpan struct {
+	kStart uint32
+	kEnd   uint32
+	vStart uint32
+	vEnd   uint32
+}
+
+// readMIMEHeaderBuffered parses an entire buffered MIME header block in two
+// passes over r.Peek without invoking ReadLine or allocating a textproto.Reader.
+// When the block is incomplete, contains obs-fold continuations, or is missing a
+// colon on any line, it leaves b unconsumed and unmodified and returns handled=false.
+func readMIMEHeaderBuffered(b *bufio.Reader, maxMemory, maxHeaders int64, skipHost bool) (m MIMEHeader, haveHost bool, hostHeader string, hostCount int, handled bool, err error) {
+	if maxMemory < 0 {
+		return nil, false, "", 0, true, errMessageTooLarge
+	}
+	if b.Buffered() == 0 {
+		b.Peek(1)
+	}
+	s := b.Buffered()
+	if s == 0 {
+		return nil, false, "", 0, false, nil
+	}
+	peek, _ := b.Peek(s)
+	if len(peek) == 0 || peek[0] == ' ' || peek[0] == '\t' {
+		return nil, false, "", 0, false, nil
+	}
+
+	var stackSpans [32]hdrSpan
+	var extraSpans []hdrSpan
+	n := 0
+	valBytes := 0
+	pos := 0
+	hasEnd := false
+	for pos < len(peek) {
+		nl := bytes.IndexByte(peek[pos:], '\n')
+		if nl < 0 {
+			return nil, false, "", 0, false, nil
+		}
+		lineStart := pos
+		lineEnd := pos + nl
+		if lineEnd > lineStart && peek[lineEnd-1] == '\r' {
+			lineEnd--
+		}
+		pos += nl + 1
+		if lineEnd == lineStart {
+			hasEnd = true
+			break
+		}
+		if peek[lineStart] == ' ' || peek[lineStart] == '\t' {
+			return nil, false, "", 0, false, nil
+		}
+		line := peek[lineStart:lineEnd]
+		colonIdx := bytes.IndexByte(line, ':')
+		if colonIdx < 0 {
+			return nil, false, "", 0, false, nil
+		}
+		if maxMemory != math.MaxInt64 && int64(pos)+int64(n+1)*200 > maxMemory {
+			return nil, false, "", 0, false, nil
+		}
+		if int64(len(line)) > maxMemory {
+			return nil, false, "", 0, false, nil
+		}
+		if int64(pos) > math.MaxUint32 {
+			return nil, false, "", 0, false, nil
+		}
+		kEnd := lineStart + colonIdx
+		start := kEnd + 1
+		for start < lineEnd && (peek[start] == ' ' || peek[start] == '\t') {
+			start++
+		}
+		end := lineEnd
+		if start == lineEnd {
+			start = kEnd + 1
+			end = kEnd + 1
+		} else {
+			for end > start && (peek[end-1] == ' ' || peek[end-1] == '\t') {
+				end--
+			}
+		}
+		valBytes += end - start
+		sp := hdrSpan{
+			kStart: uint32(lineStart),
+			kEnd:   uint32(kEnd),
+			vStart: uint32(start),
+			vEnd:   uint32(end),
+		}
+		if n < len(stackSpans) {
+			stackSpans[n] = sp
+		} else {
+			extraSpans = append(extraSpans, sp)
+		}
+		n++
+	}
+	if !hasEnd {
+		return nil, false, "", 0, false, nil
+	}
+	if n == 0 {
+		b.Discard(pos)
+		return make(MIMEHeader), false, "", 0, true, nil
+	}
+
+	hint := n
+	if hint > 1000 {
+		hint = 1000
+	}
+	strs := make([]string, hint)
+	mapHint := hint
+	if skipHost && mapHint > 1 {
+		mapHint--
+	}
+	m = make(MIMEHeader, mapHint)
+
+	var valBuf []byte
+	remKeys := n
+	remVal := valBytes
+	for i := 0; i < n; i++ {
+		var sp hdrSpan
+		if i < len(stackSpans) {
+			sp = stackSpans[i]
+		} else {
+			sp = extraSpans[i-len(stackSpans)]
+		}
+		k := peek[sp.kStart:sp.kEnd]
+		v := peek[sp.vStart:sp.vEnd]
+
+		key, ok := canonicalMIMEHeaderKey(k)
+		if !ok {
+			cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
+			b.Discard(cur)
+			kv := peek[sp.kStart:sp.vEnd]
+			return m, haveHost, hostHeader, hostCount, true, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+		}
+		for _, c := range v {
+			if !validHeaderValueByte(c) {
+				cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
+				b.Discard(cur)
+				kv := peek[sp.kStart:sp.vEnd]
+				return m, haveHost, hostHeader, hostCount, true, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+			}
+		}
+
+		maxHeaders--
+		if maxHeaders < 0 {
+			cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
+			b.Discard(cur)
+			return nil, haveHost, hostHeader, hostCount, true, errMessageTooLarge
+		}
+
+		remKeys--
+		remVal -= len(v)
+		value, interned := internHeaderValue(v)
+		if !interned {
+			if len(valBuf) < len(v) {
+				if remKeys > 0 && remVal > 0 && int64(len(v)+remVal) <= maxMemory {
+					allocSize := len(v) + remVal
+					if allocSize > 4096 {
+						allocSize = max(len(v), 4096)
+					}
+					valBuf = make([]byte, allocSize)
+				}
+			}
+			if len(valBuf) >= len(v) {
+				copy(valBuf, v)
+				value = unsafe.String(&valBuf[0], len(v))
+				valBuf = valBuf[len(v):]
+			} else {
+				value = string(v)
+			}
+		}
+
+		if skipHost && key == "Host" {
+			const mapEntryOverhead = 200
+			if hostCount == 0 {
+				maxMemory -= int64(len(key)) + mapEntryOverhead
+				haveHost = true
+				hostHeader = value
+			}
+			hostCount++
+			maxMemory -= int64(len(value))
+			if maxMemory < 0 {
+				cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
+				b.Discard(cur)
+				return m, haveHost, hostHeader, hostCount, true, errMessageTooLarge
+			}
+			continue
+		}
+
+		vv := m[key]
+		if vv == nil {
+			const mapEntryOverhead = 200
+			maxMemory -= int64(len(key))
+			maxMemory -= mapEntryOverhead
+		}
+		maxMemory -= int64(len(value))
+		if maxMemory < 0 {
+			cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
+			b.Discard(cur)
+			return m, haveHost, hostHeader, hostCount, true, errMessageTooLarge
+		}
+		if vv == nil && len(strs) > 0 {
+			vv, strs = strs[:1:1], strs[1:]
+			vv[0] = value
+			m[key] = vv
+		} else {
+			m[key] = append(vv, value)
+		}
+	}
+
+	b.Discard(pos)
+	return m, haveHost, hostHeader, hostCount, true, nil
+}
+
 // noValidation is a no-op validation func for readContinuedLineSlice
 // that permits any lines.
 func noValidation(_ []byte) error { return nil }
@@ -657,7 +879,7 @@ func (r *Reader) upcomingHeaderKeys() (n int) {
 }
 
 // upcomingHeaderInfo returns an approximation of the number of keys
-// that will be in this header and the total byte length of the header lines.
+// that will be in this header and the total byte length of the trimmed header values.
 func (r *Reader) upcomingHeaderInfo() (n, valBytes int) {
 	// Try to determine the 'hint' size.
 	r.R.Peek(1) // force a buffer load if empty
@@ -669,14 +891,22 @@ func (r *Reader) upcomingHeaderInfo() (n, valBytes int) {
 	for len(peek) > 0 && n < 1000 {
 		var line []byte
 		line, peek, _ = bytes.Cut(peek, nl)
-		if len(line) == 0 || (len(line) == 1 && line[0] == '\r') {
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		if len(line) == 0 {
 			// Blank line separating headers from the body.
 			break
 		}
-		valBytes += len(line)
 		if line[0] == ' ' || line[0] == '\t' {
 			// Folded continuation of the previous line.
+			valBytes += len(trim(line)) + 1
 			continue
+		}
+		if colonIdx := bytes.IndexByte(line, ':'); colonIdx >= 0 {
+			valBytes += len(trim(line[colonIdx+1:]))
+		} else {
+			valBytes += len(line)
 		}
 		n++
 	}
@@ -907,10 +1137,12 @@ func canonicalMIMEHeaderKey(a []byte) (_ string, ok bool) {
 func lookupCommonHeader(a []byte) string {
 	switch len(a) {
 	case 2:
-		if string(a) == "Cc" {
+		switch string(a) {
+		case "Cc":
 			return "Cc"
-		}
-		if string(a) == "To" {
+		case "Te":
+			return "Te"
+		case "To":
 			return "To"
 		}
 	case 3:
@@ -927,6 +1159,14 @@ func lookupCommonHeader(a []byte) string {
 			return "Etag"
 		case "From":
 			return "From"
+		case "Link":
+			return "Link"
+		case "Vary":
+			return "Vary"
+		}
+	case 5:
+		if string(a) == "Range" {
+			return "Range"
 		}
 	case 6:
 		switch string(a) {
@@ -934,10 +1174,14 @@ func lookupCommonHeader(a []byte) string {
 			return "Accept"
 		case "Cookie":
 			return "Cookie"
-		case "Server":
-			return "Server"
+		case "Expect":
+			return "Expect"
+		case "Origin":
+			return "Origin"
 		case "Pragma":
 			return "Pragma"
+		case "Server":
+			return "Server"
 		}
 	case 7:
 		switch string(a) {
@@ -947,6 +1191,12 @@ func lookupCommonHeader(a []byte) string {
 			return "Referer"
 		case "Subject":
 			return "Subject"
+		case "Trailer":
+			return "Trailer"
+		case "Upgrade":
+			return "Upgrade"
+		case "Warning":
+			return "Warning"
 		}
 	case 8:
 		switch string(a) {
@@ -954,6 +1204,17 @@ func lookupCommonHeader(a []byte) string {
 			return "Location"
 		case "Received":
 			return "Received"
+		case "If-Match":
+			return "If-Match"
+		case "If-Range":
+			return "If-Range"
+		}
+	case 9:
+		switch string(a) {
+		case "Forwarded":
+			return "Forwarded"
+		case "X-Real-Ip":
+			return "X-Real-Ip"
 		}
 	case 10:
 		switch string(a) {
@@ -972,6 +1233,8 @@ func lookupCommonHeader(a []byte) string {
 		switch string(a) {
 		case "In-Reply-To":
 			return "In-Reply-To"
+		case "Retry-After":
+			return "Retry-After"
 		case "Return-Path":
 			return "Return-Path"
 		}
@@ -979,23 +1242,31 @@ func lookupCommonHeader(a []byte) string {
 		switch string(a) {
 		case "Content-Type":
 			return "Content-Type"
+		case "Max-Forwards":
+			return "Max-Forwards"
 		case "Mime-Version":
 			return "Mime-Version"
-		case "X-Powered-By":
-			return "X-Powered-By"
 		case "X-Imforwards":
 			return "X-Imforwards"
+		case "X-Powered-By":
+			return "X-Powered-By"
+		case "X-Request-Id":
+			return "X-Request-Id"
 		}
 	case 13:
 		switch string(a) {
+		case "Accept-Ranges":
+			return "Accept-Ranges"
+		case "Authorization":
+			return "Authorization"
 		case "Cache-Control":
 			return "Cache-Control"
+		case "Content-Range":
+			return "Content-Range"
 		case "If-None-Match":
 			return "If-None-Match"
 		case "Last-Modified":
 			return "Last-Modified"
-		case "Accept-Ranges":
-			return "Accept-Ranges"
 		}
 	case 14:
 		switch string(a) {
@@ -1014,18 +1285,60 @@ func lookupCommonHeader(a []byte) string {
 			return "Accept-Language"
 		case "X-Forwarded-For":
 			return "X-Forwarded-For"
+		case "X-Frame-Options":
+			return "X-Frame-Options"
 		}
 	case 16:
-		if string(a) == "Content-Language" {
+		switch string(a) {
+		case "Content-Encoding":
+			return "Content-Encoding"
+		case "Content-Language":
 			return "Content-Language"
+		case "Content-Location":
+			return "Content-Location"
+		case "Www-Authenticate":
+			return "Www-Authenticate"
+		case "X-Forwarded-Host":
+			return "X-Forwarded-Host"
+		case "X-Requested-With":
+			return "X-Requested-With"
 		}
 	case 17:
-		if string(a) == "If-Modified-Since" {
+		switch string(a) {
+		case "If-Modified-Since":
 			return "If-Modified-Since"
+		case "Transfer-Encoding":
+			return "Transfer-Encoding"
+		case "X-Forwarded-Proto":
+			return "X-Forwarded-Proto"
+		}
+	case 18:
+		if string(a) == "Proxy-Authenticate" {
+			return "Proxy-Authenticate"
+		}
+	case 19:
+		switch string(a) {
+		case "Content-Disposition":
+			return "Content-Disposition"
+		case "If-Unmodified-Since":
+			return "If-Unmodified-Since"
+		case "Proxy-Authorization":
+			return "Proxy-Authorization"
+		}
+	case 22:
+		if string(a) == "X-Content-Type-Options" {
+			return "X-Content-Type-Options"
+		}
+	case 23:
+		if string(a) == "Content-Security-Policy" {
+			return "Content-Security-Policy"
 		}
 	case 25:
-		if string(a) == "Content-Transfer-Encoding" {
+		switch string(a) {
+		case "Content-Transfer-Encoding":
 			return "Content-Transfer-Encoding"
+		case "Strict-Transport-Security":
+			return "Strict-Transport-Security"
 		}
 	}
 	return ""
@@ -1036,8 +1349,11 @@ func internHeaderValue(v []byte) (string, bool) {
 	case 0:
 		return "", true
 	case 1:
-		if v[0] == '0' {
+		switch v[0] {
+		case '0':
 			return "0", true
+		case '1':
+			return "1", true
 		}
 	case 3:
 		if string(v) == "*/*" {
@@ -1062,8 +1378,11 @@ func internHeaderValue(v []byte) (string, bool) {
 			return "private", true
 		}
 	case 8:
-		if string(v) == "no-cache" {
+		switch string(v) {
+		case "no-cache":
 			return "no-cache", true
+		case "no-store":
+			return "no-store", true
 		}
 	case 9:
 		switch string(v) {
@@ -1108,6 +1427,10 @@ func internHeaderValue(v []byte) (string, bool) {
 		if string(v) == "gzip,deflate,sdch" {
 			return "gzip,deflate,sdch", true
 		}
+	case 18:
+		if string(v) == "Go-http-client/1.1" {
+			return "Go-http-client/1.1", true
+		}
 	case 24:
 		if string(v) == "text/html; charset=utf-8" {
 			return "text/html; charset=utf-8", true
@@ -1133,41 +1456,74 @@ func initCommonHeader() {
 		"Accept-Encoding",
 		"Accept-Language",
 		"Accept-Ranges",
+		"Authorization",
 		"Cache-Control",
 		"Cc",
 		"Connection",
+		"Content-Disposition",
+		"Content-Encoding",
 		"Content-Id",
 		"Content-Language",
 		"Content-Length",
+		"Content-Location",
+		"Content-Range",
+		"Content-Security-Policy",
 		"Content-Transfer-Encoding",
 		"Content-Type",
 		"Cookie",
 		"Date",
 		"Dkim-Signature",
 		"Etag",
+		"Expect",
 		"Expires",
+		"Forwarded",
 		"From",
 		"Host",
+		"If-Match",
 		"If-Modified-Since",
 		"If-None-Match",
+		"If-Range",
+		"If-Unmodified-Since",
 		"In-Reply-To",
 		"Last-Modified",
+		"Link",
 		"Location",
+		"Max-Forwards",
 		"Message-Id",
 		"Mime-Version",
+		"Origin",
 		"Pragma",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Range",
 		"Received",
 		"Referer",
+		"Retry-After",
 		"Return-Path",
 		"Server",
 		"Set-Cookie",
+		"Strict-Transport-Security",
 		"Subject",
+		"Te",
 		"To",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
 		"User-Agent",
+		"Vary",
 		"Via",
+		"Warning",
+		"Www-Authenticate",
+		"X-Content-Type-Options",
 		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+		"X-Frame-Options",
 		"X-Imforwards",
 		"X-Powered-By",
+		"X-Real-Ip",
+		"X-Request-Id",
+		"X-Requested-With",
 	} {
 		commonHeader[v] = v
 	}

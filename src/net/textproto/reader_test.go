@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -616,6 +617,7 @@ func TestReadMIMEHeaderValueInterning(t *testing.T) {
 		"Cache-Control: no-cache\r\n" +
 		"Content-Type: application/json; charset=utf-8\r\n" +
 		"Content-Length: 0\r\n" +
+		"User-Agent: Go-http-client/1.1\r\n" +
 		"X-Custom-1: first-non-interned-value-1234567890\r\n" +
 		"X-Custom-2: second-non-interned-value-0987654321\r\n" +
 		"X-Custom-3: third-non-interned-value-abcdef\r\n\r\n"
@@ -633,6 +635,7 @@ func TestReadMIMEHeaderValueInterning(t *testing.T) {
 		"Cache-Control":   "no-cache",
 		"Content-Type":    "application/json; charset=utf-8",
 		"Content-Length":  "0",
+		"User-Agent":      "Go-http-client/1.1",
 		"X-Custom-1":      "first-non-interned-value-1234567890",
 		"X-Custom-2":      "second-non-interned-value-0987654321",
 		"X-Custom-3":      "third-non-interned-value-abcdef",
@@ -641,6 +644,15 @@ func TestReadMIMEHeaderValueInterning(t *testing.T) {
 		if got := h.Get(k); got != wv {
 			t.Errorf("h.Get(%q) = %q, want %q", k, got, wv)
 		}
+	}
+	ua := []byte("Go-http-client/1.1")
+	if allocs := testing.AllocsPerRun(50, func() {
+		v, ok := internHeaderValue(ua)
+		if !ok || v != "Go-http-client/1.1" {
+			t.Fatalf("internHeaderValue(%q) = (%q, %v)", ua, v, ok)
+		}
+	}); allocs > 0 {
+		t.Errorf("internHeaderValue(%q) allocs = %v, want 0", ua, allocs)
 	}
 }
 
@@ -654,3 +666,115 @@ func BenchmarkCanonicalMIMEHeaderKey(b *testing.B) {
 	}
 }
 
+func TestReadMIMEHeaderBufferedAndCommonHeaders(t *testing.T) {
+	commonHeaderOnce.Do(initCommonHeader)
+	for h := range commonHeader {
+		b := []byte(strings.ToLower(h))
+		if allocs := testing.AllocsPerRun(50, func() {
+			for i := range b {
+				if 'A' <= b[i] && b[i] <= 'Z' {
+					b[i] += toLower
+				}
+			}
+			got, ok := canonicalMIMEHeaderKey(b)
+			if !ok || got != h {
+				t.Fatalf("canonicalMIMEHeaderKey(%q) = (%q, %v), want (%q, true)", h, got, ok, h)
+			}
+		}); allocs > 0 {
+			t.Errorf("canonicalMIMEHeaderKey(%q) allocs = %v, want 0", h, allocs)
+		}
+		if got := lookupCommonHeader([]byte(h)); got != h {
+			t.Errorf("lookupCommonHeader(%q) = %q, want %q", h, got, h)
+		}
+	}
+
+	// Verify readMIMEHeaderBuffered / readMIMEHeaderFast parity on skipHost, duplicate Host, no Host, and trailing OWS.
+	raw := "Host: example.com  \r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"Cache-Control: no-store\r\n" +
+		"X-Flag: \t1\t \r\n" +
+		"X-Custom: abcdefghijklmnop\r\n\r\nBODY"
+	br := bufio.NewReader(strings.NewReader(raw))
+	m, haveHost, hostHdr, hostCount, handled, err := readMIMEHeaderFast(br, 1<<20, 10, true)
+	if err != nil || !handled {
+		t.Fatalf("readMIMEHeaderFast failed: handled=%v err=%v", handled, err)
+	}
+	if !haveHost || hostHdr != "example.com" || hostCount != 1 {
+		t.Fatalf("host info = (%v, %q, %d), want (true, example.com, 1)", haveHost, hostHdr, hostCount)
+	}
+	if _, ok := m["Host"]; ok {
+		t.Fatalf("skipHost=true still inserted Host: %v", m["Host"])
+	}
+	want := MIMEHeader{
+		"Transfer-Encoding": {"chunked"},
+		"Cache-Control":     {"no-store"},
+		"X-Flag":            {"1"},
+		"X-Custom":          {"abcdefghijklmnop"},
+	}
+	if !reflect.DeepEqual(m, want) {
+		t.Fatalf("headers mismatch: got %#v, want %#v", m, want)
+	}
+	rest, _ := io.ReadAll(br)
+	if string(rest) != "BODY" {
+		t.Fatalf("remaining body = %q, want %q", rest, "BODY")
+	}
+
+	// Duplicate Host with skipHost=true.
+	brDup := bufio.NewReader(strings.NewReader("Host: a\r\nHost: b\r\n\r\n"))
+	_, haveHost, hostHdr, hostCount, handled, err = readMIMEHeaderFast(brDup, 1<<20, 10, true)
+	if err != nil || !handled || !haveHost || hostHdr != "a" || hostCount != 2 {
+		t.Fatalf("duplicate Host fast = (%v, %q, %d, %v, %v)", haveHost, hostHdr, hostCount, handled, err)
+	}
+
+	// maxHeaders enforcement.
+	brMaxH := bufio.NewReader(strings.NewReader("A: 1\r\nB: 2\r\n\r\n"))
+	if _, err := readMIMEHeader(NewReader(brMaxH), 1<<20, 1); err != errMessageTooLarge {
+		t.Fatalf("maxHeaders=1 err = %v, want errMessageTooLarge", err)
+	}
+
+	// Small maxMemory enforcement.
+	brMaxM := bufio.NewReader(strings.NewReader("A: b\r\nC: d\r\n\r\n"))
+	if _, err := readMIMEHeader(NewReader(brMaxM), 100, 10); err != errMessageTooLarge {
+		t.Fatalf("maxMemory=100 err = %v, want errMessageTooLarge", err)
+	}
+
+	// >32 headers (exercises extraSpans overflow beyond stackSpans) and OWS-only value.
+	var sb strings.Builder
+	sb.WriteString("X-Empty:   \t \r\n")
+	for i := range 40 {
+		s := strconv.Itoa(i)
+		sb.WriteString("X-H-")
+		sb.WriteString(s)
+		sb.WriteString(": v")
+		sb.WriteString(s)
+		sb.WriteString("\r\n")
+	}
+	sb.WriteString("\r\n")
+	mLarge, err := readMIMEHeader(NewReader(bufio.NewReader(strings.NewReader(sb.String()))), 1<<20, 100)
+	if err != nil {
+		t.Fatalf("41 headers err = %v", err)
+	}
+	if len(mLarge) != 41 || mLarge.Get("X-Empty") != "" || mLarge.Get("X-H-39") != "v39" {
+		t.Fatalf("41 headers mismatch: len=%d empty=%q h39=%q", len(mLarge), mLarge.Get("X-Empty"), mLarge.Get("X-H-39"))
+	}
+
+	// Malformed key with OWS-only value must format trimmed line and discard through newline.
+	brBadKey := bufio.NewReader(strings.NewReader("Good: 1\r\nBad@Key:   \r\nNext: 2\r\n\r\n"))
+	_, _, _, _, handled, err = readMIMEHeaderFast(brBadKey, 1<<20, 10, false)
+	if !handled || err == nil || err.Error() != `malformed MIME header line: "Bad@Key:"` {
+		t.Fatalf("bad key err = %v (handled=%v)", err, handled)
+	}
+	if rest, _ := io.ReadAll(brBadKey); string(rest) != "Next: 2\r\n\r\n" {
+		t.Fatalf("bad key remaining = %q, want %q", rest, "Next: 2\r\n\r\n")
+	}
+
+	// Invalid byte inside value with surrounding OWS must be caught and discard through newline.
+	brBadVal := bufio.NewReader(strings.NewReader("Good: 1\r\nKey:  \x01  \r\nNext: 2\r\n\r\n"))
+	_, _, _, _, handled, err = readMIMEHeaderFast(brBadVal, 1<<20, 10, false)
+	if !handled || err == nil || err.Error() != `malformed MIME header line: "Key:  \x01"` {
+		t.Fatalf("bad val err = %v (handled=%v)", err, handled)
+	}
+	if rest, _ := io.ReadAll(brBadVal); string(rest) != "Next: 2\r\n\r\n" {
+		t.Fatalf("bad val remaining = %q, want %q", rest, "Next: 2\r\n\r\n")
+	}
+}
