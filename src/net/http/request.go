@@ -358,6 +358,14 @@ func (r *Request) lazyContext() context.Context {
 		if s&ctxStateLocked == 0 && atomic.CompareAndSwapUint32(&r.ctxState, s, s|ctxStateLocked) {
 			if s&ctxStateCreated == 0 {
 				base := r.ctx
+				if scc, ok := base.(*serverConnContext); ok && scc.cr != nil && s&ctxStateCanceled == 0 {
+					ctx, cancel := scc.cr.lazyServerRequestContext(scc)
+					r.cancelCtx = cancel
+					r.ctx = ctx
+					s |= ctxStateCreated
+					atomic.StoreUint32(&r.ctxState, s)
+					return ctx
+				}
 				if base == nil {
 					base = context.Background()
 				}
@@ -379,6 +387,9 @@ func (r *Request) lazyContext() context.Context {
 }
 
 func (r *Request) cancelServerCtx() {
+	if atomic.CompareAndSwapUint32(&r.ctxState, ctxStateLazy, ctxStateLazy|ctxStateCanceled) {
+		return
+	}
 	for {
 		s := atomic.LoadUint32(&r.ctxState)
 		if s&ctxStateLocked == 0 && atomic.CompareAndSwapUint32(&r.ctxState, s, s|ctxStateLocked) {
@@ -406,7 +417,10 @@ func (r *Request) cancelServerCtx() {
 // client's connection closes, the request is canceled (with HTTP/2),
 // or when the ServeHTTP method returns.
 func (r *Request) Context() context.Context {
-	if atomic.LoadUint32(&r.ctxState) != 0 {
+	if s := atomic.LoadUint32(&r.ctxState); s != 0 {
+		if s&ctxStateCreated != 0 {
+			return r.ctx
+		}
 		return r.lazyContext()
 	}
 	if r.ctx != nil {

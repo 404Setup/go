@@ -948,8 +948,8 @@ type body struct {
 	mu          sync.Mutex // guards following, and calls to Read and Close
 	sawEOF      bool
 	closed      bool
-	dropTrailer bool   // if true, do not populate hdr.Trailer
-	onHitEOF    func() // if non-nil, func to call when EOF is Read
+	dropTrailer bool        // if true, do not populate hdr.Trailer
+	onHitEOF    *connReader // if non-nil, connReader to notify when EOF is Read
 }
 
 // ErrBodyReadAfterClose is returned when reading a [Request] or [Response]
@@ -1013,7 +1013,7 @@ func (b *body) readLocked(p []byte) (n int, err error) {
 	}
 
 	if b.sawEOF && b.onHitEOF != nil {
-		b.onHitEOF()
+		b.onHitEOF.onBodyHitEOF()
 	}
 
 	return n, err
@@ -1200,13 +1200,13 @@ func (b *body) bodyRemains() bool {
 	return !b.sawEOF
 }
 
-func (b *body) registerOnHitEOF(fn func()) {
+func (b *body) registerOnHitEOF(cr *connReader) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.onHitEOF = fn
+	b.onHitEOF = cr
 }
 
 // bodyLocked is an io.Reader reading from a *body when its mutex is

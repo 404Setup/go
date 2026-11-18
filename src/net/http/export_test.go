@@ -222,3 +222,21 @@ func (t *Transport) AddHTTP3TestDialHook(hook func(addr string) (string, error))
 		hook:                   hook,
 	}
 }
+
+func ExportConnReaderStateForTesting(w ResponseWriter) (inRead, bgReadWanted, bgReadReady bool) {
+	res := w.(*response)
+	cr := res.conn.r
+	cr.lock()
+	defer cr.unlock()
+	return cr.inRead, cr.bgReadWanted, cr.bgReadReady
+}
+
+func ExportWorkerPoolCountsForTesting() (connWorkers, maxRetainedConn, bgWorkers, maxRetainedBg int) {
+	connWorkerPool.mu.Lock()
+	connWorkers = len(connWorkerPool.free)
+	connWorkerPool.mu.Unlock()
+	bgReadWorkerPool.mu.Lock()
+	bgWorkers = len(bgReadWorkerPool.free)
+	bgReadWorkerPool.mu.Unlock()
+	return connWorkers, retainedIdleConnWorkers, bgWorkers, retainedIdleBgWorkers
+}

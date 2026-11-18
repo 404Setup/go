@@ -8745,4 +8745,86 @@ func TestServerResponsePoolHeaderReuse(t *testing.T) {
 	}
 }
 
+func TestServerLazyBackgroundRead(t *testing.T) {
+	t.Parallel()
+	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		switch r.URL.Path {
+		case "/sync":
+			inRead, wanted, _ := ExportConnReaderStateForTesting(w)
+			if inRead || wanted {
+				t.Errorf("/sync before Context(): inRead=%v, bgReadWanted=%v; want false, false", inRead, wanted)
+			}
+			w.WriteHeader(StatusOK)
+		case "/body-ctx":
+			// Calling r.Context() before reading the body must mark bgReadWanted
+			// without starting backgroundRead until the body reaches EOF.
+			ctx := r.Context()
+			inReadBeforeEOF, wantedBeforeEOF, readyBeforeEOF := ExportConnReaderStateForTesting(w)
+			if inReadBeforeEOF || !wantedBeforeEOF || readyBeforeEOF {
+				t.Errorf("before body EOF: inRead=%v, wanted=%v, ready=%v; want false, true, false",
+					inReadBeforeEOF, wantedBeforeEOF, readyBeforeEOF)
+			}
+			if _, err := io.ReadAll(r.Body); err != nil {
+				t.Errorf("ReadAll(r.Body): %v", err)
+			}
+			_, _, readyAfterEOF := ExportConnReaderStateForTesting(w)
+			if !readyAfterEOF {
+				t.Errorf("after body EOF: bgReadReady=false; want true")
+			}
+			if ctx.Err() != nil {
+				t.Errorf("ctx.Err() = %v; want nil", ctx.Err())
+			}
+			w.WriteHeader(StatusOK)
+		}
+	}))
+	defer ts.Close()
 
+	client := ts.Client()
+	r1, err := client.Get(ts.URL + "/sync")
+	if err != nil {
+		t.Fatalf("GET /sync: %v", err)
+	}
+	r1.Body.Close()
+
+	r2, err := client.Post(ts.URL+"/body-ctx", "text/plain", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("POST /body-ctx: %v", err)
+	}
+	r2.Body.Close()
+}
+
+func TestServerConnWorkerPoolPruning(t *testing.T) {
+	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		_ = r.Context()
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(StatusOK)
+	}))
+	defer ts.Close()
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := &Client{Transport: &Transport{DisableKeepAlives: true}}
+			res, err := c.Get(ts.URL)
+			if err == nil {
+				res.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		nConn, maxConn, nBg, maxBg := ExportWorkerPoolCountsForTesting()
+		if nConn <= maxConn && nBg <= maxBg {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	nConn, maxConn, nBg, maxBg := ExportWorkerPoolCountsForTesting()
+	t.Fatalf("worker pools not pruned after GC: connWorkers=%d (max %d), bgWorkers=%d (max %d)",
+		nConn, maxConn, nBg, maxBg)
+}

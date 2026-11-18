@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"internal/godebug"
+	"internal/synctest"
 	"io"
 	"log"
 	"maps"
@@ -251,6 +252,19 @@ var (
 	LocalAddrContextKey = &contextKey{"local-addr"}
 )
 
+type serverConnContext struct {
+	context.Context
+	localAddr net.Addr
+	cr        *connReader
+}
+
+func (s *serverConnContext) Value(key any) any {
+	if key == LocalAddrContextKey {
+		return s.localAddr
+	}
+	return s.Context.Value(key)
+}
+
 // A conn represents the server side of an HTTP connection.
 type conn struct {
 	// server is the server on which the connection arrived.
@@ -312,6 +326,11 @@ type conn struct {
 	// running the final ConnState hook, possibly after (*conn).serve
 	// has returned. It is only accessed by the (*conn).serve goroutine.
 	http2HandedOff bool
+
+	connCtxCanceled bool
+	lazyConnCtx     context.Context
+	baseCtx         serverConnContext
+	cr              connReader
 }
 
 func (c *conn) hijacked() bool {
@@ -697,14 +716,167 @@ const debugServerConnections = false
 
 // Create new connection from rwc.
 func (s *Server) newConn(rwc net.Conn) *conn {
-	c := &conn{
+	if debugServerConnections {
+		rwc = newLoggingConn("server", rwc)
+	}
+	return &conn{
 		server: s,
 		rwc:    rwc,
 	}
-	if debugServerConnections {
-		c.rwc = newLoggingConn("server", c.rwc)
+}
+
+const (
+	maxIdleConnWorkers      = 128
+	retainedIdleConnWorkers = 2
+	maxIdleBgReadWorkers    = 64
+	retainedIdleBgWorkers   = 2
+)
+
+type connWork struct {
+	c   *conn
+	ctx context.Context
+}
+
+type connWorker struct {
+	ch chan connWork
+}
+
+var connWorkerPool struct {
+	mu      sync.Mutex
+	free    []*connWorker
+	gcArmed bool
+}
+
+func serveConn(c *conn, ctx context.Context) {
+	if synctest.IsInBubble() {
+		go c.serve(ctx)
+		return
 	}
-	return c
+	connWorkerPool.mu.Lock()
+	n := len(connWorkerPool.free)
+	if n > 0 {
+		w := connWorkerPool.free[n-1]
+		connWorkerPool.free[n-1] = nil
+		connWorkerPool.free = connWorkerPool.free[:n-1]
+		connWorkerPool.mu.Unlock()
+		w.ch <- connWork{c: c, ctx: ctx}
+		return
+	}
+	connWorkerPool.mu.Unlock()
+	w := &connWorker{ch: make(chan connWork, 1)}
+	go w.run(connWork{c: c, ctx: ctx})
+}
+
+func (w *connWorker) run(first connWork) {
+	first.c.serve(first.ctx)
+	if !putConnWorker(w) {
+		return
+	}
+	for work := range w.ch {
+		work.c.serve(work.ctx)
+		if !putConnWorker(w) {
+			return
+		}
+	}
+}
+
+func putConnWorker(w *connWorker) bool {
+	connWorkerPool.mu.Lock()
+	if len(connWorkerPool.free) >= maxIdleConnWorkers {
+		connWorkerPool.mu.Unlock()
+		return false
+	}
+	connWorkerPool.free = append(connWorkerPool.free, w)
+	if len(connWorkerPool.free) > retainedIdleConnWorkers && !connWorkerPool.gcArmed {
+		connWorkerPool.gcArmed = true
+		runtime.SetFinalizer(new(byte), pruneConnWorkers)
+	}
+	connWorkerPool.mu.Unlock()
+	return true
+}
+
+func pruneConnWorkers(_ *byte) {
+	connWorkerPool.mu.Lock()
+	connWorkerPool.gcArmed = false
+	for len(connWorkerPool.free) > retainedIdleConnWorkers {
+		n := len(connWorkerPool.free) - 1
+		w := connWorkerPool.free[n]
+		connWorkerPool.free[n] = nil
+		connWorkerPool.free = connWorkerPool.free[:n]
+		close(w.ch)
+	}
+	connWorkerPool.mu.Unlock()
+}
+
+type bgReadWorker struct {
+	ch chan *connReader
+}
+
+var bgReadWorkerPool struct {
+	mu      sync.Mutex
+	free    []*bgReadWorker
+	gcArmed bool
+}
+
+func startBgRead(cr *connReader) {
+	if synctest.IsInBubble() {
+		go cr.backgroundRead()
+		return
+	}
+	bgReadWorkerPool.mu.Lock()
+	n := len(bgReadWorkerPool.free)
+	if n > 0 {
+		w := bgReadWorkerPool.free[n-1]
+		bgReadWorkerPool.free[n-1] = nil
+		bgReadWorkerPool.free = bgReadWorkerPool.free[:n-1]
+		bgReadWorkerPool.mu.Unlock()
+		w.ch <- cr
+		return
+	}
+	bgReadWorkerPool.mu.Unlock()
+	w := &bgReadWorker{ch: make(chan *connReader, 1)}
+	go w.run(cr)
+}
+
+func (w *bgReadWorker) run(first *connReader) {
+	first.backgroundRead()
+	if !putBgReadWorker(w) {
+		return
+	}
+	for cr := range w.ch {
+		cr.backgroundRead()
+		if !putBgReadWorker(w) {
+			return
+		}
+	}
+}
+
+func putBgReadWorker(w *bgReadWorker) bool {
+	bgReadWorkerPool.mu.Lock()
+	if len(bgReadWorkerPool.free) >= maxIdleBgReadWorkers {
+		bgReadWorkerPool.mu.Unlock()
+		return false
+	}
+	bgReadWorkerPool.free = append(bgReadWorkerPool.free, w)
+	if len(bgReadWorkerPool.free) > retainedIdleBgWorkers && !bgReadWorkerPool.gcArmed {
+		bgReadWorkerPool.gcArmed = true
+		runtime.SetFinalizer(new(byte), pruneBgReadWorkers)
+	}
+	bgReadWorkerPool.mu.Unlock()
+	return true
+}
+
+func pruneBgReadWorkers(_ *byte) {
+	bgReadWorkerPool.mu.Lock()
+	bgReadWorkerPool.gcArmed = false
+	for len(bgReadWorkerPool.free) > retainedIdleBgWorkers {
+		n := len(bgReadWorkerPool.free) - 1
+		w := bgReadWorkerPool.free[n]
+		bgReadWorkerPool.free[n] = nil
+		bgReadWorkerPool.free = bgReadWorkerPool.free[:n]
+		close(w.ch)
+	}
+	bgReadWorkerPool.mu.Unlock()
 }
 
 type readResult struct {
@@ -724,15 +896,20 @@ type readResult struct {
 type connReader struct {
 	rwc net.Conn // rwc is the underlying network connection.
 
-	mu      sync.Mutex // guards following
-	conn    *conn      // conn is nil after handler exit.
-	hasByte bool
-	byteBuf [1]byte
-	cond    *sync.Cond
-	inRead  bool
-	aborted bool  // set true before conn.rwc deadline is set to past
-	probing bool  // set true during conn.serve's idle probe read, when a timeout is expected
-	remain  int64 // bytes remaining
+	mu           sync.Mutex // guards following
+	conn         *conn      // conn is nil after handler exit.
+	cond         *sync.Cond
+	reqCtx       context.Context
+	reqCancel    context.CancelFunc
+	remain       int64 // bytes remaining
+	byteBuf      [1]byte
+	hasByte      bool
+	inRead       bool
+	aborted      bool // set true before conn.rwc deadline is set to past
+	probing      bool // set true during conn.serve's idle probe read, when a timeout is expected
+	reqActive    bool // set true while a request handler is active
+	bgReadReady  bool // set true when request body has reached EOF
+	bgReadWanted bool // set true when request context, CloseNotify, or streaming write needs disconnect detection
 }
 
 func (cr *connReader) lock() {
@@ -747,18 +924,117 @@ func (cr *connReader) releaseConn() {
 	cr.conn = nil
 }
 
+func (cr *connReader) beginRequest(bodyAtEOF bool) {
+	cr.lock()
+	cr.reqActive = true
+	cr.bgReadReady = bodyAtEOF
+	cr.bgReadWanted = false
+	cr.unlock()
+}
+
+func (cr *connReader) onBodyHitEOF() {
+	cr.lock()
+	defer cr.unlock()
+	if !cr.reqActive {
+		return
+	}
+	cr.bgReadReady = true
+	if cr.bgReadWanted && !cr.inRead {
+		cr.startBackgroundReadLocked()
+	}
+}
+
+func (cr *connReader) maybeStartBackgroundRead() {
+	cr.lock()
+	defer cr.unlock()
+	if !cr.reqActive {
+		return
+	}
+	cr.bgReadWanted = true
+	if cr.bgReadReady && !cr.inRead {
+		cr.startBackgroundReadLocked()
+	}
+}
+
+func (cr *connReader) lazyServerRequestContext(scc *serverConnContext) (context.Context, context.CancelFunc) {
+	cr.lock()
+	defer cr.unlock()
+	if !cr.reqActive || cr.conn == nil {
+		ctx, cancel := context.WithCancel(scc.Context)
+		cancel()
+		return ctx, nil
+	}
+	if cr.reqCtx != nil {
+		return cr.reqCtx, cr.reqCancel
+	}
+	c := cr.conn
+	if c.lazyConnCtx == nil {
+		lctx, connCancel := context.WithCancel(scc)
+		if c.connCtxCanceled {
+			connCancel()
+		} else {
+			c.cancelCtx = connCancel
+		}
+		c.lazyConnCtx = lctx
+	}
+	ctx, cancel := context.WithCancel(c.lazyConnCtx)
+	cr.reqCtx = ctx
+	cr.reqCancel = cancel
+	cr.bgReadWanted = true
+	if cr.bgReadReady && !cr.inRead {
+		cr.startBackgroundReadLocked()
+	}
+	return ctx, cancel
+}
+
+func (cr *connReader) cancelReqCtx() {
+	cr.lock()
+	cr.reqActive = false
+	cr.bgReadReady = false
+	cr.bgReadWanted = false
+	cr.reqCtx = nil
+	cancel := cr.reqCancel
+	cr.reqCancel = nil
+	cr.unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// cr.mu must be held.
+func (c *conn) cancelConnCtxLocked() {
+	c.connCtxCanceled = true
+	if cancel := c.cancelCtx; cancel != nil {
+		c.cancelCtx = nil
+		cancel()
+	}
+}
+
+func (c *conn) cancelConnCtx() {
+	if c.r == nil {
+		return
+	}
+	c.r.lock()
+	c.cancelConnCtxLocked()
+	c.r.unlock()
+}
+
 func (cr *connReader) startBackgroundRead() {
 	cr.lock()
 	defer cr.unlock()
+	cr.startBackgroundReadLocked()
+}
+
+func (cr *connReader) startBackgroundReadLocked() {
 	if cr.inRead {
 		panic("invalid concurrent Body.Read call")
 	}
-	if cr.hasByte {
+	if cr.hasByte || cr.conn == nil {
 		return
 	}
 	cr.inRead = true
 	cr.rwc.SetReadDeadline(time.Time{})
-	go cr.backgroundRead()
+	startBgRead(cr)
 }
 
 func (cr *connReader) backgroundRead() {
@@ -850,6 +1126,8 @@ func (cr *connReader) waitReadable() (readable bool) {
 func (cr *connReader) abortPendingRead() {
 	cr.lock()
 	defer cr.unlock()
+	cr.bgReadReady = false
+	cr.bgReadWanted = false
 	if !cr.inRead {
 		return
 	}
@@ -921,7 +1199,7 @@ func (cr *connReader) handleReadErrorLocked(err error) {
 	if err != io.EOF && !isNetTimeoutError(err) {
 		cr.conn.rwc.SetWriteDeadline(aLongTimeAgo)
 	}
-	cr.conn.cancelCtx()
+	cr.conn.cancelConnCtxLocked()
 	if res := cr.conn.curReq.Load(); res != nil {
 		res.closeNotify()
 	}
@@ -1141,6 +1419,9 @@ var errTooLarge = errors.New("http: request too large")
 var responsePool sync.Pool[*response]
 
 func (w *response) cancelCtx() {
+	if w.conn != nil && w.conn.r != nil {
+		w.conn.r.cancelReqCtx()
+	}
 	w.req.cancelServerCtx()
 }
 
@@ -2254,7 +2535,11 @@ func (c *conn) serve(ctx context.Context) {
 	if ra := c.rwc.RemoteAddr(); ra != nil {
 		c.remoteAddr = ra.String()
 	}
-	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
+	c.baseCtx = serverConnContext{
+		Context:   ctx,
+		localAddr: c.rwc.LocalAddr(),
+	}
+	ctx = &c.baseCtx
 	var inFlightResponse *response
 	defer func() {
 		if inFlightResponse != nil {
@@ -2269,6 +2554,7 @@ func (c *conn) serve(ctx context.Context) {
 			c.close()
 			c.setState(c.rwc, StateClosed, runHooks)
 		}
+		c.cancelConnCtx()
 	}()
 
 	type connectionStater interface {
@@ -2348,11 +2634,9 @@ func (c *conn) serve(ctx context.Context) {
 	// HTTP/2 may outlive this goroutine, so it gets the uncancelable ctx.
 	connCtx := ctx
 
-	ctx, cancelCtx := context.WithCancel(ctx)
-	c.cancelCtx = cancelCtx
-	defer cancelCtx()
-
-	c.r = &connReader{conn: c, rwc: c.rwc}
+	c.cr.conn = c
+	c.cr.rwc = c.rwc
+	c.r = &c.cr
 	c.bufr = newBufioReader(c.r)
 
 	if d := c.server.readHeaderTimeout(); d > 0 {
@@ -2370,6 +2654,7 @@ func (c *conn) serve(ctx context.Context) {
 	}
 
 	// HTTP/1.x from here on.
+	c.baseCtx.cr = c.r
 
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
@@ -2443,13 +2728,16 @@ func (c *conn) serve(ctx context.Context) {
 
 		c.curReq.Store(w)
 
-		// Start background read, which detects when a client has closed its connection
-		// while a request handler is still running. When the request has a body, we
-		// start the background read only after the entire body has been consumed.
+		// Prepare on-demand background read, which detects when a client has closed its
+		// connection while a request handler is still running. To avoid per-request goroutine
+		// and SetReadDeadline synchronization overhead on synchronous handlers, the background
+		// read goroutine is started lazily when the handler accesses Request.Context(),
+		// calls ResponseWriter.CloseNotify(), or flushes response data before handler exit.
 		if w.reqBody.bodyRemains() {
-			w.reqBody.registerOnHitEOF(w.conn.r.startBackgroundRead)
+			w.conn.r.beginRequest(false)
+			w.reqBody.registerOnHitEOF(w.conn.r)
 		} else {
-			w.conn.r.startBackgroundRead()
+			w.conn.r.beginRequest(true)
 		}
 
 		// HTTP cannot have multiple simultaneous active requests.[*]
@@ -2691,18 +2979,20 @@ func (w *response) Hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 }
 
 func (w *response) CloseNotify() <-chan bool {
-	w.lazyCloseNotifyMu.Lock()
-	defer w.lazyCloseNotifyMu.Unlock()
 	if w.handlerDone.Load() {
 		panic("net/http: CloseNotify called after ServeHTTP finished")
 	}
+	w.lazyCloseNotifyMu.Lock()
 	if w.closeNotifyCh == nil {
 		w.closeNotifyCh = make(chan bool, 1)
 		if w.closeNotifyTriggered {
 			w.closeNotifyCh <- true // action prior closeNotify call
 		}
 	}
-	return w.closeNotifyCh
+	ch := w.closeNotifyCh
+	w.lazyCloseNotifyMu.Unlock()
+	w.conn.r.maybeStartBackgroundRead()
+	return ch
 }
 
 func (w *response) closeNotify() {
@@ -4064,7 +4354,7 @@ func (s *Server) Serve(l net.Listener) error {
 		tempDelay = 0
 		c := s.newConn(rw)
 		c.setState(c.rwc, StateNew, runHooks) // before Serve can return
-		go c.serve(connCtx)
+		serveConn(c, connCtx)
 	}
 }
 
@@ -4786,10 +5076,13 @@ type checkConnErrorWriter struct {
 }
 
 func (w checkConnErrorWriter) Write(p []byte) (n int, err error) {
+	if res := w.c.curReq.Load(); res != nil && !res.handlerDone.Load() {
+		w.c.r.maybeStartBackgroundRead()
+	}
 	n, err = w.c.rwc.Write(p)
 	if err != nil && w.c.werr == nil {
 		w.c.werr = err
-		w.c.cancelCtx()
+		w.c.cancelConnCtx()
 	}
 	return
 }
