@@ -15,7 +15,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
 - **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
-- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and goroutine churn across HTTP/1.1 request/response parsing, header canonicalization/interning, server connection and worker pooling, client `Transport` pooling, URL/cookie parsing, and `ServeMux` routing.
+- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and goroutine churn across HTTP/1.1 request/response parsing, header canonicalization and stack-buffered lookup, server connection and worker pooling, client `Transport` pooling, URL/query/cookie/form parsing, Basic auth credentials, and `ServeMux` routing.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
 - **`runtime`**: Faster span reclamation, GC bit-scanning and sweep, write-barrier pointer deduplication, and zero-size slice fast paths.
 - **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
@@ -86,6 +86,7 @@ xychart-beta
 | Benchmark | Upstream Go | Illium | Latency Delta | Allocs (`Upstream` → `Illium`) |
 | :--- | ---: | ---: | ---: | :---: |
 | `StatusCodeString` (`internal`) | 21.29 ns/op | **0.33 ns/op** | **-98.4%** (64.52×) | 1 (3 B) → **0 (0 B)** |
+| `MIMEHeaderGet/Empty` (`textproto`) | 67.41 ns/op | **1.19 ns/op** | **-98.2%** (56.65×) | 1 (24 B) → **0 (0 B)** |
 | `DetectContentType/Binary512` (`internal`) | 263.0 ns/op | **6.55 ns/op** | **-97.5%** (40.15×) | 0 → 0 |
 | `DetectContentType/PNG` (`internal`) | 146.7 ns/op | **3.89 ns/op** | **-97.4%** (37.71×) | 0 → 0 |
 | `DetectContentType/MP4` (`internal`) | 186.9 ns/op | **7.13 ns/op** | **-96.2%** (26.21×) | 0 → 0 |
@@ -115,9 +116,12 @@ xychart-beta
 | `LowerHeader/Known` (`httpcommon`) | 11.04 ns/op | **4.50 ns/op** | **-59.3%** (2.45×) | 0 → 0 |
 | `CanonicalHeader/Known` (`httpcommon`) | 8.86 ns/op | **5.39 ns/op** | **-39.1%** (1.64×) | 0 → 0 |
 | `StreamWriteVarint` (`http3`) | 312.6 ns/op | **128.7 ns/op** | **-58.9%** (2.43×) | 0 (15 B) → 0 (15 B) |
+| `MIMEHeaderGet/Canonical` (`textproto`) | 28.44 ns/op | **11.70 ns/op** | **-58.9%** (2.43×) | 0 → 0 |
 | `ServerFakeConnNoKeepAlive` | 12,721 ns/op | **5,433 ns/op** | **-57.3%** (2.34×) | 46 (4,689 B) → **22 (3,016 B)** |
 | `CookieString` | 431.4 ns/op | **195.5 ns/op** | **-54.7%** (2.21×) | 1 (176 B) → **1 (144 B)** |
 | `ResponseRecorderResult` (`httptest`) | 401.0 ns/op | **194.6 ns/op** | **-51.5%** (2.06×) | 5 (232 B) → **3 (208 B)** |
+| `SetBasicAuth` | 117.6 ns/op | **61.62 ns/op** | **-47.6%** (1.91×) | 3 (72 B) → **2 (48 B)** |
+| `MIMEHeaderGet/Missing` (`textproto`, lower-case key) | 67.64 ns/op | **36.10 ns/op** | **-46.6%** (1.87×) | 1 (16 B) → **0 (0 B)** |
 | `HeaderWriteSubsetBuilder` | 458.6 ns/op | **257.0 ns/op** | **-44.0%** (1.78×) | 4 (240 B) → **1 (112 B)** |
 | `ClientServer/h1` | 19.58 µs/op | **11.07 µs/op** | **-43.5%** (1.77×) | 61 (5,420 B) → **22 (3,097 B)** |
 | `ServeMux` (end-to-end) | 45.24 µs/op | **25.95 µs/op** | **-42.6%** (1.74×) | 360 → 360 |
@@ -127,12 +131,23 @@ xychart-beta
 | `ReadRequest/Siege` | 1,568 ns/op | **1,008 ns/op** | **-35.7%** (1.56×) | 10 (1,029 B) → **5 (976 B)** |
 | `ReadRequest/Curl` | 1,156 ns/op | **756.9 ns/op** | **-34.5%** (1.53×) | 8 (944 B) → **5 (928 B)** |
 | `ReadRequest/Apachebench` | 1,179 ns/op | **777.5 ns/op** | **-34.1%** (1.52×) | 8 (947 B) → **5 (920 B)** |
+| `ParseQuery/Distinct64` (`url`) | 9,287 ns/op | **6,189 ns/op** | **-33.4%** (1.50×) | 75 (11,736 B) → **14 (7,000 B)** |
+| `MIMEHeaderGet/LowerCommon` (`textproto`) | 67.01 ns/op | **44.79 ns/op** | **-33.2%** (1.50×) | 0 → 0 |
+| `BasicAuth` | 100.7 ns/op | **69.09 ns/op** | **-31.4%** (1.46×) | 2 (32 B) → **1 (16 B)** |
 | `HeaderWriteSubsetBufio` | 294.3 ns/op | **204.1 ns/op** | **-30.7%** (1.44×) | 0 → 0 |
+| `MIMEHeaderGet/LowerCustom` (`textproto`) | 79.83 ns/op | **57.47 ns/op** | **-28.0%** (1.39×) | 1 (24 B) → **0 (0 B)** |
+| `ParseFormPostWithCL` | 1,509 ns/op | **1,121 ns/op** | **-25.7%** (1.35×) | 24 (1,736 B) → **15 (1,104 B)** |
+| `ParseQuery/Distinct32` (`url`) | 4,674 ns/op | **3,480 ns/op** | **-25.5%** (1.34×) | 41 (5,816 B) → **14 (3,704 B)** |
 | `QPACKPrefixedString/EncoderHeaders` (`http3`) | 476.0 ns/op | **356.7 ns/op** | **-25.1%** (1.33×) | 7 (176 B) → **4 (184 B)** |
 | `ServeMux_SkipServe` | 16.51 µs/op | **12.47 µs/op** | **-24.4%** (1.32×) | 0 → 0 |
 | `ClientRequestHeaders/1000` (`http2`) | 1,114 µs/op | **893.8 µs/op** | **-19.8%** (1.25×) | 4,074 (324 KB) → **3,054 (230 KB)** |
 | `ParseRange` | 267.7 ns/op | **219.1 ns/op** | **-18.2%** (1.22×) | 3 (112 B) → **1 (64 B)** |
+| `ParseQuery/Distinct16` (`url`) | 2,298 ns/op | **1,943 ns/op** | **-15.4%** (1.18×) | 23 (2,840 B) → **14 (2,152 B)** |
+| `ParseFormPost` | 1,511 ns/op | **1,285 ns/op** | **-15.0%** (1.18×) | 24 (1,736 B) → **17 (1,640 B)** |
 | `ServeContent` | 3,016 ns/op | **2,585 ns/op** | **-14.3%** (1.17×) | 16 (5,244 B) → 16 (5,244 B) |
+| `ParseFormPostLargeWithCL` | 8,155 ns/op | **7,213 ns/op** | **-11.6%** (1.13×) | 82 (9,656 B) → **28 (6,976 B)** |
+
+The `SetBasicAuth`, `BasicAuth`, `ParseQuery`, `MIMEHeaderGet`, and `ParseFormPost*` rows were measured against Go 1.27.3. `ParseQuery` pre-sizes the map and batches value slices once a query reaches seven distinct keys with more than four remaining settings. `ParseFormPost` and `ParseFormPostWithCL` use a 6-field body; `ParseFormPostLargeWithCL` uses a 32-field body.
 
 #### `valyala/fasthttp` Suite (`-cpu=2`)
 
