@@ -542,6 +542,7 @@ type serverConn struct {
 	priorityAware   bool // the client has sent priority signal, meaning that it is aware of it.
 
 	extendedConnectAllowed bool // server advertised ENABLE_CONNECT_PROTOCOL to this client
+	deferFlushForHeaders   bool // defer flush once after sync non-EndStream HEADERS to coalesce DATA
 }
 
 func (sc *serverConn) writeSchedIgnoresRFC7540() bool {
@@ -1451,6 +1452,7 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 		sc.hpackEncoder.SetMaxDynamicTableSize(sc.encoderTableSizeMin)
 		sc.hpackEncoder.SetMaxDynamicTableSize(sc.encoderTableSize)
 	}
+	sc.deferFlushForHeaders = false
 	if wr.write.staysWithinBuffer(sc.bw.Available()) {
 		sc.writingFrameAsync = false
 		err := wr.write.writeFrame(sc)
@@ -1462,6 +1464,7 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 			sc.wroteFrame(frameWriteResult{wr: wr, err: nil})
 		} else if len(headerBlock) <= 16384 && frameHeaderLen+len(headerBlock) <= sc.bw.Available() {
 			sc.writingFrameAsync = false
+			sc.deferFlushForHeaders = !wrh.endStream
 			err := sc.framer.WriteHeaders(HeadersFrameParam{
 				StreamID:      wrh.streamID,
 				BlockFragment: headerBlock,
@@ -1601,11 +1604,14 @@ func (sc *serverConn) scheduleFrameWrite() {
 			}
 		}
 		if sc.needsFrameFlush {
-			if len(sc.wantWriteFrameCh) > 0 {
-				// Another frame is already waiting on wantWriteFrameCh (e.g. DATA
-				// immediately following a synchronous HEADERS write); return to
-				// serveLoop to coalesce it into the same flush.
-				break
+			if sc.deferFlushForHeaders {
+				sc.deferFlushForHeaders = false
+				if len(sc.wantWriteFrameCh) > 0 {
+					// A follow-up frame (e.g. DATA immediately after synchronous
+					// HEADERS) is already queued on wantWriteFrameCh; return to
+					// serveLoop to coalesce it into the same flush.
+					break
+				}
 			}
 			sc.startFrameWrite(FrameWriteRequest{write: flushFrameWriter{}})
 			sc.needsFrameFlush = false // after startFrameWrite, since it sets this true
