@@ -15,7 +15,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
 - **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
-- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and lock/goroutine overhead across HTTP/1.1 request/response parsing and wire writes, header lookup and canonicalization, cookie parsing/formatting, `ServeMux` atomic routing snapshots and `Redirect`, `ServeContent`, client `Transport` connection/body reuse, URL/query/form/Basic-auth handling, and `httputil`/`httptest` helpers.
+- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and lock/goroutine overhead across HTTP/1.1 request/response parsing and wire writes, HTTP/2 frame reuse, direct buffered frame writes, synchronous response-header coalescing, and stream cleanup, HTTP/3 header/response handling, header lookup/validation and canonicalization, cookie parsing/formatting and `cookiejar` struct keys, `CrossOriginProtection` fast paths, `ServeMux` atomic routing snapshots and `Redirect`, `ServeContent` and closed-form range MIME sizing, client `Transport` connection/body reuse, URL/query/form/Basic-auth handling, and `httputil`/`httptest` helpers.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
 - **`runtime`**: Faster span reclamation, GC bit-scanning and sweep, write-barrier pointer deduplication, and zero-size slice fast paths.
 - **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
@@ -88,7 +88,8 @@ xychart-beta
 | Benchmark | Go `1.27.3` | Illium | Latency Delta | Allocs (`1.27.3` → `Illium`) |
 | :--- | ---: | ---: | ---: | :---: |
 | `ClientServer/h1` (`1×` / `64×` parallel) | 24.03 / 50.46 µs/op | **10.02 / 13.63 µs/op** | **-58.3% / -73.0%** | 65 / 105 → **20 / 39** |
-| `ClientServerParallel/64` (`https1` / `h2`) | 818.8 / 50.99 µs/op | **29.45 / 19.74 µs/op** | **-96.4% / -61.3%** | 795 / 90 → **58 / 59** |
+| `ClientServer/h2` (`1×` / `64×` parallel) | 35.60 / 25.72 µs/op | **26.73 / 17.33 µs/op** | **-24.9% / -32.6%** | 65 / 67 → **32 / 30** |
+| `ClientServerParallel/64` (`https1`) | 818.8 µs/op | **29.45 µs/op** | **-96.4%** (27.80×) | 795 → **58** |
 | `ServerFakeConn` (`KeepAlive` / `Lite`) | 7,414 / 4,031 ns/op | **2,374 / 759.4 ns/op** | **-68.0% / -81.2%** | 22 / 12 → **6 / 2** |
 | `ServerFakeConnNoKeepAlive` | 13.73 µs/op | **5.44 µs/op** | **-60.4%** (2.53×) | 47 (4,955 B) → **22 (3,049 B)** |
 | `ServerHandlerTypeLen` | 5,394 ns/op | **1,300 ns/op** | **-75.9%** (4.15×) | 19 (2,129 B) → **5 (532 B)** |
@@ -116,9 +117,10 @@ xychart-beta
 | `BasicAuth` / `SetBasicAuth` | 106.8 / 129.1 ns/op | **71.10 / 66.83 ns/op** | **-33.4% / -48.2%** | 2 / 3 → **1 / 2** |
 | `ParseForm` (POST w/ CL, 6 / 32 fields) | 1,742 / 9,880 ns/op | **1,283 / 7,712 ns/op** | **-26.3% / -21.9%** | 24 / 82 → **15 / 28** |
 | `url.ParseQuery` (64 distinct keys) | 10.95 µs/op | **6.78 µs/op** | **-38.1%** (1.62×) | 75 (11,736 B) → **14 (7,000 B)** |
-| `ClientRequestHeaders/1000` (`http2`) | 1,311 µs/op | **936.4 µs/op** | **-28.6%** (1.40×) | 4,064 (321 KB) → **3,047 (229 KB)** |
+| `ClientRequestHeaders/1000` (`http2`) | 1,329 µs/op | **948.9 µs/op** | **-28.6%** (1.40×) | 4,061 (320 KB) → **3,022 (225 KB)** |
+| `ClientResponseHeaders/10` (`http2`) | 57.75 µs/op | **55.03 µs/op** | **-4.7%** (1.05×) | 117 (8,818 B) → **75 (5,509 B)** |
 
-> *Measured as interleaved 5-round medians (`-count=1 -cpu=2`) on `linux/amd64` comparing upstream Go `1.27.3` against this fork. Subtests paired as `A / B` use matching order across all columns.*
+> *Measured as interleaved 5-round medians (`-count=1 -cpu=2`) on `linux/amd64` comparing upstream Go (`1.27.3`; HTTP/2 rows measured against `1.27.4`) against this fork. Subtests paired as `A / B` use matching order across all columns.*
 
 ---
 
