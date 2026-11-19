@@ -292,53 +292,123 @@ func (c *mcache) releaseAll() {
 	scanAlloc := int64(c.scanAlloc)
 	c.scanAlloc = 0
 
-	sg := mheap_.sweepgen
-	dHeapLive := int64(0)
-	for i := range c.alloc {
-		s := c.alloc[i]
-		if s != &emptymspan {
-			slotsUsed := int64(s.allocCount) - int64(s.allocCountBeforeCache)
-			s.allocCountBeforeCache = 0
-
-			// Adjust smallAllocCount for whatever was allocated.
-			stats := memstats.heapStats.acquire()
-			atomic.Xadd64(&stats.smallAllocCount[spanClass(i).sizeclass()], slotsUsed)
-			memstats.heapStats.release()
-
-			// Adjust the actual allocs in inconsistent, internal stats.
-			// We assumed earlier that the full span gets allocated.
-			gcController.totalAlloc.Add(slotsUsed * int64(s.elemsize))
-
-			if s.sweepgen != sg+1 {
-				// refill conservatively counted unallocated slots in gcController.heapLive.
-				// Undo this.
-				//
-				// If this span was cached before sweep, then gcController.heapLive was totally
-				// recomputed since caching this span, so we don't do this for stale spans.
-				dHeapLive -= int64(s.nelems-s.allocCount) * int64(s.elemsize)
+	// Fast 4-wide scan so idle and sparse mcaches skip empty spans with a single
+	// branch per 4 entries and avoid touching global heapStats or totalAlloc.
+	var active [(numSpanClasses + 63) / 64]uint64
+	empty := &emptymspan
+	emptyAddr := uintptr(unsafe.Pointer(empty))
+	anyActive := false
+	alloc := &c.alloc
+	i := 0
+	for ; i+4 <= len(alloc); i += 4 {
+		diff := (uintptr(unsafe.Pointer(alloc[i])) ^ emptyAddr) |
+			(uintptr(unsafe.Pointer(alloc[i+1])) ^ emptyAddr) |
+			(uintptr(unsafe.Pointer(alloc[i+2])) ^ emptyAddr) |
+			(uintptr(unsafe.Pointer(alloc[i+3])) ^ emptyAddr)
+		if diff == 0 {
+			continue
+		}
+		for k := 0; k < 4; k++ {
+			idx := i + k
+			if alloc[idx] != empty {
+				active[uint(idx)>>6] |= 1 << (uint(idx) & 63)
+				anyActive = true
 			}
-
-			// Release the span to the mcentral.
-			mheap_.central[i].mcentral.uncacheSpan(s)
-			c.alloc[i] = &emptymspan
 		}
 	}
+	for ; i < len(alloc); i++ {
+		if alloc[i] != empty {
+			active[uint(i)>>6] |= 1 << (uint(i) & 63)
+			anyActive = true
+		}
+	}
+
+	dHeapLive := int64(0)
+	if anyActive {
+		var totalAlloc int64
+		var stats *heapStatsDelta
+
+		// Pass 1: flush all smallAllocCount and tinyAllocCount updates under a single
+		// heapStats.acquire/release pair (without holding it across uncacheSpan, which
+		// may sweep and re-acquire heapStats). Updating smallAllocCount before
+		// uncacheSpan also prevents transient underflow if ReadMemStats runs concurrently.
+		for w := range active {
+			bits := active[w]
+			base := w * 64
+			for bits != 0 {
+				j := sys.TrailingZeros64(bits)
+				bits &= bits - 1
+				i := base + j
+				s := c.alloc[i]
+				slotsUsed := int64(s.allocCount) - int64(s.allocCountBeforeCache)
+				s.allocCountBeforeCache = 0
+				if slotsUsed != 0 {
+					if stats == nil {
+						stats = memstats.heapStats.acquire()
+					}
+					atomic.Xadd64(&stats.smallAllocCount[spanClass(i).sizeclass()], slotsUsed)
+					totalAlloc += slotsUsed * int64(s.elemsize)
+				}
+			}
+		}
+		if c.tinyAllocs != 0 {
+			if stats == nil {
+				stats = memstats.heapStats.acquire()
+			}
+			atomic.Xadd64(&stats.tinyAllocCount, int64(c.tinyAllocs))
+			c.tinyAllocs = 0
+		}
+		if stats != nil {
+			memstats.heapStats.release()
+		}
+		if totalAlloc != 0 {
+			// Adjust the actual allocs in inconsistent, internal stats.
+			// We assumed earlier that the full span gets allocated.
+			gcController.totalAlloc.Add(totalAlloc)
+		}
+
+		// Pass 2: release only the populated spans to their mcentrals.
+		sg := mheap_.sweepgen
+		for w := range active {
+			bits := active[w]
+			base := w * 64
+			for bits != 0 {
+				j := sys.TrailingZeros64(bits)
+				bits &= bits - 1
+				i := base + j
+				s := c.alloc[i]
+				if s.sweepgen != sg+1 {
+					// refill conservatively counted unallocated slots in gcController.heapLive.
+					// Undo this.
+					//
+					// If this span was cached before sweep, then gcController.heapLive was totally
+					// recomputed since caching this span, so we don't do this for stale spans.
+					dHeapLive -= int64(s.nelems-s.allocCount) * int64(s.elemsize)
+				}
+				// Release the span to the mcentral.
+				mheap_.central[i].mcentral.uncacheSpan(s)
+				c.alloc[i] = empty
+			}
+		}
+	} else if c.tinyAllocs != 0 {
+		stats := memstats.heapStats.acquire()
+		atomic.Xadd64(&stats.tinyAllocCount, int64(c.tinyAllocs))
+		c.tinyAllocs = 0
+		memstats.heapStats.release()
+	}
+
 	// Clear tinyalloc pool.
 	c.tiny = 0
 	c.tinyoffset = 0
-
-	// Flush tinyAllocs.
-	stats := memstats.heapStats.acquire()
-	atomic.Xadd64(&stats.tinyAllocCount, int64(c.tinyAllocs))
-	c.tinyAllocs = 0
-	memstats.heapStats.release()
 
 	// Clear the reusable linked lists.
 	// For noscan objects, the nodes of the linked lists are the reusable heap objects themselves,
 	// so we can simply clear the linked list head pointers.
 	// TODO(thepudds): consider having debug logging of a non-empty reusable lists getting cleared,
 	// maybe based on the existing debugReusableLog.
-	clear(c.reusableNoscan[:])
+	if runtimeFreegcEnabled {
+		clear(c.reusableNoscan[:])
+	}
 
 	// Update heapLive and heapScan.
 	gcController.update(dHeapLive, scanAlloc)

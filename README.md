@@ -17,7 +17,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
 - **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and lock/goroutine overhead across HTTP/1.1 request/response parsing and wire writes, HTTP/2 frame reuse, direct buffered frame writes, synchronous response-header coalescing, and stream cleanup, HTTP/3 header/response handling, header lookup/validation and canonicalization, cookie parsing/formatting and `cookiejar` struct keys, `CrossOriginProtection` fast paths, `ServeMux` atomic routing snapshots and `Redirect`, `ServeContent` and closed-form range MIME sizing, client `Transport` connection/body reuse, URL/query/form/Basic-auth handling, and `httputil`/`httptest` helpers.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
-- **`runtime`**: Faster span reclamation, GC bit-scanning and sweep, write-barrier pointer deduplication, and zero-size slice fast paths.
+- **`runtime`**: Faster span reclamation (`reclaimChunk`), GC bit-scanning (`markrootSpans`, `scanConservative`, `bulkBarrierBitmap`) and fused inline-mark sweep, batched `mcache.releaseAll` and lock-free empty `stackcache_clear`, O(1) `pageCache.flush` and `spanClassToNelems` lookup, write-barrier pointer deduplication, and zero-size slice fast paths.
 - **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
 - **`crypto/fips140`**: Dead code elimination of FIPS 140 integrity checks and self-tests when `GOFIPS140=off`.
 - **`cmd/go`**: Terminal progress indicator (`Building [====   ] x/y`) for `go build` and `go install`.
@@ -276,6 +276,32 @@ xychart-beta
 | `GCBulkBarrierBitmapSparseNil` (`bulkBarrierBitmap`, 2 KB) | 961.0 ns/op | **543.1 ns/op** | **-43.5%** (1.77×) | 0 → 0 |
 | `GCScanSharedPointers` (4,096-element graph `runtime.GC()`) | 303.6 µs/op | **271.7 µs/op** | **-10.5%** (1.12×) | 0 → 0 |
 | `GCSweepSmallObjects` (32 B alloc + periodic GC sweep) | 562.9 ns/op | **505.9 ns/op** | **-10.1%** (1.11×) | 0 → 0 |
+
+#### Allocator, Stack Cache & Write-Barrier Primitives (`runtime`)
+
+```mermaid
+xychart-beta
+    title "Runtime Allocator, Stack & Barrier Primitives: Baseline (left bar) vs Patched (right bar) — Latency (ns/op, lower is better)"
+    x-axis ["PageCacheFlush64", "BulkBarrier (DenseSame)", "BulkBarrier (SparseNil)", "BulkBarrier (SparseClear)", "MCacheRelease (Empty)", "StackCacheClear (Empty)"]
+    y-axis "Latency (ns/op)" 0 --> 1600
+    bar [1536, 920.5, 741.3, 424.2, 100.6, 72.59]
+    bar [263.7, 722.2, 479.4, 108.0, 64.48, 11.89]
+```
+
+| Benchmark | Baseline (`70d635fc`) | Patched | Latency Delta | Allocs |
+| :--- | ---: | ---: | ---: | :---: |
+| `StackCacheClearEmpty` (empty `stackcache_clear` skip) | 72.59 ns/op | **11.89 ns/op** | **-83.6%** (6.11×) | 0 → 0 |
+| `PageCacheFlush64` (O(1) `pageCache.flush`, 64 pages) | 1,536 ns/op | **263.7 ns/op** | **-82.8%** (5.82×) | 0 → 0 |
+| `BulkBarrierBitmapSparseClear` (2 KB clear, `TrailingZeros32`) | 424.2 ns/op | **108.0 ns/op** | **-74.5%** (3.93×) | 0 → 0 |
+| `MCacheReleaseAllEmpty` (4-wide scan + skip `reusableNoscan`) | 100.6 ns/op | **64.48 ns/op** | **-35.9%** (1.56×) | 0 → 0 |
+| `GCBulkBarrierBitmapSparseNil` (2 KB copy, `TrailingZeros32`) | 741.3 ns/op | **479.4 ns/op** | **-35.3%** (1.55×) | 0 → 0 |
+| `BulkBarrierBitmapDenseSamePtr` (2 KB copy, `dstv == srcv` dedup) | 920.5 ns/op | **722.2 ns/op** | **-21.5%** (1.27×) | 0 → 0 |
+| `StackAllocFree8K` (`stackalloc`/`stackfree`, O(1) order lookup) | 13.16 ns/op | **11.29 ns/op** | **-14.2%** (1.17×) | 0 → 0 |
+| `MCacheReleaseAllPopulated` (16 spans, batched `heapStats`) | 3,182 ns/op | **2,867 ns/op** | **-9.9%** (1.11×) | 0 → 0 |
+| `SpanReclaimChurn` (word-at-a-time `reclaimChunk`) | 9,527 ns/op | **9,247 ns/op** | **-2.9%** (1.03×) | 0 → 0 |
+| `GCSweepSmallObjects` (fused inline-mark sweep + full-span skip) | 526.2 ns/op | **517.3 ns/op** | **-1.7%** (1.02×) | 0 → 0 |
+
+> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`70d635fc`) against the patched runtime.*
 
 ---
 

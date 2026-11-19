@@ -456,27 +456,35 @@ func (p *pageAlloc) enableChunkHugePages() {
 	// be backed with huge pages, and we have the address space for the rest of the
 	// chunks. At the end of this function, all chunk metadata should be backed by huge
 	// pages.
-	lock(&mheap_.lock)
+	lock(p.mheapLock)
 	if p.chunkHugePages {
-		unlock(&mheap_.lock)
+		unlock(p.mheapLock)
 		return
 	}
 	p.chunkHugePages = true
 	var inUse addrRanges
 	inUse.sysStat = p.sysStat
 	p.inUse.cloneInto(&inUse)
-	unlock(&mheap_.lock)
+	unlock(p.mheapLock)
 
 	// This might seem like a lot of work, but all these loops are for generality.
 	//
 	// For a 1 GiB contiguous heap, a 48-bit address space, 13 L1 bits, a palloc chunk size
 	// of 4 MiB, and adherence to the default set of heap address hints, this will result in
 	// exactly 1 call to sysHugePage.
-	for _, r := range p.inUse.ranges {
-		for i := chunkIndex(r.base.addr()).l1(); i < chunkIndex(r.limit.addr()-1).l1(); i++ {
+	lastL1 := ^uint(0)
+	for _, r := range inUse.ranges {
+		end := chunkIndex(r.limit.addr() - 1).l1()
+		for i := chunkIndex(r.base.addr()).l1(); i <= end; i++ {
+			if i == lastL1 {
+				continue
+			}
+			lastL1 = i
 			// N.B. We can assume that p.chunks[i] is non-nil and in a mapped part of p.chunks
 			// because it's derived from inUse, which never shrinks.
-			sysHugePage(unsafe.Pointer(p.chunks[i]), unsafe.Sizeof(*p.chunks[0]))
+			if !p.test {
+				sysHugePage(unsafe.Pointer(p.chunks[i]), unsafe.Sizeof(*p.chunks[0]))
+			}
 		}
 	}
 }

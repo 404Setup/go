@@ -640,7 +640,7 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		spanHasNoSpecials(s)
 	}
 
-	if traceAllocFreeEnabled() || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled {
+	if traceAllocFreeEnabled() || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled || valgrindenabled {
 		// Find all newly freed objects.
 		mbits := s.markBitsForBase()
 		abits := s.allocBitsForIndex(0)
@@ -676,14 +676,14 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		}
 	}
 
-	// Copy over and clear the inline mark bits if necessary.
+	// Copy over and clear the inline mark bits if necessary, while checking
+	// for zombie objects and counting live objects in a single 64-bit pass.
+	var nalloc uint16
 	if gcUsesSpanInlineMarkBits(s.elemsize) {
-		s.moveInlineMarks(s.gcmarkBits)
+		nalloc = s.moveInlineMarksAndCountAlloc()
+	} else {
+		nalloc = s.countAllocAndCheckZombies()
 	}
-
-	// Check for zombie objects and count the number of allocated objects
-	// in a single 64-bit word pass over gcmarkBits and allocBits.
-	nalloc := s.countAllocAndCheckZombies()
 	nfreed := s.allocCount - nalloc
 	if nalloc > s.allocCount {
 		// The zombie check above should have caught this in
@@ -693,8 +693,16 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	}
 
 	s.allocCount = nalloc
-	s.freeindex = 0 // reset allocation index to start of span.
-	s.freeIndexForScan = 0
+	if nalloc == s.nelems {
+		// Span is completely full; avoid scanning allocBits on the next cycle
+		// or refilling allocCache unnecessarily.
+		s.freeindex = s.nelems
+		s.freeIndexForScan = s.nelems
+		s.allocCache = 0
+	} else {
+		s.freeindex = 0 // reset allocation index to start of span.
+		s.freeIndexForScan = 0
+	}
 	if traceEnabled() {
 		getg().m.p.ptr().trace.reclaimed += uintptr(nfreed) * s.elemsize
 	}
@@ -709,8 +717,10 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		s.refreshPinnerBits()
 	}
 
-	// Initialize alloc bits cache.
-	s.refillAllocCache(0)
+	// Initialize alloc bits cache if the span has free slots and will remain allocated.
+	if nalloc != s.nelems && (nalloc != 0 || preserve) {
+		s.refillAllocCache(0)
+	}
 
 	// The span must be in our exclusive ownership until we update sweepgen,
 	// check for potential races.

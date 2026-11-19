@@ -29,8 +29,9 @@ func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
 func (s *mspan) initInlineMarkBits() {
 }
 
-func (s *mspan) moveInlineMarks(to *gcBits) {
+func (s *mspan) moveInlineMarksAndCountAlloc() uint16 {
 	throw("unimplemented")
+	return 0
 }
 
 func gcUsesSpanInlineMarkBits(_ uintptr) bool {

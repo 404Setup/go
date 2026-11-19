@@ -83,20 +83,17 @@ func (c *pageCache) flush(p *pageAlloc) {
 	}
 	ci := chunkIndex(c.base)
 	pi := chunkPageIndex(c.base)
+	chunk := p.chunkOf(ci)
 
-	// This method is called very infrequently, so just do the
-	// slower, safer thing by iterating over each bit individually.
-	for i := uint(0); i < 64; i++ {
-		if c.cache&(1<<i) != 0 {
-			p.chunkOf(ci).free1(pi + i)
-
-			// Update density statistics.
-			p.scav.index.free(ci, pi+i, 1)
-		}
-		if c.scav&(1<<i) != 0 {
-			p.chunkOf(ci).scavenged.setRange(pi+i, 1)
-		}
+	// c.base is pageCachePages-aligned (pi%64 == 0), so we can flush all cached
+	// free and scavenged bits in O(1) word operations and update scavenge density once.
+	(*pageBits)(&chunk.pallocBits).clearBlock64(pi, c.cache)
+	if c.scav != 0 {
+		chunk.scavenged.setBlock64(pi, c.scav)
 	}
+	nfreed := uint(sys.OnesCount64(c.cache))
+	hi := uint(63 - sys.LeadingZeros64(c.cache))
+	p.scav.index.free(ci, pi+(hi+1-nfreed), nfreed)
 
 	// Since this is a lot like a free, we need to make sure
 	// we update the searchAddr just like free does.

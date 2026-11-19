@@ -413,14 +413,24 @@ func markrootSpans(gcw *gcWork, shard int) {
 	ha := mheap_.arenas[ai.l1()][ai.l2()]
 	arenaPage := uint(uintptr(shard) * pagesPerSpanRoot % pagesPerArena)
 
-	// Construct slice of bitmap which we'll iterate over.
+	// Construct slice of bitmap which we'll iterate over in word-sized chunks.
 	specialsbits := ha.pageSpecials[arenaPage/8:]
 	specialsbits = specialsbits[:pagesPerSpanRoot/8]
-	for i := range specialsbits {
+	for i := 0; i < len(specialsbits); i += goarch.PtrSize {
 		// Find set bits, which correspond to spans with specials.
-		specials := atomic.Load8(&specialsbits[i])
+		specials := atomic.Loaduintptr((*uintptr)(unsafe.Pointer(&specialsbits[i])))
+		if specials == 0 {
+			continue
+		}
+		if goarch.BigEndian {
+			if goarch.PtrSize == 8 {
+				specials = uintptr(sys.Bswap64(uint64(specials)))
+			} else {
+				specials = uintptr(sys.Bswap32(uint32(specials)))
+			}
+		}
 		for specials != 0 {
-			j := uint(sys.TrailingZeros8(specials))
+			j := uint(sys.TrailingZeros64(uint64(specials)))
 			specials &= specials - 1
 			// Find the span for this bit.
 			//
@@ -1560,28 +1570,7 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 		printunlock()
 	}
 
-	for i := uintptr(0); i < n; i += goarch.PtrSize {
-		if ptrmask != nil {
-			word := i / goarch.PtrSize
-			bits := *addb(ptrmask, word/8)
-			if bits == 0 {
-				// Skip 8 words (the loop increment will do the 8th)
-				//
-				// This must be the first time we've
-				// seen this word of ptrmask, so i
-				// must be 8-word-aligned, but check
-				// our reasoning just in case.
-				if i%(goarch.PtrSize*8) != 0 {
-					throw("misaligned mask")
-				}
-				i += goarch.PtrSize*8 - goarch.PtrSize
-				continue
-			}
-			if (bits>>(word%8))&1 == 0 {
-				continue
-			}
-		}
-
+	scanWord := func(i uintptr) {
 		val := *(*uintptr)(unsafe.Pointer(b + i))
 
 		// Check if val points into the stack.
@@ -1595,13 +1584,13 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 			// conservative scanning, we have to scan it
 			// defensively, too.
 			state.putPtr(val, true)
-			continue
+			return
 		}
 
 		// Check if val points to a heap span.
 		span := spanOfHeap(val)
 		if span == nil {
-			continue
+			return
 		}
 
 		// Check if val points to an allocated object.
@@ -1610,7 +1599,7 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 		// been allocated black.
 		idx := span.objIndex(val)
 		if span.isFreeOrNewlyAllocated(idx) {
-			continue
+			return
 		}
 
 		// val points to an allocated object. Mark it.
@@ -1618,6 +1607,26 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 		if !tryDeferToSpanScan(obj, gcw) {
 			greyobject(obj, b, i, span, gcw, idx)
 		}
+	}
+
+	if ptrmask != nil {
+		for base := uintptr(0); base < n; base += goarch.PtrSize * 8 {
+			bits := uint32(*ptrmask)
+			ptrmask = addb(ptrmask, 1)
+			for bits != 0 {
+				i := base + uintptr(sys.TrailingZeros32(bits))*goarch.PtrSize
+				if i >= n {
+					return
+				}
+				bits &= bits - 1
+				scanWord(i)
+			}
+		}
+		return
+	}
+
+	for i := uintptr(0); i < n; i += goarch.PtrSize {
+		scanWord(i)
 	}
 }
 

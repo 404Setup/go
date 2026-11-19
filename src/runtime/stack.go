@@ -322,6 +322,9 @@ func stackcache_clear(c *mcache) {
 		print("stackcache clear\n")
 	}
 	for order := uint8(0); order < _NumStackOrders; order++ {
+		if c.stackcache[order].list == 0 {
+			continue
+		}
 		lock(&stackpool[order].item.mu)
 		x := c.stackcache[order].list
 		for x.ptr() != nil {
@@ -371,10 +374,8 @@ func stackalloc(n uint32) stack {
 	var v unsafe.Pointer
 	if n < fixedStack<<_NumStackOrders && n < _StackCacheSize {
 		order := uint8(0)
-		n2 := n
-		for n2 > fixedStack {
-			order++
-			n2 >>= 1
+		if n > fixedStack {
+			order = uint8(sys.TrailingZeros32(n) - sys.TrailingZeros32(fixedStack))
 		}
 		var x gclinkptr
 		if stackNoCache != 0 || thisg.m.p == 0 || thisg.m.preemptoff != "" {
@@ -500,10 +501,8 @@ func stackfree(stk stack) {
 	}
 	if n < fixedStack<<_NumStackOrders && n < _StackCacheSize {
 		order := uint8(0)
-		n2 := n
-		for n2 > fixedStack {
-			order++
-			n2 >>= 1
+		if n > fixedStack {
+			order = uint8(sys.TrailingZeros32(uint32(n)) - sys.TrailingZeros32(fixedStack))
 		}
 		x := gclinkptr(v)
 		if stackNoCache != 0 || gp.m.p == 0 || gp.m.preemptoff != "" {

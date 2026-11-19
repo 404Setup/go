@@ -774,6 +774,8 @@ func heapArenaOf(p uintptr) *heapArena {
 	return l2[ri.l2()]
 }
 
+var spanClassToNelems [numSpanClasses]uint16
+
 // Initialize the heap.
 func (h *mheap) init() {
 	lockInit(&h.lock, lockRankMheap)
@@ -806,7 +808,20 @@ func (h *mheap) init() {
 	// h->mapcache needs no init
 
 	for i := range h.central {
-		h.central[i].mcentral.init(spanClass(i))
+		spc := spanClass(i)
+		h.central[i].mcentral.init(spc)
+		if sc := spc.sizeclass(); sc != 0 {
+			nbytes := uintptr(gc.SizeClassToNPages[sc]) * pageSize
+			elemsize := uintptr(gc.SizeClassToSize[sc])
+			var reserve uintptr
+			if goexperiment.GreenTeaGC && gcUsesSpanInlineMarkBits(elemsize) {
+				reserve += unsafe.Sizeof(spanInlineMarkBits{})
+			}
+			if heapBitsInSpan(elemsize) && !spc.noscan() {
+				reserve += nbytes / goarch.PtrSize / 8
+			}
+			spanClassToNelems[i] = uint16((nbytes - reserve) / elemsize)
+		}
 	}
 
 	h.pages.init(&h.lock, &memstats.gcMiscSys, false)
@@ -927,17 +942,24 @@ func (h *mheap) reclaimChunk(arenas []arenaIdx, pageIdx, n uintptr) uintptr {
 			marked = marked[:n/8]
 		}
 
-		// Scan this bitmap chunk for spans that are in-use
-		// but have no marked objects on them.
-		for i := range inUse {
-			inUseUnmarked := atomic.Load8(&inUse[i]) &^ marked[i]
+		// Scan this bitmap chunk in word-sized steps for spans that are
+		// in-use but have no marked objects on them.
+		for i := 0; i < len(inUse); i += goarch.PtrSize {
+			inUseUnmarked := atomic.Loaduintptr((*uintptr)(unsafe.Pointer(&inUse[i]))) &^ *(*uintptr)(unsafe.Pointer(&marked[i]))
 			if inUseUnmarked == 0 {
 				continue
 			}
+			if goarch.BigEndian {
+				if goarch.PtrSize == 8 {
+					inUseUnmarked = uintptr(sys.Bswap64(uint64(inUseUnmarked)))
+				} else {
+					inUseUnmarked = uintptr(sys.Bswap32(uint32(inUseUnmarked)))
+				}
+			}
 
 			for inUseUnmarked != 0 {
-				j := uint(sys.TrailingZeros8(inUseUnmarked))
-				inUseUnmarked &^= 1 << j
+				j := uint(sys.TrailingZeros64(uint64(inUseUnmarked)))
+				inUseUnmarked &^= uintptr(1) << j
 				s := ha.spans[arenaPage+uint(i)*8+j]
 				if s, ok := sl.tryAcquire(s); ok {
 					npages := s.npages
@@ -946,11 +968,22 @@ func (h *mheap) reclaimChunk(arenas []arenaIdx, pageIdx, n uintptr) uintptr {
 						nFreed += npages
 					}
 					lock(&h.lock)
+					if j == goarch.PtrSize*8-1 {
+						break
+					}
 					// Reload inUse. It's possible nearby
 					// spans were freed when we dropped the
 					// lock and we don't want to get stale
 					// pointers from the spans array.
-					inUseUnmarked = (atomic.Load8(&inUse[i]) &^ marked[i]) &^ ((1 << (j + 1)) - 1)
+					inUseUnmarked = atomic.Loaduintptr((*uintptr)(unsafe.Pointer(&inUse[i]))) &^ *(*uintptr)(unsafe.Pointer(&marked[i]))
+					if goarch.BigEndian {
+						if goarch.PtrSize == 8 {
+							inUseUnmarked = uintptr(sys.Bswap64(uint64(inUseUnmarked)))
+						} else {
+							inUseUnmarked = uintptr(sys.Bswap32(uint32(inUseUnmarked)))
+						}
+					}
+					inUseUnmarked &^= (uintptr(1) << (j + 1)) - 1
 				}
 			}
 		}
@@ -1106,6 +1139,18 @@ func (h *mheap) setSpans(base, npage uintptr, s *mspan) {
 	p := base / pageSize
 	ai := arenaIndex(base)
 	ha := h.arenas[ai.l1()][ai.l2()]
+	off := p % pagesPerArena
+	if npage == 1 {
+		ha.spans[off] = s
+		return
+	}
+	if off+npage <= pagesPerArena {
+		spans := ha.spans[off : off+npage]
+		for i := range spans {
+			spans[i] = s
+		}
+		return
+	}
 	for n := uintptr(0); n < npage; n++ {
 		i := (p + n) % pagesPerArena
 		if i == 0 {
@@ -1525,25 +1570,7 @@ func (h *mheap) initSpan(s *mspan, typ spanAllocType, spanclass spanClass, base,
 			s.divMul = 0
 		} else {
 			s.elemsize = uintptr(gc.SizeClassToSize[sizeclass])
-			if goexperiment.GreenTeaGC {
-				var reserve uintptr
-				if gcUsesSpanInlineMarkBits(s.elemsize) {
-					// Reserve space for the inline mark bits.
-					reserve += unsafe.Sizeof(spanInlineMarkBits{})
-				}
-				if heapBitsInSpan(s.elemsize) && !s.spanclass.noscan() {
-					// Reserve space for the pointer/scan bitmap at the end.
-					reserve += nbytes / goarch.PtrSize / 8
-				}
-				s.nelems = uint16((nbytes - reserve) / s.elemsize)
-			} else {
-				if !s.spanclass.noscan() && heapBitsInSpan(s.elemsize) {
-					// Reserve space for the pointer/scan bitmap at the end.
-					s.nelems = uint16((nbytes - (nbytes / goarch.PtrSize / 8)) / s.elemsize)
-				} else {
-					s.nelems = uint16(nbytes / s.elemsize)
-				}
-			}
+			s.nelems = spanClassToNelems[spanclass]
 			s.divMul = gc.SizeClassToDivMagic[sizeclass]
 		}
 

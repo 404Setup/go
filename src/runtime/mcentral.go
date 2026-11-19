@@ -147,9 +147,7 @@ func (c *mcentral) cacheSpan() *mspan {
 				// We got ownership of the span, so let's sweep it.
 				s.sweep(true)
 				// Check if there's any free space.
-				freeIndex := s.nextFreeIndex()
-				if freeIndex != s.nelems {
-					s.freeindex = freeIndex
+				if s.allocCount != s.nelems {
 					sweep.active.end(sl)
 					goto havespan
 				}

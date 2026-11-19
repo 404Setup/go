@@ -2263,3 +2263,74 @@ func BulkBarrierBitmapForTest(dst, src, size uintptr, bits *uint8) {
 	})
 	releasem(mp)
 }
+
+func BulkBarrierBitmapOffsetForTest(dst, src, size, maskOffset uintptr, bits *uint8) {
+	mp := acquirem()
+	systemstack(func() {
+		pp := mp.p.ptr()
+		bulkBarrierBitmap(dst, src, size, maskOffset, bits)
+		if !pp.wbBuf.empty() {
+			wbBufFlush1(pp)
+			pp.gcw.bytesMarked = 0
+		}
+	})
+	releasem(mp)
+}
+
+func ReleaseAllMCacheForTest() {
+	mp := acquirem()
+	systemstack(func() {
+		mp.p.ptr().mcache.releaseAll()
+	})
+	releasem(mp)
+}
+
+func StackCacheClearForTest() {
+	mp := acquirem()
+	systemstack(func() {
+		stackcache_clear(mp.p.ptr().mcache)
+	})
+	releasem(mp)
+}
+
+func StackAllocFreeForTest(n uint32) {
+	systemstack(func() {
+		stk := stackalloc(n)
+		stackfree(stk)
+	})
+}
+
+func CheckSpanClassToNelemsForTest() bool {
+	for i := 0; i < numSpanClasses; i++ {
+		spc := spanClass(i)
+		var want uint16
+		if sc := spc.sizeclass(); sc != 0 {
+			nbytes := uintptr(gc.SizeClassToNPages[sc]) * pageSize
+			elemsize := uintptr(gc.SizeClassToSize[sc])
+			var reserve uintptr
+			if gcUsesSpanInlineMarkBits(elemsize) {
+				reserve += unsafe.Sizeof(spanInlineMarkBits{})
+			}
+			if heapBitsInSpan(elemsize) && !spc.noscan() {
+				reserve += nbytes / goarch.PtrSize / 8
+			}
+			want = uint16((nbytes - reserve) / elemsize)
+		}
+		if spanClassToNelems[i] != want {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *PageAlloc) EnableChunkHugePages() {
+	pp := (*pageAlloc)(p)
+	systemstack(func() {
+		pp.enableChunkHugePages()
+	})
+}
+
+func (p *PageAlloc) ChunkHugePagesEnabled() bool {
+	return (*pageAlloc)(p).chunkHugePages
+}
+

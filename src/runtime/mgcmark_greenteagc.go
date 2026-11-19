@@ -190,29 +190,98 @@ func (s *mspan) initInlineMarkBits() {
 	s.inlineMarkBits().init(s.spanclass, s.needzero != 0)
 }
 
-// moveInlineMarks merges the span's inline mark bits into dst and clears them.
+// moveInlineMarksAndCountAlloc merges the span's inline mark bits into s.gcmarkBits,
+// clears the inline mark bits, checks for zombie objects at or after s.freeindex,
+// and returns the number of marked objects, all in a single 64-bit word pass.
 //
 // gcUsesSpanInlineMarkBits(s.elemsize) must be true.
-func (s *mspan) moveInlineMarks(dst *gcBits) {
+func (s *mspan) moveInlineMarksAndCountAlloc() uint16 {
 	if doubleCheckGreenTea && !gcUsesSpanInlineMarkBits(s.elemsize) {
 		throw("expected span with inline mark bits")
 	}
-	bytes := divRoundUp(uintptr(s.nelems), 8)
+	words := divRoundUp(uintptr(s.nelems), 64)
 	imb := s.inlineMarkBits()
-	imbMarks := (*gc.ObjMask)(unsafe.Pointer(&imb.marks))
-	for i := uintptr(0); i < bytes; i += goarch.PtrSize {
-		marks := bswapIfBigEndian(imbMarks[i/goarch.PtrSize])
-		if i/goarch.PtrSize == uintptr(len(imb.marks)+1)/goarch.PtrSize-1 {
-			marks &^= 0xff << ((goarch.PtrSize - 1) * 8) // mask out class
-		}
-		*(*uintptr)(unsafe.Pointer(dst.bytep(i))) |= bswapIfBigEndian(marks)
+	imbMarks := (*[8]uint64)(unsafe.Pointer(&imb.marks))
+	gcMarks := unsafe.Slice((*uint64)(unsafe.Pointer(s.gcmarkBits)), words)
+
+	const classWord = (uintptr(len(imb.marks)+1) / 8) - 1
+	var classMask uint64 = 0xff << 56
+	if goarch.BigEndian {
+		classMask = 0xff
 	}
+
+	count := 0
+	if s.freeindex >= s.nelems {
+		for w := uintptr(0); w < words; w++ {
+			marks := imbMarks[w]
+			if w == classWord {
+				marks &^= classMask // mask out imb.class
+			}
+			mrkBits := gcMarks[w] | marks
+			gcMarks[w] = mrkBits
+			count += sys.OnesCount64(mrkBits)
+		}
+		if doubleCheckGreenTea && !s.spanclass.noscan() && imb.marks != imb.scans {
+			throw("marks don't match scans for span with pointer")
+		}
+		imb.init(s.spanclass, true)
+		return uint16(count)
+	}
+
+	allocs := unsafe.Slice((*uint64)(unsafe.Pointer(s.allocBits)), words)
+	obj := uintptr(s.freeindex)
+	freeWord := obj / 64
+	zombie := false
+
+	for w := uintptr(0); w < freeWord; w++ {
+		marks := imbMarks[w]
+		if w == classWord {
+			marks &^= classMask
+		}
+		mrkBits := gcMarks[w] | marks
+		gcMarks[w] = mrkBits
+		count += sys.OnesCount64(mrkBits)
+	}
+	if freeWord < words {
+		marks := imbMarks[freeWord]
+		if freeWord == classWord {
+			marks &^= classMask
+		}
+		mrkBits := gcMarks[freeWord] | marks
+		gcMarks[freeWord] = mrkBits
+		count += sys.OnesCount64(mrkBits)
+		z := mrkBits &^ allocs[freeWord]
+		if z != 0 {
+			if goarch.BigEndian {
+				z = sys.Bswap64(z)
+			}
+			if z>>(obj%64) != 0 {
+				zombie = true
+			}
+		}
+		for w := freeWord + 1; w < words; w++ {
+			marks := imbMarks[w]
+			if w == classWord {
+				marks &^= classMask
+			}
+			mrkBits := gcMarks[w] | marks
+			gcMarks[w] = mrkBits
+			count += sys.OnesCount64(mrkBits)
+			if mrkBits&^allocs[w] != 0 {
+				zombie = true
+			}
+		}
+	}
+
 	if doubleCheckGreenTea && !s.spanclass.noscan() && imb.marks != imb.scans {
 		throw("marks don't match scans for span with pointer")
 	}
-
-	// Reset the inline mark bits.
+	// Reset the inline mark bits before reporting zombies (reportZombies reads s.gcmarkBits).
 	imb.init(s.spanclass, true /* We know these bits are always dirty now. */)
+	if zombie {
+		s.reportZombies()
+	}
+	return uint16(count)
 }
 
 // inlineMarkBits returns the inline mark bits for the span.
@@ -870,13 +939,7 @@ func scanSpan(p objptr, gcw *gcWork) {
 		return
 	}
 
-	// Compute nelems.
-	divMagic := uint64(gc.SizeClassToDivMagic[spanclass.sizeclass()])
-	usableSpanSize := uint64(gc.PageSize - unsafe.Sizeof(spanInlineMarkBits{}))
-	if !spanclass.noscan() {
-		usableSpanSize -= gc.PageSize / goarch.PtrSize / 8
-	}
-	nelems := uint16((usableSpanSize * divMagic) >> 32)
+	nelems := spanClassToNelems[spanclass]
 
 	// Grey objects and return if there's nothing else to do.
 	var toScan gc.ObjMask

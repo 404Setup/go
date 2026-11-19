@@ -1440,22 +1440,24 @@ const ptrBits = 8 * goarch.PtrSize
 //
 //go:nosplit
 func bulkBarrierBitmap(dst, src, size, maskOffset uintptr, bits *uint8) {
+	if size == 0 {
+		return
+	}
 	word := maskOffset / goarch.PtrSize
 	bits = addb(bits, word/8)
-	mask := uint8(1) << (word % 8)
+	shift := word % 8
 
 	buf := &getg().m.p.ptr().wbBuf
-	for i := uintptr(0); i < size; i += goarch.PtrSize {
-		if mask == 0 {
-			bits = addb(bits, 1)
-			if *bits == 0 {
-				// Skip 8 words.
-				i += 7 * goarch.PtrSize
-				continue
+	b := uint32(*bits) >> shift
+	base := uintptr(0)
+	step := (8 - shift) * goarch.PtrSize
+	for {
+		for b != 0 {
+			i := base + uintptr(sys.TrailingZeros32(b))*goarch.PtrSize
+			if i >= size {
+				return
 			}
-			mask = 1
-		}
-		if *bits&mask != 0 {
+			b &= b - 1
 			dstx := (*uintptr)(unsafe.Pointer(dst + i))
 			if src == 0 {
 				if v := *dstx; v >= minLegalPointer {
@@ -1466,9 +1468,14 @@ func bulkBarrierBitmap(dst, src, size, maskOffset uintptr, bits *uint8) {
 				srcx := (*uintptr)(unsafe.Pointer(src + i))
 				dstv, srcv := *dstx, *srcx
 				if dstv >= minLegalPointer && srcv >= minLegalPointer {
-					p := buf.get2()
-					p[0] = dstv
-					p[1] = srcv
+					if dstv == srcv {
+						p := buf.get1()
+						p[0] = dstv
+					} else {
+						p := buf.get2()
+						p[0] = dstv
+						p[1] = srcv
+					}
 				} else if dstv >= minLegalPointer {
 					p := buf.get1()
 					p[0] = dstv
@@ -1478,7 +1485,13 @@ func bulkBarrierBitmap(dst, src, size, maskOffset uintptr, bits *uint8) {
 				}
 			}
 		}
-		mask <<= 1
+		base += step
+		if base >= size {
+			return
+		}
+		bits = addb(bits, 1)
+		b = uint32(*bits)
+		step = 8 * goarch.PtrSize
 	}
 }
 
@@ -1522,9 +1535,14 @@ func typeBitsBulkBarrier(typ *_type, dst, src, size uintptr) {
 			srcx := (*uintptr)(unsafe.Pointer(src + i))
 			dstv, srcv := *dstx, *srcx
 			if dstv >= minLegalPointer && srcv >= minLegalPointer {
-				p := buf.get2()
-				p[0] = dstv
-				p[1] = srcv
+				if dstv == srcv {
+					p := buf.get1()
+					p[0] = dstv
+				} else {
+					p := buf.get2()
+					p[0] = dstv
+					p[1] = srcv
+				}
 			} else if dstv >= minLegalPointer {
 				p := buf.get1()
 				p[0] = dstv
