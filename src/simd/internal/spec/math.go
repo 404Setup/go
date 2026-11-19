@@ -77,6 +77,25 @@ func SubSaturated[E Ints | Uints, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
 	return map2[E, W, E, W](x, y, func(x, y E) E { return subSaturated(x, y) })
 }
 
+// AddOddSubEven adds the odd-indexed elements of x and y and subtracts the
+// even-indexed elements of y from those of x.
+//
+//	z[2*i+1] = x[2*i+1] + y[2*i+1] // Add odd
+//	z[2*i] = x[2*i] - y[2*i]       // Subtract even
+//
+//specgen:experiment
+func AddOddSubEven[E Nums, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
+	z = makeVec[E, W]()
+	for i := range z {
+		if i%2 == 0 {
+			z[i] = x[i] - y[i]
+		} else {
+			z[i] = x[i] + y[i]
+		}
+	}
+	return z
+}
+
 // Average returns the elementwise average of x and y, rounded toward +∞.
 //
 //	z[i] = (x[i] + y[i] + 1) / 2
@@ -456,6 +475,26 @@ func MulAddOddSubEven[E Floats, W Width](x, y, z Vec[E, W]) (w Vec[E, W]) {
 	return w
 }
 
+// MulSign returns x multiplied by the sign of y (-1, 0 or 1), elementwise.
+//
+//	z[i] = x[i] * sign(y[i])
+//
+// That is, z[i] is -x[i] where y[i] is negative, 0 where y[i] is 0, and x[i]
+// where y[i] is positive. The negation wraps, so the most negative value stays
+// as it is.
+//
+//specgen:experiment
+func MulSign[E Ints, W Width](x, y Vec[E, W]) (z Vec[E, W]) {
+	return map2[E, W, E, W](x, y, func(x, y E) E {
+		switch {
+		case y < 0:
+			return -x
+		case y == 0:
+			return 0
+		}
+		return x
+	})
+}
 // Neg returns the elementwise negation of x.
 //
 //	z[i] = -x[i]

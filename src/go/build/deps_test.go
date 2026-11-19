@@ -519,10 +519,10 @@ var depsRules = `
 	< crypto/internal/fips140/alias
 	< crypto/internal/fips140/subtle
 	< crypto/internal/fips140/sha256
-	< crypto/internal/fips140/sha512
-	< crypto/internal/fips140/sha3
 	< crypto/internal/fips140/hmac
 	< crypto/internal/fips140/check
+	< crypto/internal/fips140/sha512
+	< crypto/internal/fips140/sha3
 	< crypto/internal/fips140/pbkdf2
 	< crypto/internal/fips140/aes
 	< crypto/internal/fips140/drbg
@@ -556,11 +556,11 @@ var depsRules = `
 	crypto/internal/boring/sig,
 	crypto/internal/boring/syso,
 	crypto/internal/boring/bcache
+	< crypto/internal/fips140hash
 	< crypto/internal/fips140only
 	< crypto
 	< crypto/subtle
 	< crypto/sha3
-	< crypto/internal/fips140hash
 	< crypto/cipher
 	< crypto/internal/boring
 	< crypto/boring
@@ -643,10 +643,13 @@ var depsRules = `
 	hash/maphash, container/heap, go/constant, go/parser, internal/buildcfg, internal/goversion, internal/types/errors
 	< go/types;
 
+	FMT, flag, go/types, time
+	< go/analysis;
+
 	# x/tools
 	# These are the only allowed dependencies of gcexportdata. Any change here
 	# must be mirrored in x/tools/go/gcexportdata/deps_test.go.
-	FMT, STR, crypto/md5, encoding/binary, encoding/json, go/build, go/token, go/types
+	FMT, STR, crypto/md5, encoding/binary, encoding/json, go/analysis, go/build, go/token, go/types
 	< golang.org/x/tools/go/types/objectpath,
 	  golang.org/x/tools/internal/pkgbits
 	< golang.org/x/tools/internal/gcimporter

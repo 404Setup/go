@@ -397,7 +397,7 @@ func (v Value) call(op string, in []Value) []Value {
 	t := (*funcType)(unsafe.Pointer(v.typ()))
 	var (
 		fn       unsafe.Pointer
-		fnCell   unsafe.Pointer // backing store for fn of a concrete-receiver method; see methodReceiver
+		fnCell   uintptr // backing store for fn of a concrete-receiver method; see methodReceiver
 		rcvr     Value
 		rcvrtype *abi.Type
 	)
@@ -909,7 +909,7 @@ func callReflect(ctxt *makeFuncImpl, frame unsafe.Pointer, retValid *bool, regs 
 // fills in with the code pointer. The caller supplies cell (typically a
 // stack variable that is only handed to [call], which does not retain it)
 // so that no allocation is needed to build the func value.
-func methodReceiver(op string, v Value, methodIndex int, cell *unsafe.Pointer) (rcvrtype *abi.Type, t *funcType, fn unsafe.Pointer) {
+func methodReceiver(op string, v Value, methodIndex int, cell *uintptr) (rcvrtype *abi.Type, t *funcType, fn unsafe.Pointer) {
 	i := methodIndex
 	if v.typ().Kind() == abi.Interface {
 		tt := (*interfaceType)(unsafe.Pointer(v.typ()))
@@ -937,7 +937,7 @@ func methodReceiver(op string, v Value, methodIndex int, cell *unsafe.Pointer) (
 		if !nameOffFor(v.typ(), m.Name).IsExported() {
 			panic("reflect: " + op + " of unexported method")
 		}
-		*cell = textOffFor(v.typ(), m.Ifn)
+		*cell = funcHandle(uintptr(textOffFor(v.typ(), m.Ifn)))
 		fn = unsafe.Pointer(cell)
 		t = (*funcType)(unsafe.Pointer(typeOffFor(v.typ(), m.Mtyp)))
 	}
@@ -988,7 +988,7 @@ func align(x, n uintptr) uintptr {
 // the values returned from ctxt.fn in registers.
 func callMethod(ctxt *methodValue, frame unsafe.Pointer, retValid *bool, regs *abi.RegArgs) {
 	rcvr := ctxt.rcvr
-	var methodFnCell unsafe.Pointer
+	var methodFnCell uintptr
 	rcvrType, valueFuncType, methodFn := methodReceiver("call", rcvr, ctxt.method, &methodFnCell)
 
 	// There are two ABIs at play here.
@@ -2174,7 +2174,7 @@ func (v Value) Pointer() uintptr {
 		if p != nil {
 			p = *(*unsafe.Pointer)(p)
 		}
-		return uintptr(p)
+		return funcValuePC(uintptr(p))
 	case Slice:
 		return uintptr((*unsafeheader.Slice)(v.ptr).Data)
 	case String:
@@ -2686,7 +2686,7 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 		if p != nil {
 			p = *(*unsafe.Pointer)(p)
 		}
-		return p
+		return unsafe.Pointer(funcValuePC(uintptr(p)))
 	case Slice:
 		return (*unsafeheader.Slice)(v.ptr).Data
 	case String:

@@ -565,15 +565,23 @@ func RewriteValue(v *ssa.Value) bool {
 	case ssaop.OpMax32F:
 		v.Op = ssaop.OpLOONG64FMAXF
 		return true
+	case ssaop.OpMax32FSel:
+		return rewriteValue_OpMax32FSel(v)
 	case ssaop.OpMax64F:
 		v.Op = ssaop.OpLOONG64FMAXD
 		return true
+	case ssaop.OpMax64FSel:
+		return rewriteValue_OpMax64FSel(v)
 	case ssaop.OpMin32F:
 		v.Op = ssaop.OpLOONG64FMINF
 		return true
+	case ssaop.OpMin32FSel:
+		return rewriteValue_OpMin32FSel(v)
 	case ssaop.OpMin64F:
 		v.Op = ssaop.OpLOONG64FMIND
 		return true
+	case ssaop.OpMin64FSel:
+		return rewriteValue_OpMin64FSel(v)
 	case ssaop.OpMod16:
 		return rewriteValue_OpMod16(v)
 	case ssaop.OpMod16u:
@@ -2186,7 +2194,7 @@ func rewriteValue_OpLOONG64AND(v *ssa.Value) bool {
 	v_1 := v.Args[1]
 	v_0 := v.Args[0]
 	// match: (AND x (MOVVconst [c]))
-	// cond: ssa.Is32Bit(c)
+	// cond: (ssa.Is32Bit(c) || ssa.IsContiguousZeros(uint64(c)) || ssa.IsContiguousOnes(uint64(c)))
 	// result: (ANDconst [c] x)
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -2195,7 +2203,7 @@ func rewriteValue_OpLOONG64AND(v *ssa.Value) bool {
 				continue
 			}
 			c := ssa.AuxIntToInt64(v_1.AuxInt)
-			if !(ssa.Is32Bit(c)) {
+			if !(ssa.Is32Bit(c) || ssa.IsContiguousZeros(uint64(c)) || ssa.IsContiguousOnes(uint64(c))) {
 				continue
 			}
 			v.Reset(ssaop.OpLOONG64ANDconst)
@@ -9080,6 +9088,70 @@ func rewriteValue_OpLsh8x8(v *ssa.Value) bool {
 		return true
 	}
 	return false
+}
+func rewriteValue_OpMax32FSel(v *ssa.Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	b := v.Block
+	// match: (Max32FSel x y)
+	// result: (FSEL x y (CMPGTF x y))
+	for {
+		x := v_0
+		y := v_1
+		v.Reset(ssaop.OpLOONG64FSEL)
+		v0 := b.NewValue0(v.Pos, ssaop.OpLOONG64CMPGTF, types.TypeFlags)
+		v0.AddArg2(x, y)
+		v.AddArg3(x, y, v0)
+		return true
+	}
+}
+func rewriteValue_OpMax64FSel(v *ssa.Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	b := v.Block
+	// match: (Max64FSel x y)
+	// result: (FSEL x y (CMPGTD x y))
+	for {
+		x := v_0
+		y := v_1
+		v.Reset(ssaop.OpLOONG64FSEL)
+		v0 := b.NewValue0(v.Pos, ssaop.OpLOONG64CMPGTD, types.TypeFlags)
+		v0.AddArg2(x, y)
+		v.AddArg3(x, y, v0)
+		return true
+	}
+}
+func rewriteValue_OpMin32FSel(v *ssa.Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	b := v.Block
+	// match: (Min32FSel x y)
+	// result: (FSEL x y (CMPGTF y x))
+	for {
+		x := v_0
+		y := v_1
+		v.Reset(ssaop.OpLOONG64FSEL)
+		v0 := b.NewValue0(v.Pos, ssaop.OpLOONG64CMPGTF, types.TypeFlags)
+		v0.AddArg2(y, x)
+		v.AddArg3(x, y, v0)
+		return true
+	}
+}
+func rewriteValue_OpMin64FSel(v *ssa.Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	b := v.Block
+	// match: (Min64FSel x y)
+	// result: (FSEL x y (CMPGTD y x))
+	for {
+		x := v_0
+		y := v_1
+		v.Reset(ssaop.OpLOONG64FSEL)
+		v0 := b.NewValue0(v.Pos, ssaop.OpLOONG64CMPGTD, types.TypeFlags)
+		v0.AddArg2(y, x)
+		v.AddArg3(x, y, v0)
+		return true
+	}
 }
 func rewriteValue_OpMod16(v *ssa.Value) bool {
 	v_1 := v.Args[1]

@@ -38,7 +38,7 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 					nonce := make([]byte, aead.NonceSize())
 					rng.Read(nonce)
 
-					before, addData := make([]byte, adLen), make([]byte, ptLen)
+					before, addData := make([]byte, ptLen), make([]byte, adLen)
 					rng.Read(before)
 					rng.Read(addData)
 
@@ -53,6 +53,44 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 		}
 	})
 
+	t.Run("InPlace", func(t *testing.T) {
+		for _, ptLen := range lengths {
+			for _, adLen := range lengths {
+				t.Run(fmt.Sprintf("Plaintext-Length=%d,AddData-Length=%d", ptLen, adLen), func(t *testing.T) {
+					rng := newRandReader(t)
+
+					nonce := make([]byte, aead.NonceSize())
+					rng.Read(nonce)
+
+					before, addData := make([]byte, ptLen), make([]byte, adLen)
+					rng.Read(before)
+					rng.Read(addData)
+
+					// Reuse the plaintext's storage for the encrypted output,
+					// using the documented plaintext[:0] pattern, with the
+					// overhead landing in the spare capacity.
+					buf := make([]byte, ptLen, ptLen+aead.Overhead())
+					copy(buf, before)
+					ciphertext := sealMsg(t, aead, buf[:0], nonce, buf, addData)
+
+					if isDeterministic(aead) {
+						if expected := sealMsg(t, aead, nil, nonce, before, addData); !bytes.Equal(ciphertext, expected) {
+							t.Errorf("in-place Seal is different from Seal into a separate buffer; got %s, want %s", truncateHex(ciphertext), truncateHex(expected))
+						}
+					}
+
+					// Reuse the ciphertext's storage for the decrypted output,
+					// using the documented ciphertext[:0] pattern.
+					after := openWithoutError(t, aead, ciphertext[:0], nonce, ciphertext, addData)
+
+					if !bytes.Equal(after, before) {
+						t.Errorf("plaintext is different after an in-place seal/open cycle; got %s, want %s", truncateHex(after), truncateHex(before))
+					}
+				})
+			}
+		}
+	})
+
 	t.Run("OutOfBounds", func(t *testing.T) {
 		// v1.26.0 and earlier have a harmless ciphertext overread/write in
 		// short-tag (not FIPS 140 Approved) AES-GCM.
@@ -60,18 +98,37 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 		// boundaryLengths covers every offset within an AES block, as well as the tail
 		// of a multi-block message, since that's where implementations handle partial
 		// blocks, and are most likely to access memory past the end of a buffer.
+		// Lengths around multiples of 64 target ChaCha20 block boundaries and the
+		// specialized short-input paths of chacha20poly1305 assembly.
 		var boundaryLengths = []int{
 			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-			16, 17, 18, 127, 128, 129, 130, 131, 156, 8193,
+			16, 17, 18, 63, 64, 65, 127, 128, 129, 130, 131, 156,
+			191, 192, 193, 255, 256, 257, 319, 320, 321, 8193,
 		}
+		// Sweep the plaintext length with a fixed additional data length, and
+		// vice versa. The sealed message always ends with the tag, so the
+		// ciphertext processed by the authenticator can never be placed flush
+		// against a guard page; the additional data can, making its sweep the
+		// one that catches authenticator overreads at every length.
+		type boundarySizes struct{ ptLen, adLen int }
+		var sizes []boundarySizes
 		for _, ptLen := range boundaryLengths {
-			t.Run(fmt.Sprintf("Plaintext-Length=%d", ptLen), func(t *testing.T) {
+			sizes = append(sizes, boundarySizes{ptLen, 16})
+		}
+		for _, adLen := range boundaryLengths {
+			if adLen == 16 {
+				continue // covered by the plaintext length sweep
+			}
+			sizes = append(sizes, boundarySizes{156, adLen})
+		}
+		for _, size := range sizes {
+			t.Run(fmt.Sprintf("Plaintext-Length=%d,AddData-Length=%d", size.ptLen, size.adLen), func(t *testing.T) {
 				rng := newRandReader(t)
 
 				nonce := make([]byte, aead.NonceSize())
 				rng.Read(nonce)
 
-				plaintext, addData := make([]byte, ptLen), make([]byte, 16)
+				plaintext, addData := make([]byte, size.ptLen), make([]byte, size.adLen)
 				rng.Read(plaintext)
 				rng.Read(addData)
 
@@ -92,7 +149,7 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 						}
 
 						src, ad := guarded(plaintext), guarded(addData)
-						dst := guarded(make([]byte, ptLen+aead.Overhead()))
+						dst := guarded(make([]byte, size.ptLen+aead.Overhead()))
 
 						ciphertext := sealMsg(t, aead, dst[:0], nonce, src, ad)
 
@@ -284,7 +341,7 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 
 						// Check each prefix gets appended to by Open without altering them.
 						for _, prefix := range prefixes {
-							before, addData := make([]byte, adLen), make([]byte, ptLen)
+							before, addData := make([]byte, ptLen), make([]byte, adLen)
 							rng.Read(before)
 							rng.Read(addData)
 							ciphertext := sealMsg(t, aead, nil, nonce, before, addData)

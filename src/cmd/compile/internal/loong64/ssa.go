@@ -198,18 +198,21 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = v.Reg()
 
-	case ssaop.OpLOONG64BSTRPICKV,
-		ssaop.OpLOONG64BSTRPICKW:
+	case ssaop.OpLOONG64BSTRPICKV:
 		p := s.Prog(v.Op.Asm())
 		p.From.Type = obj.TYPE_CONST
-		if v.Op == ssaop.OpLOONG64BSTRPICKW {
-			p.From.Offset = v.AuxInt >> 5
-			p.AddRestSourceConst(v.AuxInt & 0x1f)
-		} else {
-			p.From.Offset = v.AuxInt >> 6
-			p.AddRestSourceConst(v.AuxInt & 0x3f)
-		}
+		p.From.Offset = v.AuxInt >> 6
+		p.AddRestSourceConst(v.AuxInt & 0x3f)
 		p.Reg = v.Args[0].Reg()
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg()
+
+	case ssaop.OpLOONG64BSTRINSV:
+		p := s.Prog(v.Op.Asm())
+		p.From.Type = obj.TYPE_CONST
+		p.From.Offset = v.AuxInt >> 6
+		p.AddRestSourceConst(v.AuxInt & 0x3f)
+		p.Reg = v.Args[1].Reg()
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = v.Reg()
 
@@ -352,6 +355,16 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p.Reg = v.Args[1].Reg()
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = loong64.REG_FCC0
+
+	case ssaop.OpLOONG64FSEL:
+		// FSEL FCC0, true, false, result selects true when FCC0 != 0.
+		p := s.Prog(loong64.AFSEL)
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = loong64.REG_FCC0
+		p.Reg = v.Args[0].Reg()
+		p.AddRestSourceReg(v.Args[1].Reg())
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg()
 
 	case ssaop.OpLOONG64FMADDF,
 		ssaop.OpLOONG64FMADDD,

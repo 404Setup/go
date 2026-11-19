@@ -652,8 +652,8 @@ type methodKey struct {
 // A methodInfo holds the parts of a Method that are expensive to
 // construct and identical for every call of Method with the same key.
 type methodInfo struct {
-	typ Type           // Method.Type
-	tfn unsafe.Pointer // the code pointer; Value.ptr will point here
+	typ Type    // Method.Type
+	tfn uintptr // the code handle/pointer; Value.ptr will point here
 }
 
 // methodCache caches the func type and function value built by rtype.Method.
@@ -691,7 +691,7 @@ func (t *rtype) Method(i int) (m Method) {
 		}
 		mi, _ = methodCache.LoadOrStore(key, &methodInfo{
 			typ: FuncOf(in, out, ft.IsVariadic()),
-			tfn: t.textOff(p.Tfn),
+			tfn: funcHandle(uintptr(t.textOff(p.Tfn))),
 		})
 	}
 	m.Type = mi.typ

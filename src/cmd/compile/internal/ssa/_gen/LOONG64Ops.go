@@ -139,6 +139,7 @@ func init() {
 		gp11      = regInfo{inputs: []regMask{gpg}, outputs: []regMask{gp}}
 		gp11sp    = regInfo{inputs: []regMask{gpspg}, outputs: []regMask{gp}}
 		gp21      = regInfo{inputs: []regMask{gpg, gpg.union(rz)}, outputs: []regMask{gp}}
+		gp21nog   = regInfo{inputs: []regMask{gp, gpg.union(rz)}, outputs: []regMask{gp}}
 		gpload    = regInfo{inputs: []regMask{gpspsbg}, outputs: []regMask{gp}}
 		gp2load   = regInfo{inputs: []regMask{gpspsbg, gpg}, outputs: []regMask{gp}}
 		gpstore   = regInfo{inputs: []regMask{gpspsbg, gpg}}
@@ -280,10 +281,9 @@ func init() {
 		{name: "CMPGTD", argLength: 2, reg: fp2flags, asm: "CMPGTD", typ: "Flags", zeroUpperBits: 56}, // flags=true if arg0 > arg1, float64
 
 		// bitfield ops
-		// for bstrpick.w msbw is auxInt>>5, lsbw is auxInt&0x1f
 		// for bstrpick.d msbd is auxInt>>6, lsbd is auxInt&0x3f
-		{name: "BSTRPICKW", argLength: 1, reg: gp11, asm: "BSTRPICKW", aux: "Int64", earlyOk: true},
 		{name: "BSTRPICKV", argLength: 1, reg: gp11, asm: "BSTRPICKV", aux: "Int64", earlyOk: true},
+		{name: "BSTRINSV", argLength: 2, reg: gp21nog, asm: "BSTRINSV", aux: "Int64", resultInArg0: true, earlyOk: true},
 
 		// moves
 		{name: "MOVVconst", argLength: 0, reg: gp01, aux: "Int64", asm: "MOVV", typ: "UInt64", rematerializeable: true, earlyOk: true},    // auxint
@@ -537,6 +537,8 @@ func init() {
 
 		// pseudo-ops
 		{name: "LoweredNilCheck", argLength: 2, reg: regInfo{inputs: []regMask{gpg}}, nilCheck: true, faultOnNilArg0: true}, // panic if arg0 is nil.  arg1=mem.
+
+		{name: "FSEL", argLength: 3, reg: fp21, asm: "FSEL", earlyOk: true}, // arg2 (flags) ? arg0 : arg1; bitwise select for float32 and float64
 
 		{name: "FPFlagTrue", argLength: 1, reg: readflags, earlyOk: true, zeroUpperBits: 56},  // bool, true if FP flag is true
 		{name: "FPFlagFalse", argLength: 1, reg: readflags, earlyOk: true, zeroUpperBits: 56}, // bool, true if FP flag is false

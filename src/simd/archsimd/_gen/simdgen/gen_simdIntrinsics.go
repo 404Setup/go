@@ -92,8 +92,8 @@ func simd{{GetSIMDTag}}Intrinsics(addF func(pkg, fn string, b intrinsicBuilder, 
 		Add("op2Imm8", `	addF(simdPackage, "{{(index .In 1).Go}}.{{.Go}}", opLen2Imm8(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}), {{GetSysArch}})`).
 		Add("op2Imm8_2I", `	addF(simdPackage, "{{(index .In 1).Go}}.{{.Go}}", opLen2Imm8_2I(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}), {{GetSysArch}})`).
 		Add("op2Imm_2I", `	addF(simdPackage, "{{(index .In 1).Go}}.{{.Go}}", opLen2Imm_2I(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}, {{(index .In 0).ImmMax}}), {{GetSysArch}})`).
-		Add("op2Imm8_21I", `	addF(simdPackage, "{{(index .In 2).Go}}.{{.Go}}", opLen2Imm8_21I(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}), {{GetSysArch}})`).
-		Add("op2Imm_21I", `	addF(simdPackage, "{{(index .In 2).Go}}.{{.Go}}", opLen2Imm_21I(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}, {{(index .In 0).ImmMax}}), {{GetSysArch}})`).
+		Add("op2Imm8_21I", `{{- if or (eq .Go "ConcatWindow") (eq .Go "ConcatWindowGrouped")}}	addF(simdPackage, "{{(index .In 2).Go}}.{{.Go}}", opLen2Imm_ConcatWindow(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}, 31), {{GetSysArch}}){{- else}}	addF(simdPackage, "{{(index .In 2).Go}}.{{.Go}}", opLen2Imm8_21I(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}), {{GetSysArch}}){{- end}}`).
+		Add("op2Imm_21I", `{{- if or (eq .Go "ConcatWindow") (eq .Go "ConcatWindowGrouped")}}	addF(simdPackage, "{{(index .In 2).Go}}.{{.Go}}", opLen2Imm_ConcatWindow(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}, {{(index .In 0).ImmMax}}), {{GetSysArch}}){{- else}}	addF(simdPackage, "{{(index .In 2).Go}}.{{.Go}}", opLen2Imm_21I(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}, {{(index .In 0).ImmMax}}), {{GetSysArch}}){{- end}}`).
 		Add("op2Imm8_II", `	addF(simdPackage, "{{(index .In 1).Go}}.{{.Go}}", opLen2Imm8_II(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}), {{GetSysArch}})`).
 		Add("op2Imm8_SHA1RNDS4", `addF(simdPackage, "{{(index .In 1).Go}}.{{.Go}}", opLen2Imm8_SHA1RNDS4(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}), {{GetSysArch}})`).
 		Add("op2ImmVecAsScalar", `addF(simdPackage, "{{(index .In 2).Go}}.{{.Go}}", opLen2Imm(ssaop.Op{{.GenericName}}, {{.SSAType}}, {{(index .In 0).ImmOffset}}, {{(index .In 0).ImmMax}}), {{GetSysArch}})`).
@@ -120,7 +120,7 @@ func simd{{GetSIMDTag}}Intrinsics(addF func(pkg, fn string, b intrinsicBuilder, 
 	var sveMask = templateNamed("sveMask", `	addF(simdPackage, "{{.Name}}AllTrue", opLen0(ssaop.Op{{.Name}}AllTrue, types.TypeMask), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}FromCount", opLen1(ssaop.Op{{.Name}}FromCount, types.TypeMask), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.First", opLen1(ssaop.Op{{.Name}}First, types.TypeMask), {{GetSysArch}})
-	addF(simdPackage, "{{.Name}}.Next", opLen1(ssaop.Op{{.Name}}Next, types.TypeMask), {{GetSysArch}})
+	addF(simdPackage, "{{.Name}}.Next", opLen2(ssaop.Op{{.Name}}Next, types.TypeMask), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.All", opLen1(ssaop.Op{{.Name}}All, types.Types[types.TBOOL]), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.None", opLen1(ssaop.Op{{.Name}}None, types.Types[types.TBOOL]), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.Any", opLen1(ssaop.Op{{.Name}}Any, types.Types[types.TBOOL]), {{GetSysArch}})`)

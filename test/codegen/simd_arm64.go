@@ -336,6 +336,37 @@ func sveCeilIfElseFoldsToMerging(x, z archsimd.Float32s, m archsimd.Mask32s) arc
 	return x.Ceil().IfElse(m, z)
 }
 
+func sveNotSynthesizesAllTrue(x archsimd.Uint8s) archsimd.Uint8s {
+	// arm64:`PWHILELT` `ZNOT.*P[0-9]+\.M`
+	return x.Not()
+}
+
+func sveNotIfElseFoldsToMerging(x, z archsimd.Uint8s, m archsimd.Mask8s) archsimd.Uint8s {
+	// NOT is predicated-only, like ABS, and folds the same way.
+	// arm64:`ZNOT.*P[0-9]+\.M` -`ZSEL` -`PWHILELT` -`ZMOVPRFX`
+	return x.Not().IfElse(m, z)
+}
+
+func sveNotMaskedFoldsToMerging(x archsimd.Uint8s, m archsimd.Mask8s) archsimd.Uint8s {
+	// arm64:`ZNOT.*P[0-9]+\.M` -`ZSEL` -`PWHILELT`
+	return x.Not().Masked(m)
+}
+
+func sveNotIfElseFoldsToMerging16(x, z archsimd.Int16s, m archsimd.Mask16s) archsimd.Int16s {
+	// arm64:`ZNOT\s+Z[0-9]+\.H, P[0-9]+\.M` -`ZSEL`
+	return x.Not().IfElse(m, z)
+}
+
+func sveNotIfElseFoldsToMerging32(x, z archsimd.Uint32s, m archsimd.Mask32s) archsimd.Uint32s {
+	// arm64:`ZNOT\s+Z[0-9]+\.S, P[0-9]+\.M` -`ZSEL`
+	return x.Not().IfElse(m, z)
+}
+
+func sveNotIfElseFoldsToMerging64(x, z archsimd.Int64s, m archsimd.Mask64s) archsimd.Int64s {
+	// arm64:`ZNOT\s+Z[0-9]+\.D, P[0-9]+\.M` -`ZSEL`
+	return x.Not().IfElse(m, z)
+}
+
 func sveIfElseFloat(x, y archsimd.Float64s, m archsimd.Mask64s) archsimd.Float64s {
 	// arm64:`ZFADD.*P[0-9]+\.M` -`ZSEL`
 	return x.Add(y).IfElse(m, x)
@@ -469,41 +500,4 @@ func sveBroadcastGpIfElse64(x int64, m archsimd.Mask64s, z archsimd.Int64s) arch
 func sveBroadcastFloatIfElse(x float32, m archsimd.Mask32s, z archsimd.Float32s) archsimd.Float32s {
 	// arm64:`ZCPYS\s+V[0-9]+, P[0-9]+\.M, Z[0-9]+\.S` -`ZDUP` -`ZSEL`
 	return archsimd.BroadcastFloat32s(x).IfElse(m, z)
-}
-
-// Keep >8 Mask32s values live simultaneously across Pg1013 operations (ZCPYW
-// /M) so regalloc must restrict <Pg> to P0-P7 even under predicate pressure.
-func sveManyLiveMasks(a archsimd.Int32s, x int32, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9 int) archsimd.Int32s {
-	// arm64:`ZCPYW\s+R[0-9]+, P[0-7]\.M, Z[0-9]+\.S` -`P(?:[89]|1[0-5])\.M`
-	m0 := archsimd.Mask32sFromCount(c0)
-	m1 := archsimd.Mask32sFromCount(c1)
-	m2 := archsimd.Mask32sFromCount(c2)
-	m3 := archsimd.Mask32sFromCount(c3)
-	m4 := archsimd.Mask32sFromCount(c4)
-	m5 := archsimd.Mask32sFromCount(c5)
-	m6 := archsimd.Mask32sFromCount(c6)
-	m7 := archsimd.Mask32sFromCount(c7)
-	m8 := archsimd.Mask32sFromCount(c8)
-	m9 := archsimd.Mask32sFromCount(c9)
-	a = archsimd.BroadcastInt32s(x).IfElse(m0, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m1, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m2, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m3, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m4, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m5, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m6, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m7, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m8, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m9, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m0, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m1, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m2, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m3, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m4, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m5, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m6, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m7, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m8, a)
-	a = archsimd.BroadcastInt32s(x).IfElse(m9, a)
-	return a
 }

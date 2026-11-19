@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"go/token"
+	"internal/abi"
 	"internal/asan"
 	"internal/goarch"
 	"internal/msan"
@@ -1625,6 +1626,12 @@ func TestMap(t *testing.T) {
 		if mv != v {
 			t.Errorf("newm[%q] = %d, but m[%q] = %d, %v", k, v, k, mv, ok)
 		}
+	}
+
+	unexportedKey := ValueOf(struct{ x string }{"b"}).Field(0)
+	newmap.SetMapIndex(ValueOf("a"), newmap.MapIndex(unexportedKey))
+	if newm["a"] != newm["b"] {
+		t.Errorf("newm[\"a\"] = %d after setting to newm[\"b\"]", newm["a"])
 	}
 
 	newmap.SetMapIndex(ValueOf("a"), Value{})
@@ -8685,7 +8692,7 @@ func TestValuePointerAndUnsafePointer(t *testing.T) {
 		{"channel", ValueOf(ch), *(*unsafe.Pointer)(unsafe.Pointer(&ch))},
 		{"map", ValueOf(m), *(*unsafe.Pointer)(unsafe.Pointer(&m))},
 		{"unsafe.Pointer", ValueOf(unsafePtr), unsafePtr},
-		{"function", ValueOf(fn), **(**unsafe.Pointer)(unsafe.Pointer(&fn))},
+		{"function", ValueOf(fn), unsafe.Pointer(abi.FuncPCABIInternal(fn))},
 		{"slice", ValueOf(slice), unsafe.Pointer(unsafe.SliceData(slice))},
 		{"string", ValueOf(s), unsafe.Pointer(unsafe.StringData(s))},
 	}
