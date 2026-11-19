@@ -34,10 +34,11 @@ import (
 // [Cross-Site Request Forgery (CSRF)]: https://developer.mozilla.org/en-US/docs/Web/Security/Attacks/CSRF
 // [safe methods]: https://developer.mozilla.org/en-US/docs/Glossary/Safe/HTTP
 type CrossOriginProtection struct {
-	bypass    atomic.Pointer[ServeMux]
-	trustedMu sync.RWMutex
-	trusted   map[string]bool
-	deny      atomic.Pointer[Handler]
+	bypass     atomic.Pointer[ServeMux]
+	hasTrusted atomic.Bool
+	trustedMu  sync.RWMutex
+	trusted    map[string]bool
+	deny       atomic.Pointer[Handler]
 }
 
 // NewCrossOriginProtection returns a new [CrossOriginProtection] value.
@@ -74,6 +75,7 @@ func (c *CrossOriginProtection) AddTrustedOrigin(origin string) error {
 		c.trusted = make(map[string]bool)
 	}
 	c.trusted[origin] = true
+	c.hasTrusted.Store(true)
 	return nil
 }
 
@@ -129,6 +131,49 @@ func (c *CrossOriginProtection) SetDenyHandler(h Handler) {
 	c.deny.Store(&h)
 }
 
+// isSimpleOriginHostPort reports whether s is a non-empty ASCII hostname or
+// IPv4 address with an optional numeric port, containing no characters that
+// url.Parse could interpret as userinfo, IPv6 brackets, path, query, fragment,
+// or percent-encoding. For any s where this returns true, url.Parse("https://"+s)
+// is guaranteed to succeed with u.Host == s.
+func isSimpleOriginHostPort(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	i := 0
+	for ; i < len(s); i++ {
+		b := s[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '.' || b == '-' {
+			continue
+		}
+		if b == ':' {
+			i++
+			for ; i < len(s); i++ {
+				if s[i] < '0' || s[i] > '9' {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+func originMatchesHost(origin, host string) bool {
+	var rest string
+	if len(origin) > len("https://") && origin[:len("https://")] == "https://" {
+		rest = origin[len("https://"):]
+	} else if len(origin) > len("http://") && origin[:len("http://")] == "http://" {
+		rest = origin[len("http://"):]
+	}
+	if rest != "" && isSimpleOriginHostPort(rest) {
+		return rest == host
+	}
+	o, err := url.Parse(origin)
+	return err == nil && o.Host == host
+}
+
 // Check applies cross-origin checks to a request.
 // It returns an error if the request should be rejected.
 func (c *CrossOriginProtection) Check(req *Request) error {
@@ -138,27 +183,27 @@ func (c *CrossOriginProtection) Check(req *Request) error {
 		return nil
 	}
 
-	switch req.Header.Get("Sec-Fetch-Site") {
+	switch req.Header.get("Sec-Fetch-Site") {
 	case "":
 		// No Sec-Fetch-Site header is present.
 		// Fallthrough to check the Origin header.
 	case "same-origin", "none":
 		return nil
 	default:
-		if c.isRequestExempt(req) {
+		if c.isRequestExempt(req, "", false) {
 			return nil
 		}
 		return errCrossOriginRequest
 	}
 
-	origin := req.Header.Get("Origin")
+	origin := req.Header.get("Origin")
 	if origin == "" {
 		// Neither Sec-Fetch-Site nor Origin headers are present.
 		// Either the request is same-origin or not a browser request.
 		return nil
 	}
 
-	if o, err := url.Parse(origin); err == nil && o.Host == req.Host {
+	if originMatchesHost(origin, req.Host) {
 		// The Origin header matches the Host header. Note that the Host header
 		// doesn't include the scheme, so we don't know if this might be an
 		// HTTP→HTTPS cross-origin request. We fail open, since all modern
@@ -168,7 +213,7 @@ func (c *CrossOriginProtection) Check(req *Request) error {
 		return nil
 	}
 
-	if c.isRequestExempt(req) {
+	if c.isRequestExempt(req, origin, true) {
 		return nil
 	}
 	return errCrossOriginRequestFromOldBrowser
@@ -182,7 +227,7 @@ var (
 
 // isRequestExempt checks the bypasses which require taking a lock, and should
 // be deferred until the last moment.
-func (c *CrossOriginProtection) isRequestExempt(req *Request) bool {
+func (c *CrossOriginProtection) isRequestExempt(req *Request, origin string, haveOrigin bool) bool {
 	if bypass := c.bypass.Load(); bypass != nil {
 		if h, _ := bypass.Handler(req); h == sentinelHandler {
 			// The request matches a bypass pattern.
@@ -190,11 +235,20 @@ func (c *CrossOriginProtection) isRequestExempt(req *Request) bool {
 		}
 	}
 
+	if !c.hasTrusted.Load() {
+		return false
+	}
+	if !haveOrigin {
+		origin = req.Header.get("Origin")
+	}
+	if origin == "" {
+		return false
+	}
 	c.trustedMu.RLock()
-	defer c.trustedMu.RUnlock()
-	origin := req.Header.Get("Origin")
+	ok := c.trusted[origin]
+	c.trustedMu.RUnlock()
 	// The request matches a trusted origin.
-	return origin != "" && c.trusted[origin]
+	return ok
 }
 
 // Handler returns a handler that applies cross-origin checks

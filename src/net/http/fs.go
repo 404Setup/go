@@ -396,26 +396,31 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 	// handle Content-Range header.
 	sendSize := size
 	var sendContent io.Reader = content
-	ranges, err := parseRange(rangeReq, size)
-	switch err {
-	case nil:
-	case errNoOverlap:
-		if size == 0 {
-			// Some clients add a Range header to all requests to
-			// limit the size of the response. If the file is empty,
-			// ignore the range header and respond with a 200 rather
-			// than a 416.
-			ranges = nil
-			break
+	var ranges []httpRange
+	if rangeReq != "" {
+		var rangeBuf [4]httpRange
+		var err error
+		ranges, err = parseRangeInto(rangeReq, size, rangeBuf[:0])
+		switch err {
+		case nil:
+		case errNoOverlap:
+			if size == 0 {
+				// Some clients add a Range header to all requests to
+				// limit the size of the response. If the file is empty,
+				// ignore the range header and respond with a 200 rather
+				// than a 416.
+				ranges = nil
+				break
+			}
+			var crBuf [64]byte
+			cr := append(crBuf[:0], "bytes */"...)
+			cr = strconv.AppendInt(cr, size, 10)
+			hdr["Content-Range"] = slab.one(string(cr))
+			fallthrough
+		default:
+			serveError(w, err.Error(), StatusRequestedRangeNotSatisfiable)
+			return
 		}
-		var crBuf [64]byte
-		cr := append(crBuf[:0], "bytes */"...)
-		cr = strconv.AppendInt(cr, size, 10)
-		hdr["Content-Range"] = slab.one(string(cr))
-		fallthrough
-	default:
-		serveError(w, err.Error(), StatusRequestedRangeNotSatisfiable)
-		return
 	}
 
 	if sumRangesSize(ranges) > size {
@@ -461,10 +466,11 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 			hdr["Content-Type"] = slab.one("multipart/byteranges; boundary=" + mw.Boundary())
 			sendContent = pr
 			defer pr.Close() // cause writing goroutine to fail and exit if copy doesn't finish.
+			rangesCopy := append([]httpRange(nil), ranges...)
 			go func() {
 				buf := getCopyBuf()
 				defer putCopyBuf(buf)
-				for _, ra := range ranges {
+				for _, ra := range rangesCopy {
 					part, err := mw.CreatePart(ra.mimeHeader(ctype, size))
 					if err != nil {
 						pw.CloseWithError(err)
@@ -1151,6 +1157,10 @@ var errInvalidRange = errors.New("invalid range")
 // parseRange parses a Range header string as per RFC 7233.
 // errNoOverlap is returned if none of the ranges overlap.
 func parseRange(s string, size int64) ([]httpRange, error) {
+	return parseRangeInto(s, size, nil)
+}
+
+func parseRangeInto(s string, size int64, dst []httpRange) ([]httpRange, error) {
 	if s == "" {
 		return nil, nil // header not present
 	}
@@ -1174,7 +1184,11 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 			continue
 		}
 		if ranges == nil {
-			ranges = make([]httpRange, 0, min(numRanges, 16))
+			if cap(dst) > 0 {
+				ranges = dst[:0]
+			} else {
+				ranges = make([]httpRange, 0, min(numRanges, 16))
+			}
 		}
 		start, end, ok := strings.Cut(ra, "-")
 		if !ok {
@@ -1235,26 +1249,55 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 	return ranges, nil
 }
 
-// countingWriter counts how many bytes have been written to it.
-type countingWriter int64
-
-func (w *countingWriter) Write(p []byte) (n int, err error) {
-	*w += countingWriter(len(p))
-	return len(p), nil
+func decimalLen(n int64) int64 {
+	var u uint64
+	var extra int64
+	if n < 0 {
+		u = uint64(-n)
+		extra = 1
+	} else {
+		u = uint64(n)
+	}
+	var d int64 = 1
+	for u >= 10 {
+		u /= 10
+		d++
+	}
+	return d + extra
 }
 
 // rangesMIMESize returns the number of bytes it takes to encode the
 // provided ranges as a multipart response.
 func rangesMIMESize(ranges []httpRange, contentType string, contentSize int64) (encSize int64) {
-	var w countingWriter
-	mw := multipart.NewWriter(&w)
-	for _, ra := range ranges {
-		mw.CreatePart(ra.mimeHeader(contentType, contentSize))
-		encSize += ra.length
+	// multipart.NewWriter always generates a 60-byte hex boundary (30 random bytes).
+	// Part 0 starts with "--<boundary>\r\n" (64 bytes); subsequent parts start with
+	// "\r\n--<boundary>\r\n" (66 bytes). Each part contains:
+	//   "Content-Range: bytes <start>-<end>/<size>\r\n"
+	//   "Content-Type: <contentType>\r\n"
+	//   "\r\n"
+	// followed by ra.length body bytes. Close writes "\r\n--<boundary>--\r\n" (68 bytes).
+	const (
+		boundaryLen      = 60
+		firstBoundaryLen = 2 + boundaryLen + 2 // "--" + boundary + "\r\n"
+		nextBoundaryLen  = 4 + boundaryLen + 2 // "\r\n--" + boundary + "\r\n"
+		closeBoundaryLen = 4 + boundaryLen + 4 // "\r\n--" + boundary + "--\r\n"
+		// Fixed per-part header bytes excluding digits and contentType:
+		// "Content-Range: bytes " (21) + "-" (1) + "/" (1) + "\r\n" (2)
+		// + "Content-Type: " (14) + "\r\n" (2) + "\r\n" (2) = 43.
+		partFixedHeaderLen = 43
+	)
+	sizeDigits := decimalLen(contentSize)
+	perPartBase := int64(partFixedHeaderLen) + int64(len(contentType)) + sizeDigits
+	encSize = closeBoundaryLen
+	for i, ra := range ranges {
+		if i == 0 {
+			encSize += firstBoundaryLen
+		} else {
+			encSize += nextBoundaryLen
+		}
+		encSize += perPartBase + decimalLen(ra.start) + decimalLen(ra.start+ra.length-1) + ra.length
 	}
-	mw.Close()
-	encSize += int64(w)
-	return
+	return encSize
 }
 
 func sumRangesSize(ranges []httpRange) (size int64) {
