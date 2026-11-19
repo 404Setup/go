@@ -10,7 +10,6 @@ package cookiejar
 import (
 	"cmp"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/internal/ascii"
@@ -70,7 +69,7 @@ type Jar struct {
 
 	// entries is a set of entries, keyed by their eTLD+1 and subkeyed by
 	// their name/domain/path.
-	entries map[string]map[string]entry
+	entries map[string]map[entryKey]entry
 
 	// nextSeqNum is the next sequence number assigned to a new cookie
 	// created SetCookies.
@@ -81,12 +80,19 @@ type Jar struct {
 // Options.
 func New(o *Options) (*Jar, error) {
 	jar := &Jar{
-		entries: make(map[string]map[string]entry),
+		entries: make(map[string]map[entryKey]entry),
 	}
 	if o != nil {
 		jar.psList = o.PublicSuffixList
 	}
 	return jar, nil
+}
+
+// entryKey uniquely identifies a cookie entry within a domain submap.
+type entryKey struct {
+	domain string
+	path   string
+	name   string
 }
 
 // entry is the internal representation of a cookie.
@@ -114,9 +120,9 @@ type entry struct {
 	seqNum uint64
 }
 
-// id returns the domain;path;name triple of e as an id.
-func (e *entry) id() string {
-	return fmt.Sprintf("%s;%s;%s", e.Domain, e.Path, e.Name)
+// id returns the (domain, path, name) key of e.
+func (e *entry) id() entryKey {
+	return entryKey{e.Domain, e.Path, e.Name}
 }
 
 // shouldSend determines whether e's cookie qualifies to be included in a
@@ -207,10 +213,9 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 	key := jarKey(host, j.psList)
 
 	j.mu.Lock()
-	defer j.mu.Unlock()
-
 	submap := j.entries[key]
 	if submap == nil {
+		j.mu.Unlock()
 		return cookies
 	}
 
@@ -221,7 +226,8 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 	}
 
 	modified := false
-	var selected []entry
+	var selectedBuf [8]entry
+	selected := selectedBuf[:0]
 	for id, e := range submap {
 		if e.Persistent && !e.Expires.After(now) {
 			delete(submap, id)
@@ -243,20 +249,29 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 			j.entries[key] = submap
 		}
 	}
+	j.mu.Unlock()
 
-	// sort according to RFC 6265 section 5.4 point 2: by longest
-	// path and then by earliest creation time.
-	slices.SortFunc(selected, func(a, b entry) int {
-		if r := cmp.Compare(b.Path, a.Path); r != 0 {
-			return r
-		}
-		if r := a.Creation.Compare(b.Creation); r != 0 {
-			return r
-		}
-		return cmp.Compare(a.seqNum, b.seqNum)
-	})
-	for _, e := range selected {
-		cookies = append(cookies, &http.Cookie{Name: e.Name, Value: e.Value, Quoted: e.Quoted})
+	if len(selected) == 0 {
+		return nil
+	}
+	if len(selected) > 1 {
+		// sort according to RFC 6265 section 5.4 point 2: by longest
+		// path and then by earliest creation time.
+		slices.SortFunc(selected, func(a, b entry) int {
+			if r := cmp.Compare(b.Path, a.Path); r != 0 {
+				return r
+			}
+			if r := a.Creation.Compare(b.Creation); r != 0 {
+				return r
+			}
+			return cmp.Compare(a.seqNum, b.seqNum)
+		})
+	}
+	slab := make([]http.Cookie, len(selected))
+	cookies = make([]*http.Cookie, len(selected))
+	for i, e := range selected {
+		slab[i] = http.Cookie{Name: e.Name, Value: e.Value, Quoted: e.Quoted}
+		cookies[i] = &slab[i]
 	}
 
 	return cookies
@@ -306,7 +321,7 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 			continue
 		}
 		if submap == nil {
-			submap = make(map[string]entry)
+			submap = make(map[entryKey]entry)
 		}
 
 		if old, ok := submap[id]; ok {
@@ -405,7 +420,11 @@ func isIP(host string) bool {
 		// of interpreting ::1%.www.example.com as a subdomain of www.example.com.
 		return true
 	}
-	return net.ParseIP(host) != nil
+	if len(host) == 0 || host[0] < '0' || host[0] > '9' || host[len(host)-1] < '0' || host[len(host)-1] > '9' {
+		return false
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
 }
 
 // defaultPath returns the directory part of a URL's path according to
