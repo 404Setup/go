@@ -377,6 +377,37 @@ func copyHeader(dst, src http.Header) {
 	if len(src) == 0 {
 		return
 	}
+	if len(dst) == 0 {
+		sv := make([]string, len(src))
+		sawNonCanonical := false
+		for k, vv := range src {
+			if len(vv) == 0 {
+				continue
+			}
+			ck := http.CanonicalHeaderKey(k)
+			if ck != k {
+				sawNonCanonical = true
+			}
+			if sawNonCanonical {
+				if existing, ok := dst[ck]; ok {
+					dst[ck] = append(existing, vv...)
+					continue
+				}
+			}
+			if len(vv) == 1 && len(sv) > 0 {
+				sv[0] = vv[0]
+				dst[ck] = sv[:1:1]
+				sv = sv[1:]
+			} else if len(sv) >= len(vv) {
+				n := copy(sv, vv)
+				dst[ck] = sv[:n:n]
+				sv = sv[n:]
+			} else {
+				dst[ck] = append([]string(nil), vv...)
+			}
+		}
+		return
+	}
 	for k, vv := range src {
 		switch len(vv) {
 		case 0:
