@@ -219,10 +219,11 @@ func (s *server) connContext(ctx context.Context, qconn *quic.Conn) context.Cont
 }
 
 type serverConn struct {
-	qconn    *quic.Conn
-	srv      *server
-	baseCtx  context.Context
-	tlsState *tls.ConnectionState
+	qconn      *quic.Conn
+	srv        *server
+	baseCtx    context.Context
+	tlsState   *tls.ConnectionState
+	remoteAddr string
 
 	genericConn // for handleUnidirectionalStream
 	enc         qpackEncoder
@@ -252,6 +253,7 @@ func (s *server) newServerConn(baseCtx context.Context, qconn *quic.Conn) {
 		srv:                 s,
 		baseCtx:             baseCtx,
 		tlsState:            new(qconn.ConnectionState()),
+		remoteAddr:          qconn.RemoteAddr().String(),
 		maxHeaderBytes:      int64(s.srv1.MaxHeaderBytes),
 		maxHeaderValueCount: int64(s.srv1.MaxHeaderValueCount),
 	}
@@ -538,13 +540,12 @@ func (sc *serverConn) requestShouldGoaway(st *stream) bool {
 }
 
 func (sc *serverConn) newResponseWriter(st *stream, hasBody bool) *responseWriter {
-	return &responseWriter{
+	rw := &responseWriter{
 		st:             st,
 		headers:        make(http.Header),
-		trailer:        make(http.Header),
 		bb:             make(bodyBuffer, 0, defaultBodyBufferCap),
 		cannotHaveBody: !hasBody,
-		bw: &bodyWriter{
+		bwStorage: bodyWriter{
 			st:     st,
 			remain: -1,
 			flush:  false,
@@ -552,6 +553,8 @@ func (sc *serverConn) newResponseWriter(st *stream, hasBody bool) *responseWrite
 			enc:    &sc.enc,
 		},
 	}
+	rw.bw = &rw.bwStorage
+	return rw
 }
 
 func (sc *serverConn) handleRequestStream(st *stream) error {
@@ -562,9 +565,14 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 		}
 	}
 
-	readStartTime := time.Now()
-	if t := sc.srv.readHeaderTimeout(); t > 0 {
-		st.readDeadline.set(readStartTime.Add(t))
+	readHeaderTimeout := sc.srv.readHeaderTimeout()
+	readTimeout := sc.srv.readTimeout()
+	var readStartTime time.Time
+	if readHeaderTimeout > 0 || readTimeout > 0 {
+		readStartTime = time.Now()
+		if readHeaderTimeout > 0 {
+			st.readDeadline.set(readStartTime.Add(readHeaderTimeout))
+		}
 	}
 	header, pHeader, err := sc.parseHeader(st)
 	if err != nil {
@@ -587,9 +595,9 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 		return err
 	}
 
-	if t := sc.srv.readTimeout(); t > 0 {
-		st.readDeadline.set(readStartTime.Add(t))
-	} else {
+	if readTimeout > 0 {
+		st.readDeadline.set(readStartTime.Add(readTimeout))
+	} else if readHeaderTimeout > 0 {
 		st.readDeadline.set(time.Time{})
 	}
 	reqInfo := httpcommon.NewServerRequest(httpcommon.ServerRequestParam{
@@ -626,7 +634,7 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 		RequestURI:    reqInfo.RequestURI,
 		Trailer:       reqInfo.Trailer,
 		ProtoMajor:    3,
-		RemoteAddr:    sc.qconn.RemoteAddr().String(),
+		RemoteAddr:    sc.remoteAddr,
 		Header:        header,
 		ContentLength: contentLength,
 		TLS:           sc.tlsState,
@@ -683,6 +691,7 @@ const trailerPrefix = "Trailer:"
 type responseWriter struct {
 	st             *stream
 	bw             *bodyWriter
+	bwStorage      bodyWriter
 	mu             sync.Mutex
 	headers        http.Header
 	snapHeaders    http.Header // Snapshot of headers at WriteHeader time
@@ -713,6 +722,9 @@ func (rw *responseWriter) prepareTrailerForWriteLocked() {
 	for name, vals := range rw.headers {
 		if name, found := strings.CutPrefix(name, trailerPrefix); found {
 			name = textproto.CanonicalMIMEHeaderKey(textproto.TrimString(name))
+			if rw.trailer == nil {
+				rw.trailer = make(http.Header)
+			}
 			rw.trailer[name] = vals
 		}
 	}
@@ -743,6 +755,9 @@ func (rw *responseWriter) writeHeaderLockedOnce() {
 	// have been pre-declared. Also, write back the extracted value, which is
 	// canonicalized, for consistency.
 	if _, ok := rw.snapHeaders["Trailer"]; ok {
+		if rw.trailer == nil {
+			rw.trailer = make(http.Header)
+		}
 		extractTrailerFromHeader(rw.snapHeaders, rw.trailer)
 		switch len(rw.trailer) {
 		case 0:

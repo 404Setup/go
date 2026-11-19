@@ -9,8 +9,8 @@ import (
 	"errors"
 	"io"
 	"math"
+	"net/http/internal/httpcommon"
 
-	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
 )
 
@@ -352,16 +352,5 @@ func appendPrefixedString(b []byte, firstByte byte, prefixLen uint8, s string) [
 //
 // This function does not validate whether a pseudo-header field name is valid.
 func validWireHeaderFieldName(v string) bool {
-	if len(v) == 0 {
-		return false
-	}
-	for _, r := range v {
-		if !httpguts.IsTokenRune(r) {
-			return false
-		}
-		if 'A' <= r && r <= 'Z' {
-			return false
-		}
-	}
-	return true
+	return httpcommon.ValidWireHeaderFieldName(v)
 }
