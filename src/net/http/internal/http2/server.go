@@ -605,6 +605,7 @@ type stream struct {
 	reqTrailer Header // handler's Request.Trailer
 
 	reqBodyStorage requestBody
+	resHeaders     writeResHeaders
 }
 
 func (sc *serverConn) Framer() *Framer  { return sc.framer }
@@ -985,7 +986,9 @@ func (sc *serverConn) serveLoop() (parked bool) {
 			sc.wroteFrame(res)
 		case res := <-sc.readFrameCh:
 			sc.endServeSend()
-			sc.lastFrameTime = time.Now()
+			if sc.readIdleTimer != nil {
+				sc.lastFrameTime = time.Now()
+			}
 			// Process any written frames before reading new frames from the client since a
 			// written frame could have triggered a new stream to be started.
 			if sc.writingFrameAsync {
@@ -1311,6 +1314,7 @@ func (sc *serverConn) writeDataFromHandler(stream *stream, data []byte, endStrea
 	}
 	putErrChan(ch)
 	if frameWriteDone {
+		writeArg.p = nil
 		writeDataPool.Put(writeArg)
 	}
 	return err
@@ -1460,8 +1464,19 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 	} else if wrh, ok := wr.write.(*writeResHeaders); ok {
 		headerBlock := wrh.encodeHeaderBlock(sc)
 		if len(headerBlock) == 0 {
-			sc.writingFrameAsync = false
-			sc.wroteFrame(frameWriteResult{wr: wr, err: nil})
+			if wrh.endStream {
+				if frameHeaderLen <= sc.bw.Available() {
+					sc.writingFrameAsync = false
+					err := sc.framer.WriteData(wrh.streamID, true, nil)
+					sc.wroteFrame(frameWriteResult{wr: wr, err: err})
+				} else {
+					sc.writingFrameAsync = true
+					go sc.writeEmptyEndStreamAsync(wr, wrh.streamID)
+				}
+			} else {
+				sc.writingFrameAsync = false
+				sc.wroteFrame(frameWriteResult{wr: wr, err: nil})
+			}
 		} else if len(headerBlock) <= 16384 && frameHeaderLen+len(headerBlock) <= sc.bw.Available() {
 			sc.writingFrameAsync = false
 			sc.deferFlushForHeaders = !wrh.endStream
@@ -1487,6 +1502,11 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 		sc.writingFrameAsync = true
 		go sc.writeFrameAsync(wr, nil)
 	}
+}
+
+func (sc *serverConn) writeEmptyEndStreamAsync(wr FrameWriteRequest, streamID uint32) {
+	err := sc.framer.WriteData(streamID, true, nil)
+	sc.wroteFrameCh <- frameWriteResult{wr: wr, err: err}
 }
 
 // errHandlerPanicked is the error given to any callers blocked in a read from
@@ -2974,7 +2994,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			snapH = nil
 		}
 		endStream := (rws.handlerDone && !rws.hasTrailers() && len(p) == 0) || isHeadResp
-		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
+		rws.stream.resHeaders = writeResHeaders{
 			streamID:      rws.stream.id,
 			httpResCode:   rws.status,
 			h:             snapH,
@@ -2982,7 +3002,8 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			contentType:   ctype,
 			contentLength: clen,
 			date:          date,
-		})
+		}
+		err = rws.conn.writeHeaders(rws.stream, &rws.stream.resHeaders)
 		if err != nil {
 			return 0, err
 		}
@@ -3359,6 +3380,7 @@ func (w *responseWriter) handlerDone() {
 		rws.releaseWriteBuffer()
 	}
 	w.rws = nil
+	*rws = responseWriterState{}
 	responseWriterStatePool.Put(rws)
 }
 

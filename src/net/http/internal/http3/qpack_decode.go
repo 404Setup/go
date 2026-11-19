@@ -59,6 +59,8 @@ func (qd *qpackDecoder) decode(st *stream, f func(itype indexType, name, value s
 		case 4:
 			// Indexed Field Line With Post-Base Name Reference
 			err = errors.New("dynamic table is not supported yet")
+		default:
+			err = errQPACKDecompressionFailed
 		}
 		if err != nil {
 			return err

@@ -64,8 +64,7 @@ func (w *bodyWriter) write(ps ...[]byte) (n int, err error) {
 			message: w.name + " body longer than specified content length",
 		}
 	}
-	w.st.writeVarint(int64(frameTypeData))
-	w.st.writeVarint(size)
+	w.st.writeFrameHeader(frameTypeData, size)
 	for _, p := range ps {
 		var n2 int
 		n2, err = w.st.Write(p)
@@ -95,7 +94,7 @@ func (w *bodyWriter) Close() error {
 		return errors.New(w.name + " body shorter than specified content length")
 	}
 	if len(w.trailer) > 0 {
-		encTrailer := w.enc.encode(func(f func(itype indexType, name, value string)) {
+		w.enc.writeHeadersFrame(w.st, func(f func(itype indexType, name, value string)) {
 			for name, values := range w.trailer {
 				if !httpguts.ValidHeaderFieldName(name) {
 					continue
@@ -108,9 +107,6 @@ func (w *bodyWriter) Close() error {
 				}
 			}
 		})
-		w.st.writeVarint(int64(frameTypeHeaders))
-		w.st.writeVarint(int64(len(encTrailer)))
-		w.st.Write(encTrailer)
 	}
 	if w.st != nil {
 		w.st.CloseWrite()
@@ -132,6 +128,7 @@ type bodyReader struct {
 	// If filterTrailer is true, headers that are not already in the map will
 	// be ignored; otherwise, all headers will be added to the map.
 	trailer             http.Header
+	respTrailer         *http.Header // if non-nil and trailer is nil, lazily initialized when undeclared trailers arrive
 	filterTrailer       bool
 	maxHeaderBytes      int64
 	maxHeaderValueCount int64
@@ -178,6 +175,14 @@ func (r *bodyReader) Read(p []byte) (n int, err error) {
 					message: "body longer than content-length",
 				}
 			}
+			if r.st.lim == 0 {
+				// RFC 9114 permits zero-length DATA frames; end and continue
+				// so callers don't observe spurious (0, nil) reads.
+				if err := r.st.endFrame(); err != nil {
+					return 0, err
+				}
+				continue
+			}
 			// Fall out of the loop and process the frame body below.
 		case frameTypeHeaders:
 			// This HEADERS frame contains the message trailers.
@@ -201,7 +206,7 @@ func (r *bodyReader) Read(p []byte) (n int, err error) {
 					(r.maxHeaderValueCount > 0 && valueCount > r.maxHeaderValueCount) {
 					return errHeadersTooLarge
 				}
-				if r.trailer == nil {
+				if r.trailer == nil && (r.respTrailer == nil || r.filterTrailer) {
 					return nil
 				}
 				if !validWireHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
@@ -209,6 +214,10 @@ func (r *bodyReader) Read(p []byte) (n int, err error) {
 				}
 				name = textproto.CanonicalMIMEHeaderKey(textproto.TrimString(name))
 				if !r.filterTrailer {
+					if r.trailer == nil {
+						r.trailer = make(http.Header)
+						*r.respTrailer = r.trailer
+					}
 					r.trailer.Add(name, value)
 				} else if _, ok := r.trailer[name]; ok {
 					r.trailer.Add(name, value)

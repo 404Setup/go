@@ -441,14 +441,43 @@ func (t *transferWriter) writeBody(w io.Writer) (err error) {
 				ncopy, err = t.doBodyCopy(io.Discard, body)
 			}
 		} else {
-			ncopy, err = t.doBodyCopy(w, io.LimitReader(body, t.ContentLength))
+			if bw, ok := w.(*bufio.Writer); ok {
+				switch b := body.(type) {
+				case *bytes.Reader:
+					if int64(b.Len()) == t.ContentLength {
+						ncopy, err = b.WriteTo(bw)
+						if err != nil && err != io.EOF {
+							t.bodyReadError = err
+							return err
+						}
+						goto bodyWritten
+					}
+				case *bytes.Buffer:
+					if int64(b.Len()) == t.ContentLength {
+						ncopy, err = b.WriteTo(bw)
+						if err != nil && err != io.EOF {
+							t.bodyReadError = err
+							return err
+						}
+						goto bodyWritten
+					}
+				case *strings.Reader:
+					if int64(b.Len()) == t.ContentLength {
+						ncopy, err = b.WriteTo(bw)
+						if err != nil && err != io.EOF {
+							t.bodyReadError = err
+							return err
+						}
+						goto bodyWritten
+					}
+				}
+			}
+			ncopy, err = t.copyBodyWithLength(w, body)
 			if err != nil {
 				return err
 			}
-			var nextra int64
-			nextra, err = t.doBodyCopy(io.Discard, body)
-			ncopy += nextra
 		}
+	bodyWritten:
 		if err != nil {
 			return err
 		}
@@ -478,6 +507,44 @@ func (t *transferWriter) writeBody(w io.Writer) (err error) {
 	return err
 }
 
+// copyBodyWithLength copies up to t.ContentLength bytes from body to w and
+// checks for any trailing extra bytes using a single pooled copy buffer.
+func (t *transferWriter) copyBodyWithLength(w io.Writer, body io.Reader) (ncopy int64, err error) {
+	buf := getCopyBuf()
+	defer putCopyBuf(buf)
+
+	ncopy, err = io.CopyBuffer(w, io.LimitReader(body, t.ContentLength), buf)
+	if err != nil {
+		if err != io.EOF {
+			t.bodyReadError = err
+		}
+		return ncopy, err
+	}
+	if ncopy < t.ContentLength {
+		return ncopy, nil
+	}
+	// Fast-path EOF check using the already-held buffer before falling back
+	// to io.CopyBuffer(io.Discard, ...).
+	n0, rerr := body.Read(buf[:1])
+	if n0 == 0 && rerr == io.EOF {
+		return ncopy, nil
+	}
+	ncopy += int64(n0)
+	if rerr != nil {
+		if rerr == io.EOF {
+			return ncopy, nil
+		}
+		t.bodyReadError = rerr
+		return ncopy, rerr
+	}
+	nextra, err := io.CopyBuffer(io.Discard, body, buf)
+	ncopy += nextra
+	if err != nil && err != io.EOF {
+		t.bodyReadError = err
+	}
+	return ncopy, err
+}
+
 // doBodyCopy wraps a copy operation, with any resulting error also
 // being saved in bodyReadError.
 //
@@ -494,19 +561,20 @@ func (t *transferWriter) doBodyCopy(dst io.Writer, src io.Reader) (n int64, err 
 }
 
 // unwrapBody unwraps the body's inner reader if it's a
-// nopCloser. This is to ensure that body writes sourced from local
-// files (*os.File types) are properly optimized.
+// readTrackingBody and/or nopCloser. This is to ensure that body writes
+// sourced from local files (*os.File) or in-memory readers are properly optimized.
 //
 // This function is only intended for use in writeBody.
 func (t *transferWriter) unwrapBody() io.Reader {
-	if r, ok := unwrapNopCloser(t.Body); ok {
+	body := t.Body
+	if r, ok := body.(*readTrackingBody); ok {
+		r.didRead = true
+		body = r.ReadCloser
+	}
+	if r, ok := unwrapNopCloser(body); ok {
 		return r
 	}
-	if r, ok := t.Body.(*readTrackingBody); ok {
-		r.didRead = true
-		return r.ReadCloser
-	}
-	return t.Body
+	return body
 }
 
 type transferReader struct {
@@ -1445,15 +1513,19 @@ func unwrapNopCloser(r io.Reader) (underlyingReader io.Reader, isNopCloser bool)
 // block on Read. Its caller uses this as an optional optimization to
 // send fewer TCP packets.
 func isKnownInMemoryReader(r io.Reader) bool {
+	if rtb, ok := r.(*readTrackingBody); ok {
+		r = rtb.ReadCloser
+	}
 	switch r.(type) {
 	case *bytes.Reader, *bytes.Buffer, *strings.Reader:
 		return true
 	}
-	if r, ok := unwrapNopCloser(r); ok {
-		return isKnownInMemoryReader(r)
-	}
-	if r, ok := r.(*readTrackingBody); ok {
-		return isKnownInMemoryReader(r.ReadCloser)
+	if u, ok := unwrapNopCloser(r); ok {
+		switch u.(type) {
+		case *bytes.Reader, *bytes.Buffer, *strings.Reader:
+			return true
+		}
+		return isKnownInMemoryReader(u)
 	}
 	return false
 }

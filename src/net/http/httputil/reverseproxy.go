@@ -601,7 +601,13 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				clientIP = strings.Join(prior, ", ") + ", " + clientIP
 			}
 			if !omit {
-				outreq.Header["X-Forwarded-For"] = []string{clientIP}
+				if _, hasUA := outreq.Header["User-Agent"]; !hasUA && outreq.Method != "CONNECT" {
+					vals := [2]string{clientIP, ""}
+					outreq.Header["X-Forwarded-For"] = vals[0:1:1]
+					outreq.Header["User-Agent"] = vals[1:2:2]
+				} else {
+					outreq.Header["X-Forwarded-For"] = []string{clientIP}
+				}
 			}
 		}
 	}
@@ -867,13 +873,39 @@ func (p *ReverseProxy) flushInterval(res *http.Response) time.Duration {
 	return p.FlushInterval
 }
 
+func resolveFlusher(rw http.ResponseWriter) (interface{ FlushError() error }, http.Flusher) {
+	for {
+		switch t := rw.(type) {
+		case interface{ FlushError() error }:
+			return t, nil
+		case http.Flusher:
+			return nil, t
+		case interface{ Unwrap() http.ResponseWriter }:
+			rw = t.Unwrap()
+		default:
+			return nil, nil
+		}
+	}
+}
+
 func (p *ReverseProxy) copyResponse(dst http.ResponseWriter, src io.Reader, flushInterval time.Duration) error {
 	if src == http.NoBody && p.BufferPool == nil {
 		return nil
 	}
-	var w io.Writer = dst
 
-	if flushInterval != 0 {
+	var buf []byte
+	if p.BufferPool != nil {
+		buf = p.BufferPool.Get()
+		defer p.BufferPool.Put(buf)
+	}
+
+	if flushInterval < 0 {
+		_, err := p.copyBufferFlush(dst, src, buf)
+		return err
+	}
+
+	var w io.Writer = dst
+	if flushInterval > 0 {
 		mlw := &maxLatencyWriter{
 			dst:     dst,
 			flush:   http.NewResponseController(dst).Flush,
@@ -888,13 +920,54 @@ func (p *ReverseProxy) copyResponse(dst http.ResponseWriter, src io.Reader, flus
 		w = mlw
 	}
 
-	var buf []byte
-	if p.BufferPool != nil {
-		buf = p.BufferPool.Get()
-		defer p.BufferPool.Put(buf)
-	}
 	_, err := p.copyBuffer(w, src, buf)
 	return err
+}
+
+func (p *ReverseProxy) copyBufferFlush(dst http.ResponseWriter, src io.Reader, buf []byte) (int64, error) {
+	flushErr, flusher := resolveFlusher(dst)
+	// Flush headers immediately so clients see them even if the first body read blocks.
+	if flushErr != nil {
+		flushErr.FlushError()
+	} else if flusher != nil {
+		flusher.Flush()
+	}
+
+	if len(buf) == 0 {
+		bp := copyBufPool.Get()
+		buf = bp[:]
+		defer copyBufPool.Put(bp)
+	}
+	var written int64
+	for {
+		nr, rerr := src.Read(buf)
+		if rerr != nil && rerr != io.EOF && rerr != context.Canceled {
+			p.logf("httputil: ReverseProxy read error during body copy: %v", rerr)
+		}
+		if nr > 0 {
+			nw, werr := dst.Write(buf[:nr])
+			if flushErr != nil {
+				flushErr.FlushError()
+			} else if flusher != nil {
+				flusher.Flush()
+			}
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				rerr = nil
+			}
+			return written, rerr
+		}
+	}
 }
 
 // copyBuffer returns any write errors or non-EOF read errors, and the amount

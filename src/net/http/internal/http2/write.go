@@ -240,6 +240,12 @@ func (w *writeResHeaders) encodeHeaderBlock(ctx writeContext) []byte {
 }
 
 func (w *writeResHeaders) writeHeaderBlockSlice(ctx writeContext, headerBlock []byte) error {
+	if len(headerBlock) == 0 {
+		if w.endStream {
+			return ctx.Framer().WriteData(w.streamID, true, nil)
+		}
+		return nil
+	}
 	const maxFrameSize = 16384
 	first := true
 	for len(headerBlock) > 0 {
@@ -398,7 +404,7 @@ func encodeHeaders(enc *hpack.Encoder, h Header, keys []string) {
 		// Using defer here, since the returned keys from the
 		// sorter.Keys method is only valid until the sorter
 		// is returned:
-		defer sorterPool.Put(sorter)
+		defer putSorter(sorter)
 		keys = sorter.Keys(h)
 	}
 	for _, k := range keys {

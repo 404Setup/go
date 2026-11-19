@@ -233,8 +233,7 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 	// time it's called.
 	forkReq := func() {
 		if ireq == req {
-			req = new(Request)
-			*req = *ireq // shallow clone
+			req = ireq.shallowCopy()
 		}
 	}
 

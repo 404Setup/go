@@ -370,6 +370,16 @@ type sorter struct {
 	v []string // owned by sorter
 }
 
+func putSorter(s *sorter) {
+	if cap(s.v) > 1024 {
+		s.v = nil
+	} else {
+		clear(s.v)
+		s.v = s.v[:0]
+	}
+	sorterPool.Put(s)
+}
+
 // Keys returns the sorted keys of h.
 //
 // The returned slice is only valid until s used again or returned to

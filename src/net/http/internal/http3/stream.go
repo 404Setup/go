@@ -9,9 +9,25 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/quic"
+)
+
+var (
+	errDeadlineExceeded = os.ErrDeadlineExceeded
+	errContextCanceled  = context.Canceled
+	closedChan          = func() chan struct{} {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}()
+	discardBufPool = sync.Pool{
+		New: func() any {
+			return new([4096]byte)
+		},
+	}
 )
 
 // A stream wraps a QUIC stream, providing methods to read/write various values.
@@ -57,22 +73,12 @@ func newConnStream(ctx context.Context, qconn *quic.Conn, stype streamType) (*st
 }
 
 func newStream(qs *quic.Stream) *stream {
-	readCtx, readCancel := context.WithCancelCause(context.Background())
-	writeCtx, writeCancel := context.WithCancelCause(context.Background())
 	st := &stream{
 		stream: qs,
 		lim:    -1, // no limit
-		readDeadline: deadline{
-			ctx:    readCtx,
-			cancel: readCancel,
-		},
-		writeDeadline: deadline{
-			ctx:    writeCtx,
-			cancel: writeCancel,
-		},
 	}
-	qs.SetReadContext(readCtx)
-	qs.SetWriteContext(writeCtx)
+	qs.SetReadContext(&st.readDeadline)
+	qs.SetWriteContext(&st.writeDeadline)
 	return st
 }
 
@@ -98,19 +104,63 @@ func (st *stream) Reset(code uint64) {
 	st.stream.Reset(code)
 }
 
-// deadline manages ctx, and cancels it when timer expires, with
-// [os.ErrDeadlineExceeded] as the cause. If the deadline is manually stopped
-// before timer expires, the context will be canceled with [context.Canceled]
-// as the cause. Once a deadline is exceeded, its timer can no longer be
-// extended.
-// Practically, this lets the http3 package support time-based deadlines by
-// utilizing the quic package's support for context-based deadlines.
+// deadline implements context.Context directly so each stream avoids allocating
+// context.WithCancelCause wrappers and taking a mutex on every byte read/write.
+// When the timer expires, it cancels with [os.ErrDeadlineExceeded]; if manually
+// stopped before expiration, it cancels with [context.Canceled]. Once canceled,
+// the error is sticky and subsequent attempts to extend the deadline are ignored.
 type deadline struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
+	cause atomic.Pointer[error] // nil until canceled; once set, sticky
 
-	mu    sync.Mutex // Guards below.
-	timer *time.Timer
+	mu     sync.Mutex // Guards timer and doneCh.
+	timer  *time.Timer
+	doneCh chan struct{}
+}
+
+func (d *deadline) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (d *deadline) Value(any) any               { return nil }
+
+func (d *deadline) Err() error {
+	if ep := d.cause.Load(); ep != nil {
+		return *ep
+	}
+	return nil
+}
+
+func (d *deadline) Done() <-chan struct{} {
+	if d.cause.Load() != nil {
+		return closedChan
+	}
+	d.mu.Lock()
+	ch := d.doneCh
+	if ch == nil {
+		if d.cause.Load() != nil {
+			d.mu.Unlock()
+			return closedChan
+		}
+		ch = make(chan struct{})
+		d.doneCh = ch
+	}
+	d.mu.Unlock()
+	return ch
+}
+
+// cancelLocked sets the sticky cancellation cause and closes doneCh if allocated.
+// The caller must hold d.mu.
+func (d *deadline) cancelLocked(ep *error) {
+	if d.cause.Load() != nil {
+		return
+	}
+	d.cause.Store(ep)
+	if d.doneCh != nil {
+		close(d.doneCh)
+	}
+}
+
+func (d *deadline) expire() {
+	d.mu.Lock()
+	d.cancelLocked(&errDeadlineExceeded)
+	d.mu.Unlock()
 }
 
 // stopTimerLocked stops the deadline timer and sets it to nil.
@@ -127,21 +177,27 @@ func (d *deadline) stopTimerLocked() {
 func (d *deadline) stop() {
 	d.mu.Lock()
 	d.stopTimerLocked()
+	d.cancelLocked(&errContextCanceled)
 	d.mu.Unlock()
-	d.cancel(context.Canceled)
 }
 
 // err returns the deadline's context cancelation cause, if any.
 func (d *deadline) err() error {
-	return context.Cause(d.ctx)
+	if ep := d.cause.Load(); ep != nil {
+		return *ep
+	}
+	return nil
 }
 
 // errOf returns the deadline's context cancelation cause if the given err is
 // non-nil. This can be used to check whether an error value returned by I/O
 // operations at the QUIC layer is non-nil because the deadline has expired.
 func (d *deadline) errOf(err error) error {
-	if dErr := d.err(); err != nil && dErr != nil {
-		return dErr
+	if err == nil {
+		return nil
+	}
+	if ep := d.cause.Load(); ep != nil {
+		return *ep
 	}
 	return err
 }
@@ -150,10 +206,13 @@ func (d *deadline) errOf(err error) error {
 // Once deadline is exceeded, it remains in the expired (sticky) state, and
 // subsequent attempts to extend or reset the deadline are ignored.
 func (d *deadline) set(deadlineTime time.Time) {
+	if d.cause.Load() != nil { // Already expired, sticky error.
+		return
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if d.ctx.Err() != nil { // Already expired, sticky error.
+	if d.cause.Load() != nil { // Already expired, sticky error.
 		return
 	}
 	if deadlineTime.IsZero() {
@@ -163,13 +222,11 @@ func (d *deadline) set(deadlineTime time.Time) {
 	dur := time.Until(deadlineTime)
 	if dur <= 0 {
 		d.stopTimerLocked()
-		d.cancel(os.ErrDeadlineExceeded)
+		d.cancelLocked(&errDeadlineExceeded)
 		return
 	}
 	if d.timer == nil {
-		d.timer = time.AfterFunc(dur, func() {
-			d.cancel(os.ErrDeadlineExceeded)
-		})
+		d.timer = time.AfterFunc(dur, d.expire)
 	} else {
 		d.timer.Reset(dur)
 	}
@@ -298,11 +355,23 @@ func (st *stream) discardUnknownFrame(ftype frameType) error {
 
 // discardFrame discards any remaining data in the current frame and resets the read limit.
 func (st *stream) discardFrame() error {
-	// TODO: Consider adding a *quic.Stream method to discard some amount of data.
-	for range st.lim {
-		_, err := st.ReadByte()
+	if st.lim <= 0 {
+		st.lim = -1
+		return nil
+	}
+	bp := discardBufPool.Get().(*[4096]byte)
+	defer discardBufPool.Put(bp)
+	for st.lim > 0 {
+		buf := bp[:]
+		if st.lim < int64(len(buf)) {
+			buf = buf[:st.lim]
+		}
+		n, err := st.Read(buf)
 		if err != nil {
 			return &streamError{errH3FrameError, err.Error()}
+		}
+		if n == 0 {
+			return &streamError{errH3FrameError, io.ErrUnexpectedEOF.Error()}
 		}
 	}
 	st.lim = -1
@@ -408,6 +477,14 @@ func (st *stream) writeVarint(v int64) {
 	default:
 		panic("varint too large")
 	}
+}
+
+// writeFrameHeader writes an HTTP/3 frame type and length in a single stream write.
+func (st *stream) writeFrameHeader(ftype frameType, size int64) {
+	var buf [16]byte
+	b := appendVarint(buf[:0], uint64(ftype))
+	b = appendVarint(b, uint64(size))
+	st.Write(b)
 }
 
 // recordBytesRead records that n bytes have been read.

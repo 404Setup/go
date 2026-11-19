@@ -290,25 +290,55 @@ func (st *stream) readPrefixedStringWithByte(firstByte byte, prefixLen uint8) (s
 	hbit := byte(1) << prefixLen
 	isHuffman := firstByte&hbit != 0
 
-	// TODO: Avoid allocating here for larger strings.
 	var scratch [256]byte
 	var data []byte
-	if size <= int64(len(scratch)) {
-		data = scratch[:size]
-	} else {
-		data = make([]byte, size)
-	}
-	for off := 0; off < len(data); {
-		n, err := st.Read(data[off:])
-		off += n
-		if err != nil {
-			if err == io.EOF && off == len(data) {
-				break
-			}
-			return "", errQPACKDecompressionFailed
+	if size <= 4096 {
+		if size <= int64(len(scratch)) {
+			data = scratch[:size]
+		} else {
+			data = make([]byte, size)
 		}
-		if n == 0 {
-			return "", errQPACKDecompressionFailed
+		for off := 0; off < len(data); {
+			n, err := st.Read(data[off:])
+			off += n
+			if err != nil {
+				if err == io.EOF && off == len(data) {
+					break
+				}
+				return "", errQPACKDecompressionFailed
+			}
+			if n == 0 {
+				return "", errQPACKDecompressionFailed
+			}
+		}
+	} else {
+		// Grow incrementally so a large declared length on a short or truncated
+		// stream cannot force a large upfront allocation before data arrives.
+		const initCap = 4096
+		data = make([]byte, 0, initCap)
+		rem := size
+		for rem > 0 {
+			want := min(rem, int64(cap(data)-len(data)))
+			if want == 0 {
+				nextCap := min(int64(cap(data))*2, size)
+				grown := make([]byte, len(data), nextCap)
+				copy(grown, data)
+				data = grown
+				want = min(rem, int64(cap(data)-len(data)))
+			}
+			off := len(data)
+			n, err := st.Read(data[off : off+int(want)])
+			data = data[:off+n]
+			rem -= int64(n)
+			if err != nil {
+				if err == io.EOF && rem == 0 {
+					break
+				}
+				return "", errQPACKDecompressionFailed
+			}
+			if n == 0 {
+				return "", errQPACKDecompressionFailed
+			}
 		}
 	}
 	if isHuffman {

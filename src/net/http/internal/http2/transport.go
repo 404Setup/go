@@ -2005,7 +2005,10 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 	}
 
 	regularFields := f.RegularFields()
-	strs := make([]string, len(regularFields))
+	var strs []string
+	if len(regularFields) > 0 {
+		strs = make([]string, len(regularFields))
+	}
 	header := make(Header, len(regularFields))
 	res := &cs.staticResp
 	cs.staticResp = ClientResponse{
@@ -2429,7 +2432,7 @@ func (rl *clientConnReadLoop) endStream(cs *clientStream) {
 		if cs.detached {
 			cs.detached = false
 			if cs.sentEndStream && cs.reqBody == nil && cs.reqBodyClosed == nil &&
-				cs.ID != 0 && !cc.draining && !cc.hasWriteErr.Load() && cc.internalStateHook == nil {
+				cs.ID != 0 && !cc.draining && !cc.hasWriteErr.Load() {
 				stopCtxWatch = cs.stopCtxWatch
 				if t := cs.respHeaderTimeoutTimer; t != nil {
 					t.Stop()
@@ -2447,6 +2450,7 @@ func (rl *clientConnReadLoop) endStream(cs *clientStream) {
 		}
 		if closeDone {
 			close(cs.donec)
+			cc.maybeCallStateHook()
 		}
 	}
 }

@@ -771,6 +771,11 @@ func (r *readTrackingBody) Close() error {
 	return r.ReadCloser.Close()
 }
 
+type requestWithReadTrackingBody struct {
+	req Request
+	rtb readTrackingBody
+}
+
 // setupRewindBody returns a new request with a custom body wrapper
 // that can report whether the body needs rewinding.
 // This lets rewindBody avoid an error result when the request
@@ -779,9 +784,11 @@ func setupRewindBody(req *Request) *Request {
 	if req.Body == nil || req.Body == NoBody {
 		return req
 	}
-	newReq := *req
-	newReq.Body = &readTrackingBody{ReadCloser: req.Body}
-	return &newReq
+	rwb := new(requestWithReadTrackingBody)
+	req.shallowCopyTo(&rwb.req)
+	rwb.rtb.ReadCloser = req.Body
+	rwb.req.Body = &rwb.rtb
+	return &rwb.req
 }
 
 // rewindBody returns a new request with the body rewound.
@@ -802,9 +809,11 @@ func rewindBody(req *Request) (rewound *Request, err error) {
 	if err != nil {
 		return nil, err
 	}
-	newReq := *req
-	newReq.Body = &readTrackingBody{ReadCloser: body}
-	return &newReq, nil
+	rwb := new(requestWithReadTrackingBody)
+	req.shallowCopyTo(&rwb.req)
+	rwb.rtb.ReadCloser = body
+	rwb.req.Body = &rwb.rtb
+	return &rwb.req, nil
 }
 
 // shouldRetryRequest reports whether we should retry sending a failed

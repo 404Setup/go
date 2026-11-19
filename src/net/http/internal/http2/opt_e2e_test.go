@@ -175,3 +175,28 @@ func TestHTTP2InlineEndStreamAndContextCancel(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTP2AllInvalidTrailersTerminatesStream(t *testing.T) {
+	ts, client := newH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Declare only an invalid trailer header name (contains space) or empty value
+		// so encodeHeaderBlock produces a 0-byte trailer header block with endStream=true.
+		w.Header().Set("Trailer", "X-Bad")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "hello")
+		// Set an invalid trailer value (contains newline) so encodeHeaders skips it.
+		w.Header()["X-Bad"] = []string{"bad\r\nvalue"}
+	}))
+
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Fatalf("body = %q, want hello", body)
+	}
+}

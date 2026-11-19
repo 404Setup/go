@@ -15,7 +15,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
 - **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
-- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and lock/goroutine overhead across HTTP/1.1 request/response parsing and wire writes, HTTP/2 frame reuse, direct buffered frame writes, synchronous response-header coalescing, and stream cleanup, HTTP/3 header/response handling, header lookup/validation and canonicalization, cookie parsing/formatting and `cookiejar` struct keys, `CrossOriginProtection` fast paths, `ServeMux` atomic routing snapshots and `Redirect`, `ServeContent` and closed-form range MIME sizing, client `Transport` connection/body reuse, URL/query/form/Basic-auth handling, and `httputil`/`httptest` helpers.
+- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and lock/goroutine overhead across HTTP/1.1 request/response parsing, chunked encoding/decoding, in-memory body writes, and `Request.Clone` co-allocation; HTTP/2 frame reuse, stack-buffered small control frames, direct buffered writes, synchronous response-header coalescing, and bounded pool/stream cleanup; HTTP/3 QPACK static-table fast paths, single-write header framing, lock-free stream deadlines, and slab-allocated headers; header lookup/validation and canonicalization, cookie parsing/formatting and `cookiejar` struct keys, `CrossOriginProtection` fast paths, `ServeMux` static-route atomic snapshots and `Redirect`, `ServeContent`, `dirList`, and closed-form range MIME sizing, client `Transport` connection/body reuse, URL/query/form/Basic-auth handling, and zero-timer `ReverseProxy` streaming and `httptest` helpers.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
 - **`runtime`**: Faster span reclamation (`reclaimChunk`), GC bit-scanning (`markrootSpans`, `scanConservative`, `bulkBarrierBitmap`) and fused inline-mark sweep, batched `mcache.releaseAll` and lock-free empty `stackcache_clear`, O(1) `pageCache.flush` and `spanClassToNelems` lookup, write-barrier pointer deduplication, and zero-size slice fast paths.
 - **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
@@ -121,6 +121,34 @@ xychart-beta
 | `ClientResponseHeaders/10` (`http2`) | 57.75 µs/op | **55.03 µs/op** | **-4.7%** (1.05×) | 117 (8,818 B) → **75 (5,509 B)** |
 
 > *Measured as interleaved 5-round medians (`-count=1 -cpu=2`) on `linux/amd64` comparing upstream Go (`1.27.3`; HTTP/2 rows measured against `1.27.4`) against this fork. Subtests paired as `A / B` use matching order across all columns.*
+
+#### Routing, Chunked/Body I/O, Proxy, HTTP/2 & HTTP/3 Primitives
+
+```mermaid
+xychart-beta
+    title "net/http Primitives: Baseline (left bar) vs Patched (right bar) — Latency (ns/op, lower is better)"
+    x-axis ["ChunkedReader (32Bx64)", "ReverseProxyStream", "RequestClone", "QPACKHeaders (h3)", "WriteBody (Bytes)", "ServeMux (Static)"]
+    y-axis "Latency (ns/op)" 0 --> 3400
+    bar [3196, 1875, 520.9, 360.6, 162.1, 101.1]
+    bar [2347, 1183, 483.4, 262.6, 78.5, 62.4]
+```
+
+| Benchmark | Baseline (`f0012dea`) | Patched | Latency Delta | Allocs (`Baseline` → `Patched`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `TransferWriterInMemoryBody` (`Bytes` / `Strings`) | 162.1 / 162.6 ns/op | **78.5 / 81.7 ns/op** | **-51.6% / -49.8%** | 3 (64 B) → **2 (40 B)** |
+| `ServeMuxSnap` (`Static` / `Param`) | 101.1 / 178.2 ns/op | **62.4 / 173.2 ns/op** | **-38.3% / -2.8%** | 0 / 1 → 0 / 1 |
+| `ReverseProxyStreaming` (`FlushInterval=-1`) | 1,875 ns/op | **1,183 ns/op** | **-36.9%** (1.58×) | 21 (2,085 B) → **15 (1,843 B)** |
+| `DirList` (200 entries) | 55.21 µs/op | **36.51 µs/op** | **-33.9%** (1.51×) | 657 → **251** |
+| `ChunkedWriter/Unbuffered` | 21.7 ns/op | **15.8 ns/op** | **-27.2%** (1.37×) | 0 → 0 |
+| `QPACKPrefixedString/EncoderHeaders` (`http3`) | 360.6 ns/op | **262.6 ns/op** | **-27.2%** (1.37×) | 4 (184 B) → **1 (16 B)** |
+| `ChunkedReader/SmallChunks32Bx64` | 3,196 ns/op | **2,347 ns/op** | **-26.6%** (1.36×) | 1 (48 B) → 1 (48 B) |
+| `RequestClone` | 520.9 ns/op | **483.4 ns/op** | **-7.2%** (1.08×) | 5 (896 B) → **4 (880 B)** |
+| `StreamWriteVarint` (`http3`) | 111.6 ns/op | **105.1 ns/op** | **-5.8%** (1.06×) | 0 → 0 |
+| `ClientServer/h2` | 27.78 µs/op | **26.41 µs/op** | **-4.9%** (1.05×) | 32 (4,508 B) → **27 (4,427 B)** |
+| `ClientResponseHeaders/10` (`http2`) | 42.98 µs/op | **41.65 µs/op** | **-3.1%** (1.03×) | 75 → **71** |
+| `ReverseProxy.ServeHTTP` (`httputil`) | 579.6 ns/op | **562.3 ns/op** | **-3.0%** (1.03×) | 9 (1,170 B) → **7 (1,154 B)** |
+
+> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`f0012dea`) against the patched `net/http` stack.*
 
 ---
 

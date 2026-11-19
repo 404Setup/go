@@ -248,14 +248,19 @@ func (s *server) newServerConn(baseCtx context.Context, qconn *quic.Conn) {
 	baseCtx, cancel := context.WithCancel(baseCtx)
 	defer cancel()
 
+	var maxHeaderBytes, maxHeaderValueCount int64
+	if s.srv1 != nil {
+		maxHeaderBytes = int64(s.srv1.MaxHeaderBytes)
+		maxHeaderValueCount = int64(s.srv1.MaxHeaderValueCount)
+	}
 	sc := &serverConn{
 		qconn:               qconn,
 		srv:                 s,
 		baseCtx:             baseCtx,
 		tlsState:            new(qconn.ConnectionState()),
 		remoteAddr:          qconn.RemoteAddr().String(),
-		maxHeaderBytes:      int64(s.srv1.MaxHeaderBytes),
-		maxHeaderValueCount: int64(s.srv1.MaxHeaderValueCount),
+		maxHeaderBytes:      maxHeaderBytes,
+		maxHeaderValueCount: maxHeaderValueCount,
 	}
 
 	// Should we permit disabling these limits? For now, we do not.
@@ -266,11 +271,11 @@ func (s *server) newServerConn(baseCtx context.Context, qconn *quic.Conn) {
 		sc.maxHeaderValueCount = int64(http.DefaultMaxHeaderValueCount)
 	}
 
-	s.registerConn(sc)
-	defer s.unregisterConn(sc)
 	sc.enc.init()
 
-	// Create control stream and send SETTINGS frame.
+	// Create control stream and send SETTINGS frame before registering the
+	// connection, so Shutdown/sendGoaway cannot race on sc.controlStream or
+	// interleave GOAWAY ahead of SETTINGS.
 	// TODO: Time out on creating stream.
 	var err error
 	sc.controlStream, err = newConnStream(context.Background(), sc.qconn, streamTypeControl)
@@ -281,6 +286,9 @@ func (s *server) newServerConn(baseCtx context.Context, qconn *quic.Conn) {
 		settingsMaxFieldSectionSize, sc.maxHeaderBytes,
 	)
 	sc.controlStream.Flush()
+
+	s.registerConn(sc)
+	defer s.unregisterConn(sc)
 
 	sc.acceptStreams(sc.qconn, sc)
 }
@@ -412,6 +420,7 @@ func (sc *serverConn) parseHeader(st *stream) (http.Header, pseudoHeader, error)
 	var headers, trailers headerBudget
 
 	header := make(http.Header)
+	var valSlab []string
 	var pHeader pseudoHeader
 	var dec qpackDecoder
 	var hasMethod, hasScheme, hasPath, hasAuthority bool
@@ -474,7 +483,17 @@ func (sc *serverConn) parseHeader(st *stream) (http.Header, pseudoHeader, error)
 				return &streamError{errH3MessageError, "invalid field name"}
 			}
 			cname := httpcommon.CanonicalHeader(name)
-			header[cname] = append(header[cname], value)
+			vv := header[cname]
+			if vv == nil {
+				if len(valSlab) == 0 {
+					valSlab = make([]string, 8)
+				}
+				vv, valSlab = valSlab[:1:1], valSlab[1:]
+				vv[0] = value
+				header[cname] = vv
+			} else {
+				header[cname] = append(vv, value)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -520,9 +539,11 @@ func (sc *serverConn) sendGoaway() {
 
 	// No lock in this section in case writing to stream blocks. This is safe
 	// since sc.maxRequestStreamID is only updated when sc.goawaySent is false.
-	sc.controlStream.writeVarint(int64(frameTypeGoaway))
-	sc.controlStream.writeVarint(int64(sizeVarint(uint64(sc.maxRequestStreamID))))
-	sc.controlStream.writeVarint(sc.maxRequestStreamID)
+	var buf [24]byte
+	b := appendVarint(buf[:0], uint64(frameTypeGoaway))
+	b = appendVarint(b, uint64(sizeVarint(uint64(sc.maxRequestStreamID))))
+	b = appendVarint(b, uint64(sc.maxRequestStreamID))
+	sc.controlStream.Write(b)
 	sc.controlStream.Flush()
 }
 
@@ -543,7 +564,6 @@ func (sc *serverConn) newResponseWriter(st *stream, hasBody bool) *responseWrite
 	rw := &responseWriter{
 		st:             st,
 		headers:        make(http.Header),
-		bb:             make(bodyBuffer, 0, defaultBodyBufferCap),
 		cannotHaveBody: !hasBody,
 		bwStorage: bodyWriter{
 			st:     st,
@@ -553,6 +573,7 @@ func (sc *serverConn) newResponseWriter(st *stream, hasBody bool) *responseWrite
 			enc:    &sc.enc,
 		},
 	}
+	rw.bb = rw.bbBuf[:0]
 	rw.bw = &rw.bwStorage
 	return rw
 }
@@ -615,8 +636,23 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 	}
 
 	contentLength := int64(-1)
-	if clens := header["Content-Length"]; len(clens) > 0 && clens[0] != "" {
-		if n, err := strconv.ParseUint(clens[0], 10, 63); err == nil {
+	if clens := header["Content-Length"]; len(clens) > 0 {
+		for _, v := range clens[1:] {
+			if v != clens[0] {
+				return &streamError{
+					code:    errH3MessageError,
+					message: "mismatching Content-Length headers",
+				}
+			}
+		}
+		if clens[0] != "" {
+			n, err := strconv.ParseUint(clens[0], 10, 63)
+			if err != nil {
+				return &streamError{
+					code:    errH3MessageError,
+					message: "invalid Content-Length header",
+				}
+			}
 			contentLength = int64(n)
 		}
 	}
@@ -626,7 +662,7 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 	// with the current API of the quic package.
 	ctx, cancel := context.WithCancel(sc.baseCtx)
 	defer cancel()
-	req := (&http.Request{
+	reqVal := http.Request{
 		Proto:         "HTTP/3.0",
 		Method:        pHeader.method,
 		Host:          reqInfo.Host,
@@ -638,7 +674,8 @@ func (sc *serverConn) handleRequestStream(st *stream) error {
 		Header:        header,
 		ContentLength: contentLength,
 		TLS:           sc.tlsState,
-	}).WithContext(ctx)
+	}
+	req := reqVal.WithContext(ctx)
 
 	rw := sc.newResponseWriter(st, req.Method != "HEAD")
 
@@ -697,6 +734,7 @@ type responseWriter struct {
 	snapHeaders    http.Header // Snapshot of headers at WriteHeader time
 	trailer        http.Header
 	bb             bodyBuffer
+	bbBuf          [defaultBodyBufferCap]byte
 	wroteHeader    bool  // Non-1xx header has been (logically) written.
 	statusCode     int   // Non-1xx status of the response that will be sent in HEADERS frame. Zero means none has been set.
 	sent100        bool  // Status 100 has been sent by the server.
@@ -722,6 +760,9 @@ func (rw *responseWriter) prepareTrailerForWriteLocked() {
 	for name, vals := range rw.headers {
 		if name, found := strings.CutPrefix(name, trailerPrefix); found {
 			name = textproto.CanonicalMIMEHeaderKey(textproto.TrimString(name))
+			if !httpguts.ValidTrailerHeader(name) {
+				continue
+			}
 			if rw.trailer == nil {
 				rw.trailer = make(http.Header)
 			}
@@ -794,8 +835,8 @@ func (rw *responseWriter) writeHeaderLockedOnce() {
 		}
 	}
 
-	rw.bb.inferHeader(rw.snapHeaders, rw.statusCode)
-	encHeaders := rw.bw.enc.encode(func(f func(itype indexType, name, value string)) {
+	date, contentType := rw.bb.inferHeaderValues(rw.snapHeaders, rw.statusCode)
+	rw.bw.enc.writeHeadersFrame(rw.st, func(f func(itype indexType, name, value string)) {
 		f(mayIndex, ":status", statusCodeString(rw.statusCode))
 		for name, values := range rw.snapHeaders {
 			if !httpguts.ValidHeaderFieldName(name) {
@@ -809,11 +850,13 @@ func (rw *responseWriter) writeHeaderLockedOnce() {
 				f(mayIndex, name, val)
 			}
 		}
+		if date != "" {
+			f(mayIndex, "date", date)
+		}
+		if contentType != "" {
+			f(mayIndex, "content-type", contentType)
+		}
 	})
-
-	rw.st.writeVarint(int64(frameTypeHeaders))
-	rw.st.writeVarint(int64(len(encHeaders)))
-	rw.st.Write(encHeaders)
 	rw.wroteHeader = true
 }
 
@@ -831,7 +874,7 @@ func (rw *responseWriter) writeHeaderLocked(statusCode int) {
 		}
 		rw.sent100 = true
 	}
-	encHeaders := rw.bw.enc.encode(func(f func(itype indexType, name, value string)) {
+	rw.bw.enc.writeHeadersFrame(rw.st, func(f func(itype indexType, name, value string)) {
 		f(mayIndex, ":status", statusCodeString(statusCode))
 		for name, values := range rw.headers {
 			if name == "Content-Length" || name == "Transfer-Encoding" {
@@ -849,9 +892,6 @@ func (rw *responseWriter) writeHeaderLocked(statusCode int) {
 			}
 		}
 	})
-	rw.st.writeVarint(int64(frameTypeHeaders))
-	rw.st.writeVarint(int64(len(encHeaders)))
-	rw.st.Write(encHeaders)
 }
 
 func isInfoStatus(status int) bool {
@@ -875,10 +915,7 @@ func checkWriteHeaderCode(code int) {
 	}
 }
 
-func (rw *responseWriter) WriteHeader(statusCode int) {
-	// TODO: handle sending informational status headers (e.g. 103).
-	rw.mu.Lock()
-	defer rw.mu.Unlock()
+func (rw *responseWriter) writeHeaderStateLocked(statusCode int) {
 	if rw.statusCode != 0 {
 		return
 	}
@@ -903,7 +940,16 @@ func (rw *responseWriter) WriteHeader(statusCode int) {
 		}
 	}
 	rw.statusCode = statusCode
-	rw.snapHeaders = rw.headers.Clone()
+	if len(rw.headers) > 0 {
+		rw.snapHeaders = rw.headers.Clone()
+	}
+}
+
+func (rw *responseWriter) WriteHeader(statusCode int) {
+	// TODO: handle sending informational status headers (e.g. 103).
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.writeHeaderStateLocked(statusCode)
 }
 
 // trimWriteLocked trims a byte slice, b, such that the length of b will not
@@ -920,11 +966,13 @@ func (rw *responseWriter) trimWriteLocked(b []byte) ([]byte, bool) {
 }
 
 func (rw *responseWriter) Write(b []byte) (n int, err error) {
-	// Calling Write implicitly calls WriteHeader(200) if WriteHeader has not
-	// been called before.
-	rw.WriteHeader(http.StatusOK)
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
+	// Calling Write implicitly calls WriteHeader(200) if WriteHeader has not
+	// been called before.
+	if rw.statusCode == 0 {
+		rw.writeHeaderStateLocked(http.StatusOK)
+	}
 
 	if rw.statusCode == http.StatusNotModified {
 		return 0, http.ErrBodyNotAllowed
@@ -984,11 +1032,13 @@ func (rw *responseWriter) EnableFullDuplex() error {
 
 func (rw *responseWriter) Flush() { rw.FlushError() }
 func (rw *responseWriter) FlushError() error {
-	// Calling Flush implicitly calls WriteHeader(200) if WriteHeader has not
-	// been called before.
-	rw.WriteHeader(http.StatusOK)
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
+	// Calling Flush implicitly calls WriteHeader(200) if WriteHeader has not
+	// been called before.
+	if rw.statusCode == 0 {
+		rw.writeHeaderStateLocked(http.StatusOK)
+	}
 	rw.writeHeaderLockedOnce()
 	if !rw.cannotHaveBody {
 		if _, err := rw.bw.Write(rw.bb); err != nil {
@@ -1007,9 +1057,22 @@ func (rw *responseWriter) close() error {
 		}
 	}
 
-	retErr := rw.FlushError()
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
+	if rw.statusCode == 0 {
+		rw.writeHeaderStateLocked(http.StatusOK)
+	}
+	rw.writeHeaderLockedOnce()
+	var retErr error
+	if !rw.cannotHaveBody {
+		if _, err := rw.bw.Write(rw.bb); err != nil {
+			retErr = err
+		}
+		rw.bb.discard()
+	}
+	if retErr == nil {
+		retErr = rw.st.Flush()
+	}
 	rw.prepareTrailerForWriteLocked()
 	if err := rw.bw.Close(); retErr == nil {
 		retErr = err
@@ -1046,13 +1109,23 @@ func (bb *bodyBuffer) discard() {
 }
 
 // inferHeader populates h with the header values that we can infer from our
-// current buffer content, if not already explicitly set. This method should be
-// called only once with as much body content as possible in the buffer, before
-// a HEADERS frame is sent, and before discard has been called. Doing so
-// properly is the responsibility of the caller.
+// current buffer content, if not already explicitly set.
 func (bb *bodyBuffer) inferHeader(h http.Header, status int) {
+	date, contentType := bb.inferHeaderValues(h, status)
+	if date != "" {
+		h["Date"] = []string{date}
+	}
+	if contentType != "" {
+		h["Content-Type"] = []string{contentType}
+	}
+}
+
+// inferHeaderValues returns inferred Date and Content-Type header values that
+// are not explicitly present in h, avoiding allocating or mutating a header map
+// solely to emit inferred headers.
+func (bb *bodyBuffer) inferHeaderValues(h http.Header, status int) (date, contentType string) {
 	if _, ok := h["Date"]; !ok {
-		h["Date"] = []string{internal.HTTPDateNowString()}
+		date = internal.HTTPDateNowString()
 	}
 	// If the Content-Encoding is non-blank, we shouldn't
 	// sniff the body. See Issue golang.org/issue/31753.
@@ -1060,12 +1133,9 @@ func (bb *bodyBuffer) inferHeader(h http.Header, status int) {
 	hasCE := len(ces) > 0 && len(ces[0]) > 0
 	_, hasCT := h["Content-Type"]
 	if !hasCE && !hasCT && internal.BodyAllowedForStatus(status) && len(*bb) > 0 {
-		h["Content-Type"] = []string{internal.DetectContentType(*bb)}
+		contentType = internal.DetectContentType(*bb)
 	}
-	// We can technically infer Content-Length too here, as long as the entire
-	// response body fits within hi.buf and does not require flushing. However,
-	// we have chosen not to do so for now as Content-Length is not very
-	// important for HTTP/3, and such inconsistent behavior might be confusing.
+	return date, contentType
 }
 
 // serverRequestReader wraps around bodyReader, allowing Read and Close calls

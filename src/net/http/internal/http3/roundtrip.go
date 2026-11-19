@@ -201,8 +201,8 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 	st.stream.SetWriteContext(req.Context())
 
 	addedGzip := httpcommon.IsRequestGzip(req.Method, req.Header, cc.tr.tr1.DisableCompression)
-	headers := cc.enc.encode(func(yield func(itype indexType, name, value string)) {
-		_, err = httpcommon.EncodeHeaders(req.Context(), httpcommon.EncodeHeadersParam{
+	err = cc.enc.writeHeadersFrameErr(st, func(yield func(itype indexType, name, value string)) error {
+		_, herr := httpcommon.EncodeHeaders(req.Context(), httpcommon.EncodeHeadersParam{
 			Request: httpcommon.Request{
 				URL:                 req.URL,
 				Method:              req.Method,
@@ -218,15 +218,11 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 			// Issue #71374: Consider supporting never-indexed fields.
 			yield(mayIndex, name, value)
 		})
+		return herr
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	// Write the HEADERS frame.
-	st.writeVarint(int64(frameTypeHeaders))
-	st.writeVarint(int64(len(headers)))
-	st.Write(headers)
 
 	is100ContinueReq := httpguts.HeaderValuesContainsToken(req.Header["Expect"], "100-continue")
 	switch {
@@ -290,24 +286,13 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 				return nil, err
 			}
 
-			trailer := make(http.Header)
-			extractTrailerFromHeader(h, trailer)
-			delete(h, "Trailer")
-
-			hasBody := true
-			if internal.BodyAllowedForStatus(statusCode) && req.Method != http.MethodHead && (contentLength != 0 || len(trailer) > 0) {
-				rt.respBody = &bodyReader{
-					st:             st,
-					remain:         contentLength,
-					trailer:        trailer,
-					maxHeaderBytes: cc.tr.maxResponseHeaderBytes(),
-				}
-			} else {
-				hasBody = false
-				rt.respBody = http.NoBody
-				st.CloseRead(uint64(errH3NoError))
-				rt.finish(roundTripReadDone)
+			var trailer http.Header
+			if len(h["Trailer"]) > 0 {
+				trailer = make(http.Header)
+				extractTrailerFromHeader(h, trailer)
+				delete(h, "Trailer")
 			}
+
 			status := internal.StatusCodeText(statusCode)
 			if status == "" {
 				status = strconv.Itoa(statusCode) + " " + http.StatusText(statusCode)
@@ -320,10 +305,24 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 				Status:        status,
 				ContentLength: contentLength,
 				Trailer:       trailer,
-				Body:          rt.respBody,
 			}
-			if hasBody {
+
+			hasBody := true
+			if internal.BodyAllowedForStatus(statusCode) && req.Method != http.MethodHead && (contentLength != 0 || len(trailer) > 0) {
+				rt.respBody = &bodyReader{
+					st:             st,
+					remain:         contentLength,
+					trailer:        trailer,
+					respTrailer:    &resp.Trailer,
+					maxHeaderBytes: cc.tr.maxResponseHeaderBytes(),
+				}
 				resp.Body = (*transportResponseBody)(rt)
+			} else {
+				hasBody = false
+				rt.respBody = http.NoBody
+				resp.Body = http.NoBody
+				st.CloseRead(uint64(errH3NoError))
+				rt.finish(roundTripReadDone)
 			}
 			if addedGzip && hasBody {
 				if ces := h["Content-Encoding"]; len(ces) > 0 && ascii.EqualFold(ces[0], "gzip") {
@@ -372,6 +371,12 @@ func reqBodyIgnored(err error) bool {
 	return false
 }
 
+var copyBufPool = sync.Pool{
+	New: func() any {
+		return new([32 * 1024]byte)
+	},
+}
+
 // writeBodyAndTrailer handles writing the body and trailer for a given
 // request, if any. This function will close the write direction of the stream.
 func (cc *clientConn) writeBodyAndTrailer(rt *roundTripState, req *http.Request) {
@@ -390,7 +395,10 @@ func (cc *clientConn) writeBodyAndTrailer(rt *roundTripState, req *http.Request)
 	rt.reqBodyWriter.trailer = req.Trailer
 	rt.reqBodyWriter.enc = &cc.enc
 
-	if _, err := io.Copy(&rt.reqBodyWriter, rt.reqBody); err != nil {
+	bp := copyBufPool.Get().(*[32 * 1024]byte)
+	_, err := io.CopyBuffer(&rt.reqBodyWriter, rt.reqBody, bp[:])
+	copyBufPool.Put(bp)
+	if err != nil {
 		if reqBodyIgnored(err) {
 			return
 		}
@@ -487,6 +495,7 @@ func (rt *roundTripState) handleHeaders() (statusCode int, h http.Header, err er
 	maxHeaderBytes := rt.cc.tr.maxResponseHeaderBytes()
 	haveStatus := false
 	cookie := ""
+	var valSlab []string
 	// The QPACK decoder will happily allocate an unbounded buffer, so check
 	// the stream read limit prior to decoding.
 	if rt.st.lim > maxHeaderBytes-rt.headerSize {
@@ -554,17 +563,18 @@ func (rt *roundTripState) handleHeaders() (statusCode int, h http.Header, err er
 			if h == nil {
 				h = make(http.Header)
 			}
-			// TODO: Use a per-connection canonicalization cache as we do in HTTP/2.
-			// Maybe we could put this in the QPACK decoder and have it deliver
-			// pre-canonicalized headers to us here?
 			cname := httpcommon.CanonicalHeader(name)
-			// TODO: Consider using a single []string slice for all headers,
-			// as we do in the HTTP/1 and HTTP/2 cases.
-			// This is a bit tricky, since we don't know the number of headers
-			// at the start of decoding. Perhaps it's worth doing a two-pass decode,
-			// or perhaps we should just allocate header value slices in
-			// reasonably-sized chunks.
-			h[cname] = append(h[cname], value)
+			vv := h[cname]
+			if vv == nil {
+				if len(valSlab) == 0 {
+					valSlab = make([]string, 8)
+				}
+				vv, valSlab = valSlab[:1:1], valSlab[1:]
+				vv[0] = value
+				h[cname] = vv
+			} else {
+				h[cname] = append(vv, value)
+			}
 		}
 		return nil
 	})

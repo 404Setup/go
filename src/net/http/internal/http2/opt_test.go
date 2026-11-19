@@ -540,3 +540,208 @@ func TestCloneHeaderSliceIsolation(t *testing.T) {
 		t.Fatalf("appending to clone corrupted orig: %#v", orig["X-A"])
 	}
 }
+
+type shortWriter struct{ limit int }
+
+func (w shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit {
+		return w.limit, nil
+	}
+	return len(p), nil
+}
+
+func TestFramerSmallFrameBufWireAndAllocs(t *testing.T) {
+	writeControlFrames := func(f *Framer) error {
+		if err := f.WriteSettingsAck(); err != nil {
+			return err
+		}
+		if err := f.WritePing(false, [8]byte{1, 2, 3, 4, 5, 6, 7, 8}); err != nil {
+			return err
+		}
+		if err := f.WritePing(true, [8]byte{8, 7, 6, 5, 4, 3, 2, 1}); err != nil {
+			return err
+		}
+		if err := f.WriteWindowUpdate(0, 65535); err != nil {
+			return err
+		}
+		if err := f.WriteWindowUpdate(13, 1024); err != nil {
+			return err
+		}
+		if err := f.WriteRSTStream(13, ErrCodeCancel); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	var fastWire, logWire bytes.Buffer
+	fastFramer := NewFramer(&fastWire, nil)
+	if err := writeControlFrames(fastFramer); err != nil {
+		t.Fatalf("fast path: %v", err)
+	}
+	logFramer := NewFramer(&logWire, nil)
+	logFramer.logWrites = true
+	logFramer.debugWriteLoggerf = func(string, ...any) {}
+	if err := writeControlFrames(logFramer); err != nil {
+		t.Fatalf("logWrites path: %v", err)
+	}
+	if !bytes.Equal(fastWire.Bytes(), logWire.Bytes()) {
+		t.Fatalf("smallFrameBuf wire bytes differ from standard path:\nfast: %x\nstd:  %x", fastWire.Bytes(), logWire.Bytes())
+	}
+
+	// Short write must return io.ErrShortWrite.
+	swFramer := NewFramer(shortWriter{limit: 4}, nil)
+	if err := swFramer.WriteSettingsAck(); !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("WriteSettingsAck short write = %v, want io.ErrShortWrite", err)
+	}
+	if err := swFramer.WritePing(false, [8]byte{}); !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("WritePing short write = %v, want io.ErrShortWrite", err)
+	}
+	if err := swFramer.WriteWindowUpdate(1, 10); !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("WriteWindowUpdate short write = %v, want io.ErrShortWrite", err)
+	}
+	if err := swFramer.WriteRSTStream(1, ErrCodeCancel); !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("WriteRSTStream short write = %v, want io.ErrShortWrite", err)
+	}
+
+	if testing.Short() {
+		return
+	}
+
+	bw := bufio.NewWriter(io.Discard)
+	af := NewFramer(bw, nil)
+	payload := []byte("hello world")
+	if mallocs := testing.AllocsPerRun(100, func() {
+		if err := af.WriteData(1, false, payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := af.WriteWindowUpdate(1, 100); err != nil {
+			t.Fatal(err)
+		}
+		if err := af.WritePing(true, [8]byte{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := af.WriteSettingsAck(); err != nil {
+			t.Fatal(err)
+		}
+		if err := af.WriteRSTStream(1, ErrCodeCancel); err != nil {
+			t.Fatal(err)
+		}
+	}); mallocs != 0 {
+		t.Errorf("small control + direct DATA frame allocs = %v, want 0", mallocs)
+	}
+}
+
+func TestFramerInvalidateLastFrameClearsReadBufRefs(t *testing.T) {
+	var wire bytes.Buffer
+	wf := NewFramer(&wire, nil)
+	if err := wf.WriteData(1, false, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.WriteHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: []byte{0x82},
+		EndHeaders:    false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.WriteContinuation(1, true, []byte{0x86}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.WritePing(false, [8]byte{}); err != nil {
+		t.Fatal(err)
+	}
+
+	rf := NewFramer(nil, &wire)
+	rf.SetReuseFrames()
+
+	if _, err := rf.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if rf.frameCache.dataFrame.data == nil {
+		t.Fatalf("expected dataFrame.data non-nil immediately after ReadFrame")
+	}
+	if _, err := rf.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if rf.frameCache.dataFrame.data != nil {
+		t.Errorf("dataFrame.data not cleared on invalidateLastFrame")
+	}
+	if rf.frameCache.headersFrame.headerFragBuf == nil {
+		t.Fatalf("expected headersFrame.headerFragBuf non-nil immediately after ReadFrame")
+	}
+	if _, err := rf.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if rf.frameCache.headersFrame.headerFragBuf != nil {
+		t.Errorf("headersFrame.headerFragBuf not cleared on invalidateLastFrame")
+	}
+	if _, err := rf.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if rf.frameCache.continuationFrame.headerFragBuf != nil {
+		t.Errorf("continuationFrame.headerFragBuf not cleared on invalidateLastFrame")
+	}
+}
+
+func TestWriteHeaderBlockSliceEmptyEndStream(t *testing.T) {
+	var wire bytes.Buffer
+	wf := NewFramer(&wire, nil)
+	ctx := testWriteContext{framer: wf}
+	wrh := &writeResHeaders{streamID: 7, endStream: true}
+	if err := wrh.writeHeaderBlockSlice(ctx, nil); err != nil {
+		t.Fatalf("writeHeaderBlockSlice: %v", err)
+	}
+	rf := NewFramer(nil, &wire)
+	f, err := rf.ReadFrame()
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	df, ok := f.(*DataFrame)
+	if !ok || df.StreamID != 7 || !df.StreamEnded() || len(df.Data()) != 0 {
+		t.Fatalf("got frame %T %+v, want empty DATA(END_STREAM) on stream 7", f, f)
+	}
+}
+
+type testWriteContext struct{ framer *Framer }
+
+func (c testWriteContext) Framer() *Framer                                { return c.framer }
+func (c testWriteContext) Flush() error                                   { return nil }
+func (c testWriteContext) CloseConn() error                               { return nil }
+func (c testWriteContext) HeaderEncoder() (*hpack.Encoder, *bytes.Buffer) { return nil, nil }
+
+func TestSorterPoolAndWriteQueuePoolBounded(t *testing.T) {
+	// Oversized sorter slice must be dropped instead of retained.
+	big := &sorter{v: make([]string, 1200)}
+	big.v[0] = "secret"
+	putSorter(big)
+	if big.v != nil {
+		t.Errorf("putSorter did not drop oversized slice (cap=1200)")
+	}
+	small := &sorter{v: []string{"a", "b"}}
+	backing := small.v[:2]
+	putSorter(small)
+	if backing[0] != "" || backing[1] != "" {
+		t.Errorf("putSorter did not clear string references: %#v", backing)
+	}
+
+	// writeQueuePool caps freelist length and drops oversized slices.
+	var p writeQueuePool
+	for i := 0; i < 80; i++ {
+		q := &writeQueue{currQueue: make([]FrameWriteRequest, 1, 4)}
+		q.prev = q
+		q.next = q
+		p.put(q)
+	}
+	if len(p) > 64 {
+		t.Errorf("writeQueuePool grew beyond cap 64: len=%d", len(p))
+	}
+	if p[0].prev != nil || p[0].next != nil || len(p[0].currQueue) != 0 {
+		t.Errorf("writeQueuePool did not reset queued item")
+	}
+	bigQ := &writeQueue{currQueue: make([]FrameWriteRequest, 1, 100)}
+	p = p[:0]
+	p.put(bigQ)
+	if len(p) != 1 || p[0].currQueue != nil {
+		t.Errorf("writeQueuePool did not drop oversized currQueue (cap=100): len=%d currQueue=%v", len(p), p[0].currQueue)
+	}
+}

@@ -18,7 +18,10 @@
 
 package http
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // A routingNode is a node in the decision tree.
 // The same struct is used for leaf and interior nodes.
@@ -37,6 +40,155 @@ type routingNode struct {
 	emptyChild *routingNode // optimization: child with key ""
 	namedMulti bool
 	multiLeaf  bool
+
+	// Precomputed exact-path lookup table attached only to method-level nodes
+	// in immutable ServeMux snapshots (cloneSnapshot). Kept behind a single
+	// pointer so interior/leaf routingNodes stay compact.
+	static *staticRoutes
+}
+
+type staticRoutes struct {
+	key     string
+	val     *routingNode
+	m       map[string]*routingNode
+	lenMask uint64 // bit (len & 63) set for each static route length
+	minLen  int
+	maxLen  int
+	only    bool // true if every pattern in this method subtree is in staticRoutes
+}
+
+// cloneSnapshot returns an independent immutable snapshot of the decision tree
+// rooted at root, with per-method O(1) static route tables populated.
+func (root *routingNode) cloneSnapshot() *routingNode {
+	c := root.clone()
+	if c == nil {
+		return nil
+	}
+	populateHostStaticTables(c.emptyChild)
+	c.children.eachPair(func(_ string, hostNode *routingNode) bool {
+		populateHostStaticTables(hostNode)
+		return true
+	})
+	return c
+}
+
+func populateHostStaticTables(hostNode *routingNode) {
+	if hostNode == nil {
+		return
+	}
+	populateMethodStaticTable(hostNode.emptyChild)
+	hostNode.children.eachPair(func(_ string, methodNode *routingNode) bool {
+		populateMethodStaticTable(methodNode)
+		return true
+	})
+}
+
+func populateMethodStaticTable(methodNode *routingNode) {
+	if methodNode == nil {
+		return
+	}
+	var entries []entry[string, *routingNode]
+	allStatic := collectStaticLeaves(methodNode, &entries)
+	if len(entries) == 0 {
+		return
+	}
+	st := &staticRoutes{
+		minLen: len(entries[0].key),
+		maxLen: len(entries[0].key),
+		only:   allStatic,
+	}
+	if len(entries) == 1 {
+		st.key = entries[0].key
+		st.val = entries[0].value
+		st.lenMask = 1 << (uint(len(st.key)) & 63)
+	} else {
+		m := make(map[string]*routingNode, len(entries))
+		for _, e := range entries {
+			l := len(e.key)
+			if l < st.minLen {
+				st.minLen = l
+			}
+			if l > st.maxLen {
+				st.maxLen = l
+			}
+			st.lenMask |= 1 << (uint(l) & 63)
+			m[e.key] = e.value
+		}
+		st.m = m
+	}
+	methodNode.static = st
+}
+
+func collectStaticLeaves(n *routingNode, out *[]entry[string, *routingNode]) (allStatic bool) {
+	if n == nil {
+		return true
+	}
+	allStatic = true
+	if n.pattern != nil {
+		if key, ok := staticPatternPath(n.pattern); ok {
+			*out = append(*out, entry[string, *routingNode]{key: key, value: n})
+		} else {
+			allStatic = false
+		}
+	}
+	if n.emptyChild != nil || n.multiChild != nil {
+		allStatic = false
+	}
+	n.children.eachPair(func(_ string, child *routingNode) bool {
+		if !collectStaticLeaves(child, out) {
+			allStatic = false
+		}
+		return true
+	})
+	return allStatic
+}
+
+func staticPatternPath(p *pattern) (string, bool) {
+	if len(p.segments) == 0 {
+		return "", false
+	}
+	size := 0
+	for i, seg := range p.segments {
+		if seg.wild || seg.multi {
+			return "", false
+		}
+		if seg.s == "/" {
+			if i != len(p.segments)-1 {
+				return "", false
+			}
+			size++
+			continue
+		}
+		if seg.s == "" || strings.IndexByte(seg.s, '/') >= 0 || strings.IndexByte(seg.s, '%') >= 0 {
+			return "", false
+		}
+		size += 1 + len(seg.s)
+	}
+	var b strings.Builder
+	b.Grow(size)
+	for _, seg := range p.segments {
+		if seg.s == "/" {
+			b.WriteByte('/')
+		} else {
+			b.WriteByte('/')
+			b.WriteString(seg.s)
+		}
+	}
+	return b.String(), true
+}
+
+func (st *staticRoutes) lookup(path string) *routingNode {
+	l := len(path)
+	if l < st.minLen || l > st.maxLen || (st.lenMask&(1<<(uint(l)&63))) == 0 {
+		return nil
+	}
+	if st.m != nil {
+		return st.m[path]
+	}
+	if path == st.key {
+		return st.val
+	}
+	return nil
 }
 
 // clone returns an independent immutable snapshot of the subtree rooted at n,
@@ -193,7 +345,7 @@ func (mb *matchBuf) result() []string {
 // For example, if the request path is "/a/b/c" and the pattern is "/{x}/b/{y}",
 // then the second return value will be []string{"a", "c"}.
 func (root *routingNode) match(host, method, path string) (*routingNode, []string) {
-	if host != "" {
+	if host != "" && (len(root.children.s) > 0 || root.children.m != nil) {
 		// There is a host. If there is a pattern that specifies that host and it
 		// matches, we are done. If the pattern doesn't match, fall through to
 		// try patterns with no host.
@@ -209,7 +361,7 @@ func (root *routingNode) match(host, method, path string) (*routingNode, []strin
 // matchTrailingSlash is like match, but matches as if path had a trailing slash.
 // It avoids allocating path + "/" when checking for trailing slash redirection.
 func (root *routingNode) matchTrailingSlash(host, method, path string) *routingNode {
-	if host != "" {
+	if host != "" && (len(root.children.s) > 0 || root.children.m != nil) {
 		if c := root.findChild(host); c != nil {
 			if l := c.matchMethodAndPathTrailingSlash(method, path); l != nil {
 				return l
@@ -284,30 +436,98 @@ func (n *routingNode) matchMethodAndPath(method, path string) (*routingNode, []s
 	if n == nil {
 		return nil, nil
 	}
-	var mb matchBuf
 	if len(n.children.s) > 0 || n.children.m != nil {
 		if c := n.findChild(method); c != nil {
+			if st := c.static; st != nil {
+				if l := st.lookup(path); l != nil {
+					return l, nil
+				}
+				if !st.only || strings.IndexByte(path, '%') >= 0 {
+					return n.matchMethodAndPathTree(method, path, c)
+				}
+			} else {
+				return n.matchMethodAndPathTree(method, path, c)
+			}
+		}
+		if method == "HEAD" {
+			if c := n.findChild("GET"); c != nil {
+				if st := c.static; st != nil {
+					if l := st.lookup(path); l != nil {
+						return l, nil
+					}
+					if !st.only || strings.IndexByte(path, '%') >= 0 {
+						return n.matchMethodAndPathTree(method, path, nil)
+					}
+				} else {
+					return n.matchMethodAndPathTree(method, path, nil)
+				}
+			}
+		}
+	}
+	// No exact method match; try patterns with no method.
+	ec := n.emptyChild
+	if ec == nil {
+		return nil, nil
+	}
+	if st := ec.static; st != nil {
+		if l := st.lookup(path); l != nil {
+			return l, nil
+		}
+		if st.only && strings.IndexByte(path, '%') < 0 {
+			return nil, nil
+		}
+	}
+	return matchPathWithBuf(ec, path)
+}
+
+func matchPathWithBuf(n *routingNode, path string) (*routingNode, []string) {
+	var mb matchBuf
+	if l := n.matchPath(path, &mb); l != nil {
+		return l, mb.result()
+	}
+	return nil, nil
+}
+
+func (n *routingNode) matchMethodAndPathTree(method, path string, methodChild *routingNode) (*routingNode, []string) {
+	var mb matchBuf
+	if methodChild != nil {
+		if l := methodChild.matchPath(path, &mb); l != nil {
+			return l, mb.result()
+		}
+		mb.rollback(0)
+	}
+	if method == "HEAD" {
+		// GET matches HEAD too.
+		if c := n.findChild("GET"); c != nil {
+			if st := c.static; st != nil {
+				if l := st.lookup(path); l != nil {
+					return l, nil
+				}
+				if st.only && strings.IndexByte(path, '%') < 0 {
+					goto tryEmpty
+				}
+			}
 			if l := c.matchPath(path, &mb); l != nil {
-				// Exact match of method name.
 				return l, mb.result()
 			}
 			mb.rollback(0)
 		}
-		if method == "HEAD" {
-			// GET matches HEAD too.
-			if c := n.findChild("GET"); c != nil {
-				if l := c.matchPath(path, &mb); l != nil {
-					return l, mb.result()
-				}
-				mb.rollback(0)
-			}
-		}
 	}
+tryEmpty:
 	// No exact match; try patterns with no method.
-	if n.emptyChild == nil {
+	ec := n.emptyChild
+	if ec == nil {
 		return nil, nil
 	}
-	if l := n.emptyChild.matchPath(path, &mb); l != nil {
+	if st := ec.static; st != nil {
+		if l := st.lookup(path); l != nil {
+			return l, nil
+		}
+		if st.only && strings.IndexByte(path, '%') < 0 {
+			return nil, nil
+		}
+	}
+	if l := ec.matchPath(path, &mb); l != nil {
 		return l, mb.result()
 	}
 	return nil, nil
@@ -315,7 +535,8 @@ func (n *routingNode) matchMethodAndPath(method, path string) (*routingNode, []s
 
 // matchPath matches a path.
 // Its return values are the same as [routingNode.match].
-// matchPath calls itself recursively. Matched wildcard values are recorded into mb.
+// matchPath calls itself recursively when backtracking is possible.
+// Matched wildcard values are recorded into mb.
 func (n *routingNode) matchPath(path string, mb *matchBuf) *routingNode {
 	if n == nil {
 		return nil

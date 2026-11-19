@@ -458,3 +458,183 @@ func BenchmarkChunkedWriter(b *testing.B) {
 	})
 }
 
+func TestChunkedReaderFastPathEdgeCases(t *testing.T) {
+	t.Run("ValidCases", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+			want string
+		}{
+			{"uppercase-hex", "A\r\n0123456789\r\n0\r\n", "0123456789"},
+			{"mixed-hex", "000a\r\n0123456789\r\n0f\r\nabcdefghijklmno\r\n0\r\n", "0123456789abcdefghijklmno"},
+			{"ows-before-crlf", "5 \t \r\nhello\r\n0\t \r\n", "hello"},
+			{"extension-after-hex", "5;foo=bar\r\nhello\r\n0;last=1\r\n", "hello"},
+			{"empty-body", "0\r\n", ""},
+			{"many-small-chunks", strings.Repeat("1\r\nx\r\n", 128) + "0\r\n", strings.Repeat("x", 128)},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				// Test with default bufio.Reader and tiny split reads (1-byte, 3-byte).
+				for _, step := range []int{0, 1, 3, 5} {
+					var src io.Reader = strings.NewReader(tc.in)
+					if step > 0 {
+						s := tc.in
+						src = &funcReader{f: func(i int) ([]byte, error) {
+							off := i * step
+							if off >= len(s) {
+								return nil, io.EOF
+							}
+							end := off + step
+							if end > len(s) {
+								end = len(s)
+							}
+							return []byte(s[off:end]), nil
+						}}
+					}
+					got, err := io.ReadAll(NewChunkedReader(src))
+					if err != nil {
+						t.Fatalf("step=%d: ReadAll error: %v", step, err)
+					}
+					if string(got) != tc.want {
+						t.Fatalf("step=%d: got %q, want %q", step, got, tc.want)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("InvalidAndSmugglingCases", func(t *testing.T) {
+		cases := []struct {
+			name string
+			in   string
+		}{
+			{"empty-hex", "\r\n0\r\n"},
+			{"invalid-hex-char", "1g\r\na\r\n0\r\n"},
+			{"hex-overflow", "10000000000000000\r\na\r\n0\r\n"},
+			{"bare-lf-size", "5\nhello\r\n0\r\n"},
+			{"bare-lf-data", "5\r\nhello\n0\r\n"},
+			{"bad-trailing-crlf", "5\r\nhello\rX0\r\n"},
+			{"space-before-hex", " 5\r\nhello\r\n0\r\n"},
+			{"cr-without-lf-in-size", "5\rhello\r\n0\r\n"},
+			{"truncated-crlf", "5\r\nhello\r"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if _, err := io.ReadAll(NewChunkedReader(strings.NewReader(tc.in))); err == nil {
+					t.Fatalf("expected error for %q, got nil", tc.in)
+				}
+			})
+		}
+	})
+}
+
+type plainDiscardWriter struct{}
+
+func (plainDiscardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestChunkedWriterNearFullAndNonStringWriterAllocs(t *testing.T) {
+	// Exercise bufio.Writer with remaining capacity sweeping across the 18-byte guard.
+	payload := []byte("0123456789abcdef")
+	for bufSize := 16; bufSize <= 64; bufSize++ {
+		var dst bytes.Buffer
+		bw := bufio.NewWriterSize(&dst, bufSize)
+		cw := NewChunkedWriter(bw)
+		for i := 0; i < 4; i++ {
+			if _, err := cw.Write(payload); err != nil {
+				t.Fatalf("bufSize=%d write %d: %v", bufSize, i, err)
+			}
+		}
+		if err := cw.Close(); err != nil {
+			t.Fatalf("bufSize=%d close: %v", bufSize, err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("bufSize=%d flush: %v", bufSize, err)
+		}
+		got, err := io.ReadAll(NewChunkedReader(&dst))
+		if err != nil {
+			t.Fatalf("bufSize=%d readback: %v", bufSize, err)
+		}
+		if want := bytes.Repeat(payload, 4); !bytes.Equal(got, want) {
+			t.Fatalf("bufSize=%d got %q, want %q", bufSize, got, want)
+		}
+	}
+
+	if testing.Short() {
+		return
+	}
+
+	// bufio.Writer near full (Available < 18) must not heap-allocate in AvailableBuffer.
+	bw := bufio.NewWriterSize(plainDiscardWriter{}, 32)
+	cw := NewChunkedWriter(bw)
+	large := bytes.Repeat([]byte("a"), 20)
+	if mallocs := testing.AllocsPerRun(100, func() {
+		bw.Reset(plainDiscardWriter{})
+		_, _ = bw.Write(large) // 12 bytes available (< 18)
+		if _, err := cw.Write(large); err != nil {
+			t.Fatal(err)
+		}
+		if err := cw.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}); mallocs != 0 {
+		t.Errorf("near-full bufio Write+Close mallocs = %v; want 0", mallocs)
+	}
+
+	// Non-io.StringWriter must allocate 0 bytes on Write and Close.
+	cwPlain := NewChunkedWriter(plainDiscardWriter{})
+	if mallocs := testing.AllocsPerRun(100, func() {
+		if _, err := cwPlain.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := cwPlain.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}); mallocs != 0 {
+		t.Errorf("plain io.Writer Write+Close mallocs = %v; want 0", mallocs)
+	}
+}
+
+func BenchmarkChunkedReader(b *testing.B) {
+	makeInput := func(chunkSize, count int) []byte {
+		var buf bytes.Buffer
+		cw := NewChunkedWriter(&buf)
+		chunk := bytes.Repeat([]byte("a"), chunkSize)
+		for i := 0; i < count; i++ {
+			_, _ = cw.Write(chunk)
+		}
+		_ = cw.Close()
+		return buf.Bytes()
+	}
+
+	for _, tc := range []struct {
+		name      string
+		chunkSize int
+		count     int
+	}{
+		{"SmallChunks32Bx64", 32, 64},
+		{"MediumChunks4Kx16", 4096, 16},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			raw := makeInput(tc.chunkSize, tc.count)
+			br := bytes.NewReader(raw)
+			bufr := bufio.NewReaderSize(br, 64*1024)
+			dst := make([]byte, 4096)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				br.Reset(raw)
+				bufr.Reset(br)
+				cr := NewChunkedReader(bufr)
+				for {
+					_, err := cr.Read(dst)
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}

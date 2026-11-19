@@ -485,9 +485,16 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 			}
 			return len(p), nil
 		}
-		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(p)), 16)
-		b = append(b, '\r', '\n')
-		_, err = bw.Write(b)
+		if bw.Available() >= 18 {
+			b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(p)), 16)
+			b = append(b, '\r', '\n')
+			_, err = bw.Write(b)
+		} else {
+			var buf [20]byte
+			b := strconv.AppendUint(buf[:0], uint64(len(p)), 16)
+			b = append(b, '\r', '\n')
+			_, err = bw.Write(b)
+		}
 		if err != nil {
 			cw.res.conn.rwc.Close()
 			return
@@ -516,14 +523,16 @@ func (cw *chunkWriter) close() {
 	}
 	if cw.chunking {
 		bw := cw.res.conn.bufw // conn's bufio writer
-		// zero chunk to mark EOF
-		bw.WriteString("0\r\n")
 		if trailers := cw.res.finalTrailers(); trailers != nil {
+			// zero chunk to mark EOF
+			bw.WriteString("0\r\n")
 			trailers.Write(bw) // the writer handles noting errors
+			// final blank line after the trailers
+			bw.WriteString("\r\n")
+		} else {
+			// zero chunk + final blank line when there are no trailers
+			bw.WriteString("0\r\n\r\n")
 		}
-		// final blank line after the trailers (whether
-		// present or not)
-		bw.WriteString("\r\n")
 	}
 }
 
@@ -636,6 +645,9 @@ const TrailerPrefix = "Trailer:"
 // finalTrailers is called after the Handler exits and returns a non-nil
 // value if the Handler set any trailers.
 func (w *response) finalTrailers() Header {
+	if len(w.trailers) == 0 && len(w.handlerHeader) == 0 {
+		return nil
+	}
 	var t Header
 	for k, vv := range w.handlerHeader {
 		if kk, found := strings.CutPrefix(k, TrailerPrefix); found {
@@ -3964,7 +3976,7 @@ func (mux *ServeMux) maybeBuildSnap() {
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
 	if mux.snap.Load() == nil && mux.snapReads.Load() >= 4 {
-		mux.snap.Store(mux.tree.clone())
+		mux.snap.Store(mux.tree.cloneSnapshot())
 	}
 }
 

@@ -464,16 +464,22 @@ func (r *Request) copyNonContextFieldsTo(dst *Request) {
 	dst.matches = r.matches
 }
 
+// shallowCopyTo copies r into dst, safely preserving r's context without
+// racing on lazy server context fields.
+func (r *Request) shallowCopyTo(dst *Request) {
+	r.copyNonContextFieldsTo(dst)
+	if atomic.LoadUint32(&r.ctxState) != 0 {
+		dst.ctx = r.Context()
+	} else {
+		dst.ctx = r.ctx
+	}
+}
+
 // shallowCopy returns a shallow copy of r that safely preserves r's context
 // without racing on lazy server context fields.
 func (r *Request) shallowCopy() *Request {
 	r2 := new(Request)
-	r.copyNonContextFieldsTo(r2)
-	if atomic.LoadUint32(&r.ctxState) != 0 {
-		r2.ctx = r.Context()
-	} else {
-		r2.ctx = r.ctx
-	}
+	r.shallowCopyTo(r2)
 	return r2
 }
 
@@ -508,10 +514,22 @@ func (r *Request) Clone(ctx context.Context) *Request {
 	if ctx == nil {
 		panic("nil context")
 	}
-	r2 := new(Request)
-	r.copyNonContextFieldsTo(r2)
+	var r2 *Request
+	if r.URL != nil {
+		ru := new(requestWithURL)
+		r2 = &ru.req
+		r.copyNonContextFieldsTo(r2)
+		ru.url = *r.URL
+		if r.URL.User != nil {
+			u2 := *r.URL.User
+			ru.url.User = &u2
+		}
+		r2.URL = &ru.url
+	} else {
+		r2 = new(Request)
+		r.copyNonContextFieldsTo(r2)
+	}
 	r2.ctx = ctx
-	r2.URL = cloneURL(r.URL)
 	r2.Header = r.Header.Clone()
 	r2.Trailer = r.Trailer.Clone()
 	if s := r.TransferEncoding; s != nil {

@@ -253,16 +253,30 @@ func (q *writeQueue) consume(n int32) (FrameWriteRequest, bool) {
 
 type writeQueuePool []*writeQueue
 
+const (
+	maxWriteQueuePoolSize = 64
+	maxWriteQueueSliceCap = 64
+)
+
 // put inserts an unused writeQueue into the pool.
 func (p *writeQueuePool) put(q *writeQueue) {
-	for i := range q.currQueue {
-		q.currQueue[i] = FrameWriteRequest{}
+	q.prev = nil
+	q.next = nil
+	if len(*p) >= maxWriteQueuePoolSize {
+		return
 	}
-	for i := range q.nextQueue {
-		q.nextQueue[i] = FrameWriteRequest{}
+	if cap(q.currQueue) > maxWriteQueueSliceCap {
+		q.currQueue = nil
+	} else {
+		clear(q.currQueue)
+		q.currQueue = q.currQueue[:0]
 	}
-	q.currQueue = q.currQueue[:0]
-	q.nextQueue = q.nextQueue[:0]
+	if cap(q.nextQueue) > maxWriteQueueSliceCap {
+		q.nextQueue = nil
+	} else {
+		clear(q.nextQueue)
+		q.nextQueue = q.nextQueue[:0]
+	}
 	q.currPos = 0
 	*p = append(*p, q)
 }

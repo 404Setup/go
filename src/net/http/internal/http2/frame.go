@@ -374,6 +374,10 @@ type Framer struct {
 	metaSawRegular bool
 	metaInvalid    error
 	metaEmitFunc   func(hpack.HeaderField)
+
+	// smallFrameBuf holds small fixed-size control frames and direct frame headers
+	// without heap allocation or writeBufPool traffic.
+	smallFrameBuf [frameHeaderLen + 8]byte
 }
 
 type headerBudget struct {
@@ -428,6 +432,14 @@ func (f *Framer) startWrite(ftype FrameType, flags Flags, streamID uint32) {
 		byte(streamID))
 }
 
+func (f *Framer) writeSmallFrame(n int) error {
+	nw, err := f.w.Write(f.smallFrameBuf[:n])
+	if err == nil && nw != n {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
 // writeFrameDirect writes a frame header and payload directly into a buffered
 // writer when the entire frame fits in its available buffer space, avoiding
 // copying through f.wbuf and writeBufPool. Because it only succeeds when
@@ -463,18 +475,16 @@ func (f *Framer) writeFrameDirect(ftype FrameType, flags Flags, streamID uint32,
 	default:
 		return false, nil
 	}
-	hdr := [frameHeaderLen]byte{
-		byte(len(payload) >> 16),
-		byte(len(payload) >> 8),
-		byte(len(payload)),
-		byte(ftype),
-		byte(flags),
-		byte(streamID >> 24),
-		byte(streamID >> 16),
-		byte(streamID >> 8),
-		byte(streamID),
-	}
-	if _, err := bw.Write(hdr[:]); err != nil {
+	f.smallFrameBuf[0] = byte(len(payload) >> 16)
+	f.smallFrameBuf[1] = byte(len(payload) >> 8)
+	f.smallFrameBuf[2] = byte(len(payload))
+	f.smallFrameBuf[3] = byte(ftype)
+	f.smallFrameBuf[4] = byte(flags)
+	f.smallFrameBuf[5] = byte(streamID >> 24)
+	f.smallFrameBuf[6] = byte(streamID >> 16)
+	f.smallFrameBuf[7] = byte(streamID >> 8)
+	f.smallFrameBuf[8] = byte(streamID)
+	if _, err := bw.Write(f.smallFrameBuf[:frameHeaderLen]); err != nil {
 		if bwriter != nil {
 			bwriter.werr = err
 		}
@@ -726,12 +736,17 @@ func (fr *Framer) invalidateLastFrame() {
 		fr.lastFrame.invalidate()
 		fr.lastFrame = nil
 	}
-	if fr.frameCache != nil && fr.metaMH == nil {
-		if len(fr.frameCache.metaFields) > 0 {
-			clear(fr.frameCache.metaFields)
-			fr.frameCache.metaFields = fr.frameCache.metaFields[:0]
+	if fr.frameCache != nil {
+		fr.frameCache.dataFrame.data = nil
+		fr.frameCache.continuationFrame.headerFragBuf = nil
+		if fr.metaMH == nil {
+			fr.frameCache.headersFrame.headerFragBuf = nil
+			if len(fr.frameCache.metaFields) > 0 {
+				clear(fr.frameCache.metaFields)
+				fr.frameCache.metaFields = fr.frameCache.metaFields[:0]
+			}
+			fr.frameCache.metaHeadersFrame.Fields = nil
 		}
-		fr.frameCache.metaHeadersFrame.Fields = nil
 	}
 }
 
@@ -1176,6 +1191,18 @@ func (f *Framer) WriteSettings(settings ...Setting) error {
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WriteSettingsAck() error {
+	if !f.logWrites {
+		f.smallFrameBuf[0] = 0
+		f.smallFrameBuf[1] = 0
+		f.smallFrameBuf[2] = 0
+		f.smallFrameBuf[3] = byte(FrameSettings)
+		f.smallFrameBuf[4] = byte(FlagSettingsAck)
+		f.smallFrameBuf[5] = 0
+		f.smallFrameBuf[6] = 0
+		f.smallFrameBuf[7] = 0
+		f.smallFrameBuf[8] = 0
+		return f.writeSmallFrame(frameHeaderLen)
+	}
 	f.startWrite(FrameSettings, FlagSettingsAck, 0)
 	return f.endWrite()
 }
@@ -1210,6 +1237,19 @@ func (f *Framer) WritePing(ack bool, data [8]byte) error {
 	var flags Flags
 	if ack {
 		flags = FlagPingAck
+	}
+	if !f.logWrites {
+		f.smallFrameBuf[0] = 0
+		f.smallFrameBuf[1] = 0
+		f.smallFrameBuf[2] = 8
+		f.smallFrameBuf[3] = byte(FramePing)
+		f.smallFrameBuf[4] = byte(flags)
+		f.smallFrameBuf[5] = 0
+		f.smallFrameBuf[6] = 0
+		f.smallFrameBuf[7] = 0
+		f.smallFrameBuf[8] = 0
+		copy(f.smallFrameBuf[9:17], data[:])
+		return f.writeSmallFrame(frameHeaderLen + 8)
 	}
 	f.startWrite(FramePing, flags, 0)
 	f.writeBytes(data[:])
@@ -1321,6 +1361,22 @@ func (f *Framer) WriteWindowUpdate(streamID, incr uint32) error {
 	// "The legal range for the increment to the flow control window is 1 to 2^31-1 (2,147,483,647) octets."
 	if (incr < 1 || incr > 2147483647) && !f.AllowIllegalWrites {
 		return errors.New("illegal window increment value")
+	}
+	if !f.logWrites {
+		f.smallFrameBuf[0] = 0
+		f.smallFrameBuf[1] = 0
+		f.smallFrameBuf[2] = 4
+		f.smallFrameBuf[3] = byte(FrameWindowUpdate)
+		f.smallFrameBuf[4] = 0
+		f.smallFrameBuf[5] = byte(streamID >> 24)
+		f.smallFrameBuf[6] = byte(streamID >> 16)
+		f.smallFrameBuf[7] = byte(streamID >> 8)
+		f.smallFrameBuf[8] = byte(streamID)
+		f.smallFrameBuf[9] = byte(incr >> 24)
+		f.smallFrameBuf[10] = byte(incr >> 16)
+		f.smallFrameBuf[11] = byte(incr >> 8)
+		f.smallFrameBuf[12] = byte(incr)
+		return f.writeSmallFrame(frameHeaderLen + 4)
 	}
 	f.startWrite(FrameWindowUpdate, 0, streamID)
 	f.writeUint32(incr)
@@ -1691,6 +1747,23 @@ func parseRSTStreamFrame(fc *frameCache, fh FrameHeader, countError func(string)
 func (f *Framer) WriteRSTStream(streamID uint32, code ErrCode) error {
 	if !validStreamID(streamID) && !f.AllowIllegalWrites {
 		return errStreamID
+	}
+	if !f.logWrites {
+		f.smallFrameBuf[0] = 0
+		f.smallFrameBuf[1] = 0
+		f.smallFrameBuf[2] = 4
+		f.smallFrameBuf[3] = byte(FrameRSTStream)
+		f.smallFrameBuf[4] = 0
+		f.smallFrameBuf[5] = byte(streamID >> 24)
+		f.smallFrameBuf[6] = byte(streamID >> 16)
+		f.smallFrameBuf[7] = byte(streamID >> 8)
+		f.smallFrameBuf[8] = byte(streamID)
+		c := uint32(code)
+		f.smallFrameBuf[9] = byte(c >> 24)
+		f.smallFrameBuf[10] = byte(c >> 16)
+		f.smallFrameBuf[11] = byte(c >> 8)
+		f.smallFrameBuf[12] = byte(c)
+		return f.writeSmallFrame(frameHeaderLen + 4)
 	}
 	f.startWrite(FrameRSTStream, 0, streamID)
 	f.writeUint32(uint32(code))

@@ -8,8 +8,8 @@ package http
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
-	"fmt"
 	"internal/godebug"
 	"io"
 	"io/fs"
@@ -23,7 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -148,10 +148,20 @@ func dirList(w ResponseWriter, r *Request, f File) {
 	if d, ok := f.(fs.ReadDirFile); ok {
 		var list dirEntryDirs
 		list, err = d.ReadDir(-1)
+		if err == nil {
+			slices.SortFunc(list, func(a, b fs.DirEntry) int {
+				return cmp.Compare(a.Name(), b.Name())
+			})
+		}
 		dirs = list
 	} else {
 		var list fileInfoDirs
 		list, err = f.Readdir(-1)
+		if err == nil {
+			slices.SortFunc(list, func(a, b fs.FileInfo) int {
+				return cmp.Compare(a.Name(), b.Name())
+			})
+		}
 		dirs = list
 	}
 
@@ -160,14 +170,13 @@ func dirList(w ResponseWriter, r *Request, f File) {
 		Error(w, "Error reading directory", StatusInternalServerError)
 		return
 	}
-	sort.Slice(dirs, func(i, j int) bool { return dirs.name(i) < dirs.name(j) })
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, "<!doctype html>\n")
-	fmt.Fprintf(w, "<meta name=\"viewport\" content=\"width=device-width\">\n")
-	fmt.Fprintf(w, "<meta name=\"color-scheme\" content=\"light dark\">\n")
-	fmt.Fprintf(w, "<pre>\n")
-	for i, n := 0, dirs.len(); i < n; i++ {
+	var buf bytes.Buffer
+	n := dirs.len()
+	buf.Grow(min(160+n*48, 8192))
+	buf.WriteString("<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<meta name=\"color-scheme\" content=\"light dark\">\n<pre>\n")
+	for i := 0; i < n; i++ {
 		name := dirs.name(i)
 		if dirs.isDir(i) {
 			name += "/"
@@ -175,10 +184,19 @@ func dirList(w ResponseWriter, r *Request, f File) {
 		// name may contain '?' or '#', which must be escaped to remain
 		// part of the URL path, and not indicate the start of a query
 		// string or fragment.
-		url := url.URL{Path: name}
-		fmt.Fprintf(w, "<a href=\"%s\">%s</a>\n", url.String(), htmlReplacer.Replace(name))
+		u := url.URL{Path: name}
+		buf.WriteString("<a href=\"")
+		buf.WriteString(u.String())
+		buf.WriteString("\">")
+		htmlReplacer.WriteString(&buf, name)
+		buf.WriteString("</a>\n")
+		if buf.Len() >= 4096 {
+			w.Write(buf.Bytes())
+			buf.Reset()
+		}
 	}
-	fmt.Fprintf(w, "</pre>\n")
+	buf.WriteString("</pre>\n")
+	w.Write(buf.Bytes())
 }
 
 // GODEBUG=httpservecontentkeepheaders=1 restores the pre-1.23 behavior of not deleting

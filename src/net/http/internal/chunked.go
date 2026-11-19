@@ -45,9 +45,55 @@ type chunkedReader struct {
 
 func (cr *chunkedReader) beginChunk() {
 	// chunk-size CRLF
-	var line []byte
-	line, cr.err = readChunkLine(cr.r)
-	if cr.err != nil {
+	p, err := cr.r.ReadSlice('\n')
+	if err != nil {
+		// We always know when EOF is coming.
+		// If the caller asked for a line, there should be a line.
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		} else if err == bufio.ErrBufferFull {
+			err = ErrLineTooLong
+		}
+		cr.err = err
+		return
+	}
+	// Fast path: 1..16 hex digits followed immediately by "\r\n" (no extensions, OWS, or bare CR).
+	if len(p) >= 3 && len(p) <= 18 && p[len(p)-2] == '\r' {
+		var n uint64
+		hexOK := true
+		for _, b := range p[:len(p)-2] {
+			switch {
+			case '0' <= b && b <= '9':
+				n = (n << 4) | uint64(b-'0')
+			case 'a' <= b && b <= 'f':
+				n = (n << 4) | uint64(b-'a'+10)
+			case 'A' <= b && b <= 'F':
+				n = (n << 4) | uint64(b-'A'+10)
+			default:
+				hexOK = false
+			}
+			if !hexOK {
+				break
+			}
+		}
+		if hexOK {
+			cr.excess += int64(len(p)) // header line + \r\n (plus \r\n after chunk data matches len(line)+2)
+			cr.n = n
+			cr.excess -= 16 + (2 * int64(cr.n))
+			cr.excess = max(cr.excess, 0)
+			if cr.excess > 16*1024 {
+				cr.err = errors.New("chunked encoding contains too much non-data")
+			}
+			if cr.n == 0 {
+				cr.err = io.EOF
+			}
+			return
+		}
+	}
+
+	line, err := validateChunkLine(p)
+	if err != nil {
+		cr.err = err
 		return
 	}
 	cr.excess += int64(len(line)) + 2 // header, plus \r\n after the chunk data
@@ -97,24 +143,34 @@ func (cr *chunkedReader) chunkHeaderAvailable() bool {
 func (cr *chunkedReader) Read(b []uint8) (n int, err error) {
 	for cr.err == nil {
 		if cr.checkEnd {
-			if n > 0 && cr.r.Buffered() < 2 {
-				// We have some data. Return early (per the io.Reader
-				// contract) instead of potentially blocking while
-				// reading more.
-				break
-			}
-			if _, cr.err = io.ReadFull(cr.r, cr.buf[:2]); cr.err == nil {
-				if string(cr.buf[:]) != "\r\n" {
+			if cr.r.Buffered() >= 2 {
+				peek, _ := cr.r.Peek(2)
+				cr.r.Discard(2)
+				if peek[0] != '\r' || peek[1] != '\n' {
 					cr.err = errors.New("malformed chunked encoding")
 					break
 				}
+				cr.checkEnd = false
 			} else {
-				if cr.err == io.EOF {
-					cr.err = io.ErrUnexpectedEOF
+				if n > 0 {
+					// We have some data. Return early (per the io.Reader
+					// contract) instead of potentially blocking while
+					// reading more.
+					break
 				}
-				break
+				if _, cr.err = io.ReadFull(cr.r, cr.buf[:2]); cr.err == nil {
+					if cr.buf[0] != '\r' || cr.buf[1] != '\n' {
+						cr.err = errors.New("malformed chunked encoding")
+						break
+					}
+				} else {
+					if cr.err == io.EOF {
+						cr.err = io.ErrUnexpectedEOF
+					}
+					break
+				}
+				cr.checkEnd = false
 			}
-			cr.checkEnd = false
 		}
 		if cr.n == 0 {
 			if n > 0 && !cr.chunkHeaderAvailable() {
@@ -148,23 +204,8 @@ func (cr *chunkedReader) Read(b []uint8) (n int, err error) {
 	return n, cr.err
 }
 
-// Read a line of bytes (up to \n) from b.
-// Give up if the line exceeds maxLineLength.
-// The returned bytes are owned by the bufio.Reader
-// so they are only valid until the next bufio read.
-func readChunkLine(b *bufio.Reader) ([]byte, error) {
-	p, err := b.ReadSlice('\n')
-	if err != nil {
-		// We always know when EOF is coming.
-		// If the caller asked for a line, there should be a line.
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		} else if err == bufio.ErrBufferFull {
-			err = ErrLineTooLong
-		}
-		return nil, err
-	}
-
+// validateChunkLine validates a line of bytes (ending in \n) returned by ReadSlice.
+func validateChunkLine(p []byte) ([]byte, error) {
 	// RFC 9112 permits parsers to accept a bare \n as a line ending in headers,
 	// but not in chunked encoding lines. See https://www.rfc-editor.org/errata/eid7633,
 	// which explicitly rejects a clarification permitting \n as a chunk terminator.
@@ -269,7 +310,7 @@ func (cw *chunkedWriter) Write(data []byte) (n int, err error) {
 		return n, err
 	}
 
-	if bw != nil {
+	if bw != nil && bw.Available() >= 18 {
 		b := strconv.AppendUint(bw.AvailableBuffer(), uint64(len(data)), 16)
 		b = append(b, '\r', '\n')
 		_, err = bw.Write(b)
@@ -288,7 +329,7 @@ func (cw *chunkedWriter) Write(data []byte) (n int, err error) {
 		err = io.ErrShortWrite
 		return
 	}
-	if _, err = io.WriteString(cw.Wire, "\r\n"); err != nil {
+	if _, err = cw.Wire.Write(chunkCRLF); err != nil {
 		return
 	}
 	if flushAfter != nil {
@@ -297,8 +338,13 @@ func (cw *chunkedWriter) Write(data []byte) (n int, err error) {
 	return
 }
 
+var (
+	chunkCRLF = []byte("\r\n")
+	chunkZero = []byte("0\r\n")
+)
+
 func (cw *chunkedWriter) Close() error {
-	_, err := io.WriteString(cw.Wire, "0\r\n")
+	_, err := cw.Wire.Write(chunkZero)
 	return err
 }
 
