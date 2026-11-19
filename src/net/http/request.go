@@ -434,6 +434,49 @@ func (r *Request) Context() context.Context {
 	return context.Background()
 }
 
+// copyNonContextFieldsTo copies all fields of r except ctx, ctxState, and
+// cancelCtx into dst. This avoids data races when r uses a lazy server request
+// context that may be materialized or canceled concurrently.
+func (r *Request) copyNonContextFieldsTo(dst *Request) {
+	dst.Method = r.Method
+	dst.URL = r.URL
+	dst.Proto = r.Proto
+	dst.ProtoMajor = r.ProtoMajor
+	dst.ProtoMinor = r.ProtoMinor
+	dst.Header = r.Header
+	dst.Body = r.Body
+	dst.GetBody = r.GetBody
+	dst.ContentLength = r.ContentLength
+	dst.TransferEncoding = r.TransferEncoding
+	dst.Close = r.Close
+	dst.Host = r.Host
+	dst.Form = r.Form
+	dst.PostForm = r.PostForm
+	dst.MultipartForm = r.MultipartForm
+	dst.Trailer = r.Trailer
+	dst.RemoteAddr = r.RemoteAddr
+	dst.RequestURI = r.RequestURI
+	dst.TLS = r.TLS
+	dst.Cancel = r.Cancel
+	dst.Response = r.Response
+	dst.Pattern = r.Pattern
+	dst.pat = r.pat
+	dst.matches = r.matches
+}
+
+// shallowCopy returns a shallow copy of r that safely preserves r's context
+// without racing on lazy server context fields.
+func (r *Request) shallowCopy() *Request {
+	r2 := new(Request)
+	r.copyNonContextFieldsTo(r2)
+	if atomic.LoadUint32(&r.ctxState) != 0 {
+		r2.ctx = r.Context()
+	} else {
+		r2.ctx = r.ctx
+	}
+	return r2
+}
+
 // WithContext returns a shallow copy of r with its context changed
 // to ctx. The provided ctx must be non-nil.
 //
@@ -448,10 +491,8 @@ func (r *Request) WithContext(ctx context.Context) *Request {
 		panic("nil context")
 	}
 	r2 := new(Request)
-	*r2 = *r
+	r.copyNonContextFieldsTo(r2)
 	r2.ctx = ctx
-	r2.ctxState = 0
-	r2.cancelCtx = nil
 	return r2
 }
 
@@ -468,10 +509,8 @@ func (r *Request) Clone(ctx context.Context) *Request {
 		panic("nil context")
 	}
 	r2 := new(Request)
-	*r2 = *r
+	r.copyNonContextFieldsTo(r2)
 	r2.ctx = ctx
-	r2.ctxState = 0
-	r2.cancelCtx = nil
 	r2.URL = cloneURL(r.URL)
 	r2.Header = r.Header.Clone()
 	r2.Trailer = r.Trailer.Clone()

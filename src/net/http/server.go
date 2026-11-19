@@ -328,9 +328,10 @@ type conn struct {
 	// by a Handler with the Hijacker interface.
 	hijackedv atomic.Bool
 
-	// readDeadlineSet and writeDeadlineSet track whether a non-zero
-	// deadline may be active on rwc so keep-alive loops can skip redundant
-	// SetReadDeadline(zero) / SetWriteDeadline(zero) calls.
+	// deadlineMu serializes deadline updates on rwc with readDeadlineSet and
+	// writeDeadlineSet so concurrent ResponseController calls and keep-alive
+	// clears cannot leave a stale deadline active.
+	deadlineMu       sync.Mutex
 	readDeadlineSet  atomic.Bool
 	writeDeadlineSet atomic.Bool
 
@@ -351,27 +352,47 @@ func (c *conn) hijacked() bool {
 }
 
 func (c *conn) setReadDeadline(d time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if !d.IsZero() {
+		c.readDeadlineSet.Store(true)
+	}
 	err := c.rwc.SetReadDeadline(d)
-	c.readDeadlineSet.Store(!d.IsZero() || err != nil)
+	if d.IsZero() && err == nil {
+		c.readDeadlineSet.Store(false)
+	} else if err != nil {
+		c.readDeadlineSet.Store(true)
+	}
 	return err
 }
 
 func (c *conn) clearReadDeadline() {
-	if c.readDeadlineSet.Load() {
-		c.setReadDeadline(time.Time{})
+	if !c.readDeadlineSet.Load() && (c.server == nil || c.server.ConnState == nil) {
+		return
 	}
+	c.setReadDeadline(time.Time{})
 }
 
 func (c *conn) setWriteDeadline(d time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if !d.IsZero() {
+		c.writeDeadlineSet.Store(true)
+	}
 	err := c.rwc.SetWriteDeadline(d)
-	c.writeDeadlineSet.Store(!d.IsZero() || err != nil)
+	if d.IsZero() && err == nil {
+		c.writeDeadlineSet.Store(false)
+	} else if err != nil {
+		c.writeDeadlineSet.Store(true)
+	}
 	return err
 }
 
 func (c *conn) clearWriteDeadline() {
-	if c.writeDeadlineSet.Load() {
-		c.setWriteDeadline(time.Time{})
+	if !c.writeDeadlineSet.Load() && (c.server == nil || c.server.ConnState == nil) {
+		return
 	}
+	c.setWriteDeadline(time.Time{})
 }
 
 // c.mu must be held.
@@ -383,10 +404,12 @@ func (c *conn) hijackLocked() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 
 	c.hijackedv.Store(true)
 	rwc = c.rwc
+	c.deadlineMu.Lock()
 	if rwc.SetDeadline(time.Time{}) == nil {
 		c.readDeadlineSet.Store(false)
 		c.writeDeadlineSet.Store(false)
 	}
+	c.deadlineMu.Unlock()
 
 	if c.r.hasByte {
 		if _, err := c.bufr.Peek(c.bufr.Buffered() + 1); err != nil {
@@ -1015,7 +1038,7 @@ func (cr *connReader) lazyServerRequestContext(scc *serverConnContext) (context.
 	cr.lock()
 	defer cr.unlock()
 	if !cr.reqActive || cr.conn == nil {
-		ctx, cancel := context.WithCancel(scc.Context)
+		ctx, cancel := context.WithCancel(scc)
 		cancel()
 		return ctx, nil
 	}
@@ -1510,11 +1533,11 @@ func putResponse(w *response) {
 	w.wants10KeepAlive = false
 	w.wantsClose = false
 	w.canWriteContinue.Store(false)
-	if len(w.handlerHeader) <= 16 {
-		clear(w.handlerHeader)
-	} else {
-		w.handlerHeader = nil
-	}
+	// Never retain handlerHeader across pooled responses: handlers may hold
+	// onto the map returned by Header() past ServeHTTP return (e.g. for async
+	// logging), so reusing the map would alias headers across requests and
+	// risk fatal concurrent map read/write panics or cross-request data leaks.
+	w.handlerHeader = nil
 	w.calledHeader = false
 	if cap(w.cwSnap) > 64 {
 		w.cwSnap = nil
@@ -1798,10 +1821,6 @@ func (w *response) WriteHeader(code int) {
 	w.wroteHeader = true
 	w.status = code
 
-	if w.calledHeader && !w.cw.hasSnap {
-		w.snapshotHeader()
-	}
-
 	if len(w.handlerHeader) > 0 {
 		if cl := w.handlerHeader.get("Content-Length"); cl != "" {
 			v, err := strconv.ParseInt(cl, 10, 64)
@@ -1812,6 +1831,10 @@ func (w *response) WriteHeader(code int) {
 				w.handlerHeader.Del("Content-Length")
 			}
 		}
+	}
+
+	if w.calledHeader && !w.cw.hasSnap {
+		w.snapshotHeader()
 	}
 }
 
@@ -3355,8 +3378,7 @@ func StripPrefix(prefix string, h Handler) Handler {
 		p := strings.TrimPrefix(r.URL.Path, prefix)
 		rp := strings.TrimPrefix(r.URL.RawPath, prefix)
 		if len(p) < len(r.URL.Path) && (r.URL.RawPath == "" || len(rp) < len(r.URL.RawPath)) {
-			r2 := new(Request)
-			*r2 = *r
+			r2 := r.shallowCopy()
 			r2.URL = new(url.URL)
 			*r2.URL = *r.URL
 			r2.URL.Path = p
@@ -4627,8 +4649,7 @@ func badServeHTTP(srv *Server, rw ResponseWriter, req *Request) {
 func AllowQuerySemicolons(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, r *Request) {
 		if strings.Contains(r.URL.RawQuery, ";") {
-			r2 := new(Request)
-			*r2 = *r
+			r2 := r.shallowCopy()
 			r2.URL = new(url.URL)
 			*r2.URL = *r.URL
 			r2.URL.RawQuery = strings.ReplaceAll(r.URL.RawQuery, ";", "&")
@@ -5547,8 +5568,8 @@ func tlsRecordHeaderLooksLikeHTTP(hdr [5]byte) bool {
 // MaxBytesHandler returns a [Handler] that runs h with its [ResponseWriter] and [Request.Body] wrapped by a MaxBytesReader.
 func MaxBytesHandler(h Handler, n int64) Handler {
 	return HandlerFunc(func(w ResponseWriter, r *Request) {
-		r2 := *r
+		r2 := r.shallowCopy()
 		r2.Body = MaxBytesReader(w, r.Body, n)
-		h.ServeHTTP(w, &r2)
+		h.ServeHTTP(w, r2)
 	})
 }
