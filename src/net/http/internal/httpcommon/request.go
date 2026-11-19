@@ -16,8 +16,13 @@ import (
 	"strings"
 
 	"golang.org/x/net/http/httpguts"
-	"golang.org/x/net/http2/hpack"
 )
+
+func headerFieldSize(name, value string) uint64 {
+	// Matches hpack.HeaderField.Size (RFC 7541 section 4.1):
+	// len(name) + len(value) + 32 as uint32.
+	return uint64(uint32(len(name) + len(value) + 32))
+}
 
 var (
 	ErrRequestHeaderListSize = errors.New("request header list larger than peer's advertised limit")
@@ -65,8 +70,10 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 	req := param.Request
 
 	// Check for invalid connection-level headers.
-	if err := checkConnHeaders(req.Header); err != nil {
-		return res, err
+	if len(req.Header) > 0 {
+		if err := checkConnHeaders(req.Header); err != nil {
+			return res, err
+		}
 	}
 
 	if req.URL == nil {
@@ -88,8 +95,10 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 	// isNormalConnect is true if this is a non-extended CONNECT request.
 	isNormalConnect := false
 	var protocol string
-	if vv := req.Header[":protocol"]; len(vv) > 0 {
-		protocol = vv[0]
+	if len(req.Header) > 0 {
+		if vv := req.Header[":protocol"]; len(vv) > 0 {
+			protocol = vv[0]
+		}
 	}
 	if req.Method == "CONNECT" && protocol == "" {
 		isNormalConnect = true
@@ -114,167 +123,260 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 		}
 	}
 
-	// Check for any invalid headers+trailers and return an error before we
-	// potentially pollute our hpack state. (We want to be able to
-	// continue to reuse the hpack encoder for future requests)
-	if err := validateHeaders(req.Header); err != "" {
-		return res, fmt.Errorf("invalid HTTP header %s", err)
-	}
-	if err := validateHeaders(req.Trailer); err != "" {
-		return res, fmt.Errorf("invalid HTTP trailer %s", err)
-	}
-
-	trailers, err := commaSeparatedTrailers(req.Trailer)
-	if err != nil {
-		return res, err
-	}
-
-	enumerateHeaders := func(f func(name, value string)) {
-		// 8.1.2.3 Request Pseudo-Header Fields
-		// The :path pseudo-header field includes the path and query parts of the
-		// target URI (the path-absolute production and optionally a '?' character
-		// followed by the query production, see Sections 3.3 and 3.4 of
-		// [RFC3986]).
-		f(":authority", host)
-		m := req.Method
-		if m == "" {
-			m = "GET"
+	// Validate headers and, when PeerMaxHeaderListSize is enforced, accumulate
+	// the request header list size in the same pass to avoid iterating req.Header
+	// three times before polluting encoder state.
+	checkSize := param.PeerMaxHeaderListSize > 0
+	var hlSize uint64
+	var didUA bool
+	for k, vv := range req.Header {
+		if !httpguts.ValidHeaderFieldName(k) && k != ":protocol" {
+			return res, fmt.Errorf("invalid HTTP header name %q", k)
 		}
-		f(":method", m)
+		for _, v := range vv {
+			if !httpguts.ValidHeaderFieldValue(v) {
+				// Don't include the value in the error,
+				// because it may be sensitive.
+				return res, fmt.Errorf("invalid HTTP header value for header %q", k)
+			}
+		}
+		if !checkSize {
+			continue
+		}
+		switch len(k) {
+		case 4:
+			if k == "Host" || asciiEqualFold(k, "host") {
+				continue
+			}
+		case 6:
+			if k == "Cookie" || asciiEqualFold(k, "cookie") {
+				for _, v := range vv {
+					for {
+						p := strings.IndexByte(v, ';')
+						if p < 0 {
+							break
+						}
+						hlSize += headerFieldSize("cookie", v[:p])
+						p++
+						for p+1 <= len(v) && v[p] == ' ' {
+							p++
+						}
+						v = v[p:]
+					}
+					if len(v) > 0 {
+						hlSize += headerFieldSize("cookie", v)
+					}
+				}
+				continue
+			}
+		case 7:
+			if k == "Upgrade" || asciiEqualFold(k, "upgrade") {
+				continue
+			}
+		case 9:
+			if k == ":protocol" {
+				continue
+			}
+		case 10:
+			if k == "User-Agent" || asciiEqualFold(k, "user-agent") {
+				didUA = true
+				if len(vv) < 1 || vv[0] == "" {
+					continue
+				}
+				hlSize += headerFieldSize("user-agent", vv[0])
+				continue
+			} else if k == "Connection" || k == "Keep-Alive" ||
+				asciiEqualFold(k, "connection") || asciiEqualFold(k, "keep-alive") {
+				continue
+			}
+		case 14:
+			if k == "Content-Length" || asciiEqualFold(k, "content-length") {
+				continue
+			}
+		case 16:
+			if k == "Proxy-Connection" || asciiEqualFold(k, "proxy-connection") {
+				continue
+			}
+		case 17:
+			if k == "Transfer-Encoding" || asciiEqualFold(k, "transfer-encoding") {
+				continue
+			}
+		}
+		for _, v := range vv {
+			hlSize += headerFieldSize(k, v)
+		}
+	}
+
+	var trailers string
+	if len(req.Trailer) > 0 {
+		if err := validateHeaders(req.Trailer); err != "" {
+			return res, fmt.Errorf("invalid HTTP trailer %s", err)
+		}
+		trailers, err = commaSeparatedTrailers(req.Trailer)
+		if err != nil {
+			return res, err
+		}
+	}
+
+	m := req.Method
+	if m == "" {
+		m = "GET"
+	}
+	var contentLengthStr string
+	sendCL := shouldSendReqContentLength(req.Method, req.ActualContentLength)
+	if sendCL {
+		contentLengthStr = strconv.FormatInt(req.ActualContentLength, 10)
+	}
+
+	if checkSize {
+		hlSize += headerFieldSize(":authority", host)
+		hlSize += headerFieldSize(":method", m)
 		if !isNormalConnect {
-			f(":path", path)
-			f(":scheme", req.URL.Scheme)
+			hlSize += headerFieldSize(":path", path)
+			hlSize += headerFieldSize(":scheme", req.URL.Scheme)
 		}
 		if protocol != "" {
-			f(":protocol", protocol)
+			hlSize += headerFieldSize(":protocol", protocol)
 		}
 		if trailers != "" {
-			f("trailer", trailers)
+			hlSize += headerFieldSize("trailer", trailers)
 		}
-
-		var didUA bool
-		for k, vv := range req.Header {
-			switch len(k) {
-			case 4:
-				if k == "Host" || asciiEqualFold(k, "host") {
-					// Host is :authority, already sent.
-					continue
-				}
-			case 6:
-				if k == "Cookie" || asciiEqualFold(k, "cookie") {
-					// Per 8.1.2.5 To allow for better compression efficiency, the
-					// Cookie header field MAY be split into separate header fields,
-					// each with one or more cookie-pairs.
-					for _, v := range vv {
-						for {
-							p := strings.IndexByte(v, ';')
-							if p < 0 {
-								break
-							}
-							f("cookie", v[:p])
-							p++
-							// strip space after semicolon if any.
-							for p+1 <= len(v) && v[p] == ' ' {
-								p++
-							}
-							v = v[p:]
-						}
-						if len(v) > 0 {
-							f("cookie", v)
-						}
-					}
-					continue
-				}
-			case 7:
-				if k == "Upgrade" || asciiEqualFold(k, "upgrade") {
-					continue
-				}
-			case 9:
-				if k == ":protocol" {
-					// :protocol pseudo-header was already sent above.
-					continue
-				}
-			case 10:
-				if k == "User-Agent" || asciiEqualFold(k, "user-agent") {
-					// Match Go's http1 behavior: at most one
-					// User-Agent. If set to nil or empty string,
-					// then omit it. Otherwise if not mentioned,
-					// include the default (below).
-					didUA = true
-					if len(vv) < 1 {
-						continue
-					}
-					vv = vv[:1]
-					if vv[0] == "" {
-						continue
-					}
-				} else if k == "Connection" || k == "Keep-Alive" ||
-					asciiEqualFold(k, "connection") || asciiEqualFold(k, "keep-alive") {
-					continue
-				}
-			case 14:
-				if k == "Content-Length" || asciiEqualFold(k, "content-length") {
-					// Content-Length is automatic, set below.
-					continue
-				}
-			case 16:
-				if k == "Proxy-Connection" || asciiEqualFold(k, "proxy-connection") {
-					continue
-				}
-			case 17:
-				if k == "Transfer-Encoding" || asciiEqualFold(k, "transfer-encoding") {
-					continue
-				}
-			}
-
-			for _, v := range vv {
-				f(k, v)
-			}
-		}
-		if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
-			f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
+		if sendCL {
+			hlSize += headerFieldSize("content-length", contentLengthStr)
 		}
 		if param.AddGzipHeader {
-			f("accept-encoding", "gzip")
+			hlSize += headerFieldSize("accept-encoding", "gzip")
 		}
 		if !didUA {
-			f("user-agent", param.DefaultUserAgent)
+			hlSize += headerFieldSize("user-agent", param.DefaultUserAgent)
 		}
-	}
-
-	// Do a first pass over the headers counting bytes to ensure
-	// we don't exceed cc.peerMaxHeaderListSize. This is done as a
-	// separate pass before encoding the headers to prevent
-	// modifying the hpack state.
-	if param.PeerMaxHeaderListSize > 0 {
-		hlSize := uint64(0)
-		enumerateHeaders(func(name, value string) {
-			hf := hpack.HeaderField{Name: name, Value: value}
-			hlSize += uint64(hf.Size())
-		})
-
 		if hlSize > param.PeerMaxHeaderListSize {
 			return res, ErrRequestHeaderListSize
 		}
 	}
 
 	trace := httptrace.ContextClientTrace(ctx)
+	traceWrote := trace != nil && trace.WroteHeaderField != nil
+	emitLower := func(name, value string) {
+		headerf(name, value)
+		if traceWrote {
+			trace.WroteHeaderField(name, []string{value})
+		}
+	}
 
-	// Header list size is ok. Write the headers.
-	enumerateHeaders(func(name, value string) {
-		name, ascii := LowerHeader(name)
+	// 8.1.2.3 Request Pseudo-Header Fields
+	// The :path pseudo-header field includes the path and query parts of the
+	// target URI (the path-absolute production and optionally a '?' character
+	// followed by the query production, see Sections 3.3 and 3.4 of
+	// [RFC3986]).
+	emitLower(":authority", host)
+	emitLower(":method", m)
+	if !isNormalConnect {
+		emitLower(":path", path)
+		emitLower(":scheme", req.URL.Scheme)
+	}
+	if protocol != "" {
+		emitLower(":protocol", protocol)
+	}
+	if trailers != "" {
+		emitLower("trailer", trailers)
+	}
+
+	didUA = false
+	for k, vv := range req.Header {
+		switch len(k) {
+		case 4:
+			if k == "Host" || asciiEqualFold(k, "host") {
+				// Host is :authority, already sent.
+				continue
+			}
+		case 6:
+			if k == "Cookie" || asciiEqualFold(k, "cookie") {
+				// Per 8.1.2.5 To allow for better compression efficiency, the
+				// Cookie header field MAY be split into separate header fields,
+				// each with one or more cookie-pairs.
+				for _, v := range vv {
+					for {
+						p := strings.IndexByte(v, ';')
+						if p < 0 {
+							break
+						}
+						emitLower("cookie", v[:p])
+						p++
+						// strip space after semicolon if any.
+						for p+1 <= len(v) && v[p] == ' ' {
+							p++
+						}
+						v = v[p:]
+					}
+					if len(v) > 0 {
+						emitLower("cookie", v)
+					}
+				}
+				continue
+			}
+		case 7:
+			if k == "Upgrade" || asciiEqualFold(k, "upgrade") {
+				continue
+			}
+		case 9:
+			if k == ":protocol" {
+				// :protocol pseudo-header was already sent above.
+				continue
+			}
+		case 10:
+			if k == "User-Agent" || asciiEqualFold(k, "user-agent") {
+				// Match Go's http1 behavior: at most one
+				// User-Agent. If set to nil or empty string,
+				// then omit it. Otherwise if not mentioned,
+				// include the default (below).
+				didUA = true
+				if len(vv) < 1 || vv[0] == "" {
+					continue
+				}
+				emitLower("user-agent", vv[0])
+				continue
+			} else if k == "Connection" || k == "Keep-Alive" ||
+				asciiEqualFold(k, "connection") || asciiEqualFold(k, "keep-alive") {
+				continue
+			}
+		case 14:
+			if k == "Content-Length" || asciiEqualFold(k, "content-length") {
+				// Content-Length is automatic, set below.
+				continue
+			}
+		case 16:
+			if k == "Proxy-Connection" || asciiEqualFold(k, "proxy-connection") {
+				continue
+			}
+		case 17:
+			if k == "Transfer-Encoding" || asciiEqualFold(k, "transfer-encoding") {
+				continue
+			}
+		}
+
+		if len(vv) == 0 {
+			continue
+		}
+		name, ascii := LowerHeader(k)
 		if !ascii {
 			// Skip writing invalid headers. Per RFC 7540, Section 8.1.2, header
 			// field names have to be ASCII characters (just as in HTTP/1.x).
-			return
+			continue
 		}
-
-		headerf(name, value)
-
-		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField(name, []string{value})
+		for _, v := range vv {
+			emitLower(name, v)
 		}
-	})
+	}
+	if sendCL {
+		emitLower("content-length", contentLengthStr)
+	}
+	if param.AddGzipHeader {
+		emitLower("accept-encoding", "gzip")
+	}
+	if !didUA {
+		emitLower("user-agent", param.DefaultUserAgent)
+	}
 
 	res.HasBody = req.ActualContentLength != 0
 	res.HasTrailers = trailers != ""
@@ -452,52 +554,105 @@ type ServerRequestResult struct {
 	InvalidReason string
 }
 
-func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
-	needsContinue := httpguts.HeaderValuesContainsToken(rp.Header["Expect"], "100-continue")
-	if needsContinue {
-		delete(rp.Header, "Expect")
-	}
-	// Merge Cookie headers into one "; "-delimited value.
-	if cookies := rp.Header["Cookie"]; len(cookies) > 1 {
-		rp.Header["Cookie"] = []string{strings.Join(cookies, "; ")}
-	}
+var cleanPathTable = [256]bool{
+	'$': true, '&': true, '+': true, ',': true, '-': true, '.': true, '/': true,
+	'0': true, '1': true, '2': true, '3': true, '4': true, '5': true,
+	'6': true, '7': true, '8': true, '9': true, ':': true, ';': true,
+	'=': true, '@': true,
+	'A': true, 'B': true, 'C': true, 'D': true, 'E': true, 'F': true,
+	'G': true, 'H': true, 'I': true, 'J': true, 'K': true, 'L': true,
+	'M': true, 'N': true, 'O': true, 'P': true, 'Q': true, 'R': true,
+	'S': true, 'T': true, 'U': true, 'V': true, 'W': true, 'X': true,
+	'Y': true, 'Z': true, '_': true,
+	'a': true, 'b': true, 'c': true, 'd': true, 'e': true, 'f': true,
+	'g': true, 'h': true, 'i': true, 'j': true, 'k': true, 'l': true,
+	'm': true, 'n': true, 'o': true, 'p': true, 'q': true, 'r': true,
+	's': true, 't': true, 'u': true, 'v': true, 'w': true, 'x': true,
+	'y': true, 'z': true, '~': true,
+}
 
-	// Setup Trailers
-	var trailer map[string][]string
-	for _, v := range rp.Header["Trailer"] {
-		for key := range strings.SplitSeq(v, ",") {
-			key = CanonicalHeader(textproto.TrimString(key))
-			switch key {
-			case "Transfer-Encoding", "Trailer", "Content-Length":
-				// Bogus. (copy of http1 rules)
-				// Ignore.
-			default:
-				if trailer == nil {
-					trailer = make(map[string][]string)
+// parseCleanOriginRequestURI parses an unescaped origin-form request URI
+// (starting with '/') optionally followed by '?' and a query without ASCII
+// control bytes. It returns nil if rawURI needs full url.ParseRequestURI.
+func parseCleanOriginRequestURI(rawURI string) *url.URL {
+	if len(rawURI) == 0 || rawURI[0] != '/' {
+		return nil
+	}
+	for i := 0; i < len(rawURI); i++ {
+		c := rawURI[i]
+		if !cleanPathTable[c] {
+			if c == '?' && i > 0 {
+				for j := i + 1; j < len(rawURI); j++ {
+					qc := rawURI[j]
+					if qc < ' ' || qc == 0x7f {
+						return nil
+					}
 				}
-				trailer[key] = nil
+				if i == len(rawURI)-1 {
+					return &url.URL{Path: rawURI[:i], ForceQuery: true}
+				}
+				return &url.URL{Path: rawURI[:i], RawQuery: rawURI[i+1:]}
 			}
+			return nil
 		}
 	}
-	delete(rp.Header, "Trailer")
+	return &url.URL{Path: rawURI}
+}
 
+func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
+	var needsContinue bool
+	var trailer map[string][]string
 	authority := rp.Authority
-	if host := rp.Header["Host"]; len(host) == 1 {
-		// HTTP/2 and HTTP/3 permit the Host header to be present,
-		// but it must match the :authority pseudo-header.
-		if authority == "" {
-			authority = host[0]
-		} else if host[0] != authority {
-			return ServerRequestResult{
-				InvalidReason: "authority_host_mismatch",
+
+	if len(rp.Header) > 0 {
+		if expect := rp.Header["Expect"]; len(expect) > 0 {
+			needsContinue = httpguts.HeaderValuesContainsToken(expect, "100-continue")
+			if needsContinue {
+				delete(rp.Header, "Expect")
 			}
 		}
-		delete(rp.Header, "Host")
-	} else if len(host) > 1 {
-		// HTTP/1.1 rejects any request containing more than one Host header.
-		// HTTP/2 and HTTP/3 don't use the Host header, but reject multiple anyway.
-		return ServerRequestResult{
-			InvalidReason: "multiple_host_headers",
+		// Merge Cookie headers into one "; "-delimited value.
+		if cookies := rp.Header["Cookie"]; len(cookies) > 1 {
+			rp.Header["Cookie"] = []string{strings.Join(cookies, "; ")}
+		}
+
+		// Setup Trailers
+		if trVals, ok := rp.Header["Trailer"]; ok {
+			for _, v := range trVals {
+				for key := range strings.SplitSeq(v, ",") {
+					key = CanonicalHeader(textproto.TrimString(key))
+					switch key {
+					case "Transfer-Encoding", "Trailer", "Content-Length":
+						// Bogus. (copy of http1 rules)
+						// Ignore.
+					default:
+						if trailer == nil {
+							trailer = make(map[string][]string)
+						}
+						trailer[key] = nil
+					}
+				}
+			}
+			delete(rp.Header, "Trailer")
+		}
+
+		if host := rp.Header["Host"]; len(host) == 1 {
+			// HTTP/2 and HTTP/3 permit the Host header to be present,
+			// but it must match the :authority pseudo-header.
+			if authority == "" {
+				authority = host[0]
+			} else if host[0] != authority {
+				return ServerRequestResult{
+					InvalidReason: "authority_host_mismatch",
+				}
+			}
+			delete(rp.Header, "Host")
+		} else if len(host) > 1 {
+			// HTTP/1.1 rejects any request containing more than one Host header.
+			// HTTP/2 and HTTP/3 don't use the Host header, but reject multiple anyway.
+			return ServerRequestResult{
+				InvalidReason: "multiple_host_headers",
+			}
 		}
 	}
 
@@ -530,11 +685,15 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 			}
 		}
 
-		var err error
-		url_, err = url.ParseRequestURI(rp.Path)
-		if err != nil {
-			return ServerRequestResult{
-				InvalidReason: "bad_path",
+		if u := parseCleanOriginRequestURI(rp.Path); u != nil {
+			url_ = u
+		} else {
+			var err error
+			url_, err = url.ParseRequestURI(rp.Path)
+			if err != nil {
+				return ServerRequestResult{
+					InvalidReason: "bad_path",
+				}
 			}
 		}
 		requestURI = rp.Path
