@@ -19,13 +19,12 @@ import (
 	"internal/godebug"
 	"net"
 	"net/http/internal"
+	"net/http/internal/httpcommon"
 	"os"
 	"slices"
 	"strconv"
 	"sync/v2"
 	"time"
-
-	"golang.org/x/net/http/httpguts"
 )
 
 var (
@@ -204,18 +203,7 @@ func (s SettingID) String() string {
 //	fashion. However, header field names MUST be converted to
 //	lowercase prior to their encoding in HTTP/2. "
 func validWireHeaderFieldName(v string) bool {
-	if len(v) == 0 {
-		return false
-	}
-	for _, r := range v {
-		if !httpguts.IsTokenRune(r) {
-			return false
-		}
-		if 'A' <= r && r <= 'Z' {
-			return false
-		}
-	}
-	return true
+	return httpcommon.ValidWireHeaderFieldName(v)
 }
 
 func httpCodeString(code int) string {

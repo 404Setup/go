@@ -366,7 +366,22 @@ type Framer struct {
 	debugWriteLoggerf func(string, ...any)
 
 	frameCache *frameCache // nil if frames aren't reused (default)
+
+	// Reusable state for readMetaFrame to avoid per-HEADERS closures.
+	metaMH         *MetaHeadersFrame
+	metaHeaders    headerBudget
+	metaTrailers   headerBudget
+	metaSawRegular bool
+	metaInvalid    error
+	metaEmitFunc   func(hpack.HeaderField)
 }
+
+type headerBudget struct {
+	remainSize uint32
+	count      int
+}
+
+func noopEmit(hpack.HeaderField) {}
 
 func (fr *Framer) maxHeaderListSize() uint32 {
 	if fr.MaxHeaderListSize == 0 {
@@ -411,6 +426,69 @@ func (f *Framer) startWrite(ftype FrameType, flags Flags, streamID uint32) {
 		byte(streamID>>16),
 		byte(streamID>>8),
 		byte(streamID))
+}
+
+// writeFrameDirect writes a frame header and payload directly into a buffered
+// writer when the entire frame fits in its available buffer space, avoiding
+// copying through f.wbuf and writeBufPool. Because it only succeeds when
+// bw.Available() >= frameHeaderLen+len(payload), no partial flush occurs.
+func (f *Framer) writeFrameDirect(ftype FrameType, flags Flags, streamID uint32, payload []byte) (wrote bool, err error) {
+	if f.logWrites || len(payload) >= (1<<24) {
+		return false, nil
+	}
+	total := frameHeaderLen + len(payload)
+	var bw *bufio.Writer
+	var bwriter *bufferedWriter
+	switch w := f.w.(type) {
+	case *bufferedWriter:
+		if w.werr != nil {
+			return true, w.werr
+		}
+		if w.Available() < total {
+			return false, nil
+		}
+		if w.bw == nil {
+			bw = bufWriterPool.Get()
+			bw.Reset((*bufferedWriterTimeoutWriter)(w))
+			w.bw = bw
+		} else {
+			bw = w.bw
+		}
+		bwriter = w
+	case *bufio.Writer:
+		if w.Available() < total {
+			return false, nil
+		}
+		bw = w
+	default:
+		return false, nil
+	}
+	hdr := [frameHeaderLen]byte{
+		byte(len(payload) >> 16),
+		byte(len(payload) >> 8),
+		byte(len(payload)),
+		byte(ftype),
+		byte(flags),
+		byte(streamID >> 24),
+		byte(streamID >> 16),
+		byte(streamID >> 8),
+		byte(streamID),
+	}
+	if _, err := bw.Write(hdr[:]); err != nil {
+		if bwriter != nil {
+			bwriter.werr = err
+		}
+		return true, err
+	}
+	if len(payload) > 0 {
+		if _, err := bw.Write(payload); err != nil {
+			if bwriter != nil {
+				bwriter.werr = err
+			}
+			return true, err
+		}
+	}
+	return true, nil
 }
 
 func (f *Framer) endWrite() error {
@@ -497,8 +575,17 @@ func (fr *Framer) SetReuseFrames() {
 	fr.frameCache = &frameCache{}
 }
 
+const maxCachedMetaFields = 256
+
 type frameCache struct {
-	dataFrame DataFrame
+	dataFrame         DataFrame
+	headersFrame      HeadersFrame
+	metaHeadersFrame  MetaHeadersFrame
+	metaFields        []hpack.HeaderField
+	windowUpdateFrame WindowUpdateFrame
+	rstStreamFrame    RSTStreamFrame
+	pingFrame         PingFrame
+	continuationFrame ContinuationFrame
 }
 
 func (fc *frameCache) getDataFrame() *DataFrame {
@@ -506,6 +593,52 @@ func (fc *frameCache) getDataFrame() *DataFrame {
 		return &DataFrame{}
 	}
 	return &fc.dataFrame
+}
+
+func (fc *frameCache) getHeadersFrame() *HeadersFrame {
+	if fc == nil {
+		return &HeadersFrame{}
+	}
+	return &fc.headersFrame
+}
+
+func (fc *frameCache) getMetaHeadersFrame(hf *HeadersFrame) *MetaHeadersFrame {
+	if fc == nil {
+		return &MetaHeadersFrame{HeadersFrame: hf}
+	}
+	mh := &fc.metaHeadersFrame
+	mh.HeadersFrame = hf
+	mh.Fields = fc.metaFields[:0]
+	mh.Truncated = false
+	return mh
+}
+
+func (fc *frameCache) getWindowUpdateFrame() *WindowUpdateFrame {
+	if fc == nil {
+		return &WindowUpdateFrame{}
+	}
+	return &fc.windowUpdateFrame
+}
+
+func (fc *frameCache) getRSTStreamFrame() *RSTStreamFrame {
+	if fc == nil {
+		return &RSTStreamFrame{}
+	}
+	return &fc.rstStreamFrame
+}
+
+func (fc *frameCache) getPingFrame() *PingFrame {
+	if fc == nil {
+		return &PingFrame{}
+	}
+	return &fc.pingFrame
+}
+
+func (fc *frameCache) getContinuationFrame() *ContinuationFrame {
+	if fc == nil {
+		return &ContinuationFrame{}
+	}
+	return &fc.continuationFrame
 }
 
 // NewFramer returns a Framer that writes frames to w and reads them from r.
@@ -592,6 +725,13 @@ func (fr *Framer) invalidateLastFrame() {
 	if fr.lastFrame != nil {
 		fr.lastFrame.invalidate()
 		fr.lastFrame = nil
+	}
+	if fr.frameCache != nil && fr.metaMH == nil {
+		if len(fr.frameCache.metaFields) > 0 {
+			clear(fr.frameCache.metaFields)
+			fr.frameCache.metaFields = fr.frameCache.metaFields[:0]
+		}
+		fr.frameCache.metaHeadersFrame.Fields = nil
 	}
 }
 
@@ -700,9 +840,10 @@ func (fr *Framer) ReadFrameForHeader(fh FrameHeader) (Frame, error) {
 // indicates the stream responsible for the error.
 func (fr *Framer) ReadFrame() (Frame, error) {
 	// The previous frame is invalid as of this call, so don't pin a
-	// frame-sized read buffer while waiting, possibly for a long time,
-	// for the next frame to arrive.
+	// frame-sized read buffer (or cached header strings) while waiting,
+	// possibly for a long time, for the next frame to arrive.
 	fr.releaseReadBuf()
+	fr.invalidateLastFrame()
 	fh, err := fr.ReadFrameHeader()
 	if err != nil {
 		return nil, err
@@ -846,6 +987,18 @@ func (f *Framer) WriteData(streamID uint32, endStream bool, data []byte) error {
 // It is the caller's responsibility not to violate the maximum frame size
 // and to not call other Write methods concurrently.
 func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []byte) error {
+	if pad == nil {
+		if !validStreamID(streamID) && !f.AllowIllegalWrites {
+			return errStreamID
+		}
+		var flags Flags
+		if endStream {
+			flags = FlagDataEndStream
+		}
+		if wrote, err := f.writeFrameDirect(FrameData, flags, streamID, data); wrote {
+			return err
+		}
+	}
 	if err := f.startWriteDataPadded(streamID, endStream, data, pad); err != nil {
 		return err
 	}
@@ -1038,7 +1191,7 @@ type PingFrame struct {
 
 func (f *PingFrame) IsAck() bool { return f.Flags.Has(FlagPingAck) }
 
-func parsePingFrame(_ *frameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
+func parsePingFrame(fc *frameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
 	if len(payload) != 8 {
 		countError("frame_ping_length")
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -1047,7 +1200,8 @@ func parsePingFrame(_ *frameCache, fh FrameHeader, countError func(string), payl
 		countError("frame_ping_has_stream")
 		return nil, ConnectionError(ErrCodeProtocol)
 	}
-	f := &PingFrame{FrameHeader: fh}
+	f := fc.getPingFrame()
+	f.FrameHeader = fh
 	copy(f.Data[:], payload)
 	return f, nil
 }
@@ -1133,7 +1287,7 @@ type WindowUpdateFrame struct {
 	Increment uint32 // never read with high bit set
 }
 
-func parseWindowUpdateFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseWindowUpdateFrame(fc *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if len(p) != 4 {
 		countError("frame_windowupdate_bad_len")
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -1153,10 +1307,10 @@ func parseWindowUpdateFrame(_ *frameCache, fh FrameHeader, countError func(strin
 		countError("frame_windowupdate_zero_inc_stream")
 		return nil, streamError(fh.StreamID, ErrCodeProtocol)
 	}
-	return &WindowUpdateFrame{
-		FrameHeader: fh,
-		Increment:   inc,
-	}, nil
+	f := fc.getWindowUpdateFrame()
+	f.FrameHeader = fh
+	f.Increment = inc
+	return f, nil
 }
 
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.
@@ -1201,10 +1355,7 @@ func (f *HeadersFrame) HasPriority() bool {
 	return f.FrameHeader.Flags.Has(FlagHeadersPriority)
 }
 
-func parseHeadersFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
-	hf := &HeadersFrame{
-		FrameHeader: fh,
-	}
+func parseHeadersFrame(fc *frameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
 	if fh.StreamID == 0 {
 		// HEADERS frames MUST be associated with a stream. If a HEADERS frame
 		// is received whose stream identifier field is 0x0, the recipient MUST
@@ -1213,6 +1364,10 @@ func parseHeadersFrame(_ *frameCache, fh FrameHeader, countError func(string), p
 		countError("frame_headers_zero_stream")
 		return nil, connError{ErrCodeProtocol, "HEADERS frame with stream ID 0"}
 	}
+	hf := fc.getHeadersFrame()
+	hf.FrameHeader = fh
+	hf.Priority = PriorityParam{}
+	hf.headerFragBuf = nil
 	var padLength uint8
 	if fh.Flags.Has(FlagHeadersPadded) {
 		if p, padLength, err = readByte(p); err != nil {
@@ -1292,14 +1447,20 @@ func (f *Framer) WriteHeaders(p HeadersFrameParam) error {
 	if p.EndHeaders {
 		flags |= FlagHeadersEndHeaders
 	}
-	if !p.Priority.IsZero() {
+	hasPriority := !p.Priority.IsZero()
+	if hasPriority {
 		flags |= FlagHeadersPriority
+	}
+	if p.PadLength == 0 && !hasPriority {
+		if wrote, err := f.writeFrameDirect(FrameHeaders, flags, p.StreamID, p.BlockFragment); wrote {
+			return err
+		}
 	}
 	f.startWrite(FrameHeaders, flags, p.StreamID)
 	if p.PadLength != 0 {
 		f.writeByte(p.PadLength)
 	}
-	if !p.Priority.IsZero() {
+	if hasPriority {
 		v := p.Priority.StreamDep
 		if !validStreamIDOrZero(v) && !f.AllowIllegalWrites {
 			return errDepStreamID
@@ -1508,7 +1669,7 @@ type RSTStreamFrame struct {
 	ErrCode ErrCode
 }
 
-func parseRSTStreamFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseRSTStreamFrame(fc *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if len(p) != 4 {
 		countError("frame_rststream_bad_len")
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -1517,7 +1678,10 @@ func parseRSTStreamFrame(_ *frameCache, fh FrameHeader, countError func(string),
 		countError("frame_rststream_zero_stream")
 		return nil, ConnectionError(ErrCodeProtocol)
 	}
-	return &RSTStreamFrame{fh, ErrCode(binary.BigEndian.Uint32(p[:4]))}, nil
+	f := fc.getRSTStreamFrame()
+	f.FrameHeader = fh
+	f.ErrCode = ErrCode(binary.BigEndian.Uint32(p[:4]))
+	return f, nil
 }
 
 // WriteRSTStream writes a RST_STREAM frame.
@@ -1540,12 +1704,15 @@ type ContinuationFrame struct {
 	headerFragBuf []byte
 }
 
-func parseContinuationFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseContinuationFrame(fc *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		countError("frame_continuation_zero_stream")
 		return nil, connError{ErrCodeProtocol, "CONTINUATION frame with stream ID 0"}
 	}
-	return &ContinuationFrame{fh, p}, nil
+	f := fc.getContinuationFrame()
+	f.FrameHeader = fh
+	f.headerFragBuf = p
+	return f, nil
 }
 
 func (f *ContinuationFrame) HeaderBlockFragment() []byte {
@@ -1568,6 +1735,9 @@ func (f *Framer) WriteContinuation(streamID uint32, endHeaders bool, headerBlock
 	var flags Flags
 	if endHeaders {
 		flags |= FlagContinuationEndHeaders
+	}
+	if wrote, err := f.writeFrameDirect(FrameContinuation, flags, streamID, headerBlockFragment); wrote {
+		return err
 	}
 	f.startWrite(FrameContinuation, flags, streamID)
 	f.wbuf = append(f.wbuf, headerBlockFragment...)
@@ -1836,6 +2006,60 @@ func (fr *Framer) maxHeaderStringLen() int {
 	return v
 }
 
+func (fr *Framer) emitMetaField(hf hpack.HeaderField) {
+	if VerboseLogs && fr.logReads {
+		fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)
+	}
+	if !httpguts.ValidHeaderFieldValue(hf.Value) {
+		// Don't include the value in the error, because it may be sensitive.
+		fr.metaInvalid = headerFieldValueError(hf.Name)
+	}
+	isPseudo := strings.HasPrefix(hf.Name, ":")
+	if isPseudo {
+		if fr.metaSawRegular {
+			fr.metaInvalid = errPseudoAfterRegular
+		}
+	} else {
+		fr.metaSawRegular = true
+		if !validWireHeaderFieldName(hf.Name) {
+			fr.metaInvalid = headerFieldNameError(hf.Name)
+		}
+	}
+
+	if fr.metaInvalid != nil {
+		fr.ReadMetaHeaders.SetEmitEnabled(false)
+		return
+	}
+
+	var budget *headerBudget
+	var size uint32
+	if hf.Name == "trailer" {
+		budget = &fr.metaTrailers
+		fieldCount := strings.Count(hf.Value, ",") + 1
+		budget.count += fieldCount
+		// Rather than actually constructing hpack.HeaderField for each
+		// trailer field and cumulatively adding its Size, just do the math
+		// manually to avoid unnecessary work. This does make it so
+		// whitespaces after comma are counted against the budget, but that
+		// should be innocuous.
+		size = uint32(len(hf.Value)-fieldCount+1) + uint32(fieldCount)*hpack.HeaderField{}.Size()
+	} else {
+		budget = &fr.metaHeaders
+		budget.count++
+		size = hf.Size()
+	}
+	if countLimit := fr.maxHeaderValueCount(); (countLimit > 0 && budget.count > countLimit) || size > budget.remainSize {
+		fr.ReadMetaHeaders.SetEmitEnabled(false)
+		fr.metaMH.Truncated = true
+		fr.metaHeaders.remainSize = 0
+		fr.metaTrailers.remainSize = 0
+		return
+	}
+	budget.remainSize -= size
+
+	fr.metaMH.Fields = append(fr.metaMH.Fields, hf)
+}
+
 // readMetaFrame returns 0 or more CONTINUATION frames from fr and
 // merge them into the provided hf and returns a MetaHeadersFrame
 // with the decoded hpack values.
@@ -1843,76 +2067,33 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	if fr.AllowIllegalReads {
 		return nil, errors.New("illegal use of AllowIllegalReads with ReadMetaHeaders")
 	}
-	mh := &MetaHeadersFrame{
-		HeadersFrame: hf,
-	}
-	type headerBudget struct {
-		remainSize uint32
-		count      int
-	}
-	headers := headerBudget{remainSize: fr.maxHeaderListSize()}
-	trailers := headerBudget{remainSize: fr.maxHeaderListSize()}
-	var sawRegular bool
+	mh := fr.frameCache.getMetaHeadersFrame(hf)
+	fr.metaMH = mh
+	fr.metaHeaders = headerBudget{remainSize: fr.maxHeaderListSize()}
+	fr.metaTrailers = headerBudget{remainSize: fr.maxHeaderListSize()}
+	fr.metaSawRegular = false
+	fr.metaInvalid = nil
 
-	var invalid error // pseudo header field errors
 	hdec := fr.ReadMetaHeaders
 	hdec.SetEmitEnabled(true)
 	hdec.SetMaxStringLength(fr.maxHeaderStringLen())
-	hdec.SetEmitFunc(func(hf hpack.HeaderField) {
-		if VerboseLogs && fr.logReads {
-			fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)
-		}
-		if !httpguts.ValidHeaderFieldValue(hf.Value) {
-			// Don't include the value in the error, because it may be sensitive.
-			invalid = headerFieldValueError(hf.Name)
-		}
-		isPseudo := strings.HasPrefix(hf.Name, ":")
-		if isPseudo {
-			if sawRegular {
-				invalid = errPseudoAfterRegular
-			}
-		} else {
-			sawRegular = true
-			if !validWireHeaderFieldName(hf.Name) {
-				invalid = headerFieldNameError(hf.Name)
+	if fr.metaEmitFunc == nil {
+		fr.metaEmitFunc = fr.emitMetaField
+	}
+	hdec.SetEmitFunc(fr.metaEmitFunc)
+	// Lose reference to MetaHeadersFrame and cache Fields backing array:
+	defer func() {
+		hdec.SetEmitFunc(noopEmit)
+		if fr.frameCache != nil {
+			if cap(mh.Fields) <= maxCachedMetaFields {
+				fr.frameCache.metaFields = mh.Fields
+			} else {
+				fr.frameCache.metaFields = nil
 			}
 		}
-
-		if invalid != nil {
-			hdec.SetEmitEnabled(false)
-			return
-		}
-
-		var budget *headerBudget
-		var size uint32
-		if hf.Name == "trailer" {
-			budget = &trailers
-			fieldCount := strings.Count(hf.Value, ",") + 1
-			budget.count += fieldCount
-			// Rather than actually constructing hpack.HeaderField for each
-			// trailer field and cumulatively adding its Size, just do the math
-			// manually to avoid unnecessary work. This does make it so
-			// whitespaces after comma are counted against the budget, but that
-			// should be innocuous.
-			size = uint32(len(hf.Value)-fieldCount+1) + uint32(fieldCount)*hpack.HeaderField{}.Size()
-		} else {
-			budget = &headers
-			budget.count++
-			size = hf.Size()
-		}
-		if countLimit := fr.maxHeaderValueCount(); (countLimit > 0 && budget.count > countLimit) || size > budget.remainSize {
-			hdec.SetEmitEnabled(false)
-			mh.Truncated = true
-			headers.remainSize = 0
-			trailers.remainSize = 0
-			return
-		}
-		budget.remainSize -= size
-
-		mh.Fields = append(mh.Fields, hf)
-	})
-	// Lose reference to MetaHeadersFrame:
-	defer hdec.SetEmitFunc(func(hf hpack.HeaderField) {})
+		fr.metaMH = nil
+		fr.metaInvalid = nil
+	}()
 
 	var hc headersOrContinuation = hf
 	for {
@@ -1926,7 +2107,7 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 		// exceeded the max header list size (if so, both budgets are 0), or a
 		// frame whose encoded size is more than twice the remaining header
 		// list bytes we're willing to accept.
-		if int64(len(frag)) > 2*int64(headers.remainSize+trailers.remainSize) {
+		if int64(len(frag)) > 2*int64(fr.metaHeaders.remainSize+fr.metaTrailers.remainSize) {
 			if VerboseLogs {
 				log.Printf("http2: header list too large")
 			}
@@ -1938,9 +2119,9 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 		// Also close the connection after any CONTINUATION frame following an
 		// invalid header, since we stop tracking the size of the headers after
 		// an invalid one.
-		if invalid != nil {
+		if fr.metaInvalid != nil {
 			if VerboseLogs {
-				log.Printf("http2: invalid header: %v", invalid)
+				log.Printf("http2: invalid header: %v", fr.metaInvalid)
 			}
 			// It would be nice to send a RST_STREAM before sending the GOAWAY,
 			// but the structure of the server's frame writer makes this difficult.
@@ -1967,7 +2148,8 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	if err := hdec.Close(); err != nil {
 		return mh, ConnectionError(ErrCodeCompression)
 	}
-	if invalid != nil {
+	if fr.metaInvalid != nil {
+		invalid := fr.metaInvalid
 		fr.errDetail = invalid
 		if VerboseLogs {
 			log.Printf("http2: invalid header: %v", invalid)

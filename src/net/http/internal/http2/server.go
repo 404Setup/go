@@ -344,6 +344,7 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 	fr.MaxHeaderListSize = sc.maxHeaderListSize()
 	fr.MaxHeaderValueCount = sc.hs.MaxHeaderValueCount()
 	fr.SetMaxReadFrameSize(uint32(conf.MaxReadFrameSize))
+	fr.SetReuseFrames()
 	sc.framer = fr
 
 	if tc, ok := c.(connectionStater); ok {
@@ -601,6 +602,8 @@ type stream struct {
 
 	trailer    Header // accumulated trailers
 	reqTrailer Header // handler's Request.Trailer
+
+	reqBodyStorage requestBody
 }
 
 func (sc *serverConn) Framer() *Framer  { return sc.framer }
@@ -791,6 +794,12 @@ func (sc *serverConn) writeFrameAsync(wr FrameWriteRequest, wd *writeData) {
 	} else {
 		err = sc.framer.endWrite()
 	}
+	sc.beginServeSend()
+	sc.wroteFrameCh <- frameWriteResult{wr: wr, err: err}
+}
+
+func (sc *serverConn) writeResHeadersAsync(wr FrameWriteRequest, wrh *writeResHeaders, headerBlock []byte) {
+	err := wrh.writeHeaderBlockSlice(sc, headerBlock)
 	sc.beginServeSend()
 	sc.wroteFrameCh <- frameWriteResult{wr: wr, err: err}
 }
@@ -1446,6 +1455,24 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 		sc.writingFrameAsync = false
 		err := wr.write.writeFrame(sc)
 		sc.wroteFrame(frameWriteResult{wr: wr, err: err})
+	} else if wrh, ok := wr.write.(*writeResHeaders); ok {
+		headerBlock := wrh.encodeHeaderBlock(sc)
+		if len(headerBlock) == 0 {
+			sc.writingFrameAsync = false
+			sc.wroteFrame(frameWriteResult{wr: wr, err: nil})
+		} else if len(headerBlock) <= 16384 && frameHeaderLen+len(headerBlock) <= sc.bw.Available() {
+			sc.writingFrameAsync = false
+			err := sc.framer.WriteHeaders(HeadersFrameParam{
+				StreamID:      wrh.streamID,
+				BlockFragment: headerBlock,
+				EndStream:     wrh.endStream,
+				EndHeaders:    true,
+			})
+			sc.wroteFrame(frameWriteResult{wr: wr, err: err})
+		} else {
+			sc.writingFrameAsync = true
+			go sc.writeResHeadersAsync(wr, wrh, headerBlock)
+		}
 	} else if wd, ok := wr.write.(*writeData); ok {
 		// Encode the frame in the serve goroutine, to ensure we don't have
 		// any lingering asynchronous references to data passed to Write.
@@ -1574,6 +1601,12 @@ func (sc *serverConn) scheduleFrameWrite() {
 			}
 		}
 		if sc.needsFrameFlush {
+			if len(sc.wantWriteFrameCh) > 0 {
+				// Another frame is already waiting on wantWriteFrameCh (e.g. DATA
+				// immediately following a synchronous HEADERS write); return to
+				// serveLoop to coalesce it into the same flush.
+				break
+			}
 			sc.startFrameWrite(FrameWriteRequest{write: flushFrameWriter{}})
 			sc.needsFrameFlush = false // after startFrameWrite, since it sets this true
 			continue
@@ -1779,7 +1812,7 @@ func (sc *serverConn) processPing(f *PingFrame) error {
 		// PROTOCOL_ERROR."
 		return sc.countError("ping_on_stream", ConnectionError(ErrCodeProtocol))
 	}
-	sc.writeFrame(FrameWriteRequest{write: writePingAck{f}})
+	sc.writeFrame(FrameWriteRequest{write: writePingAck{f.Data}})
 	return nil
 }
 
@@ -2393,14 +2426,27 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState, priority
 	return st
 }
 
+type pipeWithDataBuffer struct {
+	pipe
+	buf dataBuffer
+}
+
 func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*responseWriter, *ServerRequest, error) {
 	sc.serveG.check()
 
 	rp := httpcommon.ServerRequestParam{}
-	for _, hf := range f.Fields {
+	var regularFields []hpack.HeaderField
+	for i, hf := range f.Fields {
 		// No pseudo-headers may have a zero-length value.
 		// Rejecting them here means we can assume "" means "no header" below.
-		if hf.Name == "" || (hf.Name[0] == ':' && len(hf.Value) == 0) {
+		if hf.Name == "" {
+			return nil, nil, sc.countError("invalid_pseudo_header", streamError(f.StreamID, ErrCodeProtocol))
+		}
+		if hf.Name[0] != ':' {
+			regularFields = f.Fields[i:]
+			break
+		}
+		if len(hf.Value) == 0 {
 			return nil, nil, sc.countError("invalid_pseudo_header", streamError(f.StreamID, ErrCodeProtocol))
 		}
 		switch hf.Name {
@@ -2441,11 +2487,13 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		return nil, nil, sc.countError("bad_path_method", streamError(f.StreamID, ErrCodeProtocol))
 	}
 
-	regularFields := f.RegularFields()
 	strs := make([]string, len(regularFields))
 	header := make(Header, len(regularFields))
 	rp.Header = header
 	for _, hf := range regularFields {
+		if hf.Name == "" {
+			return nil, nil, sc.countError("invalid_pseudo_header", streamError(f.StreamID, ErrCodeProtocol))
+		}
 		key := sc.canonicalHeader(hf.Name)
 		vv := header[key]
 		if vv == nil && len(strs) > 0 {
@@ -2492,9 +2540,11 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		if _, ok := rp.Header["Content-Length"]; !ok {
 			req.ContentLength = -1
 		}
-		st.reqBody.pipe = &pipe{
-			b: &dataBuffer{expected: req.ContentLength},
+		pb := &pipeWithDataBuffer{
+			buf: dataBuffer{expected: req.ContentLength},
 		}
+		pb.pipe.b = &pb.buf
+		st.reqBody.pipe = &pb.pipe
 	}
 	return rw, req, nil
 }
@@ -2507,11 +2557,12 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 		return nil, nil, sc.countError(res.InvalidReason, streamError(st.id, ErrCodeProtocol))
 	}
 
-	st.reqBody = &requestBody{
+	st.reqBodyStorage = requestBody{
 		conn:          sc,
 		stream:        st,
 		needsContinue: res.NeedsContinue,
 	}
+	st.reqBody = &st.reqBodyStorage
 	rw := sc.newResponseWriter(st)
 	rw.rws.req = ServerRequest{
 		Context:    st.ctx,
@@ -3196,16 +3247,45 @@ func (rws *responseWriterState) writeHeader(code int) {
 	rws.wroteHeader = true
 	rws.status = code
 	if len(rws.handlerHeader) > 0 {
-		rws.snapHeader = cloneHeader(rws.handlerHeader)
+		if rws.handlerDone && !rws.hasUndeclaredTrailers() {
+			rws.snapHeader = rws.handlerHeader
+		} else {
+			rws.snapHeader = cloneHeader(rws.handlerHeader)
+		}
 	}
 }
 
+func (rws *responseWriterState) hasUndeclaredTrailers() bool {
+	for k := range rws.handlerHeader {
+		if strings.HasPrefix(k, TrailerPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func cloneHeader(h Header) Header {
+	nv := 0
+	for _, vv := range h {
+		nv += len(vv)
+	}
+	var sv []string
+	if nv > 0 {
+		sv = make([]string, nv)
+	}
 	h2 := make(Header, len(h))
 	for k, vv := range h {
-		vv2 := make([]string, len(vv))
-		copy(vv2, vv)
-		h2[k] = vv2
+		if len(vv) == 0 {
+			if vv == nil {
+				h2[k] = nil
+			} else {
+				h2[k] = []string{}
+			}
+			continue
+		}
+		n := copy(sv, vv)
+		h2[k] = sv[:n:n]
+		sv = sv[n:]
 	}
 	return h2
 }

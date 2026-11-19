@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"net/http/internal"
 	"net/http/internal/http2"
 	"time"
 
@@ -122,7 +123,7 @@ func (rt http2ErringRoundTripper) RoundTrip(*Request) (*Response, error) { retur
 
 func http2RoundTrip(req *Request, rt func(*http2.ClientRequest) (*http2.ClientResponse, error)) (*Response, error) {
 	resp := &Response{}
-	cresp, err := rt(&http2.ClientRequest{
+	creq := http2.ClientRequest{
 		Context:       req.Context(),
 		Method:        req.Method,
 		URL:           req.URL,
@@ -134,11 +135,20 @@ func http2RoundTrip(req *Request, rt func(*http2.ClientRequest) (*http2.ClientRe
 		Cancel:        req.Cancel,
 		Close:         req.Close,
 		ResTrailer:    (*http2.Header)(&resp.Trailer),
-	})
+	}
+	cresp, err := rt(&creq)
 	if err != nil {
 		return nil, err
 	}
-	resp.Status = cresp.Status + " " + StatusText(cresp.StatusCode)
+	return populateHTTP2Response(resp, req, cresp), nil
+}
+
+func populateHTTP2Response(resp *Response, req *Request, cresp *http2.ClientResponse) *Response {
+	if s := internal.StatusCodeText(cresp.StatusCode); s != "" && len(cresp.Status) == 3 {
+		resp.Status = s
+	} else {
+		resp.Status = cresp.Status + " " + StatusText(cresp.StatusCode)
+	}
 	resp.StatusCode = cresp.StatusCode
 	resp.Proto = "HTTP/2.0"
 	resp.ProtoMajor = 2
@@ -150,7 +160,7 @@ func http2RoundTrip(req *Request, rt func(*http2.ClientRequest) (*http2.ClientRe
 	resp.Body = cresp.Body
 	resp.TLS = cresp.TLS
 	resp.Request = req
-	return resp, nil
+	return resp
 }
 
 func (t *Transport) http2NewClientConn(nc net.Conn, isClientConn bool, internalStateHook func() error) (genericClientConn, error) {
@@ -224,7 +234,25 @@ type http2ClientConn struct {
 }
 
 func (cc http2ClientConn) RoundTrip(req *Request) (*Response, error) {
-	return http2RoundTrip(req, cc.NetHTTPClientConn.RoundTrip)
+	resp := &Response{}
+	creq := http2.ClientRequest{
+		Context:       req.Context(),
+		Method:        req.Method,
+		URL:           req.URL,
+		Header:        http2.Header(req.Header),
+		Trailer:       http2.Header(req.Trailer),
+		Body:          req.Body,
+		Host:          req.Host,
+		ContentLength: req.ContentLength,
+		Cancel:        req.Cancel,
+		Close:         req.Close,
+		ResTrailer:    (*http2.Header)(&resp.Trailer),
+	}
+	cresp, err := cc.NetHTTPClientConn.RoundTrip(&creq)
+	if err != nil {
+		return nil, err
+	}
+	return populateHTTP2Response(resp, req, cresp), nil
 }
 
 // transportConfig implements the http2.TransportConfig interface,

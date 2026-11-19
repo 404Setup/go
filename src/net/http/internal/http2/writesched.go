@@ -142,16 +142,8 @@ func (wr FrameWriteRequest) Consume(n int32) (FrameWriteRequest, FrameWriteReque
 			// this intermediate frame, so no need to wait.
 			done: nil,
 		}
-		rest := FrameWriteRequest{
-			stream: wr.stream,
-			write: &writeData{
-				streamID:  wd.streamID,
-				p:         wd.p[allowed:],
-				endStream: wd.endStream,
-			},
-			done: wr.done,
-		}
-		return consumed, rest, 2
+		wd.p = wd.p[allowed:]
+		return consumed, wr, 2
 	}
 
 	// The frame is consumed whole.

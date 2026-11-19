@@ -26,6 +26,7 @@ import (
 	"net/textproto"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"sync/v2"
 	"time"
 
@@ -178,12 +179,14 @@ type ClientConn struct {
 	// wmu is held while writing.
 	// Acquire BEFORE mu when holding both, to avoid blocking mu on network writes.
 	// Only acquire both at the same time when changing peer settings.
-	wmu  sync.Mutex
-	bw   *bufio.Writer
-	fr   *Framer
-	werr error        // first write error that has occurred
-	hbuf bytes.Buffer // HPACK encoder writes into this
-	henc *hpack.Encoder
+	wmu             sync.Mutex
+	bw              *bufio.Writer
+	fr              *Framer
+	werr            error // first write error that has occurred
+	hasWriteErr     atomic.Bool
+	hbuf            bytes.Buffer // HPACK encoder writes into this
+	henc            *hpack.Encoder
+	writeHeaderFunc func(name, value string)
 }
 
 // clientStream is the state for a single HTTP/2 stream. One of these
@@ -258,6 +261,7 @@ type clientStream struct {
 	resTrailer *Header // client's Response.Trailer
 
 	staticResp ClientResponse
+	buf        dataBuffer
 }
 
 var got1xxFuncForTests func(int, textproto.MIMEHeader) error
@@ -322,6 +326,7 @@ type stickyErrWriter struct {
 	conn    net.Conn
 	timeout time.Duration
 	err     *error
+	hasErr  *atomic.Bool
 }
 
 func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
@@ -330,6 +335,9 @@ func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
 	}
 	n, err = writeWithByteTimeout(sew.conn, sew.timeout, p)
 	*sew.err = err
+	if err != nil && sew.hasErr != nil {
+		sew.hasErr.Store(true)
+	}
 	return n, err
 }
 
@@ -410,9 +418,11 @@ func (t *Transport) newClientConn(c net.Conn, internalStateHook func() error) (*
 		conn:    c,
 		timeout: conf.WriteByteTimeout,
 		err:     &cc.werr,
+		hasErr:  &cc.hasWriteErr,
 	})
 	cc.br = bufio.NewReader(c)
 	cc.fr = NewFramer(cc.bw, cc.br)
+	cc.fr.SetReuseFrames()
 	cc.fr.SetMaxReadFrameSize(uint32(conf.MaxReadFrameSize))
 	if conf.CountError != nil {
 		cc.fr.countError = conf.CountError
@@ -423,6 +433,7 @@ func (t *Transport) newClientConn(c net.Conn, internalStateHook func() error) (*
 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(uint32(conf.MaxEncoderHeaderTableSize))
+	cc.writeHeaderFunc = cc.writeHeader
 	cc.peerMaxHeaderTableSize = initialHeaderTableSize
 
 	if cs, ok := c.(connectionStater); ok {
@@ -956,9 +967,11 @@ func (cs *clientStream) detach(respHeaderTimeout time.Duration) bool {
 	// stopCtxWatch must be assigned before detached is set: once detached
 	// is set, an abort or peer close can schedule cleanupWriteRequest
 	// (which calls stopCtxWatch) as soon as we release cc.mu.
-	cs.stopCtxWatch = context.AfterFunc(cs.ctx, func() {
-		cs.abortStream(cs.ctx.Err())
-	})
+	if cs.ctx.Done() != nil {
+		cs.stopCtxWatch = context.AfterFunc(cs.ctx, func() {
+			cs.abortStream(cs.ctx.Err())
+		})
+	}
 	cs.detached = true
 	return true
 }
@@ -1159,9 +1172,11 @@ func (cs *clientStream) encodeAndWriteHeaders(req *ClientRequest) error {
 	// sent by writeRequestBody below, along with any Trailers,
 	// again in form HEADERS{1}, CONTINUATION{0,})
 	cc.hbuf.Reset()
-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, func(name, value string) {
-		cc.writeHeader(name, value)
-	})
+	writeHeader := cc.writeHeaderFunc
+	if writeHeader == nil {
+		writeHeader = cc.writeHeader
+	}
+	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, writeHeader)
 	if err != nil {
 		return fmt.Errorf("http2: %w", err)
 	}
@@ -1301,7 +1316,7 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 
 	if closeConn {
 		cc.closeConn()
-	} else {
+	} else if cc.hasWriteErr.Load() {
 		cc.wmu.Lock()
 		werr := cc.werr
 		cc.wmu.Unlock()
@@ -1944,12 +1959,14 @@ func (rl *clientConnReadLoop) processHeaders(f *MetaHeadersFrame) error {
 	cs.res = res
 	close(cs.respHeaderRecv)
 	// Stop a detached stream's response header timeout, if armed.
-	rl.cc.mu.Lock()
-	if t := cs.respHeaderTimeoutTimer; t != nil {
-		t.Stop()
-		cs.respHeaderTimeoutTimer = nil
+	if rl.cc.t == nil || rl.cc.t.t1 == nil || rl.cc.responseHeaderTimeout() != 0 {
+		rl.cc.mu.Lock()
+		if t := cs.respHeaderTimeoutTimer; t != nil {
+			t.Stop()
+			cs.respHeaderTimeoutTimer = nil
+		}
+		rl.cc.mu.Unlock()
 	}
-	rl.cc.mu.Unlock()
 	if f.StreamEnded() {
 		rl.endStream(cs)
 	}
@@ -2082,26 +2099,28 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 
 	// Connection-specific header fields must not appear in an HTTP/2 message,
 	// and any message containing them is malformed. RFC 9113, Section 8.2.2.
-	for _, k := range connHeaders {
-		delete(res.Header, k)
-	}
 	res.ContentLength = -1
-	if clens, ok := res.Header["Content-Length"]; ok {
-		// Repeated Content-Length values may be collapsed into one only if
-		// they are identical per RFC 9110 Section 8.6.
-		// No need to trim whitespace, HTTP/2 header values must not have
-		// extraneous whitespace per RFC 9113 Section 8.2.1.
-		// Non-canonical headers are already rejected by our framer at this
-		// point.
-		conflicting := slices.ContainsFunc(clens[1:], func(clen string) bool {
-			return clen != clens[0]
-		})
-		cl, err := strconv.ParseUint(clens[0], 10, 63)
-		if conflicting || err != nil {
-			delete(res.Header, "Content-Length")
-		} else {
-			res.Header["Content-Length"] = clens[:1]
-			res.ContentLength = int64(cl)
+	if len(res.Header) > 0 {
+		for _, k := range connHeaders {
+			delete(res.Header, k)
+		}
+		if clens, ok := res.Header["Content-Length"]; ok {
+			// Repeated Content-Length values may be collapsed into one only if
+			// they are identical per RFC 9110 Section 8.6.
+			// No need to trim whitespace, HTTP/2 header values must not have
+			// extraneous whitespace per RFC 9113 Section 8.2.1.
+			// Non-canonical headers are already rejected by our framer at this
+			// point.
+			conflicting := slices.ContainsFunc(clens[1:], func(clen string) bool {
+				return clen != clens[0]
+			})
+			cl, err := strconv.ParseUint(clens[0], 10, 63)
+			if conflicting || err != nil {
+				delete(res.Header, "Content-Length")
+			} else {
+				res.Header["Content-Length"] = clens[:1]
+				res.ContentLength = int64(cl)
+			}
 		}
 	}
 
@@ -2123,7 +2142,8 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		return res, nil
 	}
 
-	cs.bufPipe.setBuffer(&dataBuffer{expected: res.ContentLength})
+	cs.buf.expected = res.ContentLength
+	cs.bufPipe.setBuffer(&cs.buf)
 	cs.bytesRemain = res.ContentLength
 	res.Body = transportResponseBody{cs}
 
@@ -2392,17 +2412,41 @@ func (rl *clientConnReadLoop) endStream(cs *clientStream) {
 	// server.go's (*stream).endStream method.
 	if !cs.readClosed {
 		cs.readClosed = true
+		var copyTrailers func()
+		if len(cs.trailer) > 0 {
+			copyTrailers = cs.copyTrailers
+		}
+		var stopCtxWatch func() bool
+		var closeDone bool
+		cc := rl.cc
 		// Close cs.bufPipe and cs.peerClosed with cc.mu held to avoid a
 		// race condition: The caller can read io.EOF from Response.Body
 		// and close the body before we close cs.peerClosed, causing
 		// cleanupWriteRequest to send a RST_STREAM.
-		rl.cc.mu.Lock()
-		defer rl.cc.mu.Unlock()
-		cs.bufPipe.closeWithErrorAndCode(io.EOF, cs.copyTrailers)
+		cc.mu.Lock()
+		cs.bufPipe.closeWithErrorAndCode(io.EOF, copyTrailers)
 		close(cs.peerClosed)
 		if cs.detached {
 			cs.detached = false
-			go cs.cleanupWriteRequest(nil)
+			if cs.sentEndStream && cs.reqBody == nil && cs.reqBodyClosed == nil &&
+				cs.ID != 0 && !cc.draining && !cc.hasWriteErr.Load() && cc.internalStateHook == nil {
+				stopCtxWatch = cs.stopCtxWatch
+				if t := cs.respHeaderTimeoutTimer; t != nil {
+					t.Stop()
+					cs.respHeaderTimeoutTimer = nil
+				}
+				cc.forgetStreamIDLocked(cs.ID)
+				closeDone = true
+			} else {
+				go cs.cleanupWriteRequest(nil)
+			}
+		}
+		cc.mu.Unlock()
+		if stopCtxWatch != nil {
+			stopCtxWatch()
+		}
+		if closeDone {
+			close(cs.donec)
 		}
 	}
 }

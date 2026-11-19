@@ -141,13 +141,13 @@ func (w writePing) writeFrame(ctx writeContext) error {
 
 func (w writePing) staysWithinBuffer(max int) bool { return frameHeaderLen+len(w.data) <= max }
 
-type writePingAck struct{ pf *PingFrame }
+type writePingAck struct{ data [8]byte }
 
 func (w writePingAck) writeFrame(ctx writeContext) error {
-	return ctx.Framer().WritePing(true, w.pf.Data)
+	return ctx.Framer().WritePing(true, w.data)
 }
 
-func (w writePingAck) staysWithinBuffer(max int) bool { return frameHeaderLen+len(w.pf.Data) <= max }
+func (w writePingAck) staysWithinBuffer(max int) bool { return frameHeaderLen+len(w.data) <= max }
 
 type writeSettingsAck struct{}
 
@@ -206,17 +206,13 @@ func encKV(enc *hpack.Encoder, k, v string) {
 }
 
 func (w *writeResHeaders) staysWithinBuffer(max int) bool {
-	// TODO: this is a common one. It'd be nice to return true
-	// here and get into the fast path if we could be clever and
-	// calculate the size fast enough, or at least a conservative
-	// upper bound that usually fires. (Maybe if w.h and
-	// w.trailers are nil, so we don't need to enumerate it.)
-	// Otherwise I'm afraid that just calculating the length to
-	// answer this question would be slower than the ~2µs benefit.
+	// writeResHeaders is pre-encoded directly on serveG in startFrameWrite so
+	// its exact encoded size is known before deciding between synchronous and
+	// asynchronous writing.
 	return false
 }
 
-func (w *writeResHeaders) writeFrame(ctx writeContext) error {
+func (w *writeResHeaders) encodeHeaderBlock(ctx writeContext) []byte {
 	enc, buf := ctx.HeaderEncoder()
 	buf.Reset()
 
@@ -240,21 +236,40 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 	if len(headerBlock) == 0 && w.trailers == nil {
 		panic("unexpected empty hpack")
 	}
-
-	return splitHeaderBlock(ctx, headerBlock, w.writeHeaderBlock)
+	return headerBlock
 }
 
-func (w *writeResHeaders) writeHeaderBlock(ctx writeContext, frag []byte, firstFrag, lastFrag bool) error {
-	if firstFrag {
-		return ctx.Framer().WriteHeaders(HeadersFrameParam{
-			StreamID:      w.streamID,
-			BlockFragment: frag,
-			EndStream:     w.endStream,
-			EndHeaders:    lastFrag,
-		})
-	} else {
-		return ctx.Framer().WriteContinuation(w.streamID, lastFrag, frag)
+func (w *writeResHeaders) writeHeaderBlockSlice(ctx writeContext, headerBlock []byte) error {
+	const maxFrameSize = 16384
+	first := true
+	for len(headerBlock) > 0 {
+		frag := headerBlock
+		if len(frag) > maxFrameSize {
+			frag = frag[:maxFrameSize]
+		}
+		headerBlock = headerBlock[len(frag):]
+		last := len(headerBlock) == 0
+		var err error
+		if first {
+			err = ctx.Framer().WriteHeaders(HeadersFrameParam{
+				StreamID:      w.streamID,
+				BlockFragment: frag,
+				EndStream:     w.endStream,
+				EndHeaders:    last,
+			})
+			first = false
+		} else {
+			err = ctx.Framer().WriteContinuation(w.streamID, last, frag)
+		}
+		if err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func (w *writeResHeaders) writeFrame(ctx writeContext) error {
+	return w.writeHeaderBlockSlice(ctx, w.encodeHeaderBlock(ctx))
 }
 
 // writePushPromise is a request to write a PUSH_PROMISE and 0+ CONTINUATION frames.

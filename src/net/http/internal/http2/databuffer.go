@@ -66,11 +66,12 @@ func putDataBufferChunk(p []byte) {
 // total memory used by a single connection without limiting the
 // request body size on any single stream.
 type dataBuffer struct {
-	chunks   [][]byte
-	r        int   // next byte to read is chunks[0][r]
-	w        int   // next byte to write is chunks[len(chunks)-1][w]
-	size     int   // total buffered bytes
-	expected int64 // we expect at least this many bytes in future Write calls (ignored if <= 0)
+	chunks       [][]byte
+	inlineChunks [2][]byte
+	r            int   // next byte to read is chunks[0][r]
+	w            int   // next byte to write is chunks[len(chunks)-1][w]
+	size         int   // total buffered bytes
+	expected     int64 // we expect at least this many bytes in future Write calls (ignored if <= 0)
 }
 
 var errReadEmpty = errors.New("read from empty dataBuffer")
@@ -99,7 +100,23 @@ func (b *dataBuffer) Read(p []byte) (int, error) {
 			b.r = 0
 		}
 	}
+	if b.size == 0 {
+		b.r = 0
+		b.w = 0
+	}
 	return ntotal, nil
+}
+
+// release returns all currently held chunks to the chunk pools.
+func (b *dataBuffer) release() {
+	for i, c := range b.chunks {
+		putDataBufferChunk(c)
+		b.chunks[i] = nil
+	}
+	b.chunks = nil
+	b.r = 0
+	b.w = 0
+	b.size = 0
 }
 
 func (b *dataBuffer) bytesFromFirstChunk() []byte {
@@ -138,6 +155,9 @@ func (b *dataBuffer) lastChunkOrAlloc(want int64) []byte {
 		if b.w < len(last) {
 			return last
 		}
+	}
+	if b.chunks == nil {
+		b.chunks = b.inlineChunks[:0]
 	}
 	chunk := getDataBufferChunk(want)
 	b.chunks = append(b.chunks, chunk)

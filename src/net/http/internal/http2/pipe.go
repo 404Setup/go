@@ -70,10 +70,17 @@ func (p *pipe) Read(d []byte) (n int, err error) {
 				p.readFn()     // e.g. copy trailers
 				p.readFn = nil // not sticky like p.err
 			}
+			releasePipeBuffer(p.b)
 			p.b = nil
 			return 0, p.err
 		}
 		p.c.Wait()
+	}
+}
+
+func releasePipeBuffer(b pipeBuffer) {
+	if db, ok := b.(*dataBuffer); ok {
+		db.release()
 	}
 }
 
@@ -137,6 +144,7 @@ func (p *pipe) closeWithError(dst *error, err error, fn func()) {
 	if dst == &p.breakErr {
 		if p.b != nil {
 			p.unread += p.b.Len()
+			releasePipeBuffer(p.b)
 		}
 		p.b = nil
 	}
