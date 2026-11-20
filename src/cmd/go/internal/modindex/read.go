@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"go/build"
 	"go/build/constraint"
 	"go/token"
 	"internal/godebug"
@@ -25,6 +24,7 @@ import (
 	"unsafe"
 
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
@@ -605,7 +605,7 @@ func (rp *IndexPackage) Import(bctxt build.Context, mode build.ImportMode) (p *b
 		switch {
 		case isCgo:
 			allTags["cgo"] = true
-			if ctxt.CgoEnabled {
+			if ctxt.CgoEnabled == build.CgoEnabled {
 				fileList = &p.CgoFiles
 				importMap = importPos
 				embedMap = embedPos

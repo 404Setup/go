@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
@@ -3052,7 +3053,7 @@ func (b *Builder) compilerCmd(compiler []string, incdir, workdir string) []strin
 	a = append(a, b.gccArchArgs()...)
 	// gcc-4.5 and beyond require explicit "-pthread" flag
 	// for multithreading with pthread library.
-	if cfg.BuildContext.CgoEnabled {
+	if cfg.BuildContext.CgoEnabled == build.CgoEnabled {
 		a = append(a, "-pthread")
 	}
 

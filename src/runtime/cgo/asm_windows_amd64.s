@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.cgobindings && windows && amd64
+//go:build goexperiment.runtimecgopurego && !msan && !tsan && windows && amd64
 
 #include "go_asm.h"
 #include "textflag.h"
@@ -16,7 +16,7 @@ TEXT ·cgoCallTrampoline(SB),NOSPLIT|NOFRAME,$0-0
 	PUSHQ	BP
 	MOVQ	SP, BP
 	PUSHQ	BX
-	SUBQ	$40, SP
+	ADJSP	$40		// record shadow space and alignment for unwinding
 	MOVQ	CX, BX
 	MOVQ	cgoCallFrame_fn(CX), AX
 	MOVQ	cgoCallFrame_a3(CX), R9
@@ -26,7 +26,7 @@ TEXT ·cgoCallTrampoline(SB),NOSPLIT|NOFRAME,$0-0
 	CALL	AX
 	MOVQ	AX, cgoCallFrame_r1(BX)
 	XORL	AX, AX
-	ADDQ	$40, SP
+	ADJSP	$-40
 	POPQ	BX
 	POPQ	BP
 	RET

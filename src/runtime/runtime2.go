@@ -570,7 +570,8 @@ type g struct {
 	//    param may point to a savedOpenDeferState.
 	param        unsafe.Pointer
 	atomicstatus atomic.Uint32
-	wasmCont     wasmContPerG // GOWASM=stackswitch only; fills the padding before goid
+	trace        gTraceState  // per-G tracer state
+	wasmCont     wasmContPerG // GOWASM=stackswitch only
 	goid         uint64
 	schedlink    guintptr
 	waitsince    int64      // approx time when the g become blocked
@@ -635,7 +636,6 @@ type g struct {
 
 	sig        uint32
 	secret     int32 // current nesting of runtime/secret.Do calls.
-	writebuf   []byte
 	sigcode0   uintptr
 	sigcode1   uintptr
 	sigpc      uintptr
@@ -644,7 +644,7 @@ type g struct {
 	ancestors  *[]ancestorInfo // ancestor information goroutine(s) that created this goroutine (only used if debug.tracebackancestors)
 	startpc    uintptr         // pc of goroutine function
 	racectx    uintptr
-	cgoCtxt    []uintptr      // cgo traceback context
+	cgoCtxt    *[]uintptr     // cgo traceback contexts, allocated on first use (see cgocallbackg1)
 	labels     unsafe.Pointer // profiler labels
 	timer      *timer         // cached timer for time.Sleep
 	sleepWhen  int64          // when to sleep until
@@ -664,9 +664,6 @@ type g struct {
 	// valgrind is the Valgrind state of this G's stack. It is empty
 	// unless the runtime is built with Valgrind support (see valgrind.go).
 	valgrind valgrindPerG
-
-	// Per-G tracer state.
-	trace gTraceState
 
 	// Per-G GC state
 
@@ -812,6 +809,13 @@ type m struct {
 
 	// self points this M until mexit clears it to return nil.
 	self mWeakPointer
+
+	// While writebufg is set, its print output goes to writebuf (see
+	// gwrite). Output of any other goroutine on this M, for example a
+	// signal handler running on gsignal, still goes to standard error.
+	// writebufg must not move to another M while it is set.
+	writebuf  []byte
+	writebufg guintptr
 }
 
 const mRedZoneSize = (16 << 3) * asanenabledBit // redZoneSize(2048)

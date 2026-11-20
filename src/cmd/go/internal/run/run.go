@@ -7,11 +7,11 @@ package run
 
 import (
 	"context"
-	"go/build"
 	"path/filepath"
 	"strings"
 
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
 	"cmd/go/internal/modload"
@@ -161,7 +161,7 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
 			// this case could only happen if the provided source uses cgo
 			// while cgo is disabled.
 			hint := ""
-			if !cfg.BuildContext.CgoEnabled {
+			if cfg.BuildContext.CgoEnabled != build.CgoEnabled {
 				hint = " (cgo is disabled)"
 			}
 			base.Fatalf("go: no suitable source files%s", hint)

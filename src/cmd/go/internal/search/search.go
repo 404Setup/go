@@ -6,6 +6,7 @@ package search
 
 import (
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/imports"
@@ -14,7 +15,6 @@ import (
 	"cmd/internal/pkgpattern"
 	"errors"
 	"fmt"
-	"go/build"
 	"io/fs"
 	"os"
 	"path"
@@ -122,7 +122,7 @@ func (m *Match) MatchPackages() {
 	have := map[string]bool{
 		"builtin": true, // ignore pseudo-package that exists only for documentation
 	}
-	if !cfg.BuildContext.CgoEnabled {
+	if cfg.BuildContext.CgoEnabled == build.CgoDisabled {
 		have["runtime/cgo"] = true // ignore during walk
 	}
 
