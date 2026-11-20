@@ -6,95 +6,66 @@
 
 package simd
 
-import (
-	"fmt"
-	"strings"
-	"testing"
-)
+import "testing"
 
-func TestConfigurePlainPlus(t *testing.T) {
+func TestConfigure(t *testing.T) {
 	for _, test := range []struct {
-		name           string
-		actualMax      int
-		allFeatureSize int
-		wantHWClmul    bool
-		arch           string
+		hwMax        int
+		value        string
+		wantSize     int
+		wantEmulated bool
 	}{
-		{"missing feature", 256, 128, false, "amd64"},
-		{"all features", 256, 256, true, "amd64"},
+		// By default, use the largest vectors the hardware supports.
+		{128, "", 128, false},
+		{256, "", 256, false},
+		{512, "", 512, false},
+		// 1 is the same as the default.
+		{128, "1", 128, false},
+		{256, "1", 256, false},
+		{512, "1", 512, false},
+		// 0 requests emulation.
+		{128, "0", 128, true},
+		{512, "0", 128, true},
+		// A size requests at most that size.
+		{128, "128", 128, false},
+		{256, "128", 128, false},
+		{256, "256", 256, false},
+		{512, "128", 128, false},
+		{512, "256", 256, false},
+		{512, "512", 512, false},
+		// A size larger than the hardware supports uses the largest
+		// size it does support.
+		{128, "256", 128, false},
+		{128, "512", 128, false},
+		{256, "512", 256, false},
+		// Unrecognized values are the same as the default.
+		{512, "17", 512, false},
+		{512, "64", 512, false},
+		{512, "127", 512, false},
+		{512, "129", 512, false},
+		{512, "200", 512, false},
+		{512, "1024", 512, false},
+		{512, "-1", 512, false},
+		{512, "abc", 512, false},
+		{512, "0128", 512, false},
+		// The "+" prefix used to override a limit on the vector size
+		// that no longer exists.
+		{512, "+", 512, false},
+		{512, "+256", 512, false},
+		{512, "+17", 512, false},
+		// "@" used to select a variant, which no longer exist.
+		{128, "@nclm", 128, false},
+		// Without SIMD hardware, always emulate.
+		{0, "", 128, true},
+		{0, "1", 128, true},
+		{0, "0", 128, true},
+		{0, "256", 128, true},
+		{0, "abc", 128, true},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			max, emulated, hwClmul := configure(test.actualMax, test.allFeatureSize, test.arch, "+")
-			if max != test.actualMax || emulated || hwClmul != test.wantHWClmul {
-				t.Errorf("configure(%d, %d, +) = (%d, %t, %t), want (%d, false, %t)",
-					test.actualMax, test.allFeatureSize, max, emulated, hwClmul,
-					test.actualMax, test.wantHWClmul)
-			}
-
-			maxWithSize, emulatedWithSize, hwClmulWithSize := configure(test.actualMax, test.allFeatureSize, test.arch, "+256")
-			if max != maxWithSize || emulated != emulatedWithSize || hwClmul != hwClmulWithSize {
-				t.Errorf("plain + result (%d, %t, %t) differs from +256 result (%d, %t, %t)",
-					max, emulated, hwClmul, maxWithSize, emulatedWithSize, hwClmulWithSize)
-			}
-		})
-	}
-}
-
-func TestConfigureDefault(t *testing.T) {
-	max, emulated, hwClmul := configure(256, 256, "amd64", "")
-	if max != 256 || emulated || !hwClmul {
-		t.Errorf("configure(256, 256, empty) = (%d, %t, %t), want (256, false, true)",
-			max, emulated, hwClmul)
-	}
-}
-
-func TestConfigureOne(t *testing.T) {
-	for _, test := range []struct {
-		actualMax      int
-		allFeatureSize int
-	}{
-		{128, 0},
-		{128, 128},
-		{256, 128},
-		{256, 256},
-		{512, 256},
-		{512, 512},
-	} {
-		gotMax, gotEmulated, gotHWClmul := configure(test.actualMax, test.allFeatureSize, "amd64", "1")
-		wantMax, wantEmulated, wantHWClmul := configure(test.actualMax, test.allFeatureSize, "amd64", "+")
-		if gotMax != wantMax || gotEmulated != wantEmulated || gotHWClmul != wantHWClmul {
-			t.Errorf("configure(%d, %d, 1) = (%d, %t, %t), want plain + result (%d, %t, %t)",
-				test.actualMax, test.allFeatureSize, gotMax, gotEmulated, gotHWClmul,
-				wantMax, wantEmulated, wantHWClmul)
+		size, emulated := configure(test.hwMax, test.value)
+		if size != test.wantSize || emulated != test.wantEmulated {
+			t.Errorf("configure(%d, %q) = (%d, %t), want (%d, %t)",
+				test.hwMax, test.value, size, emulated, test.wantSize, test.wantEmulated)
 		}
-	}
-}
-
-func TestConfigureInvalidSize(t *testing.T) {
-	for _, test := range []struct {
-		value string
-		want  string
-	}{
-		{"17", "not a supported vector size"},
-		{"64", "not a supported vector size"},
-		{"127", "not a supported vector size"},
-		{"129", "not a supported vector size"},
-		{"200", "not a supported vector size"},
-		{"+17", "not a supported vector size"},
-		{"-1", "is negative"},
-		{"abc", "could not parse"},
-	} {
-		t.Run(test.value, func(t *testing.T) {
-			defer func() {
-				got := recover()
-				if got == nil {
-					t.Fatalf("configure(512, 512, %q) did not panic", test.value)
-				}
-				if message := fmt.Sprint(got); !strings.Contains(message, test.want) {
-					t.Fatalf("configure(512, 512, %q) panicked with %q, want substring %q", test.value, message, test.want)
-				}
-			}()
-			configure(512, 512, "amd64", test.value)
-		})
 	}
 }

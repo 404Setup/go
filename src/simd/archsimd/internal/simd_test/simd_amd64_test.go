@@ -8,6 +8,7 @@ package simd_test
 
 import (
 	"fmt"
+	"internal/cpu"
 	"math"
 	"os"
 	"simd/archsimd"
@@ -1241,9 +1242,6 @@ func TestPermuteScalarsLoGrouped(t *testing.T) {
 }
 
 func TestClMul(t *testing.T) {
-	if !archsimd.X86.AVXCLMUL() {
-		t.Skip("Test requires X86.AVXCLMUL, not available on this hardware")
-	}
 	var x = archsimd.LoadUint64x2([]uint64{1, 5})
 	var y = archsimd.LoadUint64x2([]uint64{3, 9})
 
@@ -1253,17 +1251,17 @@ func TestClMul(t *testing.T) {
 		checkSlices[uint64](t, r, s)
 	}
 
-	foo(x.CarrylessMultiplyEven(y), []uint64{3, 0})
-	foo(x.CarrylessMultiplyEvenOdd(y), []uint64{9, 0})
-	foo(x.CarrylessMultiplyOddEven(y), []uint64{15, 0})
-	foo(x.CarrylessMultiplyOdd(y), []uint64{45, 0})
-	foo(y.CarrylessMultiplyEven(y), []uint64{5, 0})
+	foo(x.CarrylessMulEven(y), []uint64{3, 0})
+	foo(x.CarrylessMulEvenOdd(y), []uint64{9, 0})
+	foo(x.CarrylessMulOddEven(y), []uint64{15, 0})
+	foo(x.CarrylessMulOdd(y), []uint64{45, 0})
+	foo(y.CarrylessMulEven(y), []uint64{5, 0})
 
 }
 
 func TestClMul256(t *testing.T) {
-	if !archsimd.X86.AVX2CLMUL() {
-		t.Skip("Test requires X86.AVX2CLMUL, not available on this hardware")
+	if !archsimd.X86.AVX2() {
+		t.Skip("Test requires X86.AVX2, not available on this hardware")
 	}
 	x := archsimd.LoadUint64x4([]uint64{1, 5, 1 << 63, 5})
 	y := archsimd.LoadUint64x4([]uint64{3, 9, 2, 9})
@@ -1274,11 +1272,122 @@ func TestClMul256(t *testing.T) {
 		v.Store(got[:])
 		checkSlices(t, got[:], want)
 	}
-	check(x.CarrylessMultiplyEven(y), []uint64{3, 0, 0, 1})
-	check(x.CarrylessMultiplyEvenOdd(y), []uint64{9, 0, 1 << 63, 4})
-	check(x.CarrylessMultiplyOddEven(y), []uint64{15, 0, 10, 0})
-	check(x.CarrylessMultiplyOdd(y), []uint64{45, 0, 45, 0})
+	check(x.CarrylessMulEven(y), []uint64{3, 0, 0, 1})
+	check(x.CarrylessMulEvenOdd(y), []uint64{9, 0, 1 << 63, 4})
+	check(x.CarrylessMulOddEven(y), []uint64{15, 0, 10, 0})
+	check(x.CarrylessMulOdd(y), []uint64{45, 0, 45, 0})
 }
+
+// forceCLMUL limits the carryless multiply CPU features that archsimd sees to
+// those of level, for the rest of the test or benchmark:
+//
+//   - "Native": the widest carryless multiply the CPU supports.
+//   - "128": only the Uint64x2 instruction (PCLMULQDQ, without VPCLMULQDQ).
+//   - "Software": no carryless multiply instruction.
+//
+// It skips the test if the CPU doesn't support level.
+func forceCLMUL(tb testing.TB, level string) {
+	old := cpu.X86
+	tb.Cleanup(func() { cpu.X86 = old })
+	switch level {
+	case "Native":
+	case "128":
+		if !cpu.X86.HasPCLMULQDQ {
+			tb.Skip("CPU does not support PCLMULQDQ")
+		}
+		cpu.X86.HasVPCLMULQDQ = false
+		cpu.X86.HasAVX512VPCLMULQDQ = false
+	case "Software":
+		cpu.X86.HasPCLMULQDQ = false
+		cpu.X86.HasVPCLMULQDQ = false
+		cpu.X86.HasAVX512VPCLMULQDQ = false
+	default:
+		tb.Fatalf("unknown carryless multiply level %q", level)
+	}
+}
+
+func TestCarrylessMul(t *testing.T) {
+	for _, level := range []string{"Native", "128", "Software"} {
+		t.Run(level, func(t *testing.T) {
+			forceCLMUL(t, level)
+			t.Run("Uint64x2", func(t *testing.T) {
+				testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulEven, clmulSlice(0, 0))
+				testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulOdd, clmulSlice(1, 1))
+				testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulEvenOdd, clmulSlice(0, 1))
+				testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulOddEven, clmulSlice(1, 0))
+			})
+			t.Run("Uint64x4", func(t *testing.T) {
+				if !archsimd.X86.AVX2() {
+					t.Skip("Test requires X86.AVX2, not available on this hardware")
+				}
+				testUint64x4Binary(t, archsimd.Uint64x4.CarrylessMulEven, clmulSlice(0, 0))
+				testUint64x4Binary(t, archsimd.Uint64x4.CarrylessMulOdd, clmulSlice(1, 1))
+				testUint64x4Binary(t, archsimd.Uint64x4.CarrylessMulEvenOdd, clmulSlice(0, 1))
+				testUint64x4Binary(t, archsimd.Uint64x4.CarrylessMulOddEven, clmulSlice(1, 0))
+			})
+			t.Run("Uint64x8", func(t *testing.T) {
+				if !archsimd.X86.AVX512() {
+					t.Skip("Test requires X86.AVX512, not available on this hardware")
+				}
+				testUint64x8Binary(t, archsimd.Uint64x8.CarrylessMulEven, clmulSlice(0, 0))
+				testUint64x8Binary(t, archsimd.Uint64x8.CarrylessMulOdd, clmulSlice(1, 1))
+				testUint64x8Binary(t, archsimd.Uint64x8.CarrylessMulEvenOdd, clmulSlice(0, 1))
+				testUint64x8Binary(t, archsimd.Uint64x8.CarrylessMulOddEven, clmulSlice(1, 0))
+			})
+		})
+	}
+}
+
+// BenchmarkCarrylessMul measures the latency of one multiply.
+//
+// It uses b.N rather than b.Loop because the compiler keeps variables assigned
+// in a b.Loop body alive on the stack, which would add a store and a load to
+// the dependency chain being measured.
+func BenchmarkCarrylessMul(b *testing.B) {
+	for _, level := range []string{"Native", "128", "Software"} {
+		b.Run(level, func(b *testing.B) {
+			b.Run("Uint64x2", func(b *testing.B) {
+				forceCLMUL(b, level)
+				x := archsimd.LoadUint64x2([]uint64{0x0123456789abcdef, 0xfedcba9876543210})
+				y := archsimd.LoadUint64x2([]uint64{0x66b32838754f59a3, 0xaeba319ab2418c50})
+				for range b.N {
+					x = x.CarrylessMulEven(y).Xor(y)
+				}
+				sinkUint64x2 = x
+			})
+			b.Run("Uint64x4", func(b *testing.B) {
+				if !archsimd.X86.AVX2() {
+					b.Skip("Benchmark requires X86.AVX2, not available on this hardware")
+				}
+				forceCLMUL(b, level)
+				x := archsimd.LoadUint64x4([]uint64{0x0123456789abcdef, 0xfedcba9876543210, 1, 2})
+				y := archsimd.LoadUint64x4([]uint64{0x66b32838754f59a3, 0xaeba319ab2418c50, 3, 4})
+				for range b.N {
+					x = x.CarrylessMulEven(y).Xor(y)
+				}
+				sinkUint64x4 = x
+			})
+			b.Run("Uint64x8", func(b *testing.B) {
+				if !archsimd.X86.AVX512() {
+					b.Skip("Benchmark requires X86.AVX512, not available on this hardware")
+				}
+				forceCLMUL(b, level)
+				x := archsimd.LoadUint64x8([]uint64{0x0123456789abcdef, 0xfedcba9876543210, 1, 2, 3, 4, 5, 6})
+				y := archsimd.LoadUint64x8([]uint64{0x66b32838754f59a3, 0xaeba319ab2418c50, 7, 8, 9, 10, 11, 12})
+				for range b.N {
+					x = x.CarrylessMulEven(y).Xor(y)
+				}
+				sinkUint64x8 = x
+			})
+		})
+	}
+}
+
+var (
+	sinkUint64x2 archsimd.Uint64x2
+	sinkUint64x4 archsimd.Uint64x4
+	sinkUint64x8 archsimd.Uint64x8
+)
 
 func concatSubPairsSlice[T number](a, b []T) []T {
 	r := make([]T, len(a))
@@ -1871,15 +1980,15 @@ func TestEnlarge(t *testing.T) {
 	{
 		var got [8]float32
 		y := archsimd.LoadFloat32x8([]float32{1, 2, 3, 4, 5, 6, 7, 8})
-		y.GetLo().Enlarge().Store(got[:])
+		y.Lo().Enlarge().Store(got[:])
 		checkSlices(t, got[:], []float32{1, 2, 3, 4, 0, 0, 0, 0})
-		y.GetHi().Enlarge().Store(got[:])
+		y.Hi().Enlarge().Store(got[:])
 		checkSlices(t, got[:], []float32{5, 6, 7, 8, 0, 0, 0, 0})
 	}
 	if archsimd.X86.AVX2() {
 		var got [8]int32
 		y := archsimd.LoadInt32x8([]int32{1, 2, 3, 4, 5, 6, 7, 8})
-		y.GetLo().Enlarge().Store(got[:])
+		y.Lo().Enlarge().Store(got[:])
 		checkSlices(t, got[:], []int32{1, 2, 3, 4, 0, 0, 0, 0})
 	}
 
@@ -1908,7 +2017,7 @@ func testEnlarge512(t *testing.T) {
 		for i := range src {
 			src[i] = uint8(i + 1)
 		}
-		archsimd.LoadUint8x64(src[:]).GetLo().Enlarge().Store(got[:])
+		archsimd.LoadUint8x64(src[:]).Lo().Enlarge().Store(got[:])
 		want := make([]uint8, 64)
 		copy(want, src[:32])
 		checkSlices(t, got[:], want)

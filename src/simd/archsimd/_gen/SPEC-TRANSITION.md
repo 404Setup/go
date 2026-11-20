@@ -300,10 +300,11 @@ VPADDD, CPU Feature: AVX`) and wrap freely.
 `CPU Feature:` names the feature a caller must check for before calling the
 method at all. A method that uses a single instruction when some further feature
 is available, and an emulation otherwise, names the feature check that selects
-the instruction in its `Asm:` clause: `Asm: VPCLMULQDQ if AVX2CLMUL, Emulated
-otherwise, CPU Feature: AVX2`. Such a method is safe to call without that
-further feature. The `midway` generator reads only the `CPU Feature:` clause to
-decide whether a method is available to portable `simd` at a given vector size.
+the instruction in its `Asm:` clause: `Asm: VPCLMULQDQ if CPU feature AVX2CLMUL,
+Emulated otherwise, CPU Feature: AVX2`. Such a method is safe to call without
+that further feature. The `midway` generator reads only the `CPU Feature:`
+clause to decide whether a method is available to portable `simd` at a given
+vector size.
 
 **Checks.** Strict ordering is necessary for idempotence, and the tools perform
 the following checks to ensure we maintain it: (a) In an existing comment,
@@ -1006,8 +1007,8 @@ Every configuration can be tested fully and practically: amd64 including
 AVX512 on the gotip-linux-amd64 gomote, NEON on the gotip-linux-arm64
 gomote (or `qemu-aarch64 -cpu neoverse-n1`), SVE with `qemu-aarch64 -cpu
 neoverse-n2` (128-bit) and `-cpu neoverse-v1` (256-bit), and wasm with `node`.
-See "Testing on other platforms" in [README.md](README.md) for the per-builder
-feature tables, commands, and known emulator limitations.
+See "Testing on other platforms" in [the simd README](../../README.md) for the
+per-builder feature tables, commands, and known emulator limitations.
 
 Emulation is fast enough for the conformance suite: each package's conformance
 tests take seconds under `qemu-aarch64`. `qemu-aarch64 -cpu neoverse-n1` is

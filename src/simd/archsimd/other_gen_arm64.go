@@ -76,70 +76,80 @@ func BroadcastFloat64x2(x float64) (z Float64x2) {
 	return v.SetElem(0, x).broadcast1To2()
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int8x16) String() string {
 	var s [16]int8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int16x8) String() string {
 	var s [8]int16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int32x4) String() string {
 	var s [4]int32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int64x2) String() string {
 	var s [2]int64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint8x16) String() string {
 	var s [16]uint8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint16x8) String() string {
 	var s [8]uint16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint32x4) String() string {
 	var s [4]uint32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint64x2) String() string {
 	var s [2]uint64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float32x4) String() string {
 	var s [4]float32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float64x2) String() string {
 	var s [2]float64
 	x.StoreArray(&s)
@@ -152,7 +162,7 @@ func (x Float64x2) String() string {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = 16
 func (x Int8x16) HiToLo() (z Int8x16) {
 	var v Int8x16
-	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().GetElem(1)).ToBits().ReshapeToUint8s().BitsToInt8()
+	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().Elem(1)).ToBits().ReshapeToUint8s().BitsToInt8()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -161,7 +171,7 @@ func (x Int8x16) HiToLo() (z Int8x16) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = 8
 func (x Int16x8) HiToLo() (z Int16x8) {
 	var v Int16x8
-	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().GetElem(1)).ToBits().ReshapeToUint16s().BitsToInt16()
+	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().Elem(1)).ToBits().ReshapeToUint16s().BitsToInt16()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -170,7 +180,7 @@ func (x Int16x8) HiToLo() (z Int16x8) {
 //	z = {x[2], x[3], 0, 0}
 func (x Int32x4) HiToLo() (z Int32x4) {
 	var v Int32x4
-	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().GetElem(1)).ToBits().ReshapeToUint32s().BitsToInt32()
+	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().Elem(1)).ToBits().ReshapeToUint32s().BitsToInt32()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -179,7 +189,7 @@ func (x Int32x4) HiToLo() (z Int32x4) {
 //	z = {x[1], 0}
 func (x Int64x2) HiToLo() (z Int64x2) {
 	var v Int64x2
-	return v.ToBits().BitsToFloat64().SetElem(0, x.ToBits().BitsToFloat64().GetElem(1)).ToBits().BitsToInt64()
+	return v.ToBits().BitsToFloat64().SetElem(0, x.ToBits().BitsToFloat64().Elem(1)).ToBits().BitsToInt64()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -188,7 +198,7 @@ func (x Int64x2) HiToLo() (z Int64x2) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = 16
 func (x Uint8x16) HiToLo() (z Uint8x16) {
 	var v Uint8x16
-	return v.ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ReshapeToUint64s().BitsToFloat64().GetElem(1)).ToBits().ReshapeToUint8s()
+	return v.ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ReshapeToUint64s().BitsToFloat64().Elem(1)).ToBits().ReshapeToUint8s()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -197,7 +207,7 @@ func (x Uint8x16) HiToLo() (z Uint8x16) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = 8
 func (x Uint16x8) HiToLo() (z Uint16x8) {
 	var v Uint16x8
-	return v.ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ReshapeToUint64s().BitsToFloat64().GetElem(1)).ToBits().ReshapeToUint16s()
+	return v.ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ReshapeToUint64s().BitsToFloat64().Elem(1)).ToBits().ReshapeToUint16s()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -206,7 +216,7 @@ func (x Uint16x8) HiToLo() (z Uint16x8) {
 //	z = {x[2], x[3], 0, 0}
 func (x Uint32x4) HiToLo() (z Uint32x4) {
 	var v Uint32x4
-	return v.ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ReshapeToUint64s().BitsToFloat64().GetElem(1)).ToBits().ReshapeToUint32s()
+	return v.ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ReshapeToUint64s().BitsToFloat64().Elem(1)).ToBits().ReshapeToUint32s()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -215,7 +225,7 @@ func (x Uint32x4) HiToLo() (z Uint32x4) {
 //	z = {x[1], 0}
 func (x Uint64x2) HiToLo() (z Uint64x2) {
 	var v Uint64x2
-	return v.BitsToFloat64().SetElem(0, x.BitsToFloat64().GetElem(1)).ToBits()
+	return v.BitsToFloat64().SetElem(0, x.BitsToFloat64().Elem(1)).ToBits()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -224,7 +234,7 @@ func (x Uint64x2) HiToLo() (z Uint64x2) {
 //	z = {x[2], x[3], 0, 0}
 func (x Float32x4) HiToLo() (z Float32x4) {
 	var v Float32x4
-	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().GetElem(1)).ToBits().ReshapeToUint32s().BitsToFloat32()
+	return v.ToBits().ReshapeToUint64s().BitsToFloat64().SetElem(0, x.ToBits().ReshapeToUint64s().BitsToFloat64().Elem(1)).ToBits().ReshapeToUint32s().BitsToFloat32()
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -233,7 +243,7 @@ func (x Float32x4) HiToLo() (z Float32x4) {
 //	z = {x[1], 0}
 func (x Float64x2) HiToLo() (z Float64x2) {
 	var v Float64x2
-	return v.SetElem(0, x.GetElem(1))
+	return v.SetElem(0, x.Elem(1))
 }
 
 // ToMask returns a mask indicating which elements of x are non-zero.
@@ -358,7 +368,7 @@ func (x Uint64x2) RotateAllRight(shift uint64) (z Uint64x2) {
 //
 // Emulated
 func (x Int8x16) ReduceSum() (z int8) {
-	return x.reduceSum().GetElem(0)
+	return x.reduceSum().Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -367,7 +377,7 @@ func (x Int8x16) ReduceSum() (z int8) {
 //
 // Emulated
 func (x Int16x8) ReduceSum() (z int16) {
-	return x.reduceSum().GetElem(0)
+	return x.reduceSum().Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -376,7 +386,7 @@ func (x Int16x8) ReduceSum() (z int16) {
 //
 // Emulated
 func (x Int32x4) ReduceSum() (z int32) {
-	return x.reduceSum().GetElem(0)
+	return x.reduceSum().Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -385,7 +395,7 @@ func (x Int32x4) ReduceSum() (z int32) {
 //
 // Emulated
 func (x Uint8x16) ReduceSum() (z uint8) {
-	return x.reduceSum().GetElem(0)
+	return x.reduceSum().Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -394,7 +404,7 @@ func (x Uint8x16) ReduceSum() (z uint8) {
 //
 // Emulated
 func (x Uint16x8) ReduceSum() (z uint16) {
-	return x.reduceSum().GetElem(0)
+	return x.reduceSum().Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -403,7 +413,7 @@ func (x Uint16x8) ReduceSum() (z uint16) {
 //
 // Emulated
 func (x Uint32x4) ReduceSum() (z uint32) {
-	return x.reduceSum().GetElem(0)
+	return x.reduceSum().Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -412,7 +422,7 @@ func (x Uint32x4) ReduceSum() (z uint32) {
 //
 // Emulated
 func (x Int8x16) ReduceMax() (z int8) {
-	return x.reduceMax().GetElem(0)
+	return x.reduceMax().Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -421,7 +431,7 @@ func (x Int8x16) ReduceMax() (z int8) {
 //
 // Emulated
 func (x Int8x16) ReduceMin() (z int8) {
-	return x.reduceMin().GetElem(0)
+	return x.reduceMin().Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -430,7 +440,7 @@ func (x Int8x16) ReduceMin() (z int8) {
 //
 // Emulated
 func (x Int16x8) ReduceMax() (z int16) {
-	return x.reduceMax().GetElem(0)
+	return x.reduceMax().Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -439,7 +449,7 @@ func (x Int16x8) ReduceMax() (z int16) {
 //
 // Emulated
 func (x Int16x8) ReduceMin() (z int16) {
-	return x.reduceMin().GetElem(0)
+	return x.reduceMin().Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -448,7 +458,7 @@ func (x Int16x8) ReduceMin() (z int16) {
 //
 // Emulated
 func (x Int32x4) ReduceMax() (z int32) {
-	return x.reduceMax().GetElem(0)
+	return x.reduceMax().Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -457,7 +467,7 @@ func (x Int32x4) ReduceMax() (z int32) {
 //
 // Emulated
 func (x Int32x4) ReduceMin() (z int32) {
-	return x.reduceMin().GetElem(0)
+	return x.reduceMin().Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -466,7 +476,7 @@ func (x Int32x4) ReduceMin() (z int32) {
 //
 // Emulated
 func (x Uint8x16) ReduceMax() (z uint8) {
-	return x.reduceMax().GetElem(0)
+	return x.reduceMax().Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -475,7 +485,7 @@ func (x Uint8x16) ReduceMax() (z uint8) {
 //
 // Emulated
 func (x Uint8x16) ReduceMin() (z uint8) {
-	return x.reduceMin().GetElem(0)
+	return x.reduceMin().Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -484,7 +494,7 @@ func (x Uint8x16) ReduceMin() (z uint8) {
 //
 // Emulated
 func (x Uint16x8) ReduceMax() (z uint16) {
-	return x.reduceMax().GetElem(0)
+	return x.reduceMax().Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -493,7 +503,7 @@ func (x Uint16x8) ReduceMax() (z uint16) {
 //
 // Emulated
 func (x Uint16x8) ReduceMin() (z uint16) {
-	return x.reduceMin().GetElem(0)
+	return x.reduceMin().Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -502,7 +512,7 @@ func (x Uint16x8) ReduceMin() (z uint16) {
 //
 // Emulated
 func (x Uint32x4) ReduceMax() (z uint32) {
-	return x.reduceMax().GetElem(0)
+	return x.reduceMax().Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -511,7 +521,7 @@ func (x Uint32x4) ReduceMax() (z uint32) {
 //
 // Emulated
 func (x Uint32x4) ReduceMin() (z uint32) {
-	return x.reduceMin().GetElem(0)
+	return x.reduceMin().Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -522,7 +532,7 @@ func (x Uint32x4) ReduceMin() (z uint32) {
 //
 // Emulated
 func (x Float32x4) ReduceMax() (z float32) {
-	return x.reduceMax().GetElem(0)
+	return x.reduceMax().Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -533,7 +543,7 @@ func (x Float32x4) ReduceMax() (z float32) {
 //
 // Emulated
 func (x Float32x4) ReduceMin() (z float32) {
-	return x.reduceMin().GetElem(0)
+	return x.reduceMin().Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -542,7 +552,7 @@ func (x Float32x4) ReduceMin() (z float32) {
 //
 // Emulated
 func (x Int64x2) ReduceSum() (z int64) {
-	return x.ConcatAddPairs(x).GetElem(0)
+	return x.ConcatAddPairs(x).Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -551,7 +561,7 @@ func (x Int64x2) ReduceSum() (z int64) {
 //
 // Emulated
 func (x Uint64x2) ReduceSum() (z uint64) {
-	return x.ConcatAddPairs(x).GetElem(0)
+	return x.ConcatAddPairs(x).Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -560,7 +570,7 @@ func (x Uint64x2) ReduceSum() (z uint64) {
 //
 // Emulated
 func (x Float64x2) ReduceSum() (z float64) {
-	return x.ConcatAddPairs(x).GetElem(0)
+	return x.ConcatAddPairs(x).Elem(0)
 }
 
 // ReduceMax returns the largest element of x.
@@ -571,7 +581,7 @@ func (x Float64x2) ReduceSum() (z float64) {
 //
 // Emulated
 func (x Float64x2) ReduceMax() (z float64) {
-	return x.ConcatMaxPairs(x).GetElem(0)
+	return x.ConcatMaxPairs(x).Elem(0)
 }
 
 // ReduceMin returns the smallest element of x.
@@ -582,5 +592,5 @@ func (x Float64x2) ReduceMax() (z float64) {
 //
 // Emulated
 func (x Float64x2) ReduceMin() (z float64) {
-	return x.ConcatMinPairs(x).GetElem(0)
+	return x.ConcatMinPairs(x).Elem(0)
 }

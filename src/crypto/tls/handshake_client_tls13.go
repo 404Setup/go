@@ -96,17 +96,15 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 			c.sendAlert(alertInternalError)
 			return err
 		}
-		acceptConfirmation := tls13.ExpandLabel(h, prk, "ech accept confirmation", confTranscript.Sum(nil), 8)
+		var acceptConfirmation []byte
+		subtle.WithDataIndependentTiming(func() {
+			acceptConfirmation = tls13.ExpandLabel(h, prk, "ech accept confirmation", confTranscript.Sum(nil), 8)
+		})
 		if subtle.ConstantTimeCompare(acceptConfirmation, hs.serverHello.random[len(hs.serverHello.random)-8:]) == 1 {
 			hs.hello = hs.echContext.innerHello
 			c.serverName = c.config.ServerName
 			hs.transcript = hs.echContext.innerTranscript
 			c.echAccepted = true
-
-			if hs.serverHello.encryptedClientHello != nil {
-				c.sendAlert(alertUnsupportedExtension)
-				return errors.New("tls: unexpected encrypted client hello extension in server hello despite ECH being accepted")
-			}
 
 			if hs.hello.serverName == "" && hs.serverHello.serverNameAck {
 				c.sendAlert(alertUnsupportedExtension)
@@ -178,6 +176,19 @@ func (hs *clientHandshakeStateTLS13) checkServerHelloOrHRR() error {
 	if hs.serverHello.vers != VersionTLS12 {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: server sent an incorrect legacy version")
+	}
+
+	if hs.serverHello.encryptedClientHello != nil {
+		if hs.hello.encryptedClientHello == nil {
+			c.sendAlert(alertUnsupportedExtension)
+			return errors.New("tls: server sent an unsolicited encrypted_client_hello extension")
+		}
+		// RFC 9849 permits this extension in HelloRetryRequest. A final
+		// ServerHello signals ECH acceptance in its random field.
+		if !bytes.Equal(hs.serverHello.random, helloRetryRequestRandom) {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: server sent encrypted_client_hello extension in ServerHello")
+		}
 	}
 
 	if hs.serverHello.ocspStapling ||
@@ -271,7 +282,10 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 				c.sendAlert(alertInternalError)
 				return err
 			}
-			acceptConfirmation := tls13.ExpandLabel(h, prk, "hrr ech accept confirmation", confTranscript.Sum(nil), 8)
+			var acceptConfirmation []byte
+			subtle.WithDataIndependentTiming(func() {
+				acceptConfirmation = tls13.ExpandLabel(h, prk, "hrr ech accept confirmation", confTranscript.Sum(nil), 8)
+			})
 			if subtle.ConstantTimeCompare(acceptConfirmation, hs.serverHello.encryptedClientHello) == 1 {
 				hello = hs.echContext.innerHello
 				c.serverName = c.config.ServerName
@@ -284,9 +298,13 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 			return err
 		}
 	} else if hs.serverHello.encryptedClientHello != nil {
-		// Unsolicited ECH extension should be rejected
-		c.sendAlert(alertUnsupportedExtension)
-		return errors.New("tls: unexpected encrypted client hello extension in serverHello")
+		// RFC 9849, Section 6.2: when GREASE was sent, the client MUST
+		// syntactically validate any ECH extension in HelloRetryRequest and
+		// abort with decode_error if invalid; otherwise it ignores it.
+		if len(hs.serverHello.encryptedClientHello) != 8 {
+			c.sendAlert(alertDecodeError)
+			return errors.New("tls: malformed encrypted client hello extension")
+		}
 	}
 
 	// The only HelloRetryRequest extensions we support are key_share and
@@ -484,15 +502,18 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 	c.curveID = hs.serverHello.serverShare.group
 
 	earlySecret := hs.earlySecret
-	if !hs.usingPSK {
-		earlySecret = tls13.NewEarlySecret(hs.suite.hash.New, nil)
-	}
+	var clientSecret, serverSecret []byte
+	subtle.WithDataIndependentTiming(func() {
+		if !hs.usingPSK {
+			earlySecret = tls13.NewEarlySecret(hs.suite.hash.New, nil)
+		}
+		handshakeSecret := earlySecret.HandshakeSecret(sharedKey)
+		clientSecret = handshakeSecret.ClientHandshakeTrafficSecret(hs.transcript)
+		serverSecret = handshakeSecret.ServerHandshakeTrafficSecret(hs.transcript)
+		hs.masterSecret = handshakeSecret.MasterSecret()
+	})
 
-	handshakeSecret := earlySecret.HandshakeSecret(sharedKey)
-
-	clientSecret := handshakeSecret.ClientHandshakeTrafficSecret(hs.transcript)
 	c.setWriteTrafficSecret(hs.suite, QUICEncryptionLevelHandshake, clientSecret)
-	serverSecret := handshakeSecret.ServerHandshakeTrafficSecret(hs.transcript)
 	if err := c.setReadTrafficSecret(hs.suite, QUICEncryptionLevelHandshake, serverSecret, false); err != nil {
 		return err
 	}
@@ -514,8 +535,6 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 		c.sendAlert(alertInternalError)
 		return err
 	}
-
-	hs.masterSecret = handshakeSecret.MasterSecret()
 
 	return nil
 }
@@ -581,6 +600,18 @@ func (hs *clientHandshakeStateTLS13) readServerParameters() error {
 		} else if encryptedExtensions.echRetryConfigs != nil {
 			c.sendAlert(alertUnsupportedExtension)
 			return errors.New("tls: server sent encrypted client hello retry configs after accepting encrypted client hello")
+		}
+	} else if encryptedExtensions.echRetryConfigs != nil {
+		if !c.echGrease {
+			c.sendAlert(alertUnsupportedExtension)
+			return errors.New("tls: server sent unsolicited encrypted client hello retry configs")
+		}
+		// RFC 9849, Section 6.2: when GREASE was sent, the client MUST
+		// syntactically validate retry_configs and abort with decode_error
+		// if invalid; otherwise it ignores them and MUST NOT save them.
+		if _, err := parseECHConfigList(encryptedExtensions.echRetryConfigs); err != nil {
+			c.sendAlert(alertDecodeError)
+			return err
 		}
 	}
 
@@ -710,8 +741,11 @@ func (hs *clientHandshakeStateTLS13) readServerFinished() error {
 
 	// Derive secrets that take context through the server Finished.
 
-	hs.trafficSecret = hs.masterSecret.ClientApplicationTrafficSecret(hs.transcript)
-	serverSecret := hs.masterSecret.ServerApplicationTrafficSecret(hs.transcript)
+	var serverSecret []byte
+	subtle.WithDataIndependentTiming(func() {
+		hs.trafficSecret = hs.masterSecret.ClientApplicationTrafficSecret(hs.transcript)
+		serverSecret = hs.masterSecret.ServerApplicationTrafficSecret(hs.transcript)
+	})
 	if err := c.setReadTrafficSecret(hs.suite, QUICEncryptionLevelApplication, serverSecret, false); err != nil {
 		return err
 	}
@@ -824,7 +858,7 @@ func (hs *clientHandshakeStateTLS13) sendClientFinished() error {
 	c.setWriteTrafficSecret(hs.suite, QUICEncryptionLevelApplication, hs.trafficSecret)
 
 	if !c.config.SessionTicketsDisabled && c.config.ClientSessionCache != nil {
-		c.resumptionSecret = hs.masterSecret.ResumptionMasterSecret(hs.transcript)
+		subtle.WithDataIndependentTiming(func() { c.resumptionSecret = hs.masterSecret.ResumptionMasterSecret(hs.transcript) })
 	}
 
 	if c.quic != nil {
@@ -870,8 +904,11 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 		return c.sendAlert(alertInternalError)
 	}
 
-	psk := tls13.ExpandLabel(cipherSuite.hash.New, c.resumptionSecret, "resumption",
-		msg.nonce, cipherSuite.hash.Size())
+	var psk []byte
+	subtle.WithDataIndependentTiming(func() {
+		psk = tls13.ExpandLabel(cipherSuite.hash.New, c.resumptionSecret, "resumption",
+			msg.nonce, cipherSuite.hash.Size())
+	})
 
 	session := c.sessionState()
 	session.secret = psk

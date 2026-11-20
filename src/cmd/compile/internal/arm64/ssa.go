@@ -449,7 +449,7 @@ func simdVfpvResultInArg0ImmOutIn1(s *ssagen.State, v *ssa.Value, arrangement in
 	return p
 }
 
-// simdVgpImmIn1 generates vector GetElem instruction VMOV V1.S[2], R0
+// simdVgpImmIn1 generates vector Elem instruction VMOV V1.S[2], R0
 // The arrangement parameter specifies the vector element arrangement (e.g., S, D)
 func simdVgpImmIn1(s *ssagen.State, v *ssa.Value, arrangement int16) *obj.Prog {
 	p := s.Prog(v.Op.Asm())
@@ -2177,6 +2177,23 @@ func simdZ21(s *ssagen.State, v *ssa.Value, arng int16) *obj.Prog {
 	p.From.Type = obj.TYPE_REG
 	p.From.Reg = zregArng(v.Args[1].Reg(), arng)        // Zm
 	p.AddRestSourceReg(zregArng(v.Args[0].Reg(), arng)) // Zn
+	p.To.Type = obj.TYPE_REG
+	p.To.Reg = zregArng(v.Reg(), arng) // Zd
+	return p
+}
+
+// simdZ21List emits an unpredicated SVE binary Z-register instruction whose
+// first source is a single-register byte list, e.g. ZTBL Z1.B, [Z0.B], Z2.B.
+func simdZ21List(s *ssagen.State, v *ssa.Value, arng int16) *obj.Prog {
+	if arng != arm64.ARNG_B {
+		base.Fatalf("simdZ21List: unsupported arrangement %d", arng)
+	}
+	p := s.Prog(v.Op.Asm())
+	p.From.Type = obj.TYPE_REG
+	p.From.Reg = zregArng(v.Args[1].Reg(), arng) // Zm
+	// RegisterListOffset wants the register's 0-31 index.
+	regList, _ := arm64.RegisterListOffset(int(v.Args[0].Reg()&31), 1, regListArr("Z", "B"), 0)
+	p.AddRestSource(obj.Addr{Type: obj.TYPE_REGLIST, Offset: regList}) // [Zn.T]
 	p.To.Type = obj.TYPE_REG
 	p.To.Reg = zregArng(v.Reg(), arng) // Zd
 	return p

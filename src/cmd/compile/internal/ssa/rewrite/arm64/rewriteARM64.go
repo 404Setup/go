@@ -425,6 +425,8 @@ func RewriteValue(v *ssa.Value) bool {
 		return rewriteValue_OpARM64VNOT16B(v)
 	case ssaop.OpARM64VORR16B:
 		return rewriteValue_OpARM64VORR16B(v)
+	case ssaop.OpARM64VPMULL16B:
+		return rewriteValue_OpARM64VPMULL16B(v)
 	case ssaop.OpARM64VPMULL2D:
 		return rewriteValue_OpARM64VPMULL2D(v)
 	case ssaop.OpARM64VSHL16B:
@@ -1397,6 +1399,36 @@ func RewriteValue(v *ssa.Value) bool {
 		return rewriteValue_OpDivUint32s(v)
 	case ssaop.OpDivUint64s:
 		return rewriteValue_OpDivUint64s(v)
+	case ssaop.OpElemFloat32x4:
+		v.Op = ssaop.OpARM64VDUPSextr
+		return true
+	case ssaop.OpElemFloat64x2:
+		v.Op = ssaop.OpARM64VDUPDextr
+		return true
+	case ssaop.OpElemInt16x8:
+		v.Op = ssaop.OpARM64VSMOVHextr
+		return true
+	case ssaop.OpElemInt32x4:
+		v.Op = ssaop.OpARM64VSMOVSextr
+		return true
+	case ssaop.OpElemInt64x2:
+		v.Op = ssaop.OpARM64VMOVDextr
+		return true
+	case ssaop.OpElemInt8x16:
+		v.Op = ssaop.OpARM64VSMOVBextr
+		return true
+	case ssaop.OpElemUint16x8:
+		v.Op = ssaop.OpARM64VMOVHextr
+		return true
+	case ssaop.OpElemUint32x4:
+		v.Op = ssaop.OpARM64VMOVSextr
+		return true
+	case ssaop.OpElemUint64x2:
+		v.Op = ssaop.OpARM64VMOVDextr
+		return true
+	case ssaop.OpElemUint8x16:
+		v.Op = ssaop.OpARM64VMOVBextr
+		return true
 	case ssaop.OpEq16:
 		return rewriteValue_OpEq16(v)
 	case ssaop.OpEq32:
@@ -1512,36 +1544,6 @@ func RewriteValue(v *ssa.Value) bool {
 		return true
 	case ssaop.OpGetClosurePtr:
 		v.Op = ssaop.OpARM64LoweredGetClosurePtr
-		return true
-	case ssaop.OpGetElemFloat32x4:
-		v.Op = ssaop.OpARM64VDUPSextr
-		return true
-	case ssaop.OpGetElemFloat64x2:
-		v.Op = ssaop.OpARM64VDUPDextr
-		return true
-	case ssaop.OpGetElemInt16x8:
-		v.Op = ssaop.OpARM64VSMOVHextr
-		return true
-	case ssaop.OpGetElemInt32x4:
-		v.Op = ssaop.OpARM64VSMOVSextr
-		return true
-	case ssaop.OpGetElemInt64x2:
-		v.Op = ssaop.OpARM64VMOVDextr
-		return true
-	case ssaop.OpGetElemInt8x16:
-		v.Op = ssaop.OpARM64VSMOVBextr
-		return true
-	case ssaop.OpGetElemUint16x8:
-		v.Op = ssaop.OpARM64VMOVHextr
-		return true
-	case ssaop.OpGetElemUint32x4:
-		v.Op = ssaop.OpARM64VMOVSextr
-		return true
-	case ssaop.OpGetElemUint64x2:
-		v.Op = ssaop.OpARM64VMOVDextr
-		return true
-	case ssaop.OpGetElemUint8x16:
-		v.Op = ssaop.OpARM64VMOVBextr
 		return true
 	case ssaop.OpGreaterEqualFloat32s:
 		return rewriteValue_OpGreaterEqualFloat32s(v)
@@ -1908,8 +1910,14 @@ func RewriteValue(v *ssa.Value) bool {
 		return rewriteValue_OpLoadMasked8(v)
 	case ssaop.OpLocalAddr:
 		return rewriteValue_OpLocalAddr(v)
+	case ssaop.OpLookupOrZeroInt8s:
+		v.Op = ssaop.OpARM64ZTBLB
+		return true
 	case ssaop.OpLookupOrZeroInt8x16:
 		v.Op = ssaop.OpARM64VTBL16B
+		return true
+	case ssaop.OpLookupOrZeroUint8s:
+		v.Op = ssaop.OpARM64ZTBLB
 		return true
 	case ssaop.OpLookupOrZeroUint8x16:
 		v.Op = ssaop.OpARM64VTBL16B
@@ -3114,6 +3122,9 @@ func RewriteValue(v *ssa.Value) bool {
 		return rewriteValue_Opbroadcast1To8Uint16x8(v)
 	case ssaop.OpcarrylessMultiplyWidenLoUint64x2:
 		v.Op = ssaop.OpARM64VPMULL2D
+		return true
+	case ssaop.OpcarrylessMultiplyWidenLoUint8x16:
+		v.Op = ssaop.OpARM64VPMULL16B
 		return true
 	case ssaop.OporNotUint8x16:
 		v.Op = ssaop.OpARM64VORN16B
@@ -19454,6 +19465,29 @@ func rewriteValue_OpARM64VORR16B(v *ssa.Value) bool {
 			}
 			y := v_1.Args[0]
 			v.Reset(ssaop.OpARM64VORN16B)
+			v.AddArg2(x, y)
+			return true
+		}
+		break
+	}
+	return false
+}
+func rewriteValue_OpARM64VPMULL16B(v *ssa.Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (VPMULL16B (VDUPDextr [1] x) (VDUPDextr [1] y))
+	// result: (VPMULL2_16B x y)
+	for {
+		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
+			if v_0.Op != ssaop.OpARM64VDUPDextr || ssa.AuxIntToUint8(v_0.AuxInt) != 1 {
+				continue
+			}
+			x := v_0.Args[0]
+			if v_1.Op != ssaop.OpARM64VDUPDextr || ssa.AuxIntToUint8(v_1.AuxInt) != 1 {
+				continue
+			}
+			y := v_1.Args[0]
+			v.Reset(ssaop.OpARM64VPMULL2_16B)
 			v.AddArg2(x, y)
 			return true
 		}

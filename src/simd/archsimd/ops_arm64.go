@@ -880,54 +880,172 @@ func (x Float32x4) Div(y Float32x4) (z Float32x4)
 // Asm: VFDIV
 func (x Float64x2) Div(y Float64x2) (z Float64x2)
 
+/* Elem */
+
+// Elem returns the i'th element x. If i >= 4, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VDUP
+func (x Float32x4) Elem(i uint8) (z float32)
+
+// Elem returns the i'th element x. If i >= 2, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VDUP
+func (x Float64x2) Elem(i uint8) (z float64)
+
+// Elem returns the i'th element x. If i >= 16, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VSMOV
+func (x Int8x16) Elem(i uint8) (z int8)
+
+// Elem returns the i'th element x. If i >= 8, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VSMOV
+func (x Int16x8) Elem(i uint8) (z int16)
+
+// Elem returns the i'th element x. If i >= 4, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VSMOV
+func (x Int32x4) Elem(i uint8) (z int32)
+
+// Elem returns the i'th element x. If i >= 2, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VMOV
+func (x Int64x2) Elem(i uint8) (z int64)
+
+// Elem returns the i'th element x. If i >= 16, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VMOV
+func (x Uint8x16) Elem(i uint8) (z uint8)
+
+// Elem returns the i'th element x. If i >= 8, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VMOV
+func (x Uint16x8) Elem(i uint8) (z uint16)
+
+// Elem returns the i'th element x. If i >= 4, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VMOV
+func (x Uint32x4) Elem(i uint8) (z uint32)
+
+// Elem returns the i'th element x. If i >= 2, it panics.
+//
+//	z = x[i]
+//
+// Performance: A non-constant value of i may result in significantly worse performance for this operation.
+//
+// Asm: VMOV
+func (x Uint64x2) Elem(i uint8) (z uint64)
+
 /* Equal */
 
 // Equal returns a mask indicating which elements of x and y are equal.
+//
+//	z[i] = x[i] == y[i]
+//
+// Like Go's == operator on floating-point values, this follows IEEE 754: the
+// result is false if either element is NaN, and +0 equals -0.
 //
 // Asm: VFCMEQ
 func (x Float32x4) Equal(y Float32x4) (z Mask32x4)
 
 // Equal returns a mask indicating which elements of x and y are equal.
 //
+//	z[i] = x[i] == y[i]
+//
+// Like Go's == operator on floating-point values, this follows IEEE 754: the
+// result is false if either element is NaN, and +0 equals -0.
+//
 // Asm: VFCMEQ
 func (x Float64x2) Equal(y Float64x2) (z Mask64x2)
 
 // Equal returns a mask indicating which elements of x and y are equal.
+//
+//	z[i] = x[i] == y[i]
 //
 // Asm: VCMEQ
 func (x Int8x16) Equal(y Int8x16) (z Mask8x16)
 
 // Equal returns a mask indicating which elements of x and y are equal.
 //
+//	z[i] = x[i] == y[i]
+//
 // Asm: VCMEQ
 func (x Int16x8) Equal(y Int16x8) (z Mask16x8)
 
 // Equal returns a mask indicating which elements of x and y are equal.
+//
+//	z[i] = x[i] == y[i]
 //
 // Asm: VCMEQ
 func (x Int32x4) Equal(y Int32x4) (z Mask32x4)
 
 // Equal returns a mask indicating which elements of x and y are equal.
 //
+//	z[i] = x[i] == y[i]
+//
 // Asm: VCMEQ
 func (x Int64x2) Equal(y Int64x2) (z Mask64x2)
 
 // Equal returns a mask indicating which elements of x and y are equal.
+//
+//	z[i] = x[i] == y[i]
 //
 // Asm: VCMEQ
 func (x Uint8x16) Equal(y Uint8x16) (z Mask8x16)
 
 // Equal returns a mask indicating which elements of x and y are equal.
 //
+//	z[i] = x[i] == y[i]
+//
 // Asm: VCMEQ
 func (x Uint16x8) Equal(y Uint16x8) (z Mask16x8)
 
 // Equal returns a mask indicating which elements of x and y are equal.
 //
+//	z[i] = x[i] == y[i]
+//
 // Asm: VCMEQ
 func (x Uint32x4) Equal(y Uint32x4) (z Mask32x4)
 
 // Equal returns a mask indicating which elements of x and y are equal.
+//
+//	z[i] = x[i] == y[i]
 //
 // Asm: VCMEQ
 func (x Uint64x2) Equal(y Uint64x2) (z Mask64x2)
@@ -1028,103 +1146,14 @@ func (x Float32x4) Floor() (z Float32x4)
 // Asm: VFRINTM
 func (x Float64x2) Floor() (z Float64x2)
 
-/* GetElem */
-
-// GetElem returns the i'th element x. If i >= 4, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VDUP
-func (x Float32x4) GetElem(i uint8) (z float32)
-
-// GetElem returns the i'th element x. If i >= 2, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VDUP
-func (x Float64x2) GetElem(i uint8) (z float64)
-
-// GetElem returns the i'th element x. If i >= 16, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VSMOV
-func (x Int8x16) GetElem(i uint8) (z int8)
-
-// GetElem returns the i'th element x. If i >= 8, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VSMOV
-func (x Int16x8) GetElem(i uint8) (z int16)
-
-// GetElem returns the i'th element x. If i >= 4, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VSMOV
-func (x Int32x4) GetElem(i uint8) (z int32)
-
-// GetElem returns the i'th element x. If i >= 2, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VMOV
-func (x Int64x2) GetElem(i uint8) (z int64)
-
-// GetElem returns the i'th element x. If i >= 16, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VMOV
-func (x Uint8x16) GetElem(i uint8) (z uint8)
-
-// GetElem returns the i'th element x. If i >= 8, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VMOV
-func (x Uint16x8) GetElem(i uint8) (z uint16)
-
-// GetElem returns the i'th element x. If i >= 4, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VMOV
-func (x Uint32x4) GetElem(i uint8) (z uint32)
-
-// GetElem returns the i'th element x. If i >= 2, it panics.
-//
-//	z = x[i]
-//
-// Performance: A non-constant value of i may result in significantly worse performance for this operation.
-//
-// Asm: VMOV
-func (x Uint64x2) GetElem(i uint8) (z uint64)
-
 /* Greater */
 
 // Greater returns a mask indicating which elements of x are greater than y.
 //
 //	z[i] = x[i] > y[i]
+//
+// Like Go's > operator on floating-point values, this follows IEEE 754: the
+// result is false if either element is NaN, and +0 equals -0.
 //
 // Asm: VFCMGT
 func (x Float32x4) Greater(y Float32x4) (z Mask32x4)
@@ -1132,6 +1161,9 @@ func (x Float32x4) Greater(y Float32x4) (z Mask32x4)
 // Greater returns a mask indicating which elements of x are greater than y.
 //
 //	z[i] = x[i] > y[i]
+//
+// Like Go's > operator on floating-point values, this follows IEEE 754: the
+// result is false if either element is NaN, and +0 equals -0.
 //
 // Asm: VFCMGT
 func (x Float64x2) Greater(y Float64x2) (z Mask64x2)
@@ -1199,6 +1231,9 @@ func (x Uint64x2) Greater(y Uint64x2) (z Mask64x2)
 //
 //	z[i] = x[i] >= y[i]
 //
+// Like Go's >= operator on floating-point values, this follows IEEE 754: the
+// result is false if either element is NaN, and +0 equals -0.
+//
 // Asm: VFCMGE
 func (x Float32x4) GreaterEqual(y Float32x4) (z Mask32x4)
 
@@ -1206,6 +1241,9 @@ func (x Float32x4) GreaterEqual(y Float32x4) (z Mask32x4)
 // or equal to y.
 //
 //	z[i] = x[i] >= y[i]
+//
+// Like Go's >= operator on floating-point values, this follows IEEE 754: the
+// result is false if either element is NaN, and +0 equals -0.
 //
 // Asm: VFCMGE
 func (x Float64x2) GreaterEqual(y Float64x2) (z Mask64x2)
@@ -2574,7 +2612,8 @@ func (x Float64x2) SetElem(i uint8, y float64) (z Float64x2)
 /* ShiftAllLeft */
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2582,7 +2621,8 @@ func (x Float64x2) SetElem(i uint8, y float64) (z Float64x2)
 func (x Int8x16) ShiftAllLeft(shift uint64) (z Int8x16)
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2590,7 +2630,8 @@ func (x Int8x16) ShiftAllLeft(shift uint64) (z Int8x16)
 func (x Int16x8) ShiftAllLeft(shift uint64) (z Int16x8)
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2598,7 +2639,8 @@ func (x Int16x8) ShiftAllLeft(shift uint64) (z Int16x8)
 func (x Int32x4) ShiftAllLeft(shift uint64) (z Int32x4)
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2606,7 +2648,8 @@ func (x Int32x4) ShiftAllLeft(shift uint64) (z Int32x4)
 func (x Int64x2) ShiftAllLeft(shift uint64) (z Int64x2)
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2614,7 +2657,8 @@ func (x Int64x2) ShiftAllLeft(shift uint64) (z Int64x2)
 func (x Uint8x16) ShiftAllLeft(shift uint64) (z Uint8x16)
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2622,7 +2666,8 @@ func (x Uint8x16) ShiftAllLeft(shift uint64) (z Uint8x16)
 func (x Uint16x8) ShiftAllLeft(shift uint64) (z Uint16x8)
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2630,7 +2675,8 @@ func (x Uint16x8) ShiftAllLeft(shift uint64) (z Uint16x8)
 func (x Uint32x4) ShiftAllLeft(shift uint64) (z Uint32x4)
 
 // ShiftAllLeft shifts each element of x left by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] << shift
 //
@@ -2640,7 +2686,8 @@ func (x Uint64x2) ShiftAllLeft(shift uint64) (z Uint64x2)
 /* ShiftAllRight */
 
 // ShiftAllRight arithmetically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0 or -1.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0 or -1, depending on the sign of the element.
 //
 //	z[i] = x[i] >> shift
 //
@@ -2648,7 +2695,8 @@ func (x Uint64x2) ShiftAllLeft(shift uint64) (z Uint64x2)
 func (x Int8x16) ShiftAllRight(shift uint64) (z Int8x16)
 
 // ShiftAllRight arithmetically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0 or -1.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0 or -1, depending on the sign of the element.
 //
 //	z[i] = x[i] >> shift
 //
@@ -2656,7 +2704,8 @@ func (x Int8x16) ShiftAllRight(shift uint64) (z Int8x16)
 func (x Int16x8) ShiftAllRight(shift uint64) (z Int16x8)
 
 // ShiftAllRight arithmetically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0 or -1.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0 or -1, depending on the sign of the element.
 //
 //	z[i] = x[i] >> shift
 //
@@ -2664,7 +2713,8 @@ func (x Int16x8) ShiftAllRight(shift uint64) (z Int16x8)
 func (x Int32x4) ShiftAllRight(shift uint64) (z Int32x4)
 
 // ShiftAllRight arithmetically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0 or -1.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0 or -1, depending on the sign of the element.
 //
 //	z[i] = x[i] >> shift
 //
@@ -2672,7 +2722,8 @@ func (x Int32x4) ShiftAllRight(shift uint64) (z Int32x4)
 func (x Int64x2) ShiftAllRight(shift uint64) (z Int64x2)
 
 // ShiftAllRight logically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] >> shift
 //
@@ -2680,7 +2731,8 @@ func (x Int64x2) ShiftAllRight(shift uint64) (z Int64x2)
 func (x Uint8x16) ShiftAllRight(shift uint64) (z Uint8x16)
 
 // ShiftAllRight logically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] >> shift
 //
@@ -2688,7 +2740,8 @@ func (x Uint8x16) ShiftAllRight(shift uint64) (z Uint8x16)
 func (x Uint16x8) ShiftAllRight(shift uint64) (z Uint16x8)
 
 // ShiftAllRight logically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] >> shift
 //
@@ -2696,7 +2749,8 @@ func (x Uint16x8) ShiftAllRight(shift uint64) (z Uint16x8)
 func (x Uint32x4) ShiftAllRight(shift uint64) (z Uint32x4)
 
 // ShiftAllRight logically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0.
 //
 //	z[i] = x[i] >> shift
 //

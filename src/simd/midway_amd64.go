@@ -11,30 +11,37 @@ import (
 	"simd/archsimd"
 )
 
-const archHasHwClmul = true
+// archHasHwClmul reports whether carryless multiply on vectors of the given
+// bit size is a single hardware instruction.
+func archHasHwClmul(size int) bool {
+	switch size {
+	case 128:
+		return cpu.X86.HasPCLMULQDQ
+	case 256:
+		return cpu.X86.HasVPCLMULQDQ
+	case 512:
+		return cpu.X86.HasAVX512VPCLMULQDQ
+	}
+	return false
+}
 
-func archMaxVectorSize() (size, allFeatureSize int, arch string) {
-	arch = "amd64"
+// archMaxVectorSize returns the bit size of the largest vectors the CPU
+// supports, or 0 if it doesn't support the SIMD features this package
+// requires.
+func archMaxVectorSize() (size int) {
 	if archsimd.X86.AVX() {
 		size = 128
-		allFeatureSize = 128
 	}
 	if archsimd.X86.AVX2() {
 		size = 256
-		if cpu.X86.HasVPCLMULQDQ {
-			allFeatureSize = 256
-		}
 	}
 	if archsimd.X86.AVX512() {
 		size = 512
-		if cpu.X86.HasAVX512VPCLMULQDQ {
-			allFeatureSize = 512
-		}
 	}
-	// MulAdd requires FMA even for 128-bit vectors. Fall back to
-	// emulation by default if it is unavailable.
+	// MulAdd requires FMA even for 128-bit vectors, so without FMA the
+	// package can't use SIMD hardware at all.
 	if !archsimd.X86.FMA() {
-		allFeatureSize = 0
+		size = 0
 	}
-	return
+	return size
 }

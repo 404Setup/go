@@ -8,6 +8,7 @@ package simd_test
 
 import (
 	"fmt"
+	"internal/cpu"
 	"simd/archsimd"
 	"strings"
 	"testing"
@@ -24,9 +25,6 @@ func TestLookupOrZero(t *testing.T) {
 }
 
 func TestClMul(t *testing.T) {
-	if !archsimd.ARM64.PMULL() {
-		t.Skip("no carryless multiply")
-	}
 	var x = archsimd.LoadUint64x2([]uint64{1, 5})
 	var y = archsimd.LoadUint64x2([]uint64{3, 9})
 
@@ -36,12 +34,67 @@ func TestClMul(t *testing.T) {
 		checkSlices[uint64](t, r, s)
 	}
 
-	foo(x.CarrylessMultiplyEven(y), []uint64{3, 0})
-	foo(x.CarrylessMultiplyEvenOdd(y), []uint64{9, 0})
-	foo(x.CarrylessMultiplyOddEven(y), []uint64{15, 0})
-	foo(x.CarrylessMultiplyOdd(y), []uint64{45, 0})
-	foo(y.CarrylessMultiplyEven(y), []uint64{5, 0})
+	foo(x.CarrylessMulEven(y), []uint64{3, 0})
+	foo(x.CarrylessMulEvenOdd(y), []uint64{9, 0})
+	foo(x.CarrylessMulOddEven(y), []uint64{15, 0})
+	foo(x.CarrylessMulOdd(y), []uint64{45, 0})
+	foo(y.CarrylessMulEven(y), []uint64{5, 0})
 }
+
+// forcePMULL makes archsimd.ARM64.PMULL report have for the rest of the test
+// or benchmark. If have is true and the CPU doesn't support PMULL, it skips
+// the test.
+func forcePMULL(tb testing.TB, have bool) {
+	old := cpu.ARM64.HasPMULL
+	if have && !old {
+		tb.Skip("CPU does not support PMULL")
+	}
+	cpu.ARM64.HasPMULL = have
+	tb.Cleanup(func() { cpu.ARM64.HasPMULL = old })
+}
+
+func TestCarrylessMul(t *testing.T) {
+	test := func(t *testing.T) {
+		testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulEven, clmulSlice(0, 0))
+		testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulOdd, clmulSlice(1, 1))
+		testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulEvenOdd, clmulSlice(0, 1))
+		testUint64x2Binary(t, archsimd.Uint64x2.CarrylessMulOddEven, clmulSlice(1, 0))
+	}
+
+	t.Run("PMULL", func(t *testing.T) {
+		forcePMULL(t, true)
+		test(t)
+	})
+	t.Run("Emulated", func(t *testing.T) {
+		forcePMULL(t, false)
+		test(t)
+	})
+}
+
+func BenchmarkCarrylessMul(b *testing.B) {
+	bench := func(b *testing.B) {
+		x := archsimd.LoadUint64x2Array(&[2]uint64{0x0123456789abcdef, 0xfedcba9876543210})
+		y := archsimd.LoadUint64x2Array(&[2]uint64{0x66b32838754f59a3, 0xaeba319ab2418c50})
+		// This measures the latency of one multiply. It uses b.N rather
+		// than b.Loop because the compiler keeps variables assigned in a
+		// b.Loop body alive on the stack, which would add a store and a
+		// load to the dependency chain being measured.
+		for range b.N {
+			x = x.CarrylessMulEven(y).Xor(y)
+		}
+		sinkUint64x2 = x
+	}
+	b.Run("PMULL", func(b *testing.B) {
+		forcePMULL(b, true)
+		bench(b)
+	})
+	b.Run("Emulated", func(b *testing.B) {
+		forcePMULL(b, false)
+		bench(b)
+	})
+}
+
+var sinkUint64x2 archsimd.Uint64x2
 
 //go:noinline
 func addInt8sNoinline(a, b archsimd.Int8s) archsimd.Int8s { return a.Add(b) }

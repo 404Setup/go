@@ -150,7 +150,8 @@ func (x Int64x4) Abs() (z Uint64x4) {
 }
 
 // ShiftAllRight arithmetically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0 or -1.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0 or -1, depending on the sign of the element.
 //
 //	z[i] = x[i] >> shift
 //
@@ -168,7 +169,8 @@ func (x Int64x2) ShiftAllRight(shift uint64) (z Int64x2) {
 }
 
 // ShiftAllRight arithmetically shifts each element of x right by shift bits.
-// If shift is greater than the element width, the result is 0 or -1.
+// As in Go, if shift is greater than or equal to the element width, the
+// result is 0 or -1, depending on the sign of the element.
 //
 //	z[i] = x[i] >> shift
 //
@@ -388,7 +390,7 @@ func (x Uint8x64) OnesCount() (z Uint8x64) {
 func (x Float32x4) ReduceSum() (z float32) {
 	x = x.ConcatAddPairs(x) // [x0+x1, x2+x3, x0+x1, x2+x3]
 	x = x.ConcatAddPairs(x) // [(x0+x1)+(x2+x3), ...]
-	return x.GetElem(0)
+	return x.Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -397,7 +399,7 @@ func (x Float32x4) ReduceSum() (z float32) {
 //
 // Emulated, CPU Feature: AVX
 func (x Float64x2) ReduceSum() (z float64) {
-	return x.ConcatAddPairs(x).GetElem(0) // [x0+x1, x0+x1]
+	return x.ConcatAddPairs(x).Elem(0) // [x0+x1, x0+x1]
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -413,7 +415,7 @@ func (x Float32x8) ReduceSum() (z float32) {
 	// to match the pairwise summation order of the other platforms.
 	x = x.ConcatAddPairsGrouped(x) // [x0+x1, x2+x3, ... | x4+x5, x6+x7, ...]
 	x = x.ConcatAddPairsGrouped(x) // [(x0+x1)+(x2+x3), ... | (x4+x5)+(x6+x7), ...]
-	return x.GetLo().Add(x.GetHi()).GetElem(0)
+	return x.Lo().Add(x.Hi()).Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -426,7 +428,7 @@ func (x Float32x8) ReduceSum() (z float32) {
 // Emulated, CPU Feature: AVX
 func (x Float64x4) ReduceSum() (z float64) {
 	x = x.ConcatAddPairsGrouped(x) // [x0+x1, x0+x1 | x2+x3, x2+x3]
-	return x.GetLo().Add(x.GetHi()).GetElem(0)
+	return x.Lo().Add(x.Hi()).Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -439,11 +441,11 @@ func (x Float64x4) ReduceSum() (z float64) {
 // Emulated, CPU Feature: AVX512
 func (x Float32x16) ReduceSum() (z float32) {
 	// There is no 512-bit horizontal add, so start with the 256-bit halves.
-	lo, hi := x.GetLo(), x.GetHi()
+	lo, hi := x.Lo(), x.Hi()
 	y := lo.ConcatAddPairsGrouped(hi) // [x0+x1, x2+x3, x8+x9, x10+x11 | x4+x5, x6+x7, x12+x13, x14+x15]
 	y = y.ConcatAddPairsGrouped(y)    // [x0..3, x8..11, ... | x4..7, x12..15, ...]
-	w := y.GetLo().Add(y.GetHi())     // [x0..7, x8..15, ...]
-	return w.ConcatAddPairs(w).GetElem(0)
+	w := y.Lo().Add(y.Hi())           // [x0..7, x8..15, ...]
+	return w.ConcatAddPairs(w).Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -455,10 +457,10 @@ func (x Float32x16) ReduceSum() (z float32) {
 //
 // Emulated, CPU Feature: AVX512
 func (x Float64x8) ReduceSum() (z float64) {
-	lo, hi := x.GetLo(), x.GetHi()
+	lo, hi := x.Lo(), x.Hi()
 	y := lo.ConcatAddPairsGrouped(hi) // [x0+x1, x4+x5 | x2+x3, x6+x7]
-	w := y.GetLo().Add(y.GetHi())     // [x0..3, x4..7]
-	return w.ConcatAddPairs(w).GetElem(0)
+	w := y.Lo().Add(y.Hi())           // [x0..3, x4..7]
+	return w.ConcatAddPairs(w).Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -470,7 +472,7 @@ func (x Int16x8) ReduceSum() (z int16) {
 	x = x.ConcatAddPairs(x)
 	x = x.ConcatAddPairs(x)
 	x = x.ConcatAddPairs(x)
-	return x.GetElem(0)
+	return x.Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -482,7 +484,7 @@ func (x Uint16x8) ReduceSum() (z uint16) {
 	x = x.ConcatAddPairs(x)
 	x = x.ConcatAddPairs(x)
 	x = x.ConcatAddPairs(x)
-	return x.GetElem(0)
+	return x.Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -493,7 +495,7 @@ func (x Uint16x8) ReduceSum() (z uint16) {
 func (x Int32x4) ReduceSum() (z int32) {
 	x = x.ConcatAddPairs(x)
 	x = x.ConcatAddPairs(x)
-	return x.GetElem(0)
+	return x.Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -504,7 +506,7 @@ func (x Int32x4) ReduceSum() (z int32) {
 func (x Uint32x4) ReduceSum() (z uint32) {
 	x = x.ConcatAddPairs(x)
 	x = x.ConcatAddPairs(x)
-	return x.GetElem(0)
+	return x.Elem(0)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -513,7 +515,7 @@ func (x Uint32x4) ReduceSum() (z uint32) {
 //
 // Emulated, CPU Feature: AVX2
 func (x Int16x16) ReduceSum() (z int16) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -522,7 +524,7 @@ func (x Int16x16) ReduceSum() (z int16) {
 //
 // Emulated, CPU Feature: AVX2
 func (x Uint16x16) ReduceSum() (z uint16) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -531,7 +533,7 @@ func (x Uint16x16) ReduceSum() (z uint16) {
 //
 // Emulated, CPU Feature: AVX2
 func (x Int32x8) ReduceSum() (z int32) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -540,7 +542,7 @@ func (x Int32x8) ReduceSum() (z int32) {
 //
 // Emulated, CPU Feature: AVX2
 func (x Uint32x8) ReduceSum() (z uint32) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -549,7 +551,7 @@ func (x Uint32x8) ReduceSum() (z uint32) {
 //
 // Emulated, CPU Feature: AVX512
 func (x Int16x32) ReduceSum() (z int16) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -558,7 +560,7 @@ func (x Int16x32) ReduceSum() (z int16) {
 //
 // Emulated, CPU Feature: AVX512
 func (x Uint16x32) ReduceSum() (z uint16) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -567,7 +569,7 @@ func (x Uint16x32) ReduceSum() (z uint16) {
 //
 // Emulated, CPU Feature: AVX512
 func (x Int32x16) ReduceSum() (z int32) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -576,7 +578,7 @@ func (x Int32x16) ReduceSum() (z int32) {
 //
 // Emulated, CPU Feature: AVX512
 func (x Uint32x16) ReduceSum() (z uint32) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -586,7 +588,7 @@ func (x Uint32x16) ReduceSum() (z uint32) {
 // Emulated, CPU Feature: AVX
 func (x Int8x16) ReduceSum() (z int8) {
 	s := x.ToBits().SumOf8AbsDiff(Uint8x16{})
-	return int8(s.GetElem(0) + s.GetElem(1))
+	return int8(s.Elem(0) + s.Elem(1))
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -596,7 +598,7 @@ func (x Int8x16) ReduceSum() (z int8) {
 // Emulated, CPU Feature: AVX
 func (x Uint8x16) ReduceSum() (z uint8) {
 	s := x.SumOf8AbsDiff(Uint8x16{})
-	return uint8(s.GetElem(0) + s.GetElem(1))
+	return uint8(s.Elem(0) + s.Elem(1))
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -605,7 +607,7 @@ func (x Uint8x16) ReduceSum() (z uint8) {
 //
 // Emulated, CPU Feature: AVX2
 func (x Int8x32) ReduceSum() (z int8) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -614,7 +616,7 @@ func (x Int8x32) ReduceSum() (z int8) {
 //
 // Emulated, CPU Feature: AVX2
 func (x Uint8x32) ReduceSum() (z uint8) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -623,7 +625,7 @@ func (x Uint8x32) ReduceSum() (z uint8) {
 //
 // Emulated, CPU Feature: AVX512
 func (x Int8x64) ReduceSum() (z int8) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -632,7 +634,7 @@ func (x Int8x64) ReduceSum() (z int8) {
 //
 // Emulated, CPU Feature: AVX512
 func (x Uint8x64) ReduceSum() (z uint8) {
-	return x.GetLo().Add(x.GetHi()).ReduceSum()
+	return x.Lo().Add(x.Hi()).ReduceSum()
 }
 
 // LookupOrZero permutes x, returning 0 for out-of-range indices.
@@ -692,7 +694,7 @@ func (x Int8x64) LookupOrZero(indices Uint8x64) (z Int8x64) {
 	if X86.AVX512VBMI() {
 		return x.LookupMod(indices).Masked(indices.Less(BroadcastUint8x64(64)))
 	}
-	xl, xh := x.GetLo(), x.GetHi()
+	xl, xh := x.Lo(), x.Hi()
 	ll := xl.ConcatPermute128Scalars(0, 0, xl) // 2 copies of elements 0-15
 	lh := xl.ConcatPermute128Scalars(1, 1, xl) // 2 copies of elements 16-31
 	hl := xh.ConcatPermute128Scalars(0, 0, xh) // 2 copies of elements 32-47

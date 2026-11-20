@@ -266,7 +266,7 @@ func (x Float64x2) MulAdd(y Float64x2, z Float64x2) (w Float64x2) {
 	return x.Mul(y).Add(z)
 }
 
-// CarrylessMultiplyEven computes the elementwise carryless multiplication of
+// CarrylessMulEven computes the elementwise carryless multiplication of
 // even-indexed elements of x and y. The result of each carryless multiply is
 // twice the width of the input elements. The high bits are stored in elements
 // z[2*i+1] and the low bits are stored in elements z[2*i].
@@ -294,27 +294,27 @@ func (x Float64x2) MulAdd(y Float64x2, z Float64x2) (w Float64x2) {
 //	= (x^6 + x^5 + x^1)
 //
 // Emulated
-func (x Uint64x2) CarrylessMultiplyEven(y Uint64x2) (z Uint64x2) {
+func (x Uint64x2) CarrylessMulEven(y Uint64x2) (z Uint64x2) {
 	return x.carrylessMultiply(y)
 }
 
-// CarrylessMultiplyOdd computes the elementwise carryless multiplication of
+// CarrylessMulOdd computes the elementwise carryless multiplication of
 // odd-indexed elements of x and y. The result of each carryless multiply is
 // twice the width of the input elements. The high bits are stored in elements
 // z[2*i+1] and the low bits are stored in elements z[2*i].
 //
 //	concat(z[2*i+1], z[2*i]) = clmul(x[2*i+1], y[2*i+1])
 //
-// See [CarrylessMultiplyEven] for details about carryless multiply.
+// See [CarrylessMulEven] for details about carryless multiply.
 //
 // Emulated
-func (x Uint64x2) CarrylessMultiplyOdd(y Uint64x2) (z Uint64x2) {
-	x = x.SetElem(0, x.GetElem(1))
-	y = y.SetElem(0, y.GetElem(1))
+func (x Uint64x2) CarrylessMulOdd(y Uint64x2) (z Uint64x2) {
+	x = x.SetElem(0, x.Elem(1))
+	y = y.SetElem(0, y.Elem(1))
 	return x.carrylessMultiply(y)
 }
 
-// CarrylessMultiplyEvenOdd computes the elementwise carryless multiplication of
+// CarrylessMulEvenOdd computes the elementwise carryless multiplication of
 // even-indexed elements of x and odd-indexed elements of y. The result of each
 // carryless multiply is twice the width of the input elements. The high bits
 // are stored in elements z[2*i+1] and the low bits are stored in elements
@@ -322,15 +322,15 @@ func (x Uint64x2) CarrylessMultiplyOdd(y Uint64x2) (z Uint64x2) {
 //
 //	concat(z[2*i+1], z[2*i]) = clmul(x[2*i], y[2*i+1])
 //
-// See [CarrylessMultiplyEven] for details about carryless multiply.
+// See [CarrylessMulEven] for details about carryless multiply.
 //
 // Emulated
-func (x Uint64x2) CarrylessMultiplyEvenOdd(y Uint64x2) (z Uint64x2) {
-	y = y.SetElem(0, y.GetElem(1))
+func (x Uint64x2) CarrylessMulEvenOdd(y Uint64x2) (z Uint64x2) {
+	y = y.SetElem(0, y.Elem(1))
 	return x.carrylessMultiply(y)
 }
 
-// CarrylessMultiplyOddEven computes the elementwise carryless multiplication of
+// CarrylessMulOddEven computes the elementwise carryless multiplication of
 // odd-indexed elements of x and even-indexed elements of y. The result of each
 // carryless multiply is twice the width of the input elements. The high bits
 // are stored in elements z[2*i+1] and the low bits are stored in elements
@@ -338,11 +338,11 @@ func (x Uint64x2) CarrylessMultiplyEvenOdd(y Uint64x2) (z Uint64x2) {
 //
 //	concat(z[2*i+1], z[2*i]) = clmul(x[2*i+1], y[2*i])
 //
-// See [CarrylessMultiplyEven] for details about carryless multiply.
+// See [CarrylessMulEven] for details about carryless multiply.
 //
 // Emulated
-func (x Uint64x2) CarrylessMultiplyOddEven(y Uint64x2) (z Uint64x2) {
-	x = x.SetElem(0, x.GetElem(1))
+func (x Uint64x2) CarrylessMulOddEven(y Uint64x2) (z Uint64x2) {
+	x = x.SetElem(0, x.Elem(1))
 	return x.carrylessMultiply(y)
 }
 
@@ -357,7 +357,7 @@ func (x Uint64x2) CarrylessMultiplyOddEven(y Uint64x2) (z Uint64x2) {
 func (x Float32x4) ReduceSum() (z float32) {
 	// (x0+x1) + (x2 + x3) is a shorter evaluation tree,
 	// and associates the same as horizontal addition
-	return (x.GetElem(0) + x.GetElem(1)) + (x.GetElem(2) + x.GetElem(3))
+	return (x.Elem(0) + x.Elem(1)) + (x.Elem(2) + x.Elem(3))
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -366,7 +366,7 @@ func (x Float32x4) ReduceSum() (z float32) {
 //
 // Emulated
 func (x Float64x2) ReduceSum() (z float64) {
-	return x.GetElem(0) + x.GetElem(1)
+	return x.Elem(0) + x.Elem(1)
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -375,8 +375,8 @@ func (x Float64x2) ReduceSum() (z float64) {
 //
 // Emulated
 func (x Int16x8) ReduceSum() (z int16) {
-	return ((x.GetElem(0) + x.GetElem(1)) + (x.GetElem(2) + x.GetElem(3))) +
-		((x.GetElem(4) + x.GetElem(5)) + (x.GetElem(6) + x.GetElem(7)))
+	return ((x.Elem(0) + x.Elem(1)) + (x.Elem(2) + x.Elem(3))) +
+		((x.Elem(4) + x.Elem(5)) + (x.Elem(6) + x.Elem(7)))
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -385,8 +385,8 @@ func (x Int16x8) ReduceSum() (z int16) {
 //
 // Emulated
 func (x Uint16x8) ReduceSum() (z uint16) {
-	return ((x.GetElem(0) + x.GetElem(1)) + (x.GetElem(2) + x.GetElem(3))) +
-		((x.GetElem(4) + x.GetElem(5)) + (x.GetElem(6) + x.GetElem(7)))
+	return ((x.Elem(0) + x.Elem(1)) + (x.Elem(2) + x.Elem(3))) +
+		((x.Elem(4) + x.Elem(5)) + (x.Elem(6) + x.Elem(7)))
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -395,7 +395,7 @@ func (x Uint16x8) ReduceSum() (z uint16) {
 //
 // Emulated
 func (x Int32x4) ReduceSum() (z int32) {
-	return (x.GetElem(0) + x.GetElem(1)) + (x.GetElem(2) + x.GetElem(3))
+	return (x.Elem(0) + x.Elem(1)) + (x.Elem(2) + x.Elem(3))
 }
 
 // ReduceSum returns the scalar sum of the elements of x.
@@ -404,7 +404,7 @@ func (x Int32x4) ReduceSum() (z int32) {
 //
 // Emulated
 func (x Uint32x4) ReduceSum() (z uint32) {
-	return (x.GetElem(0) + x.GetElem(1)) + (x.GetElem(2) + x.GetElem(3))
+	return (x.Elem(0) + x.Elem(1)) + (x.Elem(2) + x.Elem(3))
 }
 
 // ReduceSum returns the scalar sum of the elements of x.

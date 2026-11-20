@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -378,5 +379,305 @@ func TestECHServerCipherSuite(t *testing.T) {
 				t.Fatal("rejection did not preserve outer ClientHello")
 			}
 		})
+	}
+}
+
+// TestECHOuterHelloOmitsPSK verifies computeAndUpdateOuterECHExtension strips
+// the inner hello's PSK offer from the outer hello.
+func TestECHOuterHelloOmitsPSK(t *testing.T) {
+	// Generate the ECH config in-test so the private key is known and the
+	// sealed payload can be decrypted below.
+	echKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configBuilder := cryptobyte.NewBuilder(nil)
+	configBuilder.AddUint16(extensionEncryptedClientHello)
+	configBuilder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+		builder.AddUint8(1) // config_id
+		builder.AddUint16(0x0020 /* DHKEM(X25519, HKDF-SHA256) */)
+		builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+			builder.AddBytes(echKey.PublicKey().Bytes())
+		})
+		builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+			builder.AddUint16(0x0001 /* HKDF-SHA256 */)
+			builder.AddUint16(0x0001 /* AES-128-GCM */)
+		})
+		builder.AddUint8(32) // maximum_name_length
+		builder.AddUint8LengthPrefixed(func(builder *cryptobyte.Builder) {
+			builder.AddBytes([]byte("public.example"))
+		})
+		builder.AddUint16(0) // extensions
+	})
+	echConfigBytes := configBuilder.BytesOrPanic()
+	listBuilder := cryptobyte.NewBuilder(nil)
+	listBuilder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+		builder.AddBytes(echConfigBytes)
+	})
+
+	configs, err := parseECHConfigList(listBuilder.BytesOrPanic())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, echPK, kdf, aead := pickECHConfig(configs)
+	if config == nil {
+		t.Fatal("pickECHConfig returned no config")
+	}
+	ech := &echClientContext{config: config, kdfID: kdf.ID(), aeadID: aead.ID()}
+	info := append([]byte("tls ech\x00"), config.raw...)
+	ech.encapsulatedKey, ech.hpkeContext, err = hpke.NewSender(echPK, kdf, aead, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inner := &clientHelloMsg{
+		vers:                 VersionTLS13,
+		random:               make([]byte, 32),
+		sessionId:            make([]byte, 32),
+		serverName:           "secret.example",
+		cipherSuites:         []uint16{TLS_AES_128_GCM_SHA256},
+		compressionMethods:   []uint8{0},
+		supportedVersions:    []uint16{VersionTLS13},
+		encryptedClientHello: []byte{byte(innerECHExt)},
+		pskIdentities:        []pskIdentity{{label: []byte("ticket")}},
+		pskBinders:           [][]byte{make([]byte, 32)},
+	}
+	outer := inner.clone()
+	outer.serverName = string(config.PublicName)
+
+	if err := computeAndUpdateOuterECHExtension(outer, inner, ech, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if outer.pskIdentities != nil || outer.pskBinders != nil {
+		t.Error("outer hello retains PSK state after computeAndUpdateOuterECHExtension")
+	}
+	marshaled, err := outer.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed clientHelloMsg
+	if !parsed.unmarshal(marshaled) {
+		t.Fatal("failed to unmarshal outer hello")
+	}
+	if len(parsed.pskIdentities) != 0 || len(parsed.pskBinders) != 0 {
+		t.Error("marshaled outer hello contains a pre_shared_key extension")
+	}
+	if len(inner.pskIdentities) != 1 || len(inner.pskBinders) != 1 {
+		t.Error("inner hello lost its PSK offer")
+	}
+
+	// Stripping the PSK from the outer hello must not leak into the inner
+	// hello's encoding. The sealed inner is the only place the offer is
+	// carried, so losing it there silently disables resumption. Decrypt the
+	// sealed payload as the server would and check the offer survived.
+	echType, echCipherSuite, _, encap, payload, err := parseECHExt(parsed.encryptedClientHello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if echType != outerECHExt {
+		t.Fatalf("ech extension type: got %v, want %v", echType, outerECHExt)
+	}
+	kem, err := hpke.NewKEM(config.KemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echPriv, err := kem.NewPrivateKey(echKey.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipientKDF, err := hpke.NewKDF(echCipherSuite.KDFID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipientAEAD, err := hpke.NewAEAD(echCipherSuite.AEADID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipient, err := hpke.NewRecipient(encap, echPriv, recipientKDF, recipientAEAD, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedInner, err := decryptECHPayload(recipient, parsed.original, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedInner, err := decodeInnerClientHello(&parsed, encodedInner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decodedInner.pskIdentities) != 1 || len(decodedInner.pskBinders) != 1 {
+		t.Error("decoded inner hello lost its pre_shared_key offer")
+	}
+}
+
+// TestGreaseECHGodebugOptOut verifies that GODEBUG=tlsechgrease=0 fully
+// disables sending a GREASE'd encrypted_client_hello extension.
+func TestGreaseECHGodebugOptOut(t *testing.T) {
+	newConn := func() *Conn {
+		return &Conn{config: &Config{
+			ServerName:         "test.example",
+			MinVersion:         VersionTLS13,
+			InsecureSkipVerify: true,
+		}}
+	}
+
+	t.Run("default-on", func(t *testing.T) {
+		t.Setenv("GODEBUG", "")
+		conn := newConn()
+		hello, _, ech, err := conn.makeClientHello()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ech != nil {
+			t.Errorf("ech context: got %#v, want nil for GREASE", ech)
+		}
+		if !conn.echGrease {
+			t.Errorf("conn.echGrease: got false, want true")
+		}
+		if len(hello.encryptedClientHello) == 0 {
+			t.Errorf("encryptedClientHello empty, want a GREASE extension")
+		}
+	})
+
+	t.Run("opt-out", func(t *testing.T) {
+		t.Setenv("GODEBUG", "tlsechgrease=0")
+		conn := newConn()
+		hello, _, ech, err := conn.makeClientHello()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ech != nil {
+			t.Errorf("ech context: got %#v, want nil under tlsechgrease=0", ech)
+		}
+		if conn.echGrease {
+			t.Errorf("conn.echGrease: got true, want false under tlsechgrease=0")
+		}
+		if len(hello.encryptedClientHello) != 0 {
+			t.Errorf("encryptedClientHello: got %d bytes, want 0", len(hello.encryptedClientHello))
+		}
+	})
+}
+
+// TestGreaseECHHRRMalformedExtension verifies a GREASE'ing client MUST
+// abort with a decode_error alert when the server's HRR includes a
+// malformed encrypted_client_hello extension.
+func TestGreaseECHHRRMalformedExtension(t *testing.T) {
+	c, s := localPipe(t)
+	errChan := make(chan error, 1)
+
+	go func() {
+		errChan <- Client(c, &Config{
+			ServerName:         "test.example",
+			MinVersion:         VersionTLS13,
+			InsecureSkipVerify: true,
+		}).Handshake()
+	}()
+
+	// Read the ClientHello record so we can echo session_id back in the HRR.
+	var header [5]byte
+	if _, err := io.ReadFull(s, header[:]); err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, int(header[3])<<8|int(header[4]))
+	if _, err := io.ReadFull(s, record); err != nil {
+		t.Fatal(err)
+	}
+	var clientHello clientHelloMsg
+	if !clientHello.unmarshal(record) {
+		t.Fatal("failed to parse ClientHello")
+	}
+	if len(clientHello.supportedCurves) == 0 {
+		t.Fatal("ClientHello has no supportedCurves; cannot build HRR")
+	}
+
+	// Drain any subsequent writes from the client so they don't block.
+	go io.Copy(io.Discard, s)
+
+	// Build a HelloRetryRequest carrying a 7-byte ECH extension (length != 8
+	// per RFC 9849 §6.2).
+	hrr := &serverHelloMsg{
+		vers:                 VersionTLS12,
+		random:               helloRetryRequestRandom,
+		sessionId:            clientHello.sessionId,
+		cipherSuite:          TLS_AES_128_GCM_SHA256,
+		compressionMethod:    0,
+		supportedVersion:     VersionTLS13,
+		encryptedClientHello: bytes.Repeat([]byte{0}, 7),
+		selectedGroup:        clientHello.supportedCurves[0],
+	}
+	hrrBytes := mustMarshal(t, hrr)
+	if _, err := s.Write([]byte{
+		byte(recordTypeHandshake),
+		byte(VersionTLS12 >> 8),
+		byte(VersionTLS12 & 0xff),
+		byte(len(hrrBytes) >> 8),
+		byte(len(hrrBytes)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(hrrBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	err := <-errChan
+	if err == nil {
+		t.Fatal("handshake unexpectedly succeeded; want error on malformed HRR ECH ext")
+	}
+	want := "malformed encrypted client hello extension"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("handshake error: got %q, want %q", err, want)
+	}
+}
+
+func TestECHEmptyExtensionInTLS12ServerHello(t *testing.T) {
+	// A TLS 1.2 ServerHello selecting ECDHE-ECDSA-AES128-GCM-SHA256
+	// with a single, empty encrypted_client_hello extension.
+	hello, err := hex.DecodeString("0200002c0303" + strings.Repeat("00", 32) + "00c02b000004fe0d0000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, peer := localPipe(t)
+	peer.Close()
+	defer clientConn.Close()
+	c := Client(&discardConn{clientConn}, testConfigClient())
+	c.handBuf().Write(hello)
+	if err := c.Handshake(); err == nil || !errors.Is(c.out.err, alertUnsupportedExtension) {
+		t.Fatalf("Handshake returned %v with alert %v, want unsupported_extension", err, c.out.err)
+	}
+}
+
+func TestGreaseECHInFinalServerHello(t *testing.T) {
+	t.Setenv("GODEBUG", "tlsechgrease=1")
+	c := Client(&discardConn{}, testConfigClient())
+	hello, _, _, err := c.makeClientHello()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := clientHandshakeStateTLS13{c: c, hello: hello, serverHello: &serverHelloMsg{
+		vers:                 VersionTLS12,
+		supportedVersion:     VersionTLS13,
+		sessionId:            hello.sessionId,
+		random:               make([]byte, 32),
+		cipherSuite:          TLS_AES_128_GCM_SHA256,
+		encryptedClientHello: make([]byte, 8),
+	}}
+	if err := hs.checkServerHelloOrHRR(); err == nil || !errors.Is(c.out.err, alertIllegalParameter) {
+		t.Fatalf("checkServerHelloOrHRR returned %v with alert %v, want illegal_parameter", err, c.out.err)
+	}
+}
+
+func TestUnsolicitedECHRetryConfigs(t *testing.T) {
+	t.Setenv("GODEBUG", "tlsechgrease=0")
+	c := Client(&discardConn{}, testConfigClient())
+	hello, _, _, err := c.makeClientHello()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An ECHConfigList with one config of an unknown version.
+	c.handBuf().Write(mustMarshal(t, &encryptedExtensionsMsg{echRetryConfigs: []byte{0, 4, 0xba, 0xdd, 0, 0}}))
+	hs := clientHandshakeStateTLS13{c: c, hello: hello}
+	if err := hs.readServerParameters(); err == nil || !errors.Is(c.out.err, alertUnsupportedExtension) {
+		t.Fatalf("readServerParameters returned %v with alert %v, want unsupported_extension", err, c.out.err)
 	}
 }

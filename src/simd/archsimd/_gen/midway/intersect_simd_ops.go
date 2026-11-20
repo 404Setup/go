@@ -5,7 +5,6 @@
 package main
 
 import (
-	_ "embed"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -17,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"simd/archsimd/_gen/midway/variants"
 	"simd/archsimd/_gen/sgutil"
 	"slices"
 	"sort"
@@ -34,6 +32,23 @@ import (
 type MethodSet map[string]*ast.FuncDecl
 type TypeMethods map[string]MethodSet
 
+// clmulNote is the implementation note for the CarrylessMul methods.
+const clmulNote = `Performance: If the CPU has no carryless multiply instruction at the vector
+size in use, this is implemented with narrower instructions, or with
+software if it has none at all. That is slower than the instruction, and
+can be the case even when [Emulated] returns false.`
+
+// implementationNotes maps from a method name to an implementation note to add
+// to the doc comment of that method of the portable types. The spec provides
+// the rest of the doc comment, so each of these must start with an
+// implementation note prefix, such as "Performance:".
+var implementationNotes = map[string]string{
+	"CarrylessMulEven":    clmulNote,
+	"CarrylessMulOdd":     clmulNote,
+	"CarrylessMulEvenOdd": clmulNote,
+	"CarrylessMulOddEven": clmulNote,
+}
+
 var genFlags = gentools.RegisterFlags(nil)
 var verbose = flag.Bool("v", false, "Be much chattier about processing")
 
@@ -48,19 +63,6 @@ type TypeMethod struct {
 
 type whyMissing struct {
 	wasm128, arm128, amd128, amd256, amd512 bool
-}
-
-type typeWithVariants struct {
-	t string
-	v *variants.Variant
-}
-
-func (tv *typeWithVariants) aName() string {
-	return tv.t
-}
-
-func (tv *typeWithVariants) vName() string {
-	return tv.v.Name(tv.t)
 }
 
 func (w whyMissing) String() string {
@@ -97,7 +99,7 @@ func combine(arch, typ string) string {
 // available, and is emulated otherwise, names that feature in its "Asm:" clause
 // instead, like
 //
-//	Asm: VPCLMULQDQ if AVX2CLMUL, Emulated otherwise, CPU Feature: AVX2
+//	Asm: VPCLMULQDQ if CPU feature AVX2CLMUL, Emulated otherwise, CPU Feature: AVX2
 //
 // Such a method is safe to call without that further feature, so it doesn't
 // count as required.
@@ -143,7 +145,7 @@ func main() {
 	// Hardcoded list of files
 	amd64Files := []string{"ops_amd64.go", "compare_gen_amd64.go", "types_amd64.go",
 		"other_gen_amd64.go", "extra_amd64.go", "maskmerge_gen_amd64.go",
-		"shuffles_amd64.go", "slice_gen_amd64.go", "slicepart_amd64.go",
+		"shuffles_amd64.go", "clmul_amd64.go", "slice_gen_amd64.go", "slicepart_amd64.go",
 		"slicepart_128.go", "ops_emulated_amd64.go", "maskrange_amd64.go",
 		"deprecated_amd64.go", "converts_emulated_amd64.go",
 		"converts_gen_amd64.go"}
@@ -539,6 +541,13 @@ package simd
 				fd := signatureByElemMethod[ElemMethod{elem, m}]
 				elems := elem + "s"
 				checkSpec(elems, m)
+				// The spec provides the doc comment. Add any
+				// implementation notes, which follow it.
+				if note := implementationNotes[m]; note != "" {
+					for line := range strings.SplitSeq(note, "\n") {
+						pf("// %s\n", line)
+					}
+				}
 				pf("func (x %s) %s(", elems, m)
 
 				if !emulated[TypeMethod{elems, m}] {
@@ -615,35 +624,15 @@ package simd
 		pw("%s contains %s.%s missing from intersected methods\n", emulatedFile, x.t, x.m)
 	}
 
-	twv := func(arch string) []typeWithVariants {
-		var typesForArch []typeWithVariants
+	// archTypes returns the vector and mask types of arch, in order.
+	archTypes := func(arch string) []string {
+		var typesForArch []string
 		for t := range knownReceivers {
 			if methodsByType[combine(arch, t)] != nil {
-				typesForArch = append(typesForArch, typeWithVariants{t, nil})
+				typesForArch = append(typesForArch, t)
 			}
 		}
-		tfa0 := typesForArch
-		for _, tv := range tfa0 {
-			key := variants.Key{Arch: arch, Size: sizeForType[tv.t]}
-			if v := variants.Variants[key]; v != nil {
-				typesForArch = append(typesForArch, typeWithVariants{tv.t, v})
-			}
-		}
-		slices.SortFunc(typesForArch, func(a, b typeWithVariants) int {
-			if c := sgutil.CompareNatural(a.t, b.t); c != 0 {
-				return c
-			}
-			if a.v == nil && b.v == nil {
-				return 0
-			}
-			if a.v == nil && b.v != nil {
-				return -1
-			}
-			if a.v != nil && b.v == nil {
-				return 1
-			}
-			return sgutil.CompareNatural(a.v.Suffix, b.v.Suffix)
-		})
+		slices.SortFunc(typesForArch, sgutil.CompareNatural)
 		return typesForArch
 	}
 
@@ -665,32 +654,25 @@ package simd
 			pf("// also allows additional useful exported declarations that would weirdly pollute archsimd.\n")
 			pf("\n")
 
-			typesForArch := twv(arch)
+			typesForArch := archTypes(arch)
 
 			for _, t := range typesForArch {
-				at := t.aName()
-				vt := t.vName()
-				pf("type %s archsimd.%s\n", vt, at)
-				if xAt := strings.Index(at, "x"); xAt != -1 && !strings.HasPrefix(at, "Mask") {
-					elem := at[:xAt]
+				pf("type %s archsimd.%s\n", t, t)
+				if xAt := strings.Index(t, "x"); xAt != -1 && !strings.HasPrefix(t, "Mask") {
+					elem := t[:xAt]
 					scalar := toScalar(elem)
-					pf("func Load%s(s []%s) %s {\n\treturn %s(archsimd.Load%s(s))\n}\n", vt, scalar, vt, vt, at)
+					pf("func Load%s(s []%s) %s {\n\treturn %s(archsimd.Load%s(s))\n}\n", t, scalar, t, t, t)
 					pf("func Load%sPart(s []%s) (%s, int) {\n\tv, n := archsimd.Load%sPart(s)\n\treturn %s(v), n\n}\n",
-						vt, scalar, vt, at, vt)
-					pf("func Broadcast%s(x %s) %s {\n\treturn %s(archsimd.Broadcast%s(x))\n}\n", vt, scalar, vt, vt, at)
+						t, scalar, t, t, t)
+					pf("func Broadcast%s(x %s) %s {\n\treturn %s(archsimd.Broadcast%s(x))\n}\n", t, scalar, t, t, t)
 				}
 			}
 			nl()
 
-			typeStr := func(e ast.Expr, v *variants.Variant) string {
+			typeStr := func(e ast.Expr) string {
 				var buf strings.Builder
 				format.Node(&buf, token.NewFileSet(), e)
-				t := buf.String()
-				// Know that these are always just plain types
-				if _, ok := knownReceivers[t]; ok {
-					return v.Name(t)
-				}
-				return t
+				return buf.String()
 			}
 
 			// convertArg emits a type conversion for name to the
@@ -711,16 +693,16 @@ package simd
 				return name
 			}
 
-			wrapResult := func(call string, e ast.Expr, v *variants.Variant) string {
+			wrapResult := func(call string, e ast.Expr) string {
 				switch t := e.(type) {
 				case *ast.Ident:
 					if _, ok := knownReceivers[t.Name]; ok {
-						return fmt.Sprintf("%s(%s)", v.Name(t.Name), call)
+						return fmt.Sprintf("%s(%s)", t.Name, call)
 					}
 				case *ast.StarExpr:
 					if ident, ok := t.X.(*ast.Ident); ok {
 						if _, ok := knownReceivers[ident.Name]; ok {
-							return fmt.Sprintf("(*%s)(%s)", v.Name(ident.Name), call)
+							return fmt.Sprintf("(*%s)(%s)", ident.Name, call)
 						}
 					}
 				}
@@ -730,14 +712,8 @@ package simd
 			for _, elem := range elems {
 				intersection := intersectionByElem[elem]
 				for _, m := range intersection {
-					for _, t := range typesForArch {
-						at := t.aName()
-						vt := t.vName()
+					for _, at := range typesForArch {
 						if map128[elem] != at && map256[elem] != at && map512[elem] != at {
-							continue
-						}
-						if t.v != nil && t.v.Emulated[m] {
-							// for this variant, emulate the method, do not supply
 							continue
 						}
 						fd := methodsByType[combine(arch, at)][m]
@@ -745,11 +721,11 @@ package simd
 							continue
 						}
 						bridgeName := fd.Name.Name
-						if strings.HasPrefix(vt, "Mask") && strings.HasPrefix(bridgeName, "ToInt") {
+						if strings.HasPrefix(at, "Mask") && strings.HasPrefix(bridgeName, "ToInt") {
 							x := strings.Index(bridgeName, "x")
 							bridgeName = bridgeName[:x] + "s"
 						}
-						pf("func (x %s) %s(", vt, bridgeName)
+						pf("func (x %s) %s(", at, bridgeName)
 						var args []string
 						if fd.Type.Params != nil {
 							paramCount := 0
@@ -759,7 +735,7 @@ package simd
 										if paramCount > 0 {
 											p(", ")
 										}
-										pf("%s %s", name.Name, typeStr(field.Type, t.v))
+										pf("%s %s", name.Name, typeStr(field.Type))
 										args = append(args, convertArg(name.Name, field.Type))
 										paramCount++
 									}
@@ -768,7 +744,7 @@ package simd
 										p(", ")
 									}
 									paramName := fmt.Sprintf("p%d", paramCount)
-									pf("%s %s", paramName, typeStr(field.Type, t.v))
+									pf("%s %s", paramName, typeStr(field.Type))
 									args = append(args, convertArg(paramName, field.Type))
 									paramCount++
 								}
@@ -788,7 +764,7 @@ package simd
 									p(", ")
 								}
 								results = append(results, field.Type)
-								p(typeStr(field.Type, t.v))
+								p(typeStr(field.Type))
 							}
 							if needsParens {
 								p(")")
@@ -802,7 +778,7 @@ package simd
 
 						callStr := fmt.Sprintf("(archsimd.%s(x)).%s(%s)", at, fd.Name.Name, strings.Join(args, ", "))
 						if len(results) == 1 {
-							p(wrapResult(callStr, results[0], t.v))
+							p(wrapResult(callStr, results[0]))
 						} else {
 							p(callStr)
 						}
@@ -859,13 +835,6 @@ package simd
 					pf("\t\tif z, ok := any(bridge.%s(a)).(%ss); ok {\n", t, elem)
 					pf("\t\t\treturn z\n")
 					pf("\t\t}\n")
-					key := variants.Key{Arch: arch, Size: sizeForType[t]}
-					if v := variants.Variants[key]; v != nil {
-						vt := v.Name(t)
-						pf("\t\tif z, ok := any(bridge.%s(a)).(%ss); ok {\n", vt, elem)
-						pf("\t\t\treturn z\n")
-						pf("\t\t}\n")
-					}
 					pf("\t\tpanic(fromArchError(\"simd.%ssFromArch: cannot convert from archsimd.%s\"))\n", elem, t)
 				}
 				pf("\t}\n\tpanic(\"unreachable\")\n}\n\n")
@@ -886,10 +855,7 @@ package simd
 	}
 	doToFromEmulated(files.NewGoFile("simd/tofrom_emulated.go"))
 
-	vw := files.NewGoFile("internal/simd/variants/variants.go")
-	vw.Write(variantBytes)
-
-	generateBridgeEmulated()
+	generateBridgeEmulated(specIdx)
 
 	if minorProblem {
 		pw("The logged warnings did not prevent generation of the midway API files, but the API is flawed (lacks emulations, documentation, etc).\n")
@@ -898,10 +864,23 @@ package simd
 
 // generatedBridgeEmulated generates internal/bridge/simd_emulated.go from
 // simd_emulated.go.
-func generateBridgeEmulated() {
-	b, err := genFlags.ReadFile("simd/simd_emulated.go")
+//
+// simd_emulated.go is hand-written, and cmd/specfill fills its doc comments
+// from spec. To keep this output independent of whether specfill has run since
+// spec last changed, fill the doc comments here, too, before transforming the
+// file.
+func generateBridgeEmulated(specIdx *specgen.Index) {
+	const path = "simd/simd_emulated.go"
+	b, err := genFlags.ReadFile(path)
 	if err != nil {
-		log.Fatalf("reading simd/simd_emulated.go: %v", err)
+		log.Fatalf("reading %s: %v", path, err)
+	}
+	b, err = specdoc.Fill(b, specIdx, specdoc.Options{
+		Filename:        "src/" + path,
+		AllowDocRewrite: true,
+	})
+	if err != nil {
+		log.Fatalf("filling %s: %v", path, err)
 	}
 	lines := strings.Split(string(b), "\n")
 	var sawBuild, sawPackage bool
@@ -921,11 +900,6 @@ func generateBridgeEmulated() {
 	dst.WriteString("// Code generated by 'go run -C $GOROOT/src/simd/archsimd/_gen/midway'; DO NOT EDIT.\n\n")
 	dst.WriteString(strings.Join(lines, "\n"))
 }
-
-// Ensure that generating a set of variants writes out a consistent variants.go for the compiler's use
-//
-//go:embed "variants/variants.go"
-var variantBytes []byte
 
 var emulatedElemRE = regexp.MustCompile(`^(Mask|Int|Uint|Float)(8|16|32|64)$`)
 

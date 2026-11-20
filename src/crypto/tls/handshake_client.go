@@ -202,6 +202,19 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
 		if err != nil {
 			return nil, nil, nil, err
 		}
+	} else if slices.Contains(supportedVersions, VersionTLS13) {
+		// Without a real ECHConfigList, attach a GREASE'd ECH extension so the
+		// outer ClientHello is indistinguishable from one carrying real ECH.
+		// See RFC 9849, Section 6.2. Skipped if GODEBUG=tlsechgrease=0.
+		if tlsechgrease.Value() == "0" {
+			tlsechgrease.IncNonDefault()
+		} else {
+			hello.encryptedClientHello, err = newGreaseECHExtension(config.rand(), hello)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			c.echGrease = true
+		}
 	}
 
 	return hello, keyShareKeys, ech, nil
@@ -293,7 +306,8 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 		if err := transcriptMsg(transcriptHello, transcript); err != nil {
 			return err
 		}
-		earlyTrafficSecret := earlySecret.ClientEarlyTrafficSecret(transcript)
+		var earlyTrafficSecret []byte
+		subtle.WithDataIndependentTiming(func() { earlyTrafficSecret = earlySecret.ClientEarlyTrafficSecret(transcript) })
 		c.quicSetWriteSecret(QUICEncryptionLevelEarly, suite.id, earlyTrafficSecret)
 	}
 
@@ -338,6 +352,12 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 			echContext:   ech,
 		}
 		return hs.handshake()
+	}
+
+	// ECH is a TLS 1.3+ extension.
+	if serverHello.encryptedClientHello != nil {
+		c.sendAlert(alertUnsupportedExtension)
+		return errors.New("tls: server sent encrypted_client_hello extension in a non-TLS 1.3 ServerHello")
 	}
 
 	hs := &clientHandshakeState{
@@ -499,8 +519,10 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	hello.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
 
 	// Compute the PSK binders. See RFC 8446, Section 4.2.11.2.
-	earlySecret = tls13.NewEarlySecret(cipherSuite.hash.New, session.secret)
-	binderKey = earlySecret.ResumptionBinderKey()
+	subtle.WithDataIndependentTiming(func() {
+		earlySecret = tls13.NewEarlySecret(cipherSuite.hash.New, session.secret)
+		binderKey = earlySecret.ResumptionBinderKey()
+	})
 	transcript := cipherSuite.hash.New()
 	if err := computeAndUpdatePSK(hello, binderKey, transcript, cipherSuite.finishedHash); err != nil {
 		return nil, nil, nil, err

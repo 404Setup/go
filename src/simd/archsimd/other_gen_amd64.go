@@ -804,210 +804,240 @@ func (x Uint64x8) Not() (z Uint64x8) {
 	return x.Xor(x.Equal(x).ToInt64x8().AsUint64x8())
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int8x16) String() string {
 	var s [16]int8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int16x8) String() string {
 	var s [8]int16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int32x4) String() string {
 	var s [4]int32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int64x2) String() string {
 	var s [2]int64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint8x16) String() string {
 	var s [16]uint8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint16x8) String() string {
 	var s [8]uint16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint32x4) String() string {
 	var s [4]uint32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint64x2) String() string {
 	var s [2]uint64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float32x4) String() string {
 	var s [4]float32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float64x2) String() string {
 	var s [2]float64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int8x32) String() string {
 	var s [32]int8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int16x16) String() string {
 	var s [16]int16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int32x8) String() string {
 	var s [8]int32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int64x4) String() string {
 	var s [4]int64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint8x32) String() string {
 	var s [32]uint8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint16x16) String() string {
 	var s [16]uint16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint32x8) String() string {
 	var s [8]uint32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint64x4) String() string {
 	var s [4]uint64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float32x8) String() string {
 	var s [8]float32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float64x4) String() string {
 	var s [4]float64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int8x64) String() string {
 	var s [64]int8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int16x32) String() string {
 	var s [32]int16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int32x16) String() string {
 	var s [16]int32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Int64x8) String() string {
 	var s [8]int64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint8x64) String() string {
 	var s [64]uint8
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint16x32) String() string {
 	var s [32]uint16
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint32x16) String() string {
 	var s [16]uint32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Uint64x8) String() string {
 	var s [8]uint64
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float32x16) String() string {
 	var s [16]float32
 	x.StoreArray(&s)
 	return simdfmt.SliceToString(s[:])
 }
 
-// String returns x in the form "{x[0],x[1],...}".
+// String returns x in the form "{x[0],x[1],...}". Each element is formatted
+// like the %v format specifier.
 func (x Float64x8) String() string {
 	var s [8]float64
 	x.StoreArray(&s)
@@ -1664,7 +1694,7 @@ func (x Float64x4) HiToLo() (z Float64x4) {
 // Emulated, CPU Feature: AVX512
 func (x Int8x64) HiToLo() (z Int8x64) {
 	var zero Int8x64
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1675,7 +1705,7 @@ func (x Int8x64) HiToLo() (z Int8x64) {
 // Emulated, CPU Feature: AVX512
 func (x Int16x32) HiToLo() (z Int16x32) {
 	var zero Int16x32
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1686,7 +1716,7 @@ func (x Int16x32) HiToLo() (z Int16x32) {
 // Emulated, CPU Feature: AVX512
 func (x Int32x16) HiToLo() (z Int32x16) {
 	var zero Int32x16
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1697,7 +1727,7 @@ func (x Int32x16) HiToLo() (z Int32x16) {
 // Emulated, CPU Feature: AVX512
 func (x Int64x8) HiToLo() (z Int64x8) {
 	var zero Int64x8
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1708,7 +1738,7 @@ func (x Int64x8) HiToLo() (z Int64x8) {
 // Emulated, CPU Feature: AVX512
 func (x Uint8x64) HiToLo() (z Uint8x64) {
 	var zero Uint8x64
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1719,7 +1749,7 @@ func (x Uint8x64) HiToLo() (z Uint8x64) {
 // Emulated, CPU Feature: AVX512
 func (x Uint16x32) HiToLo() (z Uint16x32) {
 	var zero Uint16x32
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1730,7 +1760,7 @@ func (x Uint16x32) HiToLo() (z Uint16x32) {
 // Emulated, CPU Feature: AVX512
 func (x Uint32x16) HiToLo() (z Uint32x16) {
 	var zero Uint32x16
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1741,7 +1771,7 @@ func (x Uint32x16) HiToLo() (z Uint32x16) {
 // Emulated, CPU Feature: AVX512
 func (x Uint64x8) HiToLo() (z Uint64x8) {
 	var zero Uint64x8
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1752,7 +1782,7 @@ func (x Uint64x8) HiToLo() (z Uint64x8) {
 // Emulated, CPU Feature: AVX512
 func (x Float32x16) HiToLo() (z Float32x16) {
 	var zero Float32x16
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
 
 // HiToLo returns a vector whose low half is the high half of x and whose high
@@ -1763,5 +1793,5 @@ func (x Float32x16) HiToLo() (z Float32x16) {
 // Emulated, CPU Feature: AVX512
 func (x Float64x8) HiToLo() (z Float64x8) {
 	var zero Float64x8
-	return zero.SetLo(x.GetHi())
+	return zero.SetLo(x.Hi())
 }
