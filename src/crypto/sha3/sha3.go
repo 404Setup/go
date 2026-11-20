@@ -78,21 +78,26 @@ func Sum512(data []byte) [64]byte {
 func SumSHAKE128(data []byte, length int) []byte {
 	// Outline the allocation for up to 256 bits of output to the caller's stack.
 	out := make([]byte, 32)
-	return sumSHAKE128(out, data, length)
-}
-
-func sumSHAKE128(out, data []byte, length int) []byte {
-	if len(out) < length {
+	if length > 32 {
 		out = make([]byte, length)
 	} else {
 		out = out[:length]
 	}
+	sumSHAKE128(out, data)
+	return out
+}
+
+// sumSHAKE128 is kept out of line so that SumSHAKE128 stays small enough to
+// be inlined into its callers, which lets the output buffer stay on their stack.
+// It does not retain out.
+//
+//go:noinline
+func sumSHAKE128(out, data []byte) {
 	subtle.WithDataIndependentTiming(func() {
 		h := sha3.NewShake128()
 		h.Write(data)
 		h.Read(out)
 	})
-	return out
 }
 
 // SumSHAKE256 applies the SHAKE256 extendable output function to data and
@@ -100,21 +105,26 @@ func sumSHAKE128(out, data []byte, length int) []byte {
 func SumSHAKE256(data []byte, length int) []byte {
 	// Outline the allocation for up to 512 bits of output to the caller's stack.
 	out := make([]byte, 64)
-	return sumSHAKE256(out, data, length)
-}
-
-func sumSHAKE256(out, data []byte, length int) []byte {
-	if len(out) < length {
+	if length > 64 {
 		out = make([]byte, length)
 	} else {
 		out = out[:length]
 	}
+	sumSHAKE256(out, data)
+	return out
+}
+
+// sumSHAKE256 is kept out of line so that SumSHAKE256 stays small enough to
+// be inlined into its callers, which lets the output buffer stay on their stack.
+// It does not retain out.
+//
+//go:noinline
+func sumSHAKE256(out, data []byte) {
 	subtle.WithDataIndependentTiming(func() {
 		h := sha3.NewShake256()
 		h.Write(data)
 		h.Read(out)
 	})
-	return out
 }
 
 // SHA3 is an instance of a SHA-3 hash. It implements [hash.Hash].
