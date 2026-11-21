@@ -15,12 +15,10 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
 - **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
-- **`net/http`, `net/textproto`, `net/url`**: Reduced allocations and lock/goroutine overhead across HTTP/1.1 request/response parsing, chunked encoding/decoding, in-memory body writes, and `Request.Clone` co-allocation; HTTP/2 frame reuse, stack-buffered small control frames, direct buffered writes, synchronous response-header coalescing, and bounded pool/stream cleanup; HTTP/3 QPACK static-table fast paths, single-write header framing, lock-free stream deadlines, and slab-allocated headers; header lookup/validation and canonicalization, cookie parsing/formatting and `cookiejar` struct keys, `CrossOriginProtection` fast paths, `ServeMux` static-route atomic snapshots and `Redirect`, `ServeContent`, `dirList`, and closed-form range MIME sizing, client `Transport` connection/body reuse, URL/query/form/Basic-auth handling, and zero-timer `ReverseProxy` streaming and `httptest` helpers.
+- **`net/http`, `net/textproto`, `net/url`**: Performance and Memory Allocation Optimization (h1/h2/h3)
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
-- **`runtime`**: Faster span reclamation (`reclaimChunk`), GC bit-scanning (`markrootSpans`, `scanConservative`, `bulkBarrierBitmap`) and fused inline-mark sweep, batched `mcache.releaseAll` and lock-free empty `stackcache_clear`, O(1) `pageCache.flush` and `spanClassToNelems` lookup, write-barrier pointer deduplication, and zero-size slice fast paths.
+- **`runtime`**: Faster span reclamation, GC bit-scanning and fused inline-mark sweep, batched `mcache.releaseAll` and lock-free empty `stackcache_clear`, O(1) `pageCache.flush` and `spanClassToNelems` lookup, write-barrier pointer deduplication, and zero-size slice fast paths.
 - **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
-- **`crypto/fips140`**: Dead code elimination of FIPS 140 integrity checks and self-tests when `GOFIPS140=off`.
-- **`cmd/go`**: Terminal progress indicator (`Building [====   ] x/y`) for `go build` and `go install`.
 
 ### Compiler & Linker Flags
 - **`-ldflags="-o2"`**: Bounded loop unrolling and post-SCCP/prove dead branch elimination.
