@@ -1,3 +1,174 @@
+pkg net/http/server, const RequestIDKey = "server.request_id" #80000
+pkg net/http/server, const RequestIDKey ideal-string #80000
+pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80000
+pkg net/http/server, func BasicAuth(string, func(string, string) bool) HandlerFunc #80000
+pkg net/http/server, func BodyLimit(int64) HandlerFunc #80000
+pkg net/http/server, func CORS(CORSConfig) HandlerFunc #80000
+pkg net/http/server, func ConstantTimeEqual(string, string) bool #80000
+pkg net/http/server, func CrossOriginProtection(*http.CrossOriginProtection) HandlerFunc #80000
+pkg net/http/server, func DefaultConfig() Config #80000
+pkg net/http/server, func DefaultErrorHandler(*Context, error) #80000
+pkg net/http/server, func GetValue[$0 interface{}](*Context, string) ($0, bool) #80000
+pkg net/http/server, func JSONErrorHandler(*Context, error) #80000
+pkg net/http/server, func Logger(*slog.Logger) HandlerFunc #80000
+pkg net/http/server, func New() *Server #80000
+pkg net/http/server, func NewError(int, string) *HTTPError #80000
+pkg net/http/server, func NewWithConfig(Config) *Server #80000
+pkg net/http/server, func Recover() HandlerFunc #80000
+pkg net/http/server, func RecoverWithConfig(RecoverConfig) HandlerFunc #80000
+pkg net/http/server, func RequestID() HandlerFunc #80000
+pkg net/http/server, func RequestIDWithConfig(RequestIDConfig) HandlerFunc #80000
+pkg net/http/server, func SecurityHeaders() HandlerFunc #80000
+pkg net/http/server, func SecurityHeadersWithConfig(SecurityHeadersConfig) HandlerFunc #80000
+pkg net/http/server, func Timeout(time.Duration) HandlerFunc #80000
+pkg net/http/server, func WrapError(int, string, error) *HTTPError #80000
+pkg net/http/server, method (*Context) AddHeader(string, string) #80000
+pkg net/http/server, method (*Context) BindJSON(interface{}) error #80000
+pkg net/http/server, method (*Context) BindJSONStrict(interface{}) error #80000
+pkg net/http/server, method (*Context) BodyBytes() ([]uint8, error) #80000
+pkg net/http/server, method (*Context) Bytes(int, string, []uint8) error #80000
+pkg net/http/server, method (*Context) BytesWritten() int64 #80000
+pkg net/http/server, method (*Context) ClientIP() string #80000
+pkg net/http/server, method (*Context) Context() context.Context #80000
+pkg net/http/server, method (*Context) Cookie(string) (*http.Cookie, error) #80000
+pkg net/http/server, method (*Context) File(string) error #80000
+pkg net/http/server, method (*Context) FileFS(fs.FS, string) error #80000
+pkg net/http/server, method (*Context) Flush() error #80000
+pkg net/http/server, method (*Context) Get(string) (interface{}, bool) #80000
+pkg net/http/server, method (*Context) HTML(int, string) error #80000
+pkg net/http/server, method (*Context) HandleError(error) #80000
+pkg net/http/server, method (*Context) Header(string) string #80000
+pkg net/http/server, method (*Context) JSON(int, interface{}) error #80000
+pkg net/http/server, method (*Context) JSONIndented(int, interface{}, string, string) error #80000
+pkg net/http/server, method (*Context) Method() string #80000
+pkg net/http/server, method (*Context) Next() error #80000
+pkg net/http/server, method (*Context) NoContent() error #80000
+pkg net/http/server, method (*Context) Param(string) string #80000
+pkg net/http/server, method (*Context) ParamInt(string) (int, error) #80000
+pkg net/http/server, method (*Context) ParamInt64(string) (int64, error) #80000
+pkg net/http/server, method (*Context) ParseForm() (url.Values, error) #80000
+pkg net/http/server, method (*Context) Path() string #80000
+pkg net/http/server, method (*Context) Query(string) string #80000
+pkg net/http/server, method (*Context) QueryDefault(string, string) string #80000
+pkg net/http/server, method (*Context) QueryInt(string, int) (int, error) #80000
+pkg net/http/server, method (*Context) QueryValues() url.Values #80000
+pkg net/http/server, method (*Context) Redirect(int, string) error #80000
+pkg net/http/server, method (*Context) Request() *http.Request #80000
+pkg net/http/server, method (*Context) ResponseWriter() http.ResponseWriter #80000
+pkg net/http/server, method (*Context) RoutePattern() string #80000
+pkg net/http/server, method (*Context) Set(string, interface{}) #80000
+pkg net/http/server, method (*Context) SetAttachment(string) #80000
+pkg net/http/server, method (*Context) SetContext(context.Context) #80000
+pkg net/http/server, method (*Context) SetCookie(*http.Cookie) #80000
+pkg net/http/server, method (*Context) SetHeader(string, string) #80000
+pkg net/http/server, method (*Context) SetMaxBodyBytes(int64) #80000
+pkg net/http/server, method (*Context) StatusCode() int #80000
+pkg net/http/server, method (*Context) Stream(int, string, io.Reader) error #80000
+pkg net/http/server, method (*Context) Text(int, string) error #80000
+pkg net/http/server, method (*Context) WriteStatus(int) error #80000
+pkg net/http/server, method (*Context) Written() bool #80000
+pkg net/http/server, method (*Group) Any(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) DELETE(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) GET(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) Group(string, ...HandlerFunc) *Group #80000
+pkg net/http/server, method (*Group) HEAD(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) Handle(string, string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) HandleHTTP(string, string, http.Handler) #80000
+pkg net/http/server, method (*Group) Mount(string, http.Handler) #80000
+pkg net/http/server, method (*Group) OPTIONS(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) PATCH(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) POST(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) PUT(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) StaticDir(string, string, ...StaticConfig) error #80000
+pkg net/http/server, method (*Group) StaticFS(string, fs.FS, ...StaticConfig) #80000
+pkg net/http/server, method (*Group) Use(...HandlerFunc) #80000
+pkg net/http/server, method (*HTTPError) Error() string #80000
+pkg net/http/server, method (*HTTPError) Unwrap() error #80000
+pkg net/http/server, method (*Server) Any(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) Close() error #80000
+pkg net/http/server, method (*Server) DELETE(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) GET(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) Group(string, ...HandlerFunc) *Group #80000
+pkg net/http/server, method (*Server) HEAD(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) HTTPServer() *http.Server #80000
+pkg net/http/server, method (*Server) Handle(string, string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) HandleHTTP(string, string, http.Handler) #80000
+pkg net/http/server, method (*Server) ListenAndServe(string) error #80000
+pkg net/http/server, method (*Server) ListenAndServeContext(context.Context, string) error #80000
+pkg net/http/server, method (*Server) ListenAndServeTLS(string, string, string) error #80000
+pkg net/http/server, method (*Server) MethodNotAllowed(HandlerFunc) #80000
+pkg net/http/server, method (*Server) Mount(string, http.Handler) #80000
+pkg net/http/server, method (*Server) NotFound(HandlerFunc) #80000
+pkg net/http/server, method (*Server) OPTIONS(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) PATCH(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) POST(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) PUT(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Server) Routes() []RouteInfo #80000
+pkg net/http/server, method (*Server) Serve(net.Listener) error #80000
+pkg net/http/server, method (*Server) ServeContext(context.Context, net.Listener) error #80000
+pkg net/http/server, method (*Server) ServeHTTP(http.ResponseWriter, *http.Request) #80000
+pkg net/http/server, method (*Server) ServeTLS(net.Listener, string, string) error #80000
+pkg net/http/server, method (*Server) Shutdown(context.Context) error #80000
+pkg net/http/server, method (*Server) StaticDir(string, string, ...StaticConfig) error #80000
+pkg net/http/server, method (*Server) StaticFS(string, fs.FS, ...StaticConfig) #80000
+pkg net/http/server, method (*Server) Use(...HandlerFunc) #80000
+pkg net/http/server, type CORSConfig struct #80000
+pkg net/http/server, type CORSConfig struct, AllowCredentials bool #80000
+pkg net/http/server, type CORSConfig struct, AllowHeaders []string #80000
+pkg net/http/server, type CORSConfig struct, AllowMethods []string #80000
+pkg net/http/server, type CORSConfig struct, AllowOriginFunc func(string) bool #80000
+pkg net/http/server, type CORSConfig struct, AllowOrigins []string #80000
+pkg net/http/server, type CORSConfig struct, ExposeHeaders []string #80000
+pkg net/http/server, type CORSConfig struct, MaxAge time.Duration #80000
+pkg net/http/server, type Config struct #80000
+pkg net/http/server, type Config struct, BaseContext func(net.Listener) context.Context #80000
+pkg net/http/server, type Config struct, DisablePathCleaning bool #80000
+pkg net/http/server, type Config struct, ErrorHandler ErrorHandler #80000
+pkg net/http/server, type Config struct, IdleTimeout time.Duration #80000
+pkg net/http/server, type Config struct, Logger *slog.Logger #80000
+pkg net/http/server, type Config struct, MaxBodyBytes int64 #80000
+pkg net/http/server, type Config struct, MaxHeaderBytes int #80000
+pkg net/http/server, type Config struct, ReadHeaderTimeout time.Duration #80000
+pkg net/http/server, type Config struct, ReadTimeout time.Duration #80000
+pkg net/http/server, type Config struct, RedirectTrailingSlash bool #80000
+pkg net/http/server, type Config struct, ShutdownTimeout time.Duration #80000
+pkg net/http/server, type Config struct, TLSConfig *tls.Config #80000
+pkg net/http/server, type Config struct, TrustedProxies []netip.Prefix #80000
+pkg net/http/server, type Config struct, WriteTimeout time.Duration #80000
+pkg net/http/server, type Context struct #80000
+pkg net/http/server, type ErrorHandler func(*Context, error) #80000
+pkg net/http/server, type Group struct #80000
+pkg net/http/server, type HTTPError struct #80000
+pkg net/http/server, type HTTPError struct, Code int #80000
+pkg net/http/server, type HTTPError struct, Err error #80000
+pkg net/http/server, type HTTPError struct, Message string #80000
+pkg net/http/server, type HandlerFunc func(*Context) error #80000
+pkg net/http/server, type RecoverConfig struct #80000
+pkg net/http/server, type RecoverConfig struct, Logger *slog.Logger #80000
+pkg net/http/server, type RecoverConfig struct, OnPanic func(*Context, interface{}, []uint8) #80000
+pkg net/http/server, type RequestIDConfig struct #80000
+pkg net/http/server, type RequestIDConfig struct, Generator func() string #80000
+pkg net/http/server, type RequestIDConfig struct, Header string #80000
+pkg net/http/server, type RequestIDConfig struct, TrustIncoming bool #80000
+pkg net/http/server, type RouteInfo struct #80000
+pkg net/http/server, type RouteInfo struct, Method string #80000
+pkg net/http/server, type RouteInfo struct, Pattern string #80000
+pkg net/http/server, type SecurityHeadersConfig struct #80000
+pkg net/http/server, type SecurityHeadersConfig struct, ContentSecurityPolicy string #80000
+pkg net/http/server, type SecurityHeadersConfig struct, ContentTypeOptions string #80000
+pkg net/http/server, type SecurityHeadersConfig struct, CrossOriginOpenerPolicy string #80000
+pkg net/http/server, type SecurityHeadersConfig struct, FrameOptions string #80000
+pkg net/http/server, type SecurityHeadersConfig struct, PermissionsPolicy string #80000
+pkg net/http/server, type SecurityHeadersConfig struct, ReferrerPolicy string #80000
+pkg net/http/server, type SecurityHeadersConfig struct, StrictTransportSecurity string #80000
+pkg net/http/server, type Server struct #80000
+pkg net/http/server, type StaticConfig struct #80000
+pkg net/http/server, type StaticConfig struct, Browse bool #80000
+pkg net/http/server, type StaticConfig struct, CacheControl string #80000
+pkg net/http/server, type StaticConfig struct, Index string #80000
+pkg net/http/server, var ErrBodyTooLarge error #80000
+pkg net/http/server, var ErrInvalidJSON error #80000
+pkg net/http/server, var ErrUnsupportedMediaType error #80000
 pkg sync/atomic/v2, method (*Value[$0]) CompareAndSwap($0, $0) bool #80000
 pkg sync/atomic/v2, method (*Value[$0]) Load() $0 #80000
 pkg sync/atomic/v2, method (*Value[$0]) Store($0) #80000

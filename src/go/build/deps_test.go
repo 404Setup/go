@@ -732,6 +732,9 @@ var depsRules = `
 	net/http, net/http/internal/ascii
 	< net/http/cookiejar, net/http/httputil;
 
+	log/slog, net/http, runtime/debug
+	< net/http/server;
+
 	net/http, regexp
 	< net/http/cgi
 	< net/http/fcgi;

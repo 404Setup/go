@@ -1,0 +1,212 @@
+// Copyright 2026 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package server
+
+import (
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"strings"
+)
+
+// StaticConfig configures static file serving via [Server.StaticDir],
+// [Server.StaticFS], [Group.StaticDir], and [Group.StaticFS].
+type StaticConfig struct {
+	// Browse enables HTML directory listings when a directory does not contain
+	// an index.html file. Default is false (returns 404 for directories without
+	// index.html).
+	Browse bool
+
+	// Index specifies the directory index filename. Default is "index.html".
+	Index string
+
+	// CacheControl optionally sets the Cache-Control header on served files.
+	CacheControl string
+}
+
+// StaticDir serves files from dir under prefix, using [os.OpenRoot] to confine
+// file access to dir and prevent path traversal and symlink escape attacks.
+func (g *Group) StaticDir(prefix, dir string, cfg ...StaticConfig) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	var c StaticConfig
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	var closer staticRootCloser = root
+	g.server.mu.Lock()
+	g.server.staticRoots = append(g.server.staticRoots, &closer)
+	g.server.mu.Unlock()
+
+	g.StaticFS(prefix, root.FS(), c)
+	return nil
+}
+
+// StaticFS serves files from fsys under prefix.
+func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
+	if fsys == nil {
+		panic("server: nil fs.FS")
+	}
+	var c StaticConfig
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	if c.Index == "" {
+		c.Index = "index.html"
+	}
+	if strings.ContainsAny(c.Index, "/\\") || c.Index == "." || c.Index == ".." {
+		panic(fmt.Sprintf("server: invalid static index filename %q", c.Index))
+	}
+
+	fullPrefix := joinPattern(g.prefix, prefix)
+	if strings.ContainsAny(fullPrefix, "{}") {
+		panic(fmt.Sprintf("server: static prefix %q must not contain parameters", fullPrefix))
+	}
+	cleanPref := strings.TrimRight(fullPrefix, "/")
+
+	effectiveFS := fsys
+	if !c.Browse {
+		effectiveFS = noBrowseFS{fs: fsys, index: c.Index}
+	}
+	fileServer := http.FileServerFS(effectiveFS)
+
+	handler := func(ctx *Context) error {
+		rel := ctx.Param("filepath")
+		// Reject backslashes and NUL bytes defensively.
+		if strings.ContainsAny(rel, "\\\x00") {
+			return NewError(http.StatusNotFound, "not found")
+		}
+
+		// Re-root request URL to the relative path for http.FileServerFS.
+		r2 := new(http.Request)
+		*r2 = *ctx.req
+		u2 := new(url.URL)
+		*u2 = *ctx.req.URL
+		if rel == "" {
+			u2.Path = "/"
+		} else {
+			u2.Path = "/" + rel
+		}
+		u2.RawPath = ""
+		r2.URL = u2
+
+		rw := ctx.ResponseWriter()
+		if c.CacheControl != "" {
+			rw = &cacheControlWriter{ResponseWriter: rw, value: c.CacheControl}
+		}
+
+		// When serving a custom index name (other than "index.html"), redirect
+		// or serve the directory index explicitly.
+		if c.Index != "index.html" {
+			name := strings.TrimPrefix(path.Clean(u2.Path), "/")
+			if name == "" {
+				name = "."
+			}
+			if info, err := fs.Stat(effectiveFS, name); err == nil && info.IsDir() {
+				idxPath := c.Index
+				if name != "." {
+					idxPath = name + "/" + c.Index
+				}
+				if _, err := fs.Stat(effectiveFS, idxPath); err == nil {
+					http.ServeFileFS(rw, r2, effectiveFS, idxPath)
+					return nil
+				}
+				if !c.Browse {
+					return NewError(http.StatusNotFound, "not found")
+				}
+			}
+		}
+
+		fileServer.ServeHTTP(rw, r2)
+		return nil
+	}
+
+	if cleanPref == "" {
+		g.GET("/{filepath...}", handler)
+		return
+	}
+	relBase := strings.TrimPrefix(cleanPref, g.prefix)
+	g.GET(relBase, func(ctx *Context) error {
+		// Redirect bare prefix "/static" -> "/static/" so relative links work,
+		// or serve index if present.
+		if _, err := fs.Stat(effectiveFS, c.Index); err == nil {
+			rw := ctx.ResponseWriter()
+			if c.CacheControl != "" {
+				rw = &cacheControlWriter{ResponseWriter: rw, value: c.CacheControl}
+			}
+			http.ServeFileFS(rw, ctx.req, effectiveFS, c.Index)
+			return nil
+		}
+		if c.Browse {
+			return ctx.Redirect(http.StatusMovedPermanently, cleanPref+"/")
+		}
+		return NewError(http.StatusNotFound, "not found")
+	})
+	g.GET(relBase+"/{filepath...}", handler)
+}
+
+type cacheControlWriter struct {
+	http.ResponseWriter
+	value   string
+	written bool
+}
+
+func (w *cacheControlWriter) WriteHeader(code int) {
+	if !w.written {
+		w.written = true
+		if code >= 200 && code < 400 && w.Header().Get("Cache-Control") == "" {
+			w.Header().Set("Cache-Control", w.value)
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *cacheControlWriter) Write(p []byte) (int, error) {
+	if !w.written {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *cacheControlWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// noBrowseFS wraps an fs.FS and hides directories that do not contain an index
+// file, preventing directory listing via http.FileServerFS.
+type noBrowseFS struct {
+	fs    fs.FS
+	index string
+}
+
+func (n noBrowseFS) Open(name string) (fs.File, error) {
+	f, err := n.fs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if info.IsDir() {
+		idx := n.index
+		if name != "." && name != "" {
+			idx = path.Join(name, n.index)
+		}
+		idxFile, err := n.fs.Open(idx)
+		if err != nil {
+			f.Close()
+			return nil, fs.ErrNotExist
+		}
+		idxFile.Close()
+	}
+	return f, nil
+}
