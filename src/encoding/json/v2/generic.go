@@ -140,7 +140,7 @@ func MarshalEncodeOf[T any](out *jsontext.Encoder, in T, opts ...Options) error 
 	}
 	if len(opts) == 0 {
 		xe := export.Encoder(out)
-		if xe.Tokens.Depth() == 1 && !xe.NeedFlush() && canFastMarshalFlags(&xe.Struct) {
+		if xe.Tokens.Depth() == 1 && xe.Tokens.Last.Length() == 0 && !xe.NeedFlush() && canFastMarshalFlags(&xe.Struct) {
 			at := abi.TypeFor[T]()
 			if at.Kind() != abi.Interface {
 				plan := lookupFastMarshalPlan(at)

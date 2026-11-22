@@ -12,6 +12,7 @@ import (
 	"errors"
 	"internal/abi"
 	"internal/byteorder"
+	"internal/runtime/maps"
 	"internal/unsafeheader"
 	"math"
 	"math/bits"
@@ -19,6 +20,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/v2"
 	"time"
 	"unicode/utf8"
@@ -125,31 +127,77 @@ func v1StringSafeHTML(s string) bool {
 }
 
 func v1AppendQuoteString(dst []byte, src string, escapeHTML bool) []byte {
-	dst = append(dst, '"')
+	need := len(src) + 2
+	if cap(dst)-len(dst) < need {
+		dst = slices.Grow(dst, need)
+	}
 	b := unsafe.Slice(unsafe.StringData(src), len(src))
-	start := 0
 	i := 0
+	if escapeHTML {
+		for len(b)-i >= 8 {
+			if m := v1EscapeMaskHTML(byteorder.LEUint64(b[i:])); m != 0 {
+				return v1AppendQuoteStringSlow(dst, src, b, i+(bits.TrailingZeros64(m)>>3), true)
+			}
+			i += 8
+		}
+		for i < len(b) {
+			c := b[i]
+			if c >= utf8.RuneSelf || !htmlSafeSet[c] {
+				return v1AppendQuoteStringSlow(dst, src, b, i, true)
+			}
+			i++
+		}
+	} else {
+		for len(b)-i >= 8 {
+			if m := v1EscapeMaskNoHTML(byteorder.LEUint64(b[i:])); m != 0 {
+				return v1AppendQuoteStringSlow(dst, src, b, i+(bits.TrailingZeros64(m)>>3), false)
+			}
+			i += 8
+		}
+		for i < len(b) {
+			c := b[i]
+			if c >= utf8.RuneSelf || !safeSet[c] {
+				return v1AppendQuoteStringSlow(dst, src, b, i, false)
+			}
+			i++
+		}
+	}
+	off := len(dst)
+	dst = dst[:off+need]
+	dst[off] = '"'
+	copy(dst[off+1:], src)
+	dst[off+1+len(src)] = '"'
+	return dst
+}
+
+func v1AppendQuoteStringSlow(dst []byte, src string, b []byte, i int, escapeHTML bool) []byte {
+	dst = append(dst, '"')
+	start := 0
+	first := true
 	for i < len(b) {
-		if escapeHTML {
-			for len(b)-i >= 8 {
-				if m := v1EscapeMaskHTML(byteorder.LEUint64(b[i:])); m != 0 {
-					i += bits.TrailingZeros64(m) >> 3
-					break
+		if !first {
+			if escapeHTML {
+				for len(b)-i >= 8 {
+					if m := v1EscapeMaskHTML(byteorder.LEUint64(b[i:])); m != 0 {
+						i += bits.TrailingZeros64(m) >> 3
+						break
+					}
+					i += 8
 				}
-				i += 8
+			} else {
+				for len(b)-i >= 8 {
+					if m := v1EscapeMaskNoHTML(byteorder.LEUint64(b[i:])); m != 0 {
+						i += bits.TrailingZeros64(m) >> 3
+						break
+					}
+					i += 8
+				}
 			}
-		} else {
-			for len(b)-i >= 8 {
-				if m := v1EscapeMaskNoHTML(byteorder.LEUint64(b[i:])); m != 0 {
-					i += bits.TrailingZeros64(m) >> 3
-					break
-				}
-				i += 8
+			if i >= len(b) {
+				break
 			}
 		}
-		if i >= len(b) {
-			break
-		}
+		first = false
 		if c := b[i]; c < utf8.RuneSelf {
 			if htmlSafeSet[c] || (!escapeHTML && safeSet[c]) {
 				i++
@@ -176,22 +224,39 @@ func v1AppendQuoteString(dst []byte, src string, escapeHTML bool) []byte {
 			start = i
 			continue
 		}
-		r, size := utf8.DecodeRuneInString(src[i:])
-		if r == utf8.RuneError && size == 1 {
-			dst = append(dst, src[start:i]...)
-			dst = append(dst, `\ufffd`...)
+		for i < len(b) {
+			b0 := b[i]
+			if b0 < utf8.RuneSelf {
+				break
+			}
+			if b0 >= 0xE3 && b0 <= 0xEC || b0 == 0xE1 || b0 == 0xEE || b0 == 0xEF {
+				if i+2 < len(b) && b[i+1]&0xC0 == 0x80 && b[i+2]&0xC0 == 0x80 {
+					i += 3
+					continue
+				}
+			} else if b0 >= 0xC2 && b0 <= 0xDF {
+				if i+1 < len(b) && b[i+1]&0xC0 == 0x80 {
+					i += 2
+					continue
+				}
+			}
+			r, size := utf8.DecodeRuneInString(src[i:])
+			if r == utf8.RuneError && size == 1 {
+				dst = append(dst, src[start:i]...)
+				dst = append(dst, `\ufffd`...)
+				i += size
+				start = i
+				continue
+			}
+			if r == '\u2028' || r == '\u2029' {
+				dst = append(dst, src[start:i]...)
+				dst = append(dst, '\\', 'u', '2', '0', '2', hex[r&0xF])
+				i += size
+				start = i
+				continue
+			}
 			i += size
-			start = i
-			continue
 		}
-		if r == '\u2028' || r == '\u2029' {
-			dst = append(dst, src[start:i]...)
-			dst = append(dst, '\\', 'u', '2', '0', '2', hex[r&0xF])
-			i += size
-			start = i
-			continue
-		}
-		i += size
 	}
 	dst = append(dst, src[start:]...)
 	dst = append(dst, '"')
@@ -199,12 +264,29 @@ func v1AppendQuoteString(dst []byte, src string, escapeHTML bool) []byte {
 }
 
 func v1AppendFloat(b []byte, f float64, bits int) []byte {
-	abs := math.Abs(f)
-	fmt := byte('f')
-	if abs != 0 {
-		if bits == 64 && (abs < 1e-6 || abs >= 1e21) || bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
-			fmt = 'e'
+	if f == 0 {
+		if math.Signbit(f) {
+			return append(b, '-', '0')
 		}
+		return append(b, '0')
+	}
+	abs := math.Abs(f)
+	if bits == 64 {
+		if abs < 1<<52 {
+			if i := int64(f); float64(i) == f {
+				return strconv.AppendInt(b, i, 10)
+			}
+		}
+	} else {
+		if abs < 1<<23 {
+			if i := int64(f); float64(i) == f {
+				return strconv.AppendInt(b, i, 10)
+			}
+		}
+	}
+	fmt := byte('f')
+	if bits == 64 && (abs < 1e-6 || abs >= 1e21) || bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
+		fmt = 'e'
 	}
 	b = strconv.AppendFloat(b, f, fmt, -1, bits)
 	if fmt == 'e' {
@@ -313,31 +395,49 @@ const (
 	v1fkMapStringString
 	v1fkMapStringInt
 	v1fkMapStringAny
+	v1fkMapStringElem
+	v1fkMapIntElem
+	v1fkMapUintElem
 	v1fkAny
 	v1fkTime
+	v1fkMarshaler
+	v1fkUnmarshaler
 )
+
+func v1IsFastNumericKind(k v1FastKind) bool {
+	return k >= v1fkInt && k <= v1fkFloat64
+}
 
 var v1TimeType = reflect.TypeFor[time.Time]()
 
 type v1FastMarshalField struct {
-	offset      uintptr
-	nameNonEsc  string
-	nameEscHTML string
-	omitEmpty   bool
-	omitZero    bool
-	kind        v1FastKind
-	plan        *v1FastMarshalPlan
+	offset           uintptr
+	nameNonEsc       string
+	nameEscHTML      string
+	commaNameNonEsc  string
+	commaNameEscHTML string
+	omitEmpty        bool
+	omitZero         bool
+	quoted           bool
+	kind             v1FastKind
+	plan             *v1FastMarshalPlan
 }
 
 type v1FastMarshalPlan struct {
-	typ      *abi.Type
-	rt       reflect.Type
-	kind     v1FastKind
-	canFast  bool
-	elemSize uintptr
-	arrayLen int
-	elemPlan *v1FastMarshalPlan
-	fields   []v1FastMarshalField
+	typ       *abi.Type
+	rt        reflect.Type
+	mapType   *abi.MapType
+	ifaceTab  unsafe.Pointer
+	kind      v1FastKind
+	keyBits   uint8
+	canFast   bool
+	hasOmit   bool
+	hasQuoted bool
+	minSize   int
+	elemSize  uintptr
+	arrayLen  int
+	elemPlan  *v1FastMarshalPlan
+	fields    []v1FastMarshalField
 }
 
 var v1FastMarshalCache sync.Map[*abi.Type, *v1FastMarshalPlan]
@@ -373,7 +473,7 @@ func finalizeV1FastMarshalPlans(visiting map[*abi.Type]*v1FastMarshalPlan) {
 				continue
 			}
 			switch p.kind {
-			case v1fkPtr, v1fkSlice, v1fkArray:
+			case v1fkPtr, v1fkSlice, v1fkArray, v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
 				if p.elemPlan == nil || !p.elemPlan.canFast {
 					p.canFast = false
 					changed = true
@@ -438,6 +538,13 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 		return p
 	}
 	if v1HasCustomMarshaler(rt) {
+		if rt.Kind() != reflect.Pointer && rt.Kind() != reflect.Interface && rt.Implements(marshalerType) {
+			m := reflect.New(rt).Interface().(Marshaler)
+			p.ifaceTab = (*[2]unsafe.Pointer)(unsafe.Pointer(&m))[0]
+			p.kind = v1fkMarshaler
+			p.canFast = true
+			return p
+		}
 		return p
 	}
 
@@ -552,14 +659,38 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 		} else if rt == reflect.TypeFor[map[string]any]() {
 			p.kind = v1fkMapStringAny
 			p.canFast = true
+		} else {
+			kt := rt.Key()
+			if kt == numberType || v1HasCustomMarshaler(kt) {
+				return p
+			}
+			switch kt.Kind() {
+			case reflect.String:
+				p.kind = v1fkMapStringElem
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				p.kind = v1fkMapIntElem
+				p.keyBits = uint8(kt.Bits())
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+				p.kind = v1fkMapUintElem
+				p.keyBits = uint8(kt.Bits())
+			default:
+				return p
+			}
+			elem := rt.Elem()
+			p.elemPlan = buildV1FastMarshalPlan(elem, v1AbiTypeOfReflect(elem), visiting)
+			p.mapType = (*abi.MapType)(unsafe.Pointer(at))
+			p.canFast = true
 		}
 
 	case reflect.Struct:
 		sf := cachedTypeFields(rt)
 		fastFields := make([]v1FastMarshalField, 0, len(sf.list))
+		hasOmit := false
+		hasQuoted := false
+		minSize := 2
 		for i := range sf.list {
 			f := &sf.list[i]
-			if f.quoted || f.isZero != nil {
+			if f.isZero != nil {
 				return p
 			}
 			off, actualType, ok := v1DirectFieldOffset(rt, f.index)
@@ -567,18 +698,40 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 				return p
 			}
 			fp := buildV1FastMarshalPlan(actualType, v1AbiTypeOfReflect(actualType), visiting)
+			if f.quoted {
+				if !v1IsFastNumericKind(fp.kind) {
+					return p
+				}
+				hasQuoted = true
+			}
+			if f.omitEmpty || f.omitZero {
+				hasOmit = true
+			}
+			prefix := ","
+			if i == 0 {
+				prefix = "{"
+			}
+			cNonEsc := prefix + f.nameNonEsc
+			cEscHTML := prefix + f.nameEscHTML
+			minSize += len(cEscHTML) + 4
 			fastFields = append(fastFields, v1FastMarshalField{
-				offset:      off,
-				nameNonEsc:  f.nameNonEsc,
-				nameEscHTML: f.nameEscHTML,
-				omitEmpty:   f.omitEmpty,
-				omitZero:    f.omitZero,
-				kind:        fp.kind,
-				plan:        fp,
+				offset:           off,
+				nameNonEsc:       f.nameNonEsc,
+				nameEscHTML:      f.nameEscHTML,
+				commaNameNonEsc:  cNonEsc,
+				commaNameEscHTML: cEscHTML,
+				omitEmpty:        f.omitEmpty,
+				omitZero:         f.omitZero,
+				quoted:           f.quoted,
+				kind:             fp.kind,
+				plan:             fp,
 			})
 		}
 		p.kind = v1fkStruct
 		p.fields = fastFields
+		p.hasOmit = hasOmit
+		p.hasQuoted = hasQuoted
+		p.minSize = minSize
 		p.canFast = true
 	}
 	return p
@@ -823,18 +976,280 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 		return v1MarshalFastMapStringInt(b, *(*map[string]int)(ptr), escapeHTML)
 	case v1fkMapStringAny:
 		return v1MarshalFastMapStringAny(b, *(*map[string]any)(ptr), escapeHTML, depth+1)
+	case v1fkMapStringElem:
+		return p.marshalMapStringElem(b, ptr, escapeHTML, depth+1)
+	case v1fkMapIntElem:
+		return p.marshalMapIntElem(b, ptr, escapeHTML, depth+1)
+	case v1fkMapUintElem:
+		return p.marshalMapUintElem(b, ptr, escapeHTML, depth+1)
 	case v1fkAny:
 		return v1MarshalFastAny(b, *(*any)(ptr), escapeHTML, depth+1)
+	case v1fkMarshaler:
+		return p.marshalCustomMarshaler(b, ptr, escapeHTML)
 	case v1fkStruct:
 		return p.marshalStruct(b, ptr, escapeHTML, depth+1)
 	}
 	return nil, errV1FastFallback
 }
 
+func (p *v1FastMarshalPlan) marshalCustomMarshaler(b []byte, ptr unsafe.Pointer, escapeHTML bool) ([]byte, error) {
+	if ptr == nil {
+		return nil, errV1FastFallback
+	}
+	var m Marshaler
+	ip := (*[2]unsafe.Pointer)(unsafe.Pointer(&m))
+	ip[0] = p.ifaceTab
+	ip[1] = v1Noescape(ptr)
+	val, err := m.MarshalJSON()
+	runtime.KeepAlive(ptr)
+	if err != nil {
+		return nil, errV1FastFallback
+	}
+	return v1AppendCompactValidJSON(b, val, escapeHTML)
+}
+
+func v1AppendCompactValidJSON(dst, src []byte, escapeHTML bool) ([]byte, error) {
+	dst, i, err := v1AppendCompactValidJSONValue(dst, src, 0, escapeHTML, 0)
+	if err != nil {
+		return nil, err
+	}
+	for i < len(src) && isSpace(src[i]) {
+		i++
+	}
+	if i != len(src) {
+		return nil, errV1FastFallback
+	}
+	return dst, nil
+}
+
+func v1AppendCompactValidJSONString(dst, src []byte, pos int, escapeHTML bool) ([]byte, int, error) {
+	if pos >= len(src) || src[pos] != '"' {
+		return nil, 0, errV1FastFallback
+	}
+	start := pos + 1
+	i := start
+	if escapeHTML {
+		for len(src)-i >= 8 {
+			if m := v1EscapeMaskHTML(byteorder.LEUint64(src[i:])); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				goto special
+			}
+			i += 8
+		}
+		for i < len(src) {
+			c := src[i]
+			if c >= utf8.RuneSelf || !htmlSafeSet[c] {
+				break
+			}
+			i++
+		}
+	} else {
+		for len(src)-i >= 8 {
+			if m := v1EscapeMaskNoHTML(byteorder.LEUint64(src[i:])); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				goto special
+			}
+			i += 8
+		}
+		for i < len(src) {
+			c := src[i]
+			if c >= utf8.RuneSelf || c < 0x20 || c == '\\' || c == '"' {
+				break
+			}
+			i++
+		}
+	}
+special:
+	if i < len(src) && src[i] == '"' {
+		return append(dst, src[pos:i+1]...), i + 1, nil
+	}
+	if escapeHTML {
+		return nil, 0, errV1FastFallback
+	}
+	end := v1ScanStringEnd(src, pos)
+	if end < 0 {
+		return nil, 0, errV1FastFallback
+	}
+	return append(dst, src[pos:end]...), end, nil
+}
+
+func v1AppendCompactValidJSONValue(dst, src []byte, i int, escapeHTML bool, depth int) ([]byte, int, error) {
+	if depth >= 64 {
+		return nil, 0, errV1FastFallback
+	}
+	for i < len(src) && isSpace(src[i]) {
+		i++
+	}
+	if i >= len(src) {
+		return nil, 0, errV1FastFallback
+	}
+	switch src[i] {
+	case 'n':
+		if i+4 <= len(src) && string(src[i:i+4]) == "null" {
+			return append(dst, "null"...), i + 4, nil
+		}
+		return nil, 0, errV1FastFallback
+	case 't':
+		if i+4 <= len(src) && string(src[i:i+4]) == "true" {
+			return append(dst, "true"...), i + 4, nil
+		}
+		return nil, 0, errV1FastFallback
+	case 'f':
+		if i+5 <= len(src) && string(src[i:i+5]) == "false" {
+			return append(dst, "false"...), i + 5, nil
+		}
+		return nil, 0, errV1FastFallback
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		end := v1ScanNumberEnd(src, i)
+		if end < 0 {
+			return nil, 0, errV1FastFallback
+		}
+		return append(dst, src[i:end]...), end, nil
+	case '"':
+		return v1AppendCompactValidJSONString(dst, src, i, escapeHTML)
+	case '[':
+		i++
+		dst = append(dst, '[')
+		for i < len(src) && isSpace(src[i]) {
+			i++
+		}
+		if i < len(src) && src[i] == ']' {
+			return append(dst, ']'), i + 1, nil
+		}
+		var err error
+		for {
+			dst, i, err = v1AppendCompactValidJSONValue(dst, src, i, escapeHTML, depth+1)
+			if err != nil {
+				return nil, 0, err
+			}
+			for i < len(src) && isSpace(src[i]) {
+				i++
+			}
+			if i >= len(src) {
+				return nil, 0, errV1FastFallback
+			}
+			if src[i] == ',' {
+				i++
+				dst = append(dst, ',')
+				continue
+			}
+			if src[i] == ']' {
+				return append(dst, ']'), i + 1, nil
+			}
+			return nil, 0, errV1FastFallback
+		}
+	case '{':
+		i++
+		dst = append(dst, '{')
+		for i < len(src) && isSpace(src[i]) {
+			i++
+		}
+		if i < len(src) && src[i] == '}' {
+			return append(dst, '}'), i + 1, nil
+		}
+		var err error
+		for {
+			for i < len(src) && isSpace(src[i]) {
+				i++
+			}
+			dst, i, err = v1AppendCompactValidJSONString(dst, src, i, escapeHTML)
+			if err != nil {
+				return nil, 0, err
+			}
+			for i < len(src) && isSpace(src[i]) {
+				i++
+			}
+			if i >= len(src) || src[i] != ':' {
+				return nil, 0, errV1FastFallback
+			}
+			i++
+			dst = append(dst, ':')
+			dst, i, err = v1AppendCompactValidJSONValue(dst, src, i, escapeHTML, depth+1)
+			if err != nil {
+				return nil, 0, err
+			}
+			for i < len(src) && isSpace(src[i]) {
+				i++
+			}
+			if i >= len(src) {
+				return nil, 0, errV1FastFallback
+			}
+			if src[i] == ',' {
+				i++
+				dst = append(dst, ',')
+				continue
+			}
+			if src[i] == '}' {
+				return append(dst, '}'), i + 1, nil
+			}
+			return nil, 0, errV1FastFallback
+		}
+	}
+	return nil, 0, errV1FastFallback
+}
+
 func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHTML bool, depth int) ([]byte, error) {
+	fields := p.fields
+	if len(fields) == 0 {
+		return append(b, "{}"...), nil
+	}
+	if !p.hasOmit && !p.hasQuoted {
+		if cap(b)-len(b) < p.minSize {
+			b = slices.Grow(b, p.minSize)
+		}
+		var err error
+		for i := range fields {
+			f := &fields[i]
+			fp := unsafe.Add(ptr, f.offset)
+			if escapeHTML {
+				b = append(b, f.commaNameEscHTML...)
+			} else {
+				b = append(b, f.commaNameNonEsc...)
+			}
+			switch f.kind {
+			case v1fkString:
+				b = v1AppendQuoteString(b, *(*string)(fp), escapeHTML)
+			case v1fkInt:
+				b = strconv.AppendInt(b, int64(*(*int)(fp)), 10)
+			case v1fkInt32:
+				b = strconv.AppendInt(b, int64(*(*int32)(fp)), 10)
+			case v1fkInt64:
+				b = strconv.AppendInt(b, *(*int64)(fp), 10)
+			case v1fkUint:
+				b = strconv.AppendUint(b, uint64(*(*uint)(fp)), 10)
+			case v1fkUint32:
+				b = strconv.AppendUint(b, uint64(*(*uint32)(fp)), 10)
+			case v1fkUint64:
+				b = strconv.AppendUint(b, *(*uint64)(fp), 10)
+			case v1fkFloat64:
+				fv := *(*float64)(fp)
+				if math.IsNaN(fv) || math.IsInf(fv, 0) {
+					return nil, errV1FastFallback
+				}
+				b = v1AppendFloat(b, fv, 64)
+			case v1fkFloat32:
+				fv := float64(*(*float32)(fp))
+				if math.IsNaN(fv) || math.IsInf(fv, 0) {
+					return nil, errV1FastFallback
+				}
+				b = v1AppendFloat(b, fv, 32)
+			case v1fkBool:
+				if *(*bool)(fp) {
+					b = append(b, "true"...)
+				} else {
+					b = append(b, "false"...)
+				}
+			default:
+				if b, err = f.plan.marshal(b, fp, escapeHTML, depth); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return append(b, '}'), nil
+	}
+
 	b = append(b, '{')
 	first := true
-	fields := p.fields
 	var err error
 	for i := range fields {
 		f := &fields[i]
@@ -853,6 +1268,9 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 			b = append(b, f.nameEscHTML...)
 		} else {
 			b = append(b, f.nameNonEsc...)
+		}
+		if f.quoted {
+			b = append(b, '"')
 		}
 		switch f.kind {
 		case v1fkString:
@@ -891,6 +1309,9 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 			if b, err = f.plan.marshal(b, fp, escapeHTML, depth); err != nil {
 				return nil, err
 			}
+		}
+		if f.quoted {
+			b = append(b, '"')
 		}
 	}
 	return append(b, '}'), nil
@@ -942,8 +1363,27 @@ func v1IsFastEmpty(k v1FastKind, plan *v1FastMarshalPlan, ptr unsafe.Pointer) bo
 		return len(*(*map[string]int)(ptr)) == 0
 	case v1fkMapStringAny:
 		return len(*(*map[string]any)(ptr)) == 0
+	case v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
+		m := *(**maps.Map)(ptr)
+		return m == nil || m.Used() == 0
 	case v1fkAny:
 		return *(*any)(ptr) == nil
+	case v1fkMarshaler:
+		v := reflect.NewAt(plan.rt, ptr).Elem()
+		switch v.Kind() {
+		case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+			return v.Len() == 0
+		case reflect.Bool:
+			return !v.Bool()
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return v.Int() == 0
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			return v.Uint() == 0
+		case reflect.Float32, reflect.Float64:
+			return v.Float() == 0
+		case reflect.Interface, reflect.Pointer:
+			return v.IsNil()
+		}
 	}
 	return false
 }
@@ -994,12 +1434,276 @@ func v1IsFastZero(k v1FastKind, plan *v1FastMarshalPlan, ptr unsafe.Pointer) boo
 		return *(*map[string]int)(ptr) == nil
 	case v1fkMapStringAny:
 		return *(*map[string]any)(ptr) == nil
+	case v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
+		return *(**maps.Map)(ptr) == nil
 	case v1fkAny:
 		return *(*any)(ptr) == nil
-	case v1fkArray, v1fkStruct:
+	case v1fkArray, v1fkStruct, v1fkMarshaler:
 		return reflect.NewAt(plan.rt, ptr).Elem().IsZero()
 	}
 	return false
+}
+
+type v1MapStringEntry struct {
+	k string
+	v unsafe.Pointer
+}
+
+var v1MapStringEntryPool = sync.Pool[*[]v1MapStringEntry]{
+	New: func() *[]v1MapStringEntry { s := make([]v1MapStringEntry, 0, 16); return &s },
+}
+
+func getV1MapStringEntries(n int) *[]v1MapStringEntry {
+	p := v1MapStringEntryPool.Get()
+	if cap(*p) < n {
+		*p = make([]v1MapStringEntry, n)
+	} else {
+		*p = (*p)[:n]
+	}
+	return p
+}
+
+func putV1MapStringEntries(p *[]v1MapStringEntry) {
+	if cap(*p) > 4096 {
+		return
+	}
+	clear(*p)
+	*p = (*p)[:0]
+	v1MapStringEntryPool.Put(p)
+}
+
+type v1MapNumEntry struct {
+	v   unsafe.Pointer
+	buf [24]byte
+	n   uint8
+}
+
+var v1MapNumEntryPool = sync.Pool[*[]v1MapNumEntry]{
+	New: func() *[]v1MapNumEntry { s := make([]v1MapNumEntry, 0, 16); return &s },
+}
+
+func getV1MapNumEntries(n int) *[]v1MapNumEntry {
+	p := v1MapNumEntryPool.Get()
+	if cap(*p) < n {
+		*p = make([]v1MapNumEntry, n)
+	} else {
+		*p = (*p)[:n]
+	}
+	return p
+}
+
+func putV1MapNumEntries(p *[]v1MapNumEntry) {
+	if cap(*p) > 4096 {
+		return
+	}
+	clear(*p)
+	*p = (*p)[:0]
+	v1MapNumEntryPool.Put(p)
+}
+
+func v1ReadSignedKey(kp unsafe.Pointer, keyBits uint8) int64 {
+	switch keyBits {
+	case 8:
+		return int64(*(*int8)(kp))
+	case 16:
+		return int64(*(*int16)(kp))
+	case 32:
+		return int64(*(*int32)(kp))
+	default:
+		return *(*int64)(kp)
+	}
+}
+
+func v1ReadUnsignedKey(kp unsafe.Pointer, keyBits uint8) uint64 {
+	switch keyBits {
+	case 8:
+		return uint64(*(*uint8)(kp))
+	case 16:
+		return uint64(*(*uint16)(kp))
+	case 32:
+		return uint64(*(*uint32)(kp))
+	default:
+		return *(*uint64)(kp)
+	}
+}
+
+func (p *v1FastMarshalPlan) marshalMapStringElem(b []byte, ptr unsafe.Pointer, escapeHTML bool, depth int) ([]byte, error) {
+	if depth > startDetectingCyclesAfter {
+		return nil, errV1FastFallback
+	}
+	m := *(**maps.Map)(ptr)
+	if m == nil {
+		return append(b, "null"...), nil
+	}
+	n := int(m.Used())
+	if n == 0 {
+		return append(b, "{}"...), nil
+	}
+	b = append(b, '{')
+	elemPlan := p.elemPlan
+	var err error
+	if n == 1 {
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		for it.Next(); it.Key() != nil; it.Next() {
+			b = v1AppendQuoteString(b, *(*string)(it.Key()), escapeHTML)
+			b = append(b, ':')
+			if b, err = elemPlan.marshal(b, it.Elem(), escapeHTML, depth); err != nil {
+				return nil, err
+			}
+		}
+		return append(b, '}'), nil
+	}
+	ep := getV1MapStringEntries(n)
+	entries := *ep
+	var it maps.Iter
+	it.Init(p.mapType, m)
+	i := 0
+	for it.Next(); it.Key() != nil && i < n; it.Next() {
+		entries[i] = v1MapStringEntry{k: *(*string)(it.Key()), v: it.Elem()}
+		i++
+	}
+	entries = entries[:i]
+	slices.SortFunc(entries, func(x, y v1MapStringEntry) int {
+		return strings.Compare(x.k, y.k)
+	})
+	for idx, e := range entries {
+		if idx > 0 {
+			b = append(b, ',')
+		}
+		b = v1AppendQuoteString(b, e.k, escapeHTML)
+		b = append(b, ':')
+		if b, err = elemPlan.marshal(b, e.v, escapeHTML, depth); err != nil {
+			putV1MapStringEntries(ep)
+			return nil, err
+		}
+	}
+	putV1MapStringEntries(ep)
+	return append(b, '}'), nil
+}
+
+func (p *v1FastMarshalPlan) marshalMapIntElem(b []byte, ptr unsafe.Pointer, escapeHTML bool, depth int) ([]byte, error) {
+	if depth > startDetectingCyclesAfter {
+		return nil, errV1FastFallback
+	}
+	m := *(**maps.Map)(ptr)
+	if m == nil {
+		return append(b, "null"...), nil
+	}
+	n := int(m.Used())
+	if n == 0 {
+		return append(b, "{}"...), nil
+	}
+	b = append(b, '{')
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var err error
+	if n == 1 {
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		for it.Next(); it.Key() != nil; it.Next() {
+			b = append(b, '"')
+			b = strconv.AppendInt(b, v1ReadSignedKey(it.Key(), keyBits), 10)
+			b = append(b, '"', ':')
+			if b, err = elemPlan.marshal(b, it.Elem(), escapeHTML, depth); err != nil {
+				return nil, err
+			}
+		}
+		return append(b, '}'), nil
+	}
+	ep := getV1MapNumEntries(n)
+	entries := *ep
+	var it maps.Iter
+	it.Init(p.mapType, m)
+	i := 0
+	for it.Next(); it.Key() != nil && i < n; it.Next() {
+		e := &entries[i]
+		e.v = it.Elem()
+		buf := append(e.buf[:0], '"')
+		buf = strconv.AppendInt(buf, v1ReadSignedKey(it.Key(), keyBits), 10)
+		buf = append(buf, '"', ':')
+		e.n = uint8(len(buf))
+		i++
+	}
+	entries = entries[:i]
+	slices.SortFunc(entries, func(x, y v1MapNumEntry) int {
+		return bytes.Compare(x.buf[:x.n], y.buf[:y.n])
+	})
+	for idx := range entries {
+		e := &entries[idx]
+		if idx > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, e.buf[:e.n]...)
+		if b, err = elemPlan.marshal(b, e.v, escapeHTML, depth); err != nil {
+			putV1MapNumEntries(ep)
+			return nil, err
+		}
+	}
+	putV1MapNumEntries(ep)
+	return append(b, '}'), nil
+}
+
+func (p *v1FastMarshalPlan) marshalMapUintElem(b []byte, ptr unsafe.Pointer, escapeHTML bool, depth int) ([]byte, error) {
+	if depth > startDetectingCyclesAfter {
+		return nil, errV1FastFallback
+	}
+	m := *(**maps.Map)(ptr)
+	if m == nil {
+		return append(b, "null"...), nil
+	}
+	n := int(m.Used())
+	if n == 0 {
+		return append(b, "{}"...), nil
+	}
+	b = append(b, '{')
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var err error
+	if n == 1 {
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		for it.Next(); it.Key() != nil; it.Next() {
+			b = append(b, '"')
+			b = strconv.AppendUint(b, v1ReadUnsignedKey(it.Key(), keyBits), 10)
+			b = append(b, '"', ':')
+			if b, err = elemPlan.marshal(b, it.Elem(), escapeHTML, depth); err != nil {
+				return nil, err
+			}
+		}
+		return append(b, '}'), nil
+	}
+	ep := getV1MapNumEntries(n)
+	entries := *ep
+	var it maps.Iter
+	it.Init(p.mapType, m)
+	i := 0
+	for it.Next(); it.Key() != nil && i < n; it.Next() {
+		e := &entries[i]
+		e.v = it.Elem()
+		buf := append(e.buf[:0], '"')
+		buf = strconv.AppendUint(buf, v1ReadUnsignedKey(it.Key(), keyBits), 10)
+		buf = append(buf, '"', ':')
+		e.n = uint8(len(buf))
+		i++
+	}
+	entries = entries[:i]
+	slices.SortFunc(entries, func(x, y v1MapNumEntry) int {
+		return bytes.Compare(x.buf[:x.n], y.buf[:y.n])
+	})
+	for idx := range entries {
+		e := &entries[idx]
+		if idx > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, e.buf[:e.n]...)
+		if b, err = elemPlan.marshal(b, e.v, escapeHTML, depth); err != nil {
+			putV1MapNumEntries(ep)
+			return nil, err
+		}
+	}
+	putV1MapNumEntries(ep)
+	return append(b, '}'), nil
 }
 
 func v1MarshalFastMapStringString(b []byte, m map[string]string, escapeHTML bool) ([]byte, error) {

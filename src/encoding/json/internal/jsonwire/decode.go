@@ -163,6 +163,37 @@ func ConsumeStringResumable(flags *ValueFlags, b []byte, resumeOffset int, valid
 			return n, nil
 		}
 
+		// Fast-skip valid 2-byte and safe 3-byte UTF-8 sequences.
+		if b[n] >= utf8.RuneSelf {
+			for uint(len(b)) > uint(n) {
+				b0 := b[n]
+				if b0 < utf8.RuneSelf {
+					break
+				}
+				if b0 >= 0xE3 && b0 <= 0xEC || b0 == 0xE1 || b0 == 0xE2 || b0 == 0xEE || b0 == 0xEF {
+					if n+2 < len(b) && b[n+1]&0xC0 == 0x80 && b[n+2]&0xC0 == 0x80 {
+						n += 3
+						continue
+					}
+					break
+				}
+				if b0 >= 0xC2 && b0 <= 0xDF {
+					if n+1 < len(b) && b[n+1]&0xC0 == 0x80 {
+						n += 2
+						continue
+					}
+					break
+				}
+				break
+			}
+			if uint(len(b)) <= uint(n) {
+				return n, io.ErrUnexpectedEOF
+			}
+			if b[n] < utf8.RuneSelf {
+				continue
+			}
+		}
+
 		switch r, rn := utf8.DecodeRune(b[n:]); {
 		// Handle UTF-8 encoded byte sequence.
 		// Due to specialized handling of ASCII above, we know that

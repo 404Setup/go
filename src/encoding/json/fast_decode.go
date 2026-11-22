@@ -12,12 +12,15 @@ import (
 	"encoding/binary"
 	"internal/abi"
 	"internal/byteorder"
+	"internal/runtime/maps"
 	"internal/unsafeheader"
 	"math"
 	"math/bits"
 	"reflect"
+	"runtime"
 	"strconv"
 	"sync/v2"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -362,18 +365,24 @@ func v1HasCustomUnmarshaler(rt reflect.Type) bool {
 }
 
 type v1FastUnmarshalField struct {
-	orderIdx int
-	offset   uintptr
-	name     string
-	kind     v1FastKind
-	plan     *v1FastUnmarshalPlan
+	orderIdx        int
+	offset          uintptr
+	name            string
+	quotedNameColon string // pre-quoted `"name":` when name is unescaped ASCII
+	quoted          bool
+	kind            v1FastKind
+	plan            *v1FastUnmarshalPlan
 }
 
 type v1FastUnmarshalPlan struct {
 	typ            *abi.Type
 	rt             reflect.Type
+	mapType        *abi.MapType
+	ifaceTab       unsafe.Pointer
 	kind           v1FastKind
+	keyBits        uint8
 	canFast        bool
+	hasQuoted      bool
 	elemSize       uintptr
 	arrayLen       int
 	emptySliceData unsafe.Pointer
@@ -417,7 +426,7 @@ func finalizeV1FastUnmarshalPlans(visiting map[*abi.Type]*v1FastUnmarshalPlan) {
 				continue
 			}
 			switch p.kind {
-			case v1fkPtr, v1fkSlice, v1fkArray:
+			case v1fkPtr, v1fkSlice, v1fkArray, v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
 				if p.elemPlan == nil || !p.elemPlan.canFast {
 					p.canFast = false
 					changed = true
@@ -446,10 +455,22 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 	p := &v1FastUnmarshalPlan{typ: at, rt: rt}
 	visiting[at] = p
 
-	if rt == numberType || rt == v1TimeType {
+	if rt == v1TimeType {
+		p.kind = v1fkTime
+		p.canFast = true
+		return p
+	}
+	if rt == numberType {
 		return p
 	}
 	if v1HasCustomUnmarshaler(rt) {
+		if reflect.PointerTo(rt).Implements(v1UnmarshalerType) {
+			u := reflect.New(rt).Interface().(Unmarshaler)
+			p.ifaceTab = (*[2]unsafe.Pointer)(unsafe.Pointer(&u))[0]
+			p.kind = v1fkUnmarshaler
+			p.canFast = true
+			return p
+		}
 		return p
 	}
 
@@ -568,28 +589,60 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 		} else if rt == reflect.TypeFor[map[string]any]() {
 			p.kind = v1fkMapStringAny
 			p.canFast = true
+		} else {
+			kt := rt.Key()
+			if kt == numberType || v1HasCustomUnmarshaler(kt) {
+				return p
+			}
+			switch kt.Kind() {
+			case reflect.String:
+				p.kind = v1fkMapStringElem
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				p.kind = v1fkMapIntElem
+				p.keyBits = uint8(kt.Bits())
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+				p.kind = v1fkMapUintElem
+				p.keyBits = uint8(kt.Bits())
+			default:
+				return p
+			}
+			elem := rt.Elem()
+			p.elemPlan = buildV1FastUnmarshalPlan(elem, v1AbiTypeOfReflect(elem), visiting)
+			p.elemRT = elem
+			p.elemSize = elem.Size()
+			p.mapType = (*abi.MapType)(unsafe.Pointer(at))
+			p.canFast = true
 		}
 
 	case reflect.Struct:
 		sf := cachedTypeFields(rt)
 		fastFields := make([]v1FastUnmarshalField, 0, len(sf.list))
+		hasQuoted := false
 		for i := range sf.list {
 			f := &sf.list[i]
-			if f.quoted {
-				return p
-			}
 			off, actualType, ok := v1DirectFieldOffset(rt, f.index)
 			if !ok {
 				return p
 			}
 			fp := buildV1FastUnmarshalPlan(actualType, v1AbiTypeOfReflect(actualType), visiting)
-			fastFields = append(fastFields, v1FastUnmarshalField{
+			if f.quoted {
+				if !v1IsFastNumericKind(fp.kind) {
+					return p
+				}
+				hasQuoted = true
+			}
+			ff := v1FastUnmarshalField{
 				orderIdx: i,
 				offset:   off,
 				name:     f.name,
+				quoted:   f.quoted,
 				kind:     fp.kind,
 				plan:     fp,
-			})
+			}
+			if v1StringSafeHTML(f.name) {
+				ff.quotedNameColon = `"` + f.name + `":`
+			}
+			fastFields = append(fastFields, ff)
 		}
 		byExact := make(map[string]*v1FastUnmarshalField, len(fastFields))
 		byFolded := make(map[string]*v1FastUnmarshalField, len(fastFields))
@@ -605,6 +658,7 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 		p.fields = fastFields
 		p.byExactName = byExact
 		p.byFoldedName = byFolded
+		p.hasQuoted = hasQuoted
 		p.canFast = true
 	}
 	return p
@@ -785,16 +839,149 @@ func (d *v1FastDecoder) readUint64(bits int) (uint64, error) {
 	return v, nil
 }
 
+var v1ExactPow10F64 = [23]float64{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+	1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20,
+	1e21, 1e22,
+}
+
+var v1ExactPow10F32 = [11]float32{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+}
+
 func (d *v1FastDecoder) readFloat(bits int) (float64, error) {
-	end := v1ScanNumberEnd(d.data, d.pos)
-	if end < 0 {
+	data := d.data
+	start := d.pos
+	i := start
+	n := len(data)
+	if i >= n {
 		return 0, errV1FastFallback
 	}
-	fv, err := strconv.ParseFloat(string(d.data[d.pos:end]), bits)
+	neg := false
+	if data[i] == '-' {
+		neg = true
+		i++
+		if i >= n {
+			return 0, errV1FastFallback
+		}
+	}
+	var mant uint64
+	exact := true
+	const maxMantDiv10 = (1<<53 - 1) / 10
+	c := data[i]
+	if c == '0' {
+		i++
+		if i < n && '0' <= data[i] && data[i] <= '9' {
+			return 0, errV1FastFallback
+		}
+	} else if '1' <= c && c <= '9' {
+		mant = uint64(c - '0')
+		i++
+		for i < n {
+			dc := data[i]
+			if dc < '0' || dc > '9' {
+				break
+			}
+			if exact {
+				if mant < maxMantDiv10 {
+					mant = mant*10 + uint64(dc-'0')
+				} else {
+					exact = false
+				}
+			}
+			i++
+		}
+	} else {
+		return 0, errV1FastFallback
+	}
+
+	exp := 0
+	if i < n && data[i] == '.' {
+		i++
+		if i >= n || data[i] < '0' || data[i] > '9' {
+			return 0, errV1FastFallback
+		}
+		for i < n {
+			dc := data[i]
+			if dc < '0' || dc > '9' {
+				break
+			}
+			if exact {
+				if mant < maxMantDiv10 {
+					mant = mant*10 + uint64(dc-'0')
+					exp--
+				} else {
+					exact = false
+				}
+			}
+			i++
+		}
+	}
+
+	if i < n && (data[i] == 'e' || data[i] == 'E') {
+		i++
+		expNeg := false
+		if i < n && (data[i] == '+' || data[i] == '-') {
+			expNeg = data[i] == '-'
+			i++
+		}
+		if i >= n || data[i] < '0' || data[i] > '9' {
+			return 0, errV1FastFallback
+		}
+		expVal := 0
+		for i < n {
+			dc := data[i]
+			if dc < '0' || dc > '9' {
+				break
+			}
+			if expVal < 1000 {
+				expVal = expVal*10 + int(dc-'0')
+			}
+			i++
+		}
+		if expNeg {
+			exp -= expVal
+		} else {
+			exp += expVal
+		}
+	}
+
+	if exact {
+		if bits == 64 {
+			if exp >= -22 && exp <= 22 {
+				f := float64(mant)
+				if exp > 0 {
+					f *= v1ExactPow10F64[exp]
+				} else if exp < 0 {
+					f /= v1ExactPow10F64[-exp]
+				}
+				if neg {
+					f = -f
+				}
+				d.pos = i
+				return f, nil
+			}
+		} else if mant < 1<<24 && exp >= -10 && exp <= 10 {
+			f := float32(mant)
+			if exp > 0 {
+				f *= v1ExactPow10F32[exp]
+			} else if exp < 0 {
+				f /= v1ExactPow10F32[-exp]
+			}
+			if neg {
+				f = -f
+			}
+			d.pos = i
+			return float64(f), nil
+		}
+	}
+
+	raw := data[start:i]
+	fv, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(raw), len(raw)), bits)
 	if err != nil {
 		return 0, errV1FastFallback
 	}
-	d.pos = end
+	d.pos = i
 	return fv, nil
 }
 
@@ -802,75 +989,118 @@ func (d *v1FastDecoder) skipValue(depth int) error {
 	if depth >= maxNestingDepth {
 		return errV1FastFallback
 	}
-	d.skipWS()
-	if d.pos >= len(d.data) {
-		return errV1FastFallback
-	}
-	switch d.data[d.pos] {
-	case '"':
-		end := v1ScanStringEnd(d.data, d.pos)
-		if end < 0 {
-			return errV1FastFallback
-		}
-		d.pos = end
-		return nil
-	case 't':
-		if d.pos+4 <= len(d.data) && string(d.data[d.pos:d.pos+4]) == "true" {
-			d.pos += 4
-			return nil
-		}
-		return errV1FastFallback
-	case 'f':
-		if d.pos+5 <= len(d.data) && string(d.data[d.pos:d.pos+5]) == "false" {
-			d.pos += 5
-			return nil
-		}
-		return errV1FastFallback
-	case 'n':
-		if d.consumeNull() {
-			return nil
-		}
-		return errV1FastFallback
-	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		end := v1ScanNumberEnd(d.data, d.pos)
-		if end < 0 {
-			return errV1FastFallback
-		}
-		d.pos = end
-		return nil
-	case '[':
-		d.pos++
-		d.skipWS()
-		if d.pos < len(d.data) && d.data[d.pos] == ']' {
-			d.pos++
-			return nil
-		}
-		for {
-			if err := d.skipValue(depth + 1); err != nil {
-				return err
-			}
+	var stackBuf [64]byte
+	stack := stackBuf[:0]
+	const (
+		stExpectValue = 0
+		stAfterValue  = 1
+	)
+	state := stExpectValue
+
+	for {
+		if state == stExpectValue {
 			d.skipWS()
 			if d.pos >= len(d.data) {
 				return errV1FastFallback
 			}
-			if d.data[d.pos] == ',' {
+			switch d.data[d.pos] {
+			case '"':
+				end := v1ScanStringEnd(d.data, d.pos)
+				if end < 0 {
+					return errV1FastFallback
+				}
+				d.pos = end
+				state = stAfterValue
+			case 't':
+				if d.pos+4 <= len(d.data) && string(d.data[d.pos:d.pos+4]) == "true" {
+					d.pos += 4
+					state = stAfterValue
+				} else {
+					return errV1FastFallback
+				}
+			case 'f':
+				if d.pos+5 <= len(d.data) && string(d.data[d.pos:d.pos+5]) == "false" {
+					d.pos += 5
+					state = stAfterValue
+				} else {
+					return errV1FastFallback
+				}
+			case 'n':
+				if d.consumeNull() {
+					state = stAfterValue
+				} else {
+					return errV1FastFallback
+				}
+			case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+				end := v1ScanNumberEnd(d.data, d.pos)
+				if end < 0 {
+					return errV1FastFallback
+				}
+				d.pos = end
+				state = stAfterValue
+			case '[':
+				if depth+len(stack) >= maxNestingDepth {
+					return errV1FastFallback
+				}
 				d.pos++
+				d.skipWS()
+				if d.pos < len(d.data) && d.data[d.pos] == ']' {
+					d.pos++
+					state = stAfterValue
+					continue
+				}
+				stack = append(stack, ']')
 				continue
-			}
-			if d.data[d.pos] == ']' {
+			case '{':
+				if depth+len(stack) >= maxNestingDepth {
+					return errV1FastFallback
+				}
 				d.pos++
-				return nil
+				d.skipWS()
+				if d.pos < len(d.data) && d.data[d.pos] == '}' {
+					d.pos++
+					state = stAfterValue
+					continue
+				}
+				if d.pos >= len(d.data) || d.data[d.pos] != '"' {
+					return errV1FastFallback
+				}
+				end := v1ScanStringEnd(d.data, d.pos)
+				if end < 0 {
+					return errV1FastFallback
+				}
+				d.pos = end
+				d.skipWS()
+				if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+					return errV1FastFallback
+				}
+				d.pos++
+				stack = append(stack, '}')
+				continue
+			default:
+				return errV1FastFallback
 			}
-			return errV1FastFallback
 		}
-	case '{':
-		d.pos++
-		d.skipWS()
-		if d.pos < len(d.data) && d.data[d.pos] == '}' {
-			d.pos++
+
+		if len(stack) == 0 {
 			return nil
 		}
-		for {
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errV1FastFallback
+		}
+		top := stack[len(stack)-1]
+		c := d.data[d.pos]
+		if c == top {
+			d.pos++
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		if c != ',' {
+			return errV1FastFallback
+		}
+		d.pos++
+		if top == '}' {
 			d.skipWS()
 			if d.pos >= len(d.data) || d.data[d.pos] != '"' {
 				return errV1FastFallback
@@ -885,25 +1115,9 @@ func (d *v1FastDecoder) skipValue(depth int) error {
 				return errV1FastFallback
 			}
 			d.pos++
-			if err := d.skipValue(depth + 1); err != nil {
-				return err
-			}
-			d.skipWS()
-			if d.pos >= len(d.data) {
-				return errV1FastFallback
-			}
-			if d.data[d.pos] == ',' {
-				d.pos++
-				continue
-			}
-			if d.data[d.pos] == '}' {
-				d.pos++
-				return nil
-			}
-			return errV1FastFallback
 		}
+		state = stExpectValue
 	}
-	return errV1FastFallback
 }
 
 func (d *v1FastDecoder) unmarshal(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
@@ -1138,6 +1352,9 @@ func (d *v1FastDecoder) unmarshal(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, de
 	case v1fkArray:
 		return d.unmarshalArray(p, ptr, depth+1)
 
+	case v1fkTime:
+		return d.unmarshalTime(ptr)
+
 	case v1fkMapStringString:
 		return d.unmarshalMapStringString(ptr)
 
@@ -1147,13 +1364,495 @@ func (d *v1FastDecoder) unmarshal(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, de
 	case v1fkMapStringAny:
 		return d.unmarshalMapStringAny(ptr, depth+1)
 
+	case v1fkMapStringElem:
+		return d.unmarshalMapStringElem(p, ptr, depth+1)
+
+	case v1fkMapIntElem:
+		return d.unmarshalMapIntElem(p, ptr, depth+1)
+
+	case v1fkMapUintElem:
+		return d.unmarshalMapUintElem(p, ptr, depth+1)
+
 	case v1fkAny:
 		return d.unmarshalAny(ptr, depth+1)
+
+	case v1fkUnmarshaler:
+		return d.unmarshalCustomUnmarshaler(p, ptr, depth+1)
 
 	case v1fkStruct:
 		return d.unmarshalStruct(p, ptr, depth+1)
 	}
 	return errV1FastFallback
+}
+
+func (d *v1FastDecoder) unmarshalTime(ptr unsafe.Pointer) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			return nil
+		}
+		return errV1FastFallback
+	}
+	if c != '"' {
+		return errV1FastFallback
+	}
+	end := v1ScanStringEnd(d.data, d.pos)
+	if end < 0 {
+		return errV1FastFallback
+	}
+	var tt time.Time
+	if err := tt.UnmarshalJSON(d.data[d.pos:end]); err != nil {
+		return errV1FastFallback
+	}
+	*(*time.Time)(ptr) = tt
+	d.pos = end
+	return nil
+}
+
+func (d *v1FastDecoder) unmarshalCustomUnmarshaler(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	start := d.pos
+	if err := d.skipValue(depth); err != nil {
+		return err
+	}
+	raw := d.data[start:d.pos]
+	var u Unmarshaler
+	ip := (*[2]unsafe.Pointer)(unsafe.Pointer(&u))
+	ip[0] = p.ifaceTab
+	ip[1] = ptr
+	if err := u.UnmarshalJSON(raw); err != nil {
+		return errV1FastFallback
+	}
+	return nil
+}
+
+func (d *v1FastDecoder) unmarshalQuotedNumber(kind v1FastKind, fp unsafe.Pointer) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			return nil
+		}
+		return errV1FastFallback
+	}
+	if c != '"' {
+		return errV1FastFallback
+	}
+	s, err := d.readString()
+	if err != nil {
+		return err
+	}
+	if len(s) == 4 && string(s) == "null" {
+		return nil
+	}
+	sub := v1FastDecoder{data: s}
+	switch kind {
+	case v1fkInt:
+		v, err := sub.readInt64(strconv.IntSize)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*int)(fp) = int(v)
+	case v1fkInt8:
+		v, err := sub.readInt64(8)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*int8)(fp) = int8(v)
+	case v1fkInt16:
+		v, err := sub.readInt64(16)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*int16)(fp) = int16(v)
+	case v1fkInt32:
+		v, err := sub.readInt64(32)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*int32)(fp) = int32(v)
+	case v1fkInt64:
+		v, err := sub.readInt64(64)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*int64)(fp) = v
+	case v1fkUint:
+		v, err := sub.readUint64(strconv.IntSize)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*uint)(fp) = uint(v)
+	case v1fkUint8:
+		v, err := sub.readUint64(8)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*uint8)(fp) = uint8(v)
+	case v1fkUint16:
+		v, err := sub.readUint64(16)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*uint16)(fp) = uint16(v)
+	case v1fkUint32:
+		v, err := sub.readUint64(32)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*uint32)(fp) = uint32(v)
+	case v1fkUint64:
+		v, err := sub.readUint64(64)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*uint64)(fp) = v
+	case v1fkUintptr:
+		v, err := sub.readUint64(int(unsafe.Sizeof(uintptr(0)) * 8))
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*uintptr)(fp) = uintptr(v)
+	case v1fkFloat32:
+		v, err := sub.readFloat(32)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*float32)(fp) = float32(v)
+	case v1fkFloat64:
+		v, err := sub.readFloat(64)
+		if err != nil || sub.pos != len(s) {
+			return errV1FastFallback
+		}
+		*(*float64)(fp) = v
+	default:
+		return errV1FastFallback
+	}
+	return nil
+}
+
+func v1ParseStrictInt64Key(kb []byte, bits int) (int64, bool) {
+	if len(kb) == 0 || (kb[0] == '-' && len(kb) == 2 && kb[1] == '0') {
+		return 0, false
+	}
+	sub := v1FastDecoder{data: kb}
+	v, err := sub.readInt64(bits)
+	if err != nil || sub.pos != len(kb) {
+		return 0, false
+	}
+	return v, true
+}
+
+func v1ParseStrictUint64Key(kb []byte, bits int) (uint64, bool) {
+	if len(kb) == 0 {
+		return 0, false
+	}
+	sub := v1FastDecoder{data: kb}
+	v, err := sub.readUint64(bits)
+	if err != nil || sub.pos != len(kb) {
+		return 0, false
+	}
+	return v, true
+}
+
+func v1ClearBytes(ptr unsafe.Pointer, size uintptr, rt reflect.Type) {
+	if size == 0 {
+		return
+	}
+	if rt.Kind() == reflect.Pointer {
+		*(*unsafe.Pointer)(ptr) = nil
+		return
+	}
+	reflect.NewAt(rt, ptr).Elem().SetZero()
+}
+
+func (d *v1FastDecoder) unmarshalMapStringElem(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			*(**maps.Map)(ptr) = nil
+			return nil
+		}
+		return errV1FastFallback
+	}
+	if c != '{' {
+		return errV1FastFallback
+	}
+	d.pos++
+	d.skipWS()
+	mt := p.mapType
+	mp := (**maps.Map)(ptr)
+	m := *mp
+	if m == nil {
+		m = maps.NewMap(mt, 0, nil)
+		*mp = m
+	}
+	if d.pos < len(d.data) && d.data[d.pos] == '}' {
+		d.pos++
+		return nil
+	}
+	if m.Used() > 0 {
+		return errV1FastFallback
+	}
+	elemPlan := p.elemPlan
+	var key string
+	keyPtr := v1Noescape(unsafe.Pointer(&key))
+	for {
+		d.skipWS()
+		kb, err := d.readString()
+		if err != nil {
+			return err
+		}
+		key = v1MakeString(d.strCache, kb)
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+			return errV1FastFallback
+		}
+		d.pos++
+		existing, exists := m.Get(mt, keyPtr)
+		var elemPtr unsafe.Pointer
+		if exists {
+			v1ClearBytes(existing, p.elemSize, p.elemRT)
+			elemPtr = existing
+		} else {
+			elemPtr = m.PutSlot(mt, keyPtr)
+		}
+		if err := d.unmarshal(elemPlan, elemPtr, depth); err != nil {
+			if !exists {
+				m.Delete(mt, keyPtr)
+			}
+			runtime.KeepAlive(&key)
+			return err
+		}
+		runtime.KeepAlive(&key)
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errV1FastFallback
+		}
+		if d.data[d.pos] == ',' {
+			d.pos++
+			continue
+		}
+		if d.data[d.pos] == '}' {
+			d.pos++
+			return nil
+		}
+		return errV1FastFallback
+	}
+}
+
+func (d *v1FastDecoder) unmarshalMapIntElem(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			*(**maps.Map)(ptr) = nil
+			return nil
+		}
+		return errV1FastFallback
+	}
+	if c != '{' {
+		return errV1FastFallback
+	}
+	d.pos++
+	d.skipWS()
+	mt := p.mapType
+	mp := (**maps.Map)(ptr)
+	m := *mp
+	if m == nil {
+		m = maps.NewMap(mt, 0, nil)
+		*mp = m
+	}
+	if d.pos < len(d.data) && d.data[d.pos] == '}' {
+		d.pos++
+		return nil
+	}
+	if m.Used() > 0 {
+		return errV1FastFallback
+	}
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var k8 int8
+	var k16 int16
+	var k32 int32
+	var k64 int64
+	var keyPtr unsafe.Pointer
+	switch keyBits {
+	case 8:
+		keyPtr = v1Noescape(unsafe.Pointer(&k8))
+	case 16:
+		keyPtr = v1Noescape(unsafe.Pointer(&k16))
+	case 32:
+		keyPtr = v1Noescape(unsafe.Pointer(&k32))
+	default:
+		keyPtr = v1Noescape(unsafe.Pointer(&k64))
+	}
+	for {
+		d.skipWS()
+		kb, err := d.readString()
+		if err != nil {
+			return err
+		}
+		kv, ok := v1ParseStrictInt64Key(kb, int(keyBits))
+		if !ok {
+			return errV1FastFallback
+		}
+		switch keyBits {
+		case 8:
+			k8 = int8(kv)
+		case 16:
+			k16 = int16(kv)
+		case 32:
+			k32 = int32(kv)
+		default:
+			k64 = kv
+		}
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+			return errV1FastFallback
+		}
+		d.pos++
+		existing, exists := m.Get(mt, keyPtr)
+		var elemPtr unsafe.Pointer
+		if exists {
+			v1ClearBytes(existing, p.elemSize, p.elemRT)
+			elemPtr = existing
+		} else {
+			elemPtr = m.PutSlot(mt, keyPtr)
+		}
+		if err := d.unmarshal(elemPlan, elemPtr, depth); err != nil {
+			if !exists {
+				m.Delete(mt, keyPtr)
+			}
+			runtime.KeepAlive(&k8)
+			runtime.KeepAlive(&k16)
+			runtime.KeepAlive(&k32)
+			runtime.KeepAlive(&k64)
+			return err
+		}
+		runtime.KeepAlive(&k8)
+		runtime.KeepAlive(&k16)
+		runtime.KeepAlive(&k32)
+		runtime.KeepAlive(&k64)
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errV1FastFallback
+		}
+		if d.data[d.pos] == ',' {
+			d.pos++
+			continue
+		}
+		if d.data[d.pos] == '}' {
+			d.pos++
+			return nil
+		}
+		return errV1FastFallback
+	}
+}
+
+func (d *v1FastDecoder) unmarshalMapUintElem(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			*(**maps.Map)(ptr) = nil
+			return nil
+		}
+		return errV1FastFallback
+	}
+	if c != '{' {
+		return errV1FastFallback
+	}
+	d.pos++
+	d.skipWS()
+	mt := p.mapType
+	mp := (**maps.Map)(ptr)
+	m := *mp
+	if m == nil {
+		m = maps.NewMap(mt, 0, nil)
+		*mp = m
+	}
+	if d.pos < len(d.data) && d.data[d.pos] == '}' {
+		d.pos++
+		return nil
+	}
+	if m.Used() > 0 {
+		return errV1FastFallback
+	}
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var k8 uint8
+	var k16 uint16
+	var k32 uint32
+	var k64 uint64
+	var keyPtr unsafe.Pointer
+	switch keyBits {
+	case 8:
+		keyPtr = v1Noescape(unsafe.Pointer(&k8))
+	case 16:
+		keyPtr = v1Noescape(unsafe.Pointer(&k16))
+	case 32:
+		keyPtr = v1Noescape(unsafe.Pointer(&k32))
+	default:
+		keyPtr = v1Noescape(unsafe.Pointer(&k64))
+	}
+	for {
+		d.skipWS()
+		kb, err := d.readString()
+		if err != nil {
+			return err
+		}
+		kv, ok := v1ParseStrictUint64Key(kb, int(keyBits))
+		if !ok {
+			return errV1FastFallback
+		}
+		switch keyBits {
+		case 8:
+			k8 = uint8(kv)
+		case 16:
+			k16 = uint16(kv)
+		case 32:
+			k32 = uint32(kv)
+		default:
+			k64 = kv
+		}
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+			return errV1FastFallback
+		}
+		d.pos++
+		existing, exists := m.Get(mt, keyPtr)
+		var elemPtr unsafe.Pointer
+		if exists {
+			v1ClearBytes(existing, p.elemSize, p.elemRT)
+			elemPtr = existing
+		} else {
+			elemPtr = m.PutSlot(mt, keyPtr)
+		}
+		if err := d.unmarshal(elemPlan, elemPtr, depth); err != nil {
+			if !exists {
+				m.Delete(mt, keyPtr)
+			}
+			runtime.KeepAlive(&k8)
+			runtime.KeepAlive(&k16)
+			runtime.KeepAlive(&k32)
+			runtime.KeepAlive(&k64)
+			return err
+		}
+		runtime.KeepAlive(&k8)
+		runtime.KeepAlive(&k16)
+		runtime.KeepAlive(&k32)
+		runtime.KeepAlive(&k64)
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errV1FastFallback
+		}
+		if d.data[d.pos] == ',' {
+			d.pos++
+			continue
+		}
+		if d.data[d.pos] == '}' {
+			d.pos++
+			return nil
+		}
+		return errV1FastFallback
+	}
 }
 
 func (d *v1FastDecoder) unmarshalBytes(ptr unsafe.Pointer) error {
@@ -2157,26 +2856,54 @@ func (d *v1FastDecoder) unmarshalStruct(p *v1FastUnmarshalPlan, ptr unsafe.Point
 	fields := p.fields
 	nextIdx := 0
 	for {
-		d.skipWS()
-		keyBytes, err := d.readString()
-		if err != nil {
-			return err
+		data := d.data
+		pos := d.pos
+		if pos < len(data) && data[pos] <= ' ' {
+			for pos < len(data) && data[pos] <= ' ' && isSpace(data[pos]) {
+				pos++
+			}
+			d.pos = pos
 		}
-		d.skipWS()
-		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
-			return errV1FastFallback
-		}
-		d.pos++
 
 		var f *v1FastUnmarshalField
-		if nextIdx < len(fields) && string(keyBytes) == fields[nextIdx].name {
-			f = &fields[nextIdx]
-			nextIdx++
-		} else {
-			f = p.byExactName[string(keyBytes)]
-			if f != nil {
-				nextIdx = f.orderIdx + 1
+		if nextIdx < len(fields) {
+			if qf := fields[nextIdx].quotedNameColon; len(qf) > 0 && pos+len(qf) <= len(data) && string(data[pos:pos+len(qf)]) == qf {
+				d.pos = pos + len(qf)
+				f = &fields[nextIdx]
+				nextIdx++
+				goto gotField
+			}
+		}
+
+		{
+			keyBytes, err := d.readString()
+			if err != nil {
+				return err
+			}
+			d.skipWS()
+			if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+				return errV1FastFallback
+			}
+			d.pos++
+
+			if nextIdx < len(fields) && string(keyBytes) == fields[nextIdx].name {
+				f = &fields[nextIdx]
+				nextIdx++
+			} else if len(fields) <= 8 {
+				for j := range fields {
+					if string(keyBytes) == fields[j].name {
+						f = &fields[j]
+						nextIdx = j + 1
+						break
+					}
+				}
 			} else {
+				f = p.byExactName[string(keyBytes)]
+				if f != nil {
+					nextIdx = f.orderIdx + 1
+				}
+			}
+			if f == nil {
 				f = p.byFoldedName[string(foldName(keyBytes))]
 				if f != nil {
 					nextIdx = f.orderIdx + 1
@@ -2184,6 +2911,7 @@ func (d *v1FastDecoder) unmarshalStruct(p *v1FastUnmarshalPlan, ptr unsafe.Point
 			}
 		}
 
+	gotField:
 		if f == nil {
 			if d.disallowUnknownFields {
 				return errV1FastFallback
@@ -2197,115 +2925,121 @@ func (d *v1FastDecoder) unmarshalStruct(p *v1FastUnmarshalPlan, ptr unsafe.Point
 			if d.pos >= len(d.data) {
 				return errV1FastFallback
 			}
-			vc := d.data[d.pos]
-			switch f.kind {
-			case v1fkString:
-				if vc == '"' {
-					b, err := d.readString()
-					if err != nil {
-						return err
-					}
-					*(*string)(fp) = v1MakeString(d.strCache, b)
-				} else if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					return errV1FastFallback
-				}
-			case v1fkInt:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readInt64(strconv.IntSize)
-					if err != nil {
-						return err
-					}
-					*(*int)(fp) = int(v)
-				}
-			case v1fkInt32:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readInt64(32)
-					if err != nil {
-						return err
-					}
-					*(*int32)(fp) = int32(v)
-				}
-			case v1fkInt64:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readInt64(64)
-					if err != nil {
-						return err
-					}
-					*(*int64)(fp) = v
-				}
-			case v1fkUint:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readUint64(strconv.IntSize)
-					if err != nil {
-						return err
-					}
-					*(*uint)(fp) = uint(v)
-				}
-			case v1fkUint32:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readUint64(32)
-					if err != nil {
-						return err
-					}
-					*(*uint32)(fp) = uint32(v)
-				}
-			case v1fkUint64:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readUint64(64)
-					if err != nil {
-						return err
-					}
-					*(*uint64)(fp) = v
-				}
-			case v1fkFloat64:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readFloat(64)
-					if err != nil {
-						return err
-					}
-					*(*float64)(fp) = v
-				}
-			case v1fkFloat32:
-				if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					v, err := d.readFloat(32)
-					if err != nil {
-						return err
-					}
-					*(*float32)(fp) = float32(v)
-				}
-			case v1fkBool:
-				if vc == 't' && d.pos+4 <= len(d.data) && string(d.data[d.pos:d.pos+4]) == "true" {
-					d.pos += 4
-					*(*bool)(fp) = true
-				} else if vc == 'f' && d.pos+5 <= len(d.data) && string(d.data[d.pos:d.pos+5]) == "false" {
-					d.pos += 5
-					*(*bool)(fp) = false
-				} else if vc == 'n' && d.consumeNull() {
-					// no-op
-				} else {
-					return errV1FastFallback
-				}
-			default:
-				if err := d.unmarshal(f.plan, fp, depth); err != nil {
+			if p.hasQuoted && f.quoted {
+				if err := d.unmarshalQuotedNumber(f.kind, fp); err != nil {
 					return err
+				}
+			} else {
+				vc := d.data[d.pos]
+				switch f.kind {
+				case v1fkString:
+					if vc == '"' {
+						b, err := d.readString()
+						if err != nil {
+							return err
+						}
+						*(*string)(fp) = v1MakeString(d.strCache, b)
+					} else if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						return errV1FastFallback
+					}
+				case v1fkInt:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readInt64(strconv.IntSize)
+						if err != nil {
+							return err
+						}
+						*(*int)(fp) = int(v)
+					}
+				case v1fkInt32:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readInt64(32)
+						if err != nil {
+							return err
+						}
+						*(*int32)(fp) = int32(v)
+					}
+				case v1fkInt64:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readInt64(64)
+						if err != nil {
+							return err
+						}
+						*(*int64)(fp) = v
+					}
+				case v1fkUint:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readUint64(strconv.IntSize)
+						if err != nil {
+							return err
+						}
+						*(*uint)(fp) = uint(v)
+					}
+				case v1fkUint32:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readUint64(32)
+						if err != nil {
+							return err
+						}
+						*(*uint32)(fp) = uint32(v)
+					}
+				case v1fkUint64:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readUint64(64)
+						if err != nil {
+							return err
+						}
+						*(*uint64)(fp) = v
+					}
+				case v1fkFloat64:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readFloat(64)
+						if err != nil {
+							return err
+						}
+						*(*float64)(fp) = v
+					}
+				case v1fkFloat32:
+					if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						v, err := d.readFloat(32)
+						if err != nil {
+							return err
+						}
+						*(*float32)(fp) = float32(v)
+					}
+				case v1fkBool:
+					if vc == 't' && d.pos+4 <= len(d.data) && string(d.data[d.pos:d.pos+4]) == "true" {
+						d.pos += 4
+						*(*bool)(fp) = true
+					} else if vc == 'f' && d.pos+5 <= len(d.data) && string(d.data[d.pos:d.pos+5]) == "false" {
+						d.pos += 5
+						*(*bool)(fp) = false
+					} else if vc == 'n' && d.consumeNull() {
+						// no-op
+					} else {
+						return errV1FastFallback
+					}
+				default:
+					if err := d.unmarshal(f.plan, fp, depth); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -2330,6 +3064,8 @@ func v1IsTargetZero(p *v1FastUnmarshalPlan, ptr unsafe.Pointer) bool {
 	switch p.kind {
 	case v1fkPtr:
 		return *(*unsafe.Pointer)(ptr) == nil
+	case v1fkTime:
+		return (*time.Time)(ptr).IsZero()
 	case v1fkBytes, v1fkSliceBool, v1fkSliceString, v1fkSliceInt, v1fkSliceInt64, v1fkSliceUint64, v1fkSliceFloat64, v1fkSliceFloat32, v1fkSlice:
 		return (*unsafeheader.Slice)(ptr).Data == nil
 	case v1fkMapStringString:
@@ -2338,9 +3074,11 @@ func v1IsTargetZero(p *v1FastUnmarshalPlan, ptr unsafe.Pointer) bool {
 		return *(*map[string]int)(ptr) == nil
 	case v1fkMapStringAny:
 		return *(*map[string]any)(ptr) == nil
+	case v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
+		return *(**maps.Map)(ptr) == nil
 	case v1fkAny:
 		return *(*any)(ptr) == nil
-	case v1fkStruct, v1fkArray:
+	case v1fkStruct, v1fkArray, v1fkUnmarshaler:
 		return reflect.NewAt(p.rt, ptr).Elem().IsZero()
 	}
 	return false

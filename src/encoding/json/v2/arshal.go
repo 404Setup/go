@@ -251,7 +251,7 @@ func MarshalEncode(out *jsontext.Encoder, in any, opts ...Options) (err error) {
 		panic("nil jsontext.Encoder")
 	}
 	xe := export.Encoder(out)
-	if len(opts) == 0 && xe.Tokens.Depth() == 1 && !xe.NeedFlush() && canFastMarshalFlags(&xe.Struct) {
+	if len(opts) == 0 && xe.Tokens.Depth() == 1 && xe.Tokens.Last.Length() == 0 && !xe.NeedFlush() && canFastMarshalFlags(&xe.Struct) {
 		at, ptr := efacePtr(&in)
 		if at != nil {
 			plan := lookupFastMarshalPlan(at)
@@ -488,6 +488,20 @@ func Unmarshal(in []byte, out any, opts ...Options) (err error) {
 func UnmarshalRead(in io.Reader, out any, opts ...Options) (err error) {
 	if in == nil {
 		panic("nil io.Reader")
+	}
+	if bb, ok := in.(*bytes.Buffer); ok && bb != nil {
+		e := (*eface)(unsafe.Pointer(&out))
+		if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
+			data := bb.Bytes()
+			var uoBuf jsonopts.Struct
+			uo := fastOpts(opts, &uoBuf)
+			if tryFastUnmarshal(data, e.typ.Elem(), e.data, uo) {
+				bb.Next(len(data))
+				runtime.KeepAlive(&out)
+				return nil
+			}
+			runtime.KeepAlive(&out)
+		}
 	}
 	dec := export.GetStreamingDecoder(in, opts...)
 	defer export.PutStreamingDecoder(dec)

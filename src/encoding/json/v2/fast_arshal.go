@@ -12,6 +12,7 @@ import (
 	"errors"
 	"internal/abi"
 	"internal/byteorder"
+	"internal/runtime/maps"
 	"internal/unsafeheader"
 	"math"
 	"math/bits"
@@ -117,6 +118,7 @@ const (
 	fkFloat32
 	fkFloat64
 	fkBytes
+	fkByteArray
 	fkSliceBool
 	fkSliceString
 	fkSliceInt
@@ -131,29 +133,46 @@ const (
 	fkMapStringString
 	fkMapStringInt
 	fkMapStringAny
+	fkMapStringElem
+	fkMapIntElem
+	fkMapUintElem
 	fkAny
 	fkTime
+	fkMarshaler
+	fkUnmarshaler
 )
 
+func isFastNumericKind(k fastKind) bool {
+	return k >= fkInt && k <= fkFloat64
+}
+
 type fastMarshalField struct {
-	offset          uintptr
-	quotedNameColon string // pre-quoted `"name":` when !nameNeedEscape
-	name            string
-	nameNeedEscape  bool
-	omitEmpty       bool
-	omitZero        bool
-	kind            fastKind
-	plan            *fastMarshalPlan
+	offset               uintptr
+	quotedNameColon      string // pre-quoted `"name":` when !nameNeedEscape
+	commaQuotedNameColon string // pre-quoted `,"name":` when !nameNeedEscape
+	name                 string
+	nameNeedEscape       bool
+	omitEmpty            bool
+	omitZero             bool
+	quoted               bool
+	kind                 fastKind
+	plan                 *fastMarshalPlan
 }
 
 type fastMarshalPlan struct {
-	typ      *abi.Type
-	kind     fastKind
-	canFast  bool
-	elemSize uintptr
-	arrayLen int
-	elemPlan *fastMarshalPlan
-	fields   []fastMarshalField
+	typ       *abi.Type
+	mapType   *abi.MapType
+	ifaceTab  unsafe.Pointer
+	kind      fastKind
+	keyBits   uint8
+	canFast   bool
+	hasOmit   bool
+	hasQuoted bool
+	minSize   int
+	elemSize  uintptr
+	arrayLen  int
+	elemPlan  *fastMarshalPlan
+	fields    []fastMarshalField
 }
 
 var fastMarshalCache sync.Map[*abi.Type, *fastMarshalPlan]
@@ -191,7 +210,7 @@ func finalizeFastMarshalPlans(visiting map[*abi.Type]*fastMarshalPlan) {
 				continue
 			}
 			switch p.kind {
-			case fkPtr, fkSlice, fkArray:
+			case fkPtr, fkSlice, fkArray, fkMapStringElem, fkMapIntElem, fkMapUintElem:
 				if p.elemPlan == nil || !p.elemPlan.canFast {
 					p.canFast = false
 					changed = true
@@ -210,12 +229,10 @@ func finalizeFastMarshalPlans(visiting map[*abi.Type]*fastMarshalPlan) {
 	}
 }
 
-func reflectTypeFromABI(t *abi.Type) reflect.Type {
-	// Construct a reflect.Type by creating a zero-valued interface header?
-	// Safer: we pass reflect.Type alongside *abi.Type from reflect.TypeOf / TypeFor.
-	// When recursing into Elem()/Field(), we have reflect.Type directly.
-	panic("unreachable")
-}
+var reflectTypeIfaceTab = func() unsafe.Pointer {
+	rt := reflect.TypeFor[int]()
+	return (*[2]unsafe.Pointer)(unsafe.Pointer(&rt))[0]
+}()
 
 func abiTypeOfReflect(rt reflect.Type) *abi.Type {
 	// reflect.Type is an interface whose data word is *abi.Type.
@@ -237,24 +254,15 @@ func lookupFastMarshalPlanReflect(rt reflect.Type) *fastMarshalPlan {
 }
 
 func buildFastMarshalPlan(at *abi.Type, visiting map[*abi.Type]*fastMarshalPlan) *fastMarshalPlan {
-	// We need reflect.Type for method/field inspection; synthesize via a nil pointer eface.
-	// For *abi.Type, we can only safely get reflect.Type via abiTypeToReflect.
-	rt := abiTypeToReflect(at)
-	return buildFastMarshalPlanReflect(rt, at, visiting)
+	return buildFastMarshalPlanReflect(abiTypeToReflect(at), at, visiting)
 }
 
 func abiTypeToReflect(at *abi.Type) reflect.Type {
-	// Use an empty interface whose typ is *abi.Type? No: reflect.TypeOf takes any!
-	// If we construct a zero-value any with typ=at, we must handle direct vs indirect.
-	// Better: store reflect.Type in a tiny cache or construct via a safe dummy value?
-	// Wait: for any non-nil *abi.Type, constructing eface{typ: at, data: zeroMem} is only valid
-	// if zeroMem is large enough for at.Size() if copied, whereas reflect.TypeOf ONLY reads e.typ!
-	// Let's verify: reflect.TypeOf(i any) literally does: eface := *(*emptyInterface)(unsafe.Pointer(&i)); return toType(eface.typ)!
-	// It NEVER dereferences eface.data!
-	var a any
-	e := (*eface)(unsafe.Pointer(&a))
-	e.typ = at
-	return reflect.TypeOf(a)
+	var rt reflect.Type
+	p := (*[2]unsafe.Pointer)(unsafe.Pointer(&rt))
+	p[0] = reflectTypeIfaceTab
+	p[1] = unsafe.Pointer(at)
+	return rt
 }
 
 func hasAnyMarshalerMethod(rt reflect.Type) bool {
@@ -283,6 +291,15 @@ func buildFastMarshalPlanReflect(rt reflect.Type, at *abi.Type, visiting map[*ab
 		return p // canFast = false
 	}
 	if hasAnyMarshalerMethod(rt) {
+		if !implementsAny(rt, jsonMarshalerToType) {
+			if needAddr, ok := implements(rt, jsonMarshalerType); ok && !needAddr {
+				m := reflect.New(rt).Interface().(Marshaler)
+				p.ifaceTab = (*[2]unsafe.Pointer)(unsafe.Pointer(&m))[0]
+				p.kind = fkMarshaler
+				p.canFast = true
+				return p
+			}
+		}
 		return p // canFast = false
 	}
 
@@ -369,7 +386,11 @@ func buildFastMarshalPlanReflect(rt reflect.Type, at *abi.Type, visiting map[*ab
 	case reflect.Array:
 		elem := rt.Elem()
 		if elem.Kind() == reflect.Uint8 {
-			// [N]byte has FormatByteArrayAsArray / Base64 nuances; let standard path handle it.
+			if elem.PkgPath() == "" && !hasAnyMarshalerMethod(elem) {
+				p.kind = fkByteArray
+				p.arrayLen = rt.Len()
+				p.canFast = true
+			}
 			return p
 		}
 		ep := buildFastMarshalPlanReflect(elem, abiTypeOfReflect(elem), visiting)
@@ -396,6 +417,27 @@ func buildFastMarshalPlanReflect(rt reflect.Type, at *abi.Type, visiting map[*ab
 		} else if rt == mapStringAnyType {
 			p.kind = fkMapStringAny
 			p.canFast = true
+		} else {
+			kt := rt.Key()
+			if kt == timeDurationType || hasAnyMarshalerMethod(kt) {
+				return p
+			}
+			switch kt.Kind() {
+			case reflect.String:
+				p.kind = fkMapStringElem
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				p.kind = fkMapIntElem
+				p.keyBits = uint8(kt.Bits())
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+				p.kind = fkMapUintElem
+				p.keyBits = uint8(kt.Bits())
+			default:
+				return p
+			}
+			elem := rt.Elem()
+			p.elemPlan = buildFastMarshalPlanReflect(elem, abiTypeOfReflect(elem), visiting)
+			p.mapType = (*abi.MapType)(unsafe.Pointer(at))
+			p.canFast = true
 		}
 
 	case reflect.Interface:
@@ -410,9 +452,12 @@ func buildFastMarshalPlanReflect(rt reflect.Type, at *abi.Type, visiting map[*ab
 			return p
 		}
 		fastFields := make([]fastMarshalField, 0, len(fields.flattened))
+		hasOmit := false
+		hasQuoted := false
+		minSize := 2
 		for i := range fields.flattened {
 			f := &fields.flattened[i]
-			if f.string || f.format != "" {
+			if f.format != "" {
 				return p
 			}
 			// Custom IsZero() method (other than time.Time which we handle inline) falls back.
@@ -425,22 +470,43 @@ func buildFastMarshalPlanReflect(rt reflect.Type, at *abi.Type, visiting map[*ab
 				return p
 			}
 			fp := buildFastMarshalPlanReflect(f.typ, abiTypeOfReflect(f.typ), visiting)
+			if f.string {
+				if !isFastNumericKind(fp.kind) {
+					return p
+				}
+				hasQuoted = true
+			}
+			if f.omitempty || f.omitzero {
+				hasOmit = true
+			}
 			ff := fastMarshalField{
 				offset:         off,
 				name:           f.name,
 				nameNeedEscape: f.nameNeedEscape,
 				omitEmpty:      f.omitempty,
 				omitZero:       f.omitzero,
+				quoted:         f.string,
 				kind:           fp.kind,
 				plan:           fp,
 			}
 			if !f.nameNeedEscape {
 				ff.quotedNameColon = f.quotedName + ":"
+				if i == 0 {
+					ff.commaQuotedNameColon = "{" + ff.quotedNameColon
+				} else {
+					ff.commaQuotedNameColon = "," + ff.quotedNameColon
+				}
+				minSize += len(ff.commaQuotedNameColon) + 4
+			} else {
+				minSize += len(f.name) + 8
 			}
 			fastFields = append(fastFields, ff)
 		}
 		p.kind = fkStruct
 		p.fields = fastFields
+		p.hasOmit = hasOmit
+		p.hasQuoted = hasQuoted
+		p.minSize = minSize
 		p.canFast = true
 	}
 	return p
@@ -558,6 +624,26 @@ func (p *fastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, mo *jsonopts.Str
 		s := *(*[]byte)(ptr)
 		if s == nil && mo.Flags.Get(jsonflags.FormatNilSliceAsNull) {
 			return append(b, "null"...), nil
+		}
+		b = append(b, '"')
+		b = base64.StdEncoding.AppendEncode(b, s)
+		b = append(b, '"')
+		return b, nil
+
+	case fkByteArray:
+		s := unsafe.Slice((*byte)(ptr), p.arrayLen)
+		if mo.Flags.Get(jsonflags.FormatByteArrayAsArray) {
+			if len(s) == 0 {
+				return append(b, "[]"...), nil
+			}
+			b = append(b, '[')
+			for i, v := range s {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				b = strconv.AppendUint(b, uint64(v), 10)
+			}
+			return append(b, ']'), nil
 		}
 		b = append(b, '"')
 		b = base64.StdEncoding.AppendEncode(b, s)
@@ -757,8 +843,20 @@ func (p *fastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, mo *jsonopts.Str
 	case fkMapStringAny:
 		return marshalFastMapStringAny(b, *(*map[string]any)(ptr), mo, depth+1)
 
+	case fkMapStringElem:
+		return p.marshalMapStringElem(b, ptr, mo, depth+1)
+
+	case fkMapIntElem:
+		return p.marshalMapIntElem(b, ptr, mo, depth+1)
+
+	case fkMapUintElem:
+		return p.marshalMapUintElem(b, ptr, mo, depth+1)
+
 	case fkAny:
 		return marshalFastAny(b, *(*any)(ptr), mo, depth+1)
+
+	case fkMarshaler:
+		return p.marshalCustomMarshaler(b, ptr, mo)
 
 	case fkStruct:
 		return p.marshalStruct(b, ptr, mo, depth+1)
@@ -766,12 +864,315 @@ func (p *fastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, mo *jsonopts.Str
 	return nil, errFastFallback
 }
 
+func (p *fastMarshalPlan) marshalCustomMarshaler(b []byte, ptr unsafe.Pointer, mo *jsonopts.Struct) ([]byte, error) {
+	if ptr == nil {
+		return nil, errFastFallback
+	}
+	var m Marshaler
+	ip := (*[2]unsafe.Pointer)(unsafe.Pointer(&m))
+	ip[0] = p.ifaceTab
+	ip[1] = noescape(ptr)
+	val, err := m.MarshalJSON()
+	runtime.KeepAlive(ptr)
+	if err != nil {
+		return nil, errFastFallback
+	}
+	return appendCompactValidJSON(b, val, mo)
+}
+
+func appendCompactValidJSON(dst, src []byte, mo *jsonopts.Struct) ([]byte, error) {
+	if mo.Flags.Get(jsonflags.CanonicalizeRawInts | jsonflags.CanonicalizeRawFloats) {
+		return nil, errFastFallback
+	}
+	allowBadUTF8 := mo.Flags.Get(jsonflags.AllowInvalidUTF8)
+	allowDup := mo.Flags.Get(jsonflags.AllowDuplicateNames)
+	escHTML := mo.Flags.Get(jsonflags.EscapeForHTML)
+	escJS := mo.Flags.Get(jsonflags.EscapeForJS)
+	dst, i, err := appendCompactValidJSONValue(dst, src, 0, allowBadUTF8, allowDup, escHTML, escJS, 0)
+	if err != nil {
+		return nil, err
+	}
+	for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+		i++
+	}
+	if i != len(src) {
+		return nil, errFastFallback
+	}
+	return dst, nil
+}
+
+func appendCompactValidJSONString(dst, src []byte, pos int, allowBadUTF8, escHTML, escJS bool) ([]byte, int, []byte, bool, error) {
+	if pos >= len(src) || src[pos] != '"' {
+		return nil, 0, nil, false, errFastFallback
+	}
+	start := pos + 1
+	i := start
+	for len(src)-i >= 8 {
+		if m := fswarEscapeMask(byteorder.LEUint64(src[i:])); m != 0 {
+			i += bits.TrailingZeros64(m) >> 3
+			goto special
+		}
+		i += 8
+	}
+	for i < len(src) {
+		c := src[i]
+		if c >= utf8.RuneSelf || c < ' ' || c == '\\' || c == '"' {
+			break
+		}
+		i++
+	}
+special:
+	if i < len(src) && src[i] == '"' {
+		raw := src[start:i]
+		if escHTML {
+			for _, c := range raw {
+				if c == '<' || c == '>' || c == '&' {
+					return nil, 0, nil, false, errFastFallback
+				}
+			}
+		}
+		return append(dst, src[pos:i+1]...), i + 1, raw, false, nil
+	}
+	if escHTML || escJS {
+		return nil, 0, nil, false, errFastFallback
+	}
+	var flags jsonwire.ValueFlags
+	n, err := jsonwire.ConsumeString(&flags, src[pos:], !allowBadUTF8)
+	if err != nil {
+		return nil, 0, nil, false, errFastFallback
+	}
+	return append(dst, src[pos:pos+n]...), pos + n, src[pos+1 : pos+n-1], !flags.IsVerbatim(), nil
+}
+
+func appendCompactValidJSONValue(dst, src []byte, i int, allowBadUTF8, allowDup, escHTML, escJS bool, depth int) ([]byte, int, error) {
+	if depth >= 64 {
+		return nil, 0, errFastFallback
+	}
+	for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+		i++
+	}
+	if i >= len(src) {
+		return nil, 0, errFastFallback
+	}
+	switch src[i] {
+	case 'n':
+		if n := jsonwire.ConsumeNull(src[i:]); n > 0 {
+			return append(dst, "null"...), i + n, nil
+		}
+		return nil, 0, errFastFallback
+	case 't':
+		if n := jsonwire.ConsumeTrue(src[i:]); n > 0 {
+			return append(dst, "true"...), i + n, nil
+		}
+		return nil, 0, errFastFallback
+	case 'f':
+		if n := jsonwire.ConsumeFalse(src[i:]); n > 0 {
+			return append(dst, "false"...), i + n, nil
+		}
+		return nil, 0, errFastFallback
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		n, err := jsonwire.ConsumeNumber(src[i:])
+		if err != nil {
+			return nil, 0, errFastFallback
+		}
+		return append(dst, src[i:i+n]...), i + n, nil
+	case '"':
+		dst, next, _, _, err := appendCompactValidJSONString(dst, src, i, allowBadUTF8, escHTML, escJS)
+		return dst, next, err
+	case '[':
+		i++
+		dst = append(dst, '[')
+		for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+			i++
+		}
+		if i < len(src) && src[i] == ']' {
+			return append(dst, ']'), i + 1, nil
+		}
+		var err error
+		for {
+			dst, i, err = appendCompactValidJSONValue(dst, src, i, allowBadUTF8, allowDup, escHTML, escJS, depth+1)
+			if err != nil {
+				return nil, 0, err
+			}
+			for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+				i++
+			}
+			if i >= len(src) {
+				return nil, 0, errFastFallback
+			}
+			if src[i] == ',' {
+				i++
+				dst = append(dst, ',')
+				continue
+			}
+			if src[i] == ']' {
+				return append(dst, ']'), i + 1, nil
+			}
+			return nil, 0, errFastFallback
+		}
+	case '{':
+		if allowBadUTF8 && !allowDup {
+			return nil, 0, errFastFallback
+		}
+		i++
+		dst = append(dst, '{')
+		for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+			i++
+		}
+		if i < len(src) && src[i] == '}' {
+			return append(dst, '}'), i + 1, nil
+		}
+		var keys [8][]byte
+		numKeys := 0
+		var err error
+		for {
+			for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+				i++
+			}
+			var kb []byte
+			var escaped bool
+			dst, i, kb, escaped, err = appendCompactValidJSONString(dst, src, i, allowBadUTF8, escHTML, escJS)
+			if err != nil {
+				return nil, 0, err
+			}
+			if !allowDup {
+				if escaped || numKeys >= len(keys) {
+					return nil, 0, errFastFallback
+				}
+				for j := range numKeys {
+					if bytes.Equal(keys[j], kb) {
+						return nil, 0, errFastFallback
+					}
+				}
+				keys[numKeys] = kb
+				numKeys++
+			}
+			for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+				i++
+			}
+			if i >= len(src) || src[i] != ':' {
+				return nil, 0, errFastFallback
+			}
+			i++
+			dst = append(dst, ':')
+			dst, i, err = appendCompactValidJSONValue(dst, src, i, allowBadUTF8, allowDup, escHTML, escJS, depth+1)
+			if err != nil {
+				return nil, 0, err
+			}
+			for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+				i++
+			}
+			if i >= len(src) {
+				return nil, 0, errFastFallback
+			}
+			if src[i] == ',' {
+				i++
+				dst = append(dst, ',')
+				continue
+			}
+			if src[i] == '}' {
+				return append(dst, '}'), i + 1, nil
+			}
+			return nil, 0, errFastFallback
+		}
+	}
+	return nil, 0, errFastFallback
+}
+
 func (p *fastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, mo *jsonopts.Struct, depth int) ([]byte, error) {
+	fields := p.fields
+	if len(fields) == 0 {
+		return append(b, "{}"...), nil
+	}
+	omitZeroAll := mo.Flags.Get(jsonflags.OmitZeroStructFields)
+	if !p.hasOmit && !p.hasQuoted && !omitZeroAll {
+		if cap(b)-len(b) < p.minSize {
+			b = slices.Grow(b, p.minSize)
+		}
+		var err error
+		for i := range fields {
+			f := &fields[i]
+			fp := unsafe.Add(ptr, f.offset)
+			if !f.nameNeedEscape {
+				b = append(b, f.commaQuotedNameColon...)
+			} else {
+				if i == 0 {
+					b = append(b, '{')
+				} else {
+					b = append(b, ',')
+				}
+				if b, err = jsonwire.AppendQuoteString(b, f.name, &mo.Flags); err != nil {
+					return nil, errFastFallback
+				}
+				b = append(b, ':')
+			}
+			switch f.kind {
+			case fkString:
+				if b, err = jsonwire.AppendQuoteString(b, *(*string)(fp), &mo.Flags); err != nil {
+					return nil, errFastFallback
+				}
+			case fkInt:
+				b = strconv.AppendInt(b, int64(*(*int)(fp)), 10)
+			case fkInt32:
+				b = strconv.AppendInt(b, int64(*(*int32)(fp)), 10)
+			case fkInt64:
+				b = strconv.AppendInt(b, *(*int64)(fp), 10)
+			case fkUint:
+				b = strconv.AppendUint(b, uint64(*(*uint)(fp)), 10)
+			case fkUint32:
+				b = strconv.AppendUint(b, uint64(*(*uint32)(fp)), 10)
+			case fkUint64:
+				b = strconv.AppendUint(b, *(*uint64)(fp), 10)
+			case fkFloat64:
+				fv := *(*float64)(fp)
+				if math.IsNaN(fv) || math.IsInf(fv, 0) {
+					return nil, errFastFallback
+				}
+				b = jsonwire.AppendFloat(b, fv, 64)
+			case fkFloat32:
+				fv := float64(*(*float32)(fp))
+				if math.IsNaN(fv) || math.IsInf(fv, 0) {
+					return nil, errFastFallback
+				}
+				b = jsonwire.AppendFloat(b, fv, 32)
+			case fkBool:
+				if *(*bool)(fp) {
+					b = append(b, "true"...)
+				} else {
+					b = append(b, "false"...)
+				}
+			case fkSliceString:
+				s := *(*[]string)(fp)
+				if len(s) == 0 {
+					if s == nil && mo.Flags.Get(jsonflags.FormatNilSliceAsNull) {
+						b = append(b, "null"...)
+					} else {
+						b = append(b, "[]"...)
+					}
+				} else {
+					b = append(b, '[')
+					for j, v := range s {
+						if j > 0 {
+							b = append(b, ',')
+						}
+						if b, err = jsonwire.AppendQuoteString(b, v, &mo.Flags); err != nil {
+							return nil, errFastFallback
+						}
+					}
+					b = append(b, ']')
+				}
+			default:
+				if b, err = f.plan.marshal(b, fp, mo, depth); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return append(b, '}'), nil
+	}
+
 	b = append(b, '{')
 	first := true
-	omitZeroAll := mo.Flags.Get(jsonflags.OmitZeroStructFields)
 	legacyOmitEmpty := mo.Flags.Get(jsonflags.OmitEmptyWithLegacySemantics)
-	fields := p.fields
 	var err error
 
 	for i := range fields {
@@ -799,12 +1200,12 @@ func (p *fastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, mo *jsonop
 					if len(*(*[]byte)(fp)) == 0 {
 						continue
 					}
-				case fkSliceBool, fkSliceString, fkSliceInt, fkSliceInt64, fkSliceUint64, fkSliceFloat64, fkSliceFloat32, fkSlice:
-					if (*unsafeheader.Slice)(fp).Len == 0 {
+				case fkByteArray, fkArray:
+					if f.plan.arrayLen == 0 {
 						continue
 					}
-				case fkArray:
-					if f.plan.arrayLen == 0 {
+				case fkSliceBool, fkSliceString, fkSliceInt, fkSliceInt64, fkSliceUint64, fkSliceFloat64, fkSliceFloat32, fkSlice:
+					if (*unsafeheader.Slice)(fp).Len == 0 {
 						continue
 					}
 				case fkPtr:
@@ -824,12 +1225,16 @@ func (p *fastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, mo *jsonop
 					if len(*(*map[string]any)(fp)) == 0 {
 						continue
 					}
+				case fkMapStringElem, fkMapIntElem, fkMapUintElem:
+					if m := *(**maps.Map)(fp); m == nil || m.Used() == 0 {
+						continue
+					}
 				case fkAny:
 					if *(*any)(fp) == nil {
 						continue
 					}
 					checkPostEmpty = true
-				case fkStruct:
+				case fkStruct, fkMarshaler:
 					checkPostEmpty = true
 				}
 			}
@@ -848,6 +1253,9 @@ func (p *fastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, mo *jsonop
 			b = append(b, ':')
 		}
 		valStart := len(b)
+		if f.quoted {
+			b = append(b, '"')
+		}
 
 		switch f.kind {
 		case fkString:
@@ -909,6 +1317,9 @@ func (p *fastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, mo *jsonop
 				return nil, err
 			}
 		}
+		if f.quoted {
+			b = append(b, '"')
+		}
 
 		if checkPostEmpty && isMarshaledJSONEmpty(b[valStart:]) {
 			b = b[:mark]
@@ -967,6 +1378,13 @@ func isFastZero(k fastKind, plan *fastMarshalPlan, ptr unsafe.Pointer) bool {
 		return (*time.Time)(ptr).IsZero()
 	case fkBytes:
 		return *(*[]byte)(ptr) == nil
+	case fkByteArray:
+		for _, v := range unsafe.Slice((*byte)(ptr), plan.arrayLen) {
+			if v != 0 {
+				return false
+			}
+		}
+		return true
 	case fkSliceBool, fkSliceString, fkSliceInt, fkSliceInt64, fkSliceUint64, fkSliceFloat64, fkSliceFloat32, fkSlice:
 		return (*unsafeheader.Slice)(ptr).Data == nil
 	case fkPtr:
@@ -977,6 +1395,8 @@ func isFastZero(k fastKind, plan *fastMarshalPlan, ptr unsafe.Pointer) bool {
 		return *(*map[string]int)(ptr) == nil
 	case fkMapStringAny:
 		return *(*map[string]any)(ptr) == nil
+	case fkMapStringElem, fkMapIntElem, fkMapUintElem:
+		return *(**maps.Map)(ptr) == nil
 	case fkAny:
 		return *(*any)(ptr) == nil
 	case fkArray:
@@ -988,7 +1408,7 @@ func isFastZero(k fastKind, plan *fastMarshalPlan, ptr unsafe.Pointer) bool {
 			}
 		}
 		return true
-	case fkStruct:
+	case fkStruct, fkMarshaler:
 		// Check all bytes in struct are zero? Beware padding bytes or unexported fields!
 		// Struct IsZero checks every Go struct field (including unexported ones).
 		// To be 100% exact, check via reflect if struct has unexported fields or just check size == 0.
@@ -1039,10 +1459,10 @@ func isFastLegacyEmpty(k fastKind, plan *fastMarshalPlan, ptr unsafe.Pointer) bo
 		return *(*float64)(ptr) == 0
 	case fkBytes:
 		return len(*(*[]byte)(ptr)) == 0
+	case fkByteArray, fkArray:
+		return plan.arrayLen == 0
 	case fkSliceBool, fkSliceString, fkSliceInt, fkSliceInt64, fkSliceUint64, fkSliceFloat64, fkSliceFloat32, fkSlice:
 		return (*unsafeheader.Slice)(ptr).Len == 0
-	case fkArray:
-		return plan.arrayLen == 0
 	case fkPtr:
 		return *(*unsafe.Pointer)(ptr) == nil
 	case fkMapStringString:
@@ -1051,10 +1471,314 @@ func isFastLegacyEmpty(k fastKind, plan *fastMarshalPlan, ptr unsafe.Pointer) bo
 		return len(*(*map[string]int)(ptr)) == 0
 	case fkMapStringAny:
 		return len(*(*map[string]any)(ptr)) == 0
+	case fkMapStringElem, fkMapIntElem, fkMapUintElem:
+		m := *(**maps.Map)(ptr)
+		return m == nil || m.Used() == 0
 	case fkAny:
 		return *(*any)(ptr) == nil
+	case fkMarshaler:
+		v := reflect.NewAt(abiTypeToReflect(plan.typ), ptr).Elem()
+		switch v.Kind() {
+		case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+			return v.Len() == 0
+		case reflect.Bool:
+			return !v.Bool()
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return v.Int() == 0
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			return v.Uint() == 0
+		case reflect.Float32, reflect.Float64:
+			return v.Float() == 0
+		case reflect.Interface, reflect.Pointer:
+			return v.IsNil()
+		}
 	}
 	return false
+}
+
+type mapStringEntry struct {
+	k string
+	v unsafe.Pointer
+}
+
+var mapStringEntryPool = sync.Pool[*[]mapStringEntry]{
+	New: func() *[]mapStringEntry { s := make([]mapStringEntry, 0, 16); return &s },
+}
+
+func getMapStringEntries(n int) *[]mapStringEntry {
+	p := mapStringEntryPool.Get()
+	if cap(*p) < n {
+		*p = make([]mapStringEntry, n)
+	} else {
+		*p = (*p)[:n]
+	}
+	return p
+}
+
+func putMapStringEntries(p *[]mapStringEntry) {
+	if cap(*p) > 4096 {
+		return
+	}
+	clear(*p)
+	*p = (*p)[:0]
+	mapStringEntryPool.Put(p)
+}
+
+type mapNumEntry struct {
+	v   unsafe.Pointer
+	buf [24]byte // formatted `"<digits>":`
+	n   uint8
+}
+
+var mapNumEntryPool = sync.Pool[*[]mapNumEntry]{
+	New: func() *[]mapNumEntry { s := make([]mapNumEntry, 0, 16); return &s },
+}
+
+func getMapNumEntries(n int) *[]mapNumEntry {
+	p := mapNumEntryPool.Get()
+	if cap(*p) < n {
+		*p = make([]mapNumEntry, n)
+	} else {
+		*p = (*p)[:n]
+	}
+	return p
+}
+
+func putMapNumEntries(p *[]mapNumEntry) {
+	if cap(*p) > 4096 {
+		return
+	}
+	clear(*p)
+	*p = (*p)[:0]
+	mapNumEntryPool.Put(p)
+}
+
+func readSignedKey(kp unsafe.Pointer, keyBits uint8) int64 {
+	switch keyBits {
+	case 8:
+		return int64(*(*int8)(kp))
+	case 16:
+		return int64(*(*int16)(kp))
+	case 32:
+		return int64(*(*int32)(kp))
+	default:
+		return *(*int64)(kp)
+	}
+}
+
+func readUnsignedKey(kp unsafe.Pointer, keyBits uint8) uint64 {
+	switch keyBits {
+	case 8:
+		return uint64(*(*uint8)(kp))
+	case 16:
+		return uint64(*(*uint16)(kp))
+	case 32:
+		return uint64(*(*uint32)(kp))
+	default:
+		return *(*uint64)(kp)
+	}
+}
+
+func (p *fastMarshalPlan) marshalMapStringElem(b []byte, ptr unsafe.Pointer, mo *jsonopts.Struct, depth int) ([]byte, error) {
+	if depth > startDetectingCyclesAfter {
+		return nil, errFastFallback
+	}
+	m := *(**maps.Map)(ptr)
+	if m == nil || m.Used() == 0 {
+		if m == nil && mo.Flags.Get(jsonflags.FormatNilMapAsNull) {
+			return append(b, "null"...), nil
+		}
+		return append(b, "{}"...), nil
+	}
+	n := int(m.Used())
+	if mo.Flags.Get(jsonflags.AllowInvalidUTF8) && !mo.Flags.Get(jsonflags.AllowDuplicateNames) && n > 1 {
+		return nil, errFastFallback
+	}
+	b = append(b, '{')
+	elemPlan := p.elemPlan
+	var err error
+	if !mo.Flags.Get(jsonflags.Deterministic) || n <= 1 {
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		first := true
+		for it.Next(); it.Key() != nil; it.Next() {
+			if !first {
+				b = append(b, ',')
+			}
+			first = false
+			if b, err = jsonwire.AppendQuoteString(b, *(*string)(it.Key()), &mo.Flags); err != nil {
+				return nil, errFastFallback
+			}
+			b = append(b, ':')
+			if b, err = elemPlan.marshal(b, it.Elem(), mo, depth); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		ep := getMapStringEntries(n)
+		entries := *ep
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		i := 0
+		for it.Next(); it.Key() != nil && i < n; it.Next() {
+			entries[i] = mapStringEntry{k: *(*string)(it.Key()), v: it.Elem()}
+			i++
+		}
+		entries = entries[:i]
+		slices.SortFunc(entries, func(x, y mapStringEntry) int {
+			return strings.Compare(x.k, y.k)
+		})
+		for idx, e := range entries {
+			if idx > 0 {
+				b = append(b, ',')
+			}
+			if b, err = jsonwire.AppendQuoteString(b, e.k, &mo.Flags); err != nil {
+				putMapStringEntries(ep)
+				return nil, errFastFallback
+			}
+			b = append(b, ':')
+			if b, err = elemPlan.marshal(b, e.v, mo, depth); err != nil {
+				putMapStringEntries(ep)
+				return nil, err
+			}
+		}
+		putMapStringEntries(ep)
+	}
+	return append(b, '}'), nil
+}
+
+func (p *fastMarshalPlan) marshalMapIntElem(b []byte, ptr unsafe.Pointer, mo *jsonopts.Struct, depth int) ([]byte, error) {
+	if depth > startDetectingCyclesAfter {
+		return nil, errFastFallback
+	}
+	m := *(**maps.Map)(ptr)
+	if m == nil || m.Used() == 0 {
+		if m == nil && mo.Flags.Get(jsonflags.FormatNilMapAsNull) {
+			return append(b, "null"...), nil
+		}
+		return append(b, "{}"...), nil
+	}
+	n := int(m.Used())
+	b = append(b, '{')
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var err error
+	if !mo.Flags.Get(jsonflags.Deterministic) || n <= 1 {
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		first := true
+		for it.Next(); it.Key() != nil; it.Next() {
+			if !first {
+				b = append(b, ',')
+			}
+			first = false
+			b = append(b, '"')
+			b = strconv.AppendInt(b, readSignedKey(it.Key(), keyBits), 10)
+			b = append(b, '"', ':')
+			if b, err = elemPlan.marshal(b, it.Elem(), mo, depth); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		ep := getMapNumEntries(n)
+		entries := *ep
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		i := 0
+		for it.Next(); it.Key() != nil && i < n; it.Next() {
+			e := &entries[i]
+			e.v = it.Elem()
+			buf := append(e.buf[:0], '"')
+			buf = strconv.AppendInt(buf, readSignedKey(it.Key(), keyBits), 10)
+			buf = append(buf, '"', ':')
+			e.n = uint8(len(buf))
+			i++
+		}
+		entries = entries[:i]
+		slices.SortFunc(entries, func(x, y mapNumEntry) int {
+			return bytes.Compare(x.buf[:x.n], y.buf[:y.n])
+		})
+		for idx := range entries {
+			e := &entries[idx]
+			if idx > 0 {
+				b = append(b, ',')
+			}
+			b = append(b, e.buf[:e.n]...)
+			if b, err = elemPlan.marshal(b, e.v, mo, depth); err != nil {
+				putMapNumEntries(ep)
+				return nil, err
+			}
+		}
+		putMapNumEntries(ep)
+	}
+	return append(b, '}'), nil
+}
+
+func (p *fastMarshalPlan) marshalMapUintElem(b []byte, ptr unsafe.Pointer, mo *jsonopts.Struct, depth int) ([]byte, error) {
+	if depth > startDetectingCyclesAfter {
+		return nil, errFastFallback
+	}
+	m := *(**maps.Map)(ptr)
+	if m == nil || m.Used() == 0 {
+		if m == nil && mo.Flags.Get(jsonflags.FormatNilMapAsNull) {
+			return append(b, "null"...), nil
+		}
+		return append(b, "{}"...), nil
+	}
+	n := int(m.Used())
+	b = append(b, '{')
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var err error
+	if !mo.Flags.Get(jsonflags.Deterministic) || n <= 1 {
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		first := true
+		for it.Next(); it.Key() != nil; it.Next() {
+			if !first {
+				b = append(b, ',')
+			}
+			first = false
+			b = append(b, '"')
+			b = strconv.AppendUint(b, readUnsignedKey(it.Key(), keyBits), 10)
+			b = append(b, '"', ':')
+			if b, err = elemPlan.marshal(b, it.Elem(), mo, depth); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		ep := getMapNumEntries(n)
+		entries := *ep
+		var it maps.Iter
+		it.Init(p.mapType, m)
+		i := 0
+		for it.Next(); it.Key() != nil && i < n; it.Next() {
+			e := &entries[i]
+			e.v = it.Elem()
+			buf := append(e.buf[:0], '"')
+			buf = strconv.AppendUint(buf, readUnsignedKey(it.Key(), keyBits), 10)
+			buf = append(buf, '"', ':')
+			e.n = uint8(len(buf))
+			i++
+		}
+		entries = entries[:i]
+		slices.SortFunc(entries, func(x, y mapNumEntry) int {
+			return bytes.Compare(x.buf[:x.n], y.buf[:y.n])
+		})
+		for idx := range entries {
+			e := &entries[idx]
+			if idx > 0 {
+				b = append(b, ',')
+			}
+			b = append(b, e.buf[:e.n]...)
+			if b, err = elemPlan.marshal(b, e.v, mo, depth); err != nil {
+				putMapNumEntries(ep)
+				return nil, err
+			}
+		}
+		putMapNumEntries(ep)
+	}
+	return append(b, '}'), nil
 }
 
 func marshalFastMapStringString(b []byte, m map[string]string, mo *jsonopts.Struct) ([]byte, error) {
@@ -1424,6 +2148,16 @@ func marshalFastAlloc(plan *fastMarshalPlan, ptr unsafe.Pointer, mo *jsonopts.St
 		}
 		var scratch [32]byte
 		return bytes.Clone(jsonwire.AppendFloat(scratch[:0], fv, 64)), true
+	case fkByteArray:
+		if !mo.Flags.Get(jsonflags.FormatByteArrayAsArray) {
+			s := unsafe.Slice((*byte)(ptr), plan.arrayLen)
+			encLen := base64.StdEncoding.EncodedLen(len(s))
+			out := make([]byte, encLen+2)
+			out[0] = '"'
+			base64.StdEncoding.Encode(out[1:], s)
+			out[encLen+1] = '"'
+			return out, true
+		}
 	}
 	fb := getFastBuf()
 	b, err := plan.marshal(fb.b, ptr, mo, 0)
@@ -1442,20 +2176,26 @@ func marshalFastAlloc(plan *fastMarshalPlan, ptr unsafe.Pointer, mo *jsonopts.St
 // ============================================================================
 
 type fastUnmarshalField struct {
-	id       int
-	orderIdx int
-	offset   uintptr
-	name     string
-	casing   int8
-	kind     fastKind
-	plan     *fastUnmarshalPlan
+	id              int
+	orderIdx        int
+	offset          uintptr
+	name            string
+	quotedNameColon string // pre-quoted `"name":` when !nameNeedEscape
+	casing          int8
+	quoted          bool
+	kind            fastKind
+	plan            *fastUnmarshalPlan
 }
 
 type fastUnmarshalPlan struct {
 	typ            *abi.Type
 	rt             reflect.Type
+	mapType        *abi.MapType
+	ifaceTab       unsafe.Pointer
 	kind           fastKind
+	keyBits        uint8
 	canFast        bool
+	hasQuoted      bool
 	elemSize       uintptr
 	arrayLen       int
 	emptySliceData unsafe.Pointer
@@ -1500,7 +2240,7 @@ func finalizeFastUnmarshalPlans(visiting map[*abi.Type]*fastUnmarshalPlan) {
 				continue
 			}
 			switch p.kind {
-			case fkPtr, fkSlice, fkArray:
+			case fkPtr, fkSlice, fkArray, fkMapStringElem, fkMapIntElem, fkMapUintElem:
 				if p.elemPlan == nil || !p.elemPlan.canFast {
 					p.canFast = false
 					changed = true
@@ -1536,10 +2276,24 @@ func buildFastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 	p := &fastUnmarshalPlan{typ: at, rt: rt}
 	visiting[at] = p
 
-	if rt == timeTimeType || rt == timeDurationType {
-		return p // standard path handles time formats
+	if rt == timeTimeType {
+		p.kind = fkTime
+		p.canFast = true
+		return p
+	}
+	if rt == timeDurationType {
+		return p // standard path handles duration formats
 	}
 	if hasAnyUnmarshalerMethod(rt) {
+		if !implementsAny(rt, jsonUnmarshalerFromType) {
+			if _, ok := implements(rt, jsonUnmarshalerType); ok {
+				u := reflect.New(rt).Interface().(Unmarshaler)
+				p.ifaceTab = (*[2]unsafe.Pointer)(unsafe.Pointer(&u))[0]
+				p.kind = fkUnmarshaler
+				p.canFast = true
+				return p
+			}
+		}
 		return p
 	}
 
@@ -1627,7 +2381,12 @@ func buildFastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 	case reflect.Array:
 		elem := rt.Elem()
 		if elem.Kind() == reflect.Uint8 {
-			return p // [N]byte base64/array legacy nuances handled by standard path
+			if elem.PkgPath() == "" && !hasAnyUnmarshalerMethod(elem) {
+				p.kind = fkByteArray
+				p.arrayLen = rt.Len()
+				p.canFast = true
+			}
+			return p
 		}
 		ep := buildFastUnmarshalPlan(elem, abiTypeOfReflect(elem), visiting)
 		p.elemPlan = ep
@@ -1661,6 +2420,29 @@ func buildFastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 		} else if rt == reflect.TypeFor[map[string]any]() {
 			p.kind = fkMapStringAny
 			p.canFast = true
+		} else {
+			kt := rt.Key()
+			if kt == timeDurationType || hasAnyUnmarshalerMethod(kt) {
+				return p
+			}
+			switch kt.Kind() {
+			case reflect.String:
+				p.kind = fkMapStringElem
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				p.kind = fkMapIntElem
+				p.keyBits = uint8(kt.Bits())
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+				p.kind = fkMapUintElem
+				p.keyBits = uint8(kt.Bits())
+			default:
+				return p
+			}
+			elem := rt.Elem()
+			p.elemPlan = buildFastUnmarshalPlan(elem, abiTypeOfReflect(elem), visiting)
+			p.elemRT = elem
+			p.elemSize = elem.Size()
+			p.mapType = (*abi.MapType)(unsafe.Pointer(at))
+			p.canFast = true
 		}
 
 	case reflect.Struct:
@@ -1670,9 +2452,10 @@ func buildFastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 		}
 		fastFields := make([]fastUnmarshalField, 0, len(fields.flattened))
 		hasCaseIgnore := false
+		hasQuoted := false
 		for i := range fields.flattened {
 			f := &fields.flattened[i]
-			if f.string || f.format != "" {
+			if f.format != "" {
 				return p
 			}
 			off, ok := directFieldOffset(rt, f.index0, f.index, f.typ)
@@ -1680,18 +2463,29 @@ func buildFastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 				return p
 			}
 			fp := buildFastUnmarshalPlan(f.typ, abiTypeOfReflect(f.typ), visiting)
+			if f.string {
+				if !isFastNumericKind(fp.kind) {
+					return p
+				}
+				hasQuoted = true
+			}
 			if f.casing == caseIgnore {
 				hasCaseIgnore = true
 			}
-			fastFields = append(fastFields, fastUnmarshalField{
+			ff := fastUnmarshalField{
 				id:       f.id,
 				orderIdx: i,
 				offset:   off,
 				name:     f.name,
 				casing:   f.casing,
+				quoted:   f.string,
 				kind:     fp.kind,
 				plan:     fp,
-			})
+			}
+			if !f.nameNeedEscape {
+				ff.quotedNameColon = f.quotedName + ":"
+			}
+			fastFields = append(fastFields, ff)
 		}
 		byActual := make(map[string]*fastUnmarshalField, len(fastFields))
 		byFolded := make(map[string][]*fastUnmarshalField, len(fastFields))
@@ -1720,6 +2514,7 @@ func buildFastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 		p.byActualName = byActual
 		p.byFoldedName = byFolded
 		p.hasCaseIgnore = hasCaseIgnore
+		p.hasQuoted = hasQuoted
 		p.canFast = true
 	}
 	return p
@@ -1734,7 +2529,7 @@ func canFastUnmarshalFlags(uo *jsonopts.Struct) bool {
 type fastDecoder struct {
 	data         []byte
 	pos          int
-	uo           *jsonopts.Struct
+	flags        jsonflags.Flags
 	strCache     *stringCache
 	allowDup     bool
 	allowBadUTF8 bool
@@ -1918,19 +2713,149 @@ func (d *fastDecoder) readUint64(bits int) (uint64, error) {
 	return v, nil
 }
 
+var exactPow10F64 = [23]float64{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+	1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20,
+	1e21, 1e22,
+}
+
+var exactPow10F32 = [11]float32{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+}
+
 func (d *fastDecoder) readFloat(bits int) (float64, error) {
 	data := d.data
-	pos := d.pos
-	n, err := jsonwire.ConsumeNumber(data[pos:])
+	start := d.pos
+	i := start
+	n := len(data)
+	if i >= n {
+		return 0, errFastFallback
+	}
+	neg := false
+	if data[i] == '-' {
+		neg = true
+		i++
+		if i >= n {
+			return 0, errFastFallback
+		}
+	}
+	var mant uint64
+	exact := true
+	const maxMantDiv10 = (1<<53 - 1) / 10 // 900719925474099; maxMantDiv10*10 + 9 < 1<<53
+	c := data[i]
+	if c == '0' {
+		i++
+		if i < n && '0' <= data[i] && data[i] <= '9' {
+			return 0, errFastFallback
+		}
+	} else if '1' <= c && c <= '9' {
+		mant = uint64(c - '0')
+		i++
+		for i < n {
+			dc := data[i]
+			if dc < '0' || dc > '9' {
+				break
+			}
+			if exact {
+				if mant < maxMantDiv10 {
+					mant = mant*10 + uint64(dc-'0')
+				} else {
+					exact = false
+				}
+			}
+			i++
+		}
+	} else {
+		return 0, errFastFallback
+	}
+
+	exp := 0
+	if i < n && data[i] == '.' {
+		i++
+		if i >= n || data[i] < '0' || data[i] > '9' {
+			return 0, errFastFallback
+		}
+		for i < n {
+			dc := data[i]
+			if dc < '0' || dc > '9' {
+				break
+			}
+			if exact {
+				if mant < maxMantDiv10 {
+					mant = mant*10 + uint64(dc-'0')
+					exp--
+				} else {
+					exact = false
+				}
+			}
+			i++
+		}
+	}
+
+	if i < n && (data[i] == 'e' || data[i] == 'E') {
+		i++
+		expNeg := false
+		if i < n && (data[i] == '+' || data[i] == '-') {
+			expNeg = data[i] == '-'
+			i++
+		}
+		if i >= n || data[i] < '0' || data[i] > '9' {
+			return 0, errFastFallback
+		}
+		expVal := 0
+		for i < n {
+			dc := data[i]
+			if dc < '0' || dc > '9' {
+				break
+			}
+			if expVal < 1000 {
+				expVal = expVal*10 + int(dc-'0')
+			}
+			i++
+		}
+		if expNeg {
+			exp -= expVal
+		} else {
+			exp += expVal
+		}
+	}
+
+	if exact {
+		if bits == 64 {
+			if exp >= -22 && exp <= 22 {
+				f := float64(mant)
+				if exp > 0 {
+					f *= exactPow10F64[exp]
+				} else if exp < 0 {
+					f /= exactPow10F64[-exp]
+				}
+				if neg {
+					f = -f
+				}
+				d.pos = i
+				return f, nil
+			}
+		} else if mant < 1<<24 && exp >= -10 && exp <= 10 {
+			f := float32(mant)
+			if exp > 0 {
+				f *= exactPow10F32[exp]
+			} else if exp < 0 {
+				f /= exactPow10F32[-exp]
+			}
+			if neg {
+				f = -f
+			}
+			d.pos = i
+			return float64(f), nil
+		}
+	}
+
+	raw := data[start:i]
+	fv, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(raw), len(raw)), bits)
 	if err != nil {
 		return 0, errFastFallback
 	}
-	raw := data[pos : pos+n]
-	fv, err := strconv.ParseFloat(string(raw), bits)
-	if err != nil {
-		return 0, errFastFallback
-	}
-	d.pos = pos + n
+	d.pos = i
 	return fv, nil
 }
 
@@ -1946,78 +2871,115 @@ func (d *fastDecoder) skipValue(depth int) error {
 	if depth >= 10000 {
 		return errFastFallback
 	}
-	d.skipWS()
-	if d.pos >= len(d.data) {
-		return errFastFallback
-	}
-	switch d.data[d.pos] {
-	case '"':
-		if _, err := d.readString(); err != nil {
-			return err
-		}
-		return nil
-	case 't':
-		if n := jsonwire.ConsumeTrue(d.data[d.pos:]); n > 0 {
-			d.pos += n
-			return nil
-		}
-		return errFastFallback
-	case 'f':
-		if n := jsonwire.ConsumeFalse(d.data[d.pos:]); n > 0 {
-			d.pos += n
-			return nil
-		}
-		return errFastFallback
-	case 'n':
-		if n := jsonwire.ConsumeNull(d.data[d.pos:]); n > 0 {
-			d.pos += n
-			return nil
-		}
-		return errFastFallback
-	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		n, err := jsonwire.ConsumeNumber(d.data[d.pos:])
-		if err != nil {
-			return errFastFallback
-		}
-		d.pos += n
-		return nil
-	case '[':
-		d.pos++
-		d.skipWS()
-		if d.pos < len(d.data) && d.data[d.pos] == ']' {
-			d.pos++
-			return nil
-		}
-		for {
-			if err := d.skipValue(depth + 1); err != nil {
-				return err
-			}
+	var stackBuf [64]byte
+	stack := stackBuf[:0]
+	const (
+		stExpectValue = 0
+		stAfterValue  = 1
+	)
+	state := stExpectValue
+
+	for {
+		if state == stExpectValue {
 			d.skipWS()
 			if d.pos >= len(d.data) {
 				return errFastFallback
 			}
-			if d.data[d.pos] == ',' {
+			switch d.data[d.pos] {
+			case '"':
+				if _, err := d.readString(); err != nil {
+					return err
+				}
+				state = stAfterValue
+			case 't':
+				if n := jsonwire.ConsumeTrue(d.data[d.pos:]); n > 0 {
+					d.pos += n
+					state = stAfterValue
+				} else {
+					return errFastFallback
+				}
+			case 'f':
+				if n := jsonwire.ConsumeFalse(d.data[d.pos:]); n > 0 {
+					d.pos += n
+					state = stAfterValue
+				} else {
+					return errFastFallback
+				}
+			case 'n':
+				if n := jsonwire.ConsumeNull(d.data[d.pos:]); n > 0 {
+					d.pos += n
+					state = stAfterValue
+				} else {
+					return errFastFallback
+				}
+			case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+				n, err := jsonwire.ConsumeNumber(d.data[d.pos:])
+				if err != nil {
+					return errFastFallback
+				}
+				d.pos += n
+				state = stAfterValue
+			case '[':
+				if depth+len(stack) >= 10000 {
+					return errFastFallback
+				}
 				d.pos++
+				d.skipWS()
+				if d.pos < len(d.data) && d.data[d.pos] == ']' {
+					d.pos++
+					state = stAfterValue
+					continue
+				}
+				stack = append(stack, ']')
 				continue
-			}
-			if d.data[d.pos] == ']' {
+			case '{':
+				if !d.allowDup {
+					return errFastFallback
+				}
+				if depth+len(stack) >= 10000 {
+					return errFastFallback
+				}
 				d.pos++
-				return nil
+				d.skipWS()
+				if d.pos < len(d.data) && d.data[d.pos] == '}' {
+					d.pos++
+					state = stAfterValue
+					continue
+				}
+				if _, err := d.readString(); err != nil {
+					return err
+				}
+				d.skipWS()
+				if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+					return errFastFallback
+				}
+				d.pos++
+				stack = append(stack, '}')
+				continue
+			default:
+				return errFastFallback
 			}
+		}
+
+		if len(stack) == 0 {
+			return nil
+		}
+		d.skipWS()
+		if d.pos >= len(d.data) {
 			return errFastFallback
 		}
-	case '{':
-		// If !allowDup, we must validate no duplicate names inside skipped objects too!
-		if !d.allowDup {
+		top := stack[len(stack)-1]
+		c := d.data[d.pos]
+		if c == top {
+			d.pos++
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		if c != ',' {
 			return errFastFallback
 		}
 		d.pos++
-		d.skipWS()
-		if d.pos < len(d.data) && d.data[d.pos] == '}' {
-			d.pos++
-			return nil
-		}
-		for {
+		if top == '}' {
 			d.skipWS()
 			if _, err := d.readString(); err != nil {
 				return err
@@ -2027,25 +2989,9 @@ func (d *fastDecoder) skipValue(depth int) error {
 				return errFastFallback
 			}
 			d.pos++
-			if err := d.skipValue(depth + 1); err != nil {
-				return err
-			}
-			d.skipWS()
-			if d.pos >= len(d.data) {
-				return errFastFallback
-			}
-			if d.data[d.pos] == ',' {
-				d.pos++
-				continue
-			}
-			if d.data[d.pos] == '}' {
-				d.pos++
-				return nil
-			}
-			return errFastFallback
 		}
+		state = stExpectValue
 	}
-	return errFastFallback
 }
 
 func (d *fastDecoder) unmarshal(p *fastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
@@ -2360,8 +3306,14 @@ func (d *fastDecoder) unmarshal(p *fastUnmarshalPlan, ptr unsafe.Pointer, depth 
 	case fkSliceBool:
 		return d.unmarshalSliceBool(ptr)
 
+	case fkTime:
+		return d.unmarshalTime(ptr)
+
 	case fkBytes:
 		return d.unmarshalBytes(ptr)
+
+	case fkByteArray:
+		return d.unmarshalByteArray(p, ptr)
 
 	case fkSlice:
 		return d.unmarshalSlice(p, ptr, depth+1)
@@ -2378,13 +3330,732 @@ func (d *fastDecoder) unmarshal(p *fastUnmarshalPlan, ptr unsafe.Pointer, depth 
 	case fkMapStringAny:
 		return d.unmarshalMapStringAny(ptr, depth+1)
 
+	case fkMapStringElem:
+		return d.unmarshalMapStringElem(p, ptr, depth+1)
+
+	case fkMapIntElem:
+		return d.unmarshalMapIntElem(p, ptr, depth+1)
+
+	case fkMapUintElem:
+		return d.unmarshalMapUintElem(p, ptr, depth+1)
+
 	case fkAny:
 		return d.unmarshalAny(ptr, depth+1)
+
+	case fkUnmarshaler:
+		return d.unmarshalCustomUnmarshaler(p, ptr, depth+1)
 
 	case fkStruct:
 		return d.unmarshalStruct(p, ptr, depth+1)
 	}
 	return errFastFallback
+}
+
+func (d *fastDecoder) unmarshalCustomUnmarshaler(p *fastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	start := d.pos
+	if err := d.skipValueChecked(depth); err != nil {
+		return err
+	}
+	raw := d.data[start:d.pos]
+	var u Unmarshaler
+	ip := (*[2]unsafe.Pointer)(unsafe.Pointer(&u))
+	ip[0] = p.ifaceTab
+	ip[1] = ptr
+	if err := u.UnmarshalJSON(raw); err != nil {
+		return errFastFallback
+	}
+	return nil
+}
+
+func (d *fastDecoder) skipValueChecked(depth int) error {
+	if d.allowDup {
+		return d.skipValue(depth)
+	}
+	if depth >= 64 {
+		return errFastFallback
+	}
+	d.skipWS()
+	if d.pos >= len(d.data) {
+		return errFastFallback
+	}
+	switch d.data[d.pos] {
+	case '"':
+		_, err := d.readString()
+		return err
+	case 't':
+		if n := jsonwire.ConsumeTrue(d.data[d.pos:]); n > 0 {
+			d.pos += n
+			return nil
+		}
+		return errFastFallback
+	case 'f':
+		if n := jsonwire.ConsumeFalse(d.data[d.pos:]); n > 0 {
+			d.pos += n
+			return nil
+		}
+		return errFastFallback
+	case 'n':
+		if n := jsonwire.ConsumeNull(d.data[d.pos:]); n > 0 {
+			d.pos += n
+			return nil
+		}
+		return errFastFallback
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		n, err := jsonwire.ConsumeNumber(d.data[d.pos:])
+		if err != nil {
+			return errFastFallback
+		}
+		d.pos += n
+		return nil
+	case '[':
+		d.pos++
+		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] == ']' {
+			d.pos++
+			return nil
+		}
+		for {
+			if err := d.skipValueChecked(depth + 1); err != nil {
+				return err
+			}
+			d.skipWS()
+			if d.pos >= len(d.data) {
+				return errFastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				continue
+			}
+			if d.data[d.pos] == ']' {
+				d.pos++
+				return nil
+			}
+			return errFastFallback
+		}
+	case '{':
+		if d.allowBadUTF8 {
+			return errFastFallback
+		}
+		d.pos++
+		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] == '}' {
+			d.pos++
+			return nil
+		}
+		var keys [16][]byte
+		numKeys := 0
+		for {
+			d.skipWS()
+			kb, err := d.readString()
+			if err != nil {
+				return err
+			}
+			if numKeys >= len(keys) {
+				return errFastFallback
+			}
+			for j := range numKeys {
+				if bytes.Equal(keys[j], kb) {
+					return errFastFallback
+				}
+			}
+			keys[numKeys] = kb
+			numKeys++
+			d.skipWS()
+			if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+				return errFastFallback
+			}
+			d.pos++
+			if err := d.skipValueChecked(depth + 1); err != nil {
+				return err
+			}
+			d.skipWS()
+			if d.pos >= len(d.data) {
+				return errFastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				continue
+			}
+			if d.data[d.pos] == '}' {
+				d.pos++
+				return nil
+			}
+			return errFastFallback
+		}
+	}
+	return errFastFallback
+}
+
+func (d *fastDecoder) unmarshalTime(ptr unsafe.Pointer) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			if !d.legacyMerge {
+				*(*time.Time)(ptr) = time.Time{}
+			}
+			return nil
+		}
+		return errFastFallback
+	}
+	if c != '"' {
+		return errFastFallback
+	}
+	b, err := d.readString()
+	if err != nil {
+		return err
+	}
+	var tt time.Time
+	if err := tt.UnmarshalText(b); err != nil {
+		return errFastFallback
+	}
+	if !d.flags.Get(jsonflags.ParseTimeWithLooseRFC3339) {
+		switch {
+		case b[len("2006-01-02T")+1] == ':':
+			return errFastFallback
+		case b[len("2006-01-02T15:04:05")] == ',':
+			return errFastFallback
+		case b[len(b)-1] != 'Z':
+			if parseDec2(b[len(b)-len("07:00"):]) >= 24 || parseDec2(b[len(b)-len("00"):]) >= 60 {
+				return errFastFallback
+			}
+		}
+	}
+	*(*time.Time)(ptr) = tt
+	return nil
+}
+
+func (d *fastDecoder) unmarshalByteArray(p *fastUnmarshalPlan, ptr unsafe.Pointer) error {
+	if d.flags.Get(jsonflags.FormatByteArrayAsArray) {
+		return errFastFallback
+	}
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			if !d.legacyMerge {
+				clear(unsafe.Slice((*byte)(ptr), p.arrayLen))
+			}
+			return nil
+		}
+		return errFastFallback
+	}
+	if c != '"' {
+		return errFastFallback
+	}
+	b, err := d.readString()
+	if err != nil {
+		return err
+	}
+	dst := unsafe.Slice((*byte)(ptr), p.arrayLen)
+	if len(b) == 0 {
+		if p.arrayLen != 0 && !d.flags.Get(jsonflags.UnmarshalArrayFromAnyLength) {
+			return errFastFallback
+		}
+		clear(dst)
+		return nil
+	}
+	if len(b)%4 != 0 {
+		return errFastFallback
+	}
+	maxLen := base64StdEncoding.DecodedLen(len(b))
+	var stackBuf [64]byte
+	var tmp []byte
+	if maxLen <= len(stackBuf) {
+		tmp = stackBuf[:maxLen]
+	} else {
+		tmp = make([]byte, maxLen)
+	}
+	n, decErr := base64StdEncoding.Decode(tmp, b)
+	if decErr != nil {
+		return errFastFallback
+	}
+	if len(b) != base64StdEncoding.EncodedLen(n) && !d.flags.Get(jsonflags.ParseBytesWithLooseRFC4648) {
+		return errFastFallback
+	}
+	if n != p.arrayLen && !d.flags.Get(jsonflags.UnmarshalArrayFromAnyLength) {
+		return errFastFallback
+	}
+	clear(dst[copy(dst, tmp[:n]):])
+	return nil
+}
+
+func (d *fastDecoder) unmarshalQuotedNumber(kind fastKind, fp unsafe.Pointer) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if !d.consumeNull() {
+			return errFastFallback
+		}
+		if !d.legacyMerge {
+			zeroNumericField(kind, fp)
+		}
+		return nil
+	}
+	if c != '"' {
+		return errFastFallback
+	}
+	s, err := d.readString()
+	if err != nil {
+		return err
+	}
+	if len(s) == 4 && string(s) == "null" {
+		if d.flags.Get(jsonflags.StringifyWithLegacySemantics) {
+			if !d.legacyMerge {
+				zeroNumericField(kind, fp)
+			}
+			return nil
+		}
+		return errFastFallback
+	}
+	sub := fastDecoder{data: s}
+	switch kind {
+	case fkInt:
+		v, err := sub.readInt64(strconv.IntSize)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*int)(fp) = int(v)
+	case fkInt8:
+		v, err := sub.readInt64(8)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*int8)(fp) = int8(v)
+	case fkInt16:
+		v, err := sub.readInt64(16)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*int16)(fp) = int16(v)
+	case fkInt32:
+		v, err := sub.readInt64(32)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*int32)(fp) = int32(v)
+	case fkInt64:
+		v, err := sub.readInt64(64)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*int64)(fp) = v
+	case fkUint:
+		v, err := sub.readUint64(strconv.IntSize)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*uint)(fp) = uint(v)
+	case fkUint8:
+		v, err := sub.readUint64(8)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*uint8)(fp) = uint8(v)
+	case fkUint16:
+		v, err := sub.readUint64(16)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*uint16)(fp) = uint16(v)
+	case fkUint32:
+		v, err := sub.readUint64(32)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*uint32)(fp) = uint32(v)
+	case fkUint64:
+		v, err := sub.readUint64(64)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*uint64)(fp) = v
+	case fkUintptr:
+		v, err := sub.readUint64(int(unsafe.Sizeof(uintptr(0)) * 8))
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*uintptr)(fp) = uintptr(v)
+	case fkFloat32:
+		v, err := sub.readFloat(32)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*float32)(fp) = float32(v)
+	case fkFloat64:
+		v, err := sub.readFloat(64)
+		if err != nil || sub.pos != len(s) {
+			return errFastFallback
+		}
+		*(*float64)(fp) = v
+	default:
+		return errFastFallback
+	}
+	return nil
+}
+
+func zeroNumericField(kind fastKind, fp unsafe.Pointer) {
+	switch kind {
+	case fkInt:
+		*(*int)(fp) = 0
+	case fkInt8:
+		*(*int8)(fp) = 0
+	case fkInt16:
+		*(*int16)(fp) = 0
+	case fkInt32:
+		*(*int32)(fp) = 0
+	case fkInt64:
+		*(*int64)(fp) = 0
+	case fkUint:
+		*(*uint)(fp) = 0
+	case fkUint8:
+		*(*uint8)(fp) = 0
+	case fkUint16:
+		*(*uint16)(fp) = 0
+	case fkUint32:
+		*(*uint32)(fp) = 0
+	case fkUint64:
+		*(*uint64)(fp) = 0
+	case fkUintptr:
+		*(*uintptr)(fp) = 0
+	case fkFloat32:
+		*(*float32)(fp) = 0
+	case fkFloat64:
+		*(*float64)(fp) = 0
+	}
+}
+
+func parseStrictInt64Key(kb []byte, bits int) (int64, bool) {
+	if len(kb) == 0 {
+		return 0, false
+	}
+	if kb[0] == '-' && len(kb) == 2 && kb[1] == '0' {
+		return 0, false // let standard path handle "-0" / duplicate "0" nuances
+	}
+	sub := fastDecoder{data: kb}
+	v, err := sub.readInt64(bits)
+	if err != nil || sub.pos != len(kb) {
+		return 0, false
+	}
+	return v, true
+}
+
+func parseStrictUint64Key(kb []byte, bits int) (uint64, bool) {
+	if len(kb) == 0 {
+		return 0, false
+	}
+	sub := fastDecoder{data: kb}
+	v, err := sub.readUint64(bits)
+	if err != nil || sub.pos != len(kb) {
+		return 0, false
+	}
+	return v, true
+}
+
+func (d *fastDecoder) unmarshalMapStringElem(p *fastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			*(**maps.Map)(ptr) = nil
+			return nil
+		}
+		return errFastFallback
+	}
+	if c != '{' {
+		return errFastFallback
+	}
+	d.pos++
+	d.skipWS()
+	mt := p.mapType
+	mp := (**maps.Map)(ptr)
+	m := *mp
+	if m == nil {
+		m = maps.NewMap(mt, 0, nil)
+		*mp = m
+	}
+	if d.pos < len(d.data) && d.data[d.pos] == '}' {
+		d.pos++
+		return nil
+	}
+	if m.Used() > 0 {
+		return errFastFallback
+	}
+	if d.allowBadUTF8 && !d.allowDup {
+		return errFastFallback
+	}
+	elemPlan := p.elemPlan
+	var key string
+	keyPtr := noescape(unsafe.Pointer(&key))
+	for {
+		d.skipWS()
+		kb, err := d.readString()
+		if err != nil {
+			return err
+		}
+		key = makeString(d.strCache, kb)
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+			return errFastFallback
+		}
+		d.pos++
+		existing, exists := m.Get(mt, keyPtr)
+		var elemPtr unsafe.Pointer
+		if exists {
+			if !d.allowDup {
+				return errFastFallback
+			}
+			if d.legacyMerge {
+				clearBytes(existing, p.elemSize, p.elemRT)
+			}
+			elemPtr = existing
+		} else {
+			elemPtr = m.PutSlot(mt, keyPtr)
+		}
+		if err := d.unmarshal(elemPlan, elemPtr, depth); err != nil {
+			if !exists {
+				m.Delete(mt, keyPtr)
+			}
+			runtime.KeepAlive(&key)
+			return err
+		}
+		runtime.KeepAlive(&key)
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errFastFallback
+		}
+		if d.data[d.pos] == ',' {
+			d.pos++
+			continue
+		}
+		if d.data[d.pos] == '}' {
+			d.pos++
+			return nil
+		}
+		return errFastFallback
+	}
+}
+
+func (d *fastDecoder) unmarshalMapIntElem(p *fastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			*(**maps.Map)(ptr) = nil
+			return nil
+		}
+		return errFastFallback
+	}
+	if c != '{' {
+		return errFastFallback
+	}
+	d.pos++
+	d.skipWS()
+	mt := p.mapType
+	mp := (**maps.Map)(ptr)
+	m := *mp
+	if m == nil {
+		m = maps.NewMap(mt, 0, nil)
+		*mp = m
+	}
+	if d.pos < len(d.data) && d.data[d.pos] == '}' {
+		d.pos++
+		return nil
+	}
+	if m.Used() > 0 {
+		return errFastFallback
+	}
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var k8 int8
+	var k16 int16
+	var k32 int32
+	var k64 int64
+	var keyPtr unsafe.Pointer
+	switch keyBits {
+	case 8:
+		keyPtr = noescape(unsafe.Pointer(&k8))
+	case 16:
+		keyPtr = noescape(unsafe.Pointer(&k16))
+	case 32:
+		keyPtr = noescape(unsafe.Pointer(&k32))
+	default:
+		keyPtr = noescape(unsafe.Pointer(&k64))
+	}
+	for {
+		d.skipWS()
+		kb, err := d.readString()
+		if err != nil {
+			return err
+		}
+		kv, ok := parseStrictInt64Key(kb, int(keyBits))
+		if !ok {
+			return errFastFallback
+		}
+		switch keyBits {
+		case 8:
+			k8 = int8(kv)
+		case 16:
+			k16 = int16(kv)
+		case 32:
+			k32 = int32(kv)
+		default:
+			k64 = kv
+		}
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+			return errFastFallback
+		}
+		d.pos++
+		existing, exists := m.Get(mt, keyPtr)
+		var elemPtr unsafe.Pointer
+		if exists {
+			if !d.allowDup {
+				return errFastFallback
+			}
+			if d.legacyMerge {
+				clearBytes(existing, p.elemSize, p.elemRT)
+			}
+			elemPtr = existing
+		} else {
+			elemPtr = m.PutSlot(mt, keyPtr)
+		}
+		if err := d.unmarshal(elemPlan, elemPtr, depth); err != nil {
+			if !exists {
+				m.Delete(mt, keyPtr)
+			}
+			runtime.KeepAlive(&k8)
+			runtime.KeepAlive(&k16)
+			runtime.KeepAlive(&k32)
+			runtime.KeepAlive(&k64)
+			return err
+		}
+		runtime.KeepAlive(&k8)
+		runtime.KeepAlive(&k16)
+		runtime.KeepAlive(&k32)
+		runtime.KeepAlive(&k64)
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errFastFallback
+		}
+		if d.data[d.pos] == ',' {
+			d.pos++
+			continue
+		}
+		if d.data[d.pos] == '}' {
+			d.pos++
+			return nil
+		}
+		return errFastFallback
+	}
+}
+
+func (d *fastDecoder) unmarshalMapUintElem(p *fastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			*(**maps.Map)(ptr) = nil
+			return nil
+		}
+		return errFastFallback
+	}
+	if c != '{' {
+		return errFastFallback
+	}
+	d.pos++
+	d.skipWS()
+	mt := p.mapType
+	mp := (**maps.Map)(ptr)
+	m := *mp
+	if m == nil {
+		m = maps.NewMap(mt, 0, nil)
+		*mp = m
+	}
+	if d.pos < len(d.data) && d.data[d.pos] == '}' {
+		d.pos++
+		return nil
+	}
+	if m.Used() > 0 {
+		return errFastFallback
+	}
+	elemPlan := p.elemPlan
+	keyBits := p.keyBits
+	var k8 uint8
+	var k16 uint16
+	var k32 uint32
+	var k64 uint64
+	var keyPtr unsafe.Pointer
+	switch keyBits {
+	case 8:
+		keyPtr = noescape(unsafe.Pointer(&k8))
+	case 16:
+		keyPtr = noescape(unsafe.Pointer(&k16))
+	case 32:
+		keyPtr = noescape(unsafe.Pointer(&k32))
+	default:
+		keyPtr = noescape(unsafe.Pointer(&k64))
+	}
+	for {
+		d.skipWS()
+		kb, err := d.readString()
+		if err != nil {
+			return err
+		}
+		kv, ok := parseStrictUint64Key(kb, int(keyBits))
+		if !ok {
+			return errFastFallback
+		}
+		switch keyBits {
+		case 8:
+			k8 = uint8(kv)
+		case 16:
+			k16 = uint16(kv)
+		case 32:
+			k32 = uint32(kv)
+		default:
+			k64 = kv
+		}
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+			return errFastFallback
+		}
+		d.pos++
+		existing, exists := m.Get(mt, keyPtr)
+		var elemPtr unsafe.Pointer
+		if exists {
+			if !d.allowDup {
+				return errFastFallback
+			}
+			if d.legacyMerge {
+				clearBytes(existing, p.elemSize, p.elemRT)
+			}
+			elemPtr = existing
+		} else {
+			elemPtr = m.PutSlot(mt, keyPtr)
+		}
+		if err := d.unmarshal(elemPlan, elemPtr, depth); err != nil {
+			if !exists {
+				m.Delete(mt, keyPtr)
+			}
+			runtime.KeepAlive(&k8)
+			runtime.KeepAlive(&k16)
+			runtime.KeepAlive(&k32)
+			runtime.KeepAlive(&k64)
+			return err
+		}
+		runtime.KeepAlive(&k8)
+		runtime.KeepAlive(&k16)
+		runtime.KeepAlive(&k32)
+		runtime.KeepAlive(&k64)
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errFastFallback
+		}
+		if d.data[d.pos] == ',' {
+			d.pos++
+			continue
+		}
+		if d.data[d.pos] == '}' {
+			d.pos++
+			return nil
+		}
+		return errFastFallback
+	}
 }
 
 func (d *fastDecoder) unmarshalSliceString(ptr unsafe.Pointer) error {
@@ -2944,6 +4615,9 @@ func (d *fastDecoder) unmarshalBytes(ptr unsafe.Pointer) error {
 	if decErr != nil {
 		return errFastFallback
 	}
+	if len(b) != base64StdEncoding.EncodedLen(n) && !d.flags.Get(jsonflags.ParseBytesWithLooseRFC4648) {
+		return errFastFallback
+	}
 	*bp = dst[:n]
 	return nil
 }
@@ -3185,7 +4859,7 @@ func (d *fastDecoder) readAny(depth int) (any, error) {
 		}
 		return makeString(d.strCache, b), nil
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		if d.uo.Flags.Get(jsonflags.UnmarshalAnyWithRawNumber) {
+		if d.flags.Get(jsonflags.UnmarshalAnyWithRawNumber) {
 			return nil, errFastFallback
 		}
 		v, err := d.readFloat(64)
@@ -3475,26 +5149,56 @@ func (d *fastDecoder) unmarshalStruct(p *fastUnmarshalPlan, ptr unsafe.Pointer, 
 	numUnk := 0
 
 	for {
-		d.skipWS()
-		keyBytes, err := d.readString()
-		if err != nil {
-			return err
+		data := d.data
+		pos := d.pos
+		if pos < len(data) && data[pos] <= ' ' {
+			for pos < len(data) && data[pos] <= ' ' && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r' || data[pos] == '\n') {
+				pos++
+			}
+			d.pos = pos
 		}
-		d.skipWS()
-		if d.pos >= len(d.data) || d.data[d.pos] != ':' {
-			return errFastFallback
-		}
-		d.pos++
 
 		var f *fastUnmarshalField
-		if nextIdx < len(fields) && string(keyBytes) == fields[nextIdx].name {
-			f = &fields[nextIdx]
-			nextIdx++
-		} else {
-			f = p.byActualName[string(keyBytes)]
-			if f != nil {
-				nextIdx = f.orderIdx + 1
-			} else if p.hasCaseIgnore || d.caseInsens {
+		var keyBytes []byte
+		if nextIdx < len(fields) {
+			if qf := fields[nextIdx].quotedNameColon; len(qf) > 0 && pos+len(qf) <= len(data) && string(data[pos:pos+len(qf)]) == qf {
+				d.pos = pos + len(qf)
+				f = &fields[nextIdx]
+				nextIdx++
+				goto gotField
+			}
+		}
+
+		{
+			var err error
+			keyBytes, err = d.readString()
+			if err != nil {
+				return err
+			}
+			d.skipWS()
+			if d.pos >= len(d.data) || d.data[d.pos] != ':' {
+				return errFastFallback
+			}
+			d.pos++
+
+			if nextIdx < len(fields) && string(keyBytes) == fields[nextIdx].name {
+				f = &fields[nextIdx]
+				nextIdx++
+			} else if len(fields) <= 8 {
+				for j := range fields {
+					if string(keyBytes) == fields[j].name {
+						f = &fields[j]
+						nextIdx = j + 1
+						break
+					}
+				}
+			} else {
+				f = p.byActualName[string(keyBytes)]
+				if f != nil {
+					nextIdx = f.orderIdx + 1
+				}
+			}
+			if f == nil && (p.hasCaseIgnore || d.caseInsens) {
 				cands := p.byFoldedName[string(foldName(keyBytes))]
 				numMatch := 0
 				for _, cand := range cands {
@@ -3507,12 +5211,13 @@ func (d *fastDecoder) unmarshalStruct(p *fastUnmarshalPlan, ptr unsafe.Pointer, 
 						}
 					}
 				}
-				if numMatch > 1 && !d.uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				if numMatch > 1 && !d.flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
 					return errFastFallback
 				}
 			}
 		}
 
+	gotField:
 		if f == nil {
 			if d.rejectUnk {
 				return errFastFallback
@@ -3530,7 +5235,7 @@ func (d *fastDecoder) unmarshalStruct(p *fastUnmarshalPlan, ptr unsafe.Pointer, 
 				unkKeys[numUnk] = ks
 				numUnk++
 			}
-			if err := d.skipValue(depth); err != nil {
+			if err := d.skipValueChecked(depth); err != nil {
 				return err
 			}
 		} else {
@@ -3551,143 +5256,149 @@ func (d *fastDecoder) unmarshalStruct(p *fastUnmarshalPlan, ptr unsafe.Pointer, 
 			if d.pos >= len(d.data) {
 				return errFastFallback
 			}
-			vc := d.data[d.pos]
-			switch f.kind {
-			case fkString:
-				if vc == '"' {
-					b, err := d.readString()
-					if err != nil {
-						return err
-					}
-					*(*string)(fp) = makeString(d.strCache, b)
-				} else if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*string)(fp) = ""
-					}
-				} else {
-					return errFastFallback
-				}
-			case fkInt:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*int)(fp) = 0
-					}
-				} else {
-					v, err := d.readInt64(strconv.IntSize)
-					if err != nil {
-						return err
-					}
-					*(*int)(fp) = int(v)
-				}
-			case fkInt32:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*int32)(fp) = 0
-					}
-				} else {
-					v, err := d.readInt64(32)
-					if err != nil {
-						return err
-					}
-					*(*int32)(fp) = int32(v)
-				}
-			case fkInt64:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*int64)(fp) = 0
-					}
-				} else {
-					v, err := d.readInt64(64)
-					if err != nil {
-						return err
-					}
-					*(*int64)(fp) = v
-				}
-			case fkUint:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*uint)(fp) = 0
-					}
-				} else {
-					v, err := d.readUint64(strconv.IntSize)
-					if err != nil {
-						return err
-					}
-					*(*uint)(fp) = uint(v)
-				}
-			case fkUint32:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*uint32)(fp) = 0
-					}
-				} else {
-					v, err := d.readUint64(32)
-					if err != nil {
-						return err
-					}
-					*(*uint32)(fp) = uint32(v)
-				}
-			case fkUint64:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*uint64)(fp) = 0
-					}
-				} else {
-					v, err := d.readUint64(64)
-					if err != nil {
-						return err
-					}
-					*(*uint64)(fp) = v
-				}
-			case fkFloat64:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*float64)(fp) = 0
-					}
-				} else {
-					v, err := d.readFloat(64)
-					if err != nil {
-						return err
-					}
-					*(*float64)(fp) = v
-				}
-			case fkFloat32:
-				if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*float32)(fp) = 0
-					}
-				} else {
-					v, err := d.readFloat(32)
-					if err != nil {
-						return err
-					}
-					*(*float32)(fp) = float32(v)
-				}
-			case fkBool:
-				if vc == 't' {
-					if n := jsonwire.ConsumeTrue(d.data[d.pos:]); n > 0 {
-						d.pos += n
-						*(*bool)(fp) = true
-					} else {
-						return errFastFallback
-					}
-				} else if vc == 'f' {
-					if n := jsonwire.ConsumeFalse(d.data[d.pos:]); n > 0 {
-						d.pos += n
-						*(*bool)(fp) = false
-					} else {
-						return errFastFallback
-					}
-				} else if vc == 'n' && d.consumeNull() {
-					if !d.legacyMerge {
-						*(*bool)(fp) = false
-					}
-				} else {
-					return errFastFallback
-				}
-			default:
-				if err := d.unmarshal(f.plan, fp, depth); err != nil {
+			if p.hasQuoted && f.quoted {
+				if err := d.unmarshalQuotedNumber(f.kind, fp); err != nil {
 					return err
+				}
+			} else {
+				vc := d.data[d.pos]
+				switch f.kind {
+				case fkString:
+					if vc == '"' {
+						b, err := d.readString()
+						if err != nil {
+							return err
+						}
+						*(*string)(fp) = makeString(d.strCache, b)
+					} else if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*string)(fp) = ""
+						}
+					} else {
+						return errFastFallback
+					}
+				case fkInt:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*int)(fp) = 0
+						}
+					} else {
+						v, err := d.readInt64(strconv.IntSize)
+						if err != nil {
+							return err
+						}
+						*(*int)(fp) = int(v)
+					}
+				case fkInt32:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*int32)(fp) = 0
+						}
+					} else {
+						v, err := d.readInt64(32)
+						if err != nil {
+							return err
+						}
+						*(*int32)(fp) = int32(v)
+					}
+				case fkInt64:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*int64)(fp) = 0
+						}
+					} else {
+						v, err := d.readInt64(64)
+						if err != nil {
+							return err
+						}
+						*(*int64)(fp) = v
+					}
+				case fkUint:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*uint)(fp) = 0
+						}
+					} else {
+						v, err := d.readUint64(strconv.IntSize)
+						if err != nil {
+							return err
+						}
+						*(*uint)(fp) = uint(v)
+					}
+				case fkUint32:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*uint32)(fp) = 0
+						}
+					} else {
+						v, err := d.readUint64(32)
+						if err != nil {
+							return err
+						}
+						*(*uint32)(fp) = uint32(v)
+					}
+				case fkUint64:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*uint64)(fp) = 0
+						}
+					} else {
+						v, err := d.readUint64(64)
+						if err != nil {
+							return err
+						}
+						*(*uint64)(fp) = v
+					}
+				case fkFloat64:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*float64)(fp) = 0
+						}
+					} else {
+						v, err := d.readFloat(64)
+						if err != nil {
+							return err
+						}
+						*(*float64)(fp) = v
+					}
+				case fkFloat32:
+					if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*float32)(fp) = 0
+						}
+					} else {
+						v, err := d.readFloat(32)
+						if err != nil {
+							return err
+						}
+						*(*float32)(fp) = float32(v)
+					}
+				case fkBool:
+					if vc == 't' {
+						if n := jsonwire.ConsumeTrue(d.data[d.pos:]); n > 0 {
+							d.pos += n
+							*(*bool)(fp) = true
+						} else {
+							return errFastFallback
+						}
+					} else if vc == 'f' {
+						if n := jsonwire.ConsumeFalse(d.data[d.pos:]); n > 0 {
+							d.pos += n
+							*(*bool)(fp) = false
+						} else {
+							return errFastFallback
+						}
+					} else if vc == 'n' && d.consumeNull() {
+						if !d.legacyMerge {
+							*(*bool)(fp) = false
+						}
+					} else {
+						return errFastFallback
+					}
+				default:
+					if err := d.unmarshal(f.plan, fp, depth); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -3742,7 +5453,7 @@ func tryFastUnmarshal(in []byte, at *abi.Type, ptr unsafe.Pointer, uo *jsonopts.
 	sc := fastStringCachePool.Get()
 	d := fastDecoder{
 		data:         in,
-		uo:           uo,
+		flags:        uo.Flags,
 		strCache:     sc,
 		allowDup:     uo.Flags.Get(jsonflags.AllowDuplicateNames),
 		allowBadUTF8: uo.Flags.Get(jsonflags.AllowInvalidUTF8),
@@ -3771,6 +5482,15 @@ func isFastTargetZero(p *fastUnmarshalPlan, ptr unsafe.Pointer) bool {
 	switch p.kind {
 	case fkPtr:
 		return *(*unsafe.Pointer)(ptr) == nil
+	case fkTime:
+		return (*time.Time)(ptr).IsZero()
+	case fkByteArray:
+		for _, v := range unsafe.Slice((*byte)(ptr), p.arrayLen) {
+			if v != 0 {
+				return false
+			}
+		}
+		return true
 	case fkBytes, fkSliceBool, fkSliceString, fkSliceInt, fkSliceInt64, fkSliceUint64, fkSliceFloat64, fkSliceFloat32, fkSlice:
 		return (*unsafeheader.Slice)(ptr).Data == nil
 	case fkMapStringString:
@@ -3779,9 +5499,11 @@ func isFastTargetZero(p *fastUnmarshalPlan, ptr unsafe.Pointer) bool {
 		return *(*map[string]int)(ptr) == nil
 	case fkMapStringAny:
 		return *(*map[string]any)(ptr) == nil
+	case fkMapStringElem, fkMapIntElem, fkMapUintElem:
+		return *(**maps.Map)(ptr) == nil
 	case fkAny:
 		return *(*any)(ptr) == nil
-	case fkStruct, fkArray:
+	case fkStruct, fkArray, fkUnmarshaler:
 		return reflect.NewAt(p.rt, ptr).Elem().IsZero()
 	}
 	return false
@@ -3790,7 +5512,7 @@ func isFastTargetZero(p *fastUnmarshalPlan, ptr unsafe.Pointer) bool {
 func tryFastUnmarshalScalar(in []byte, plan *fastUnmarshalPlan, ptr unsafe.Pointer, uo *jsonopts.Struct) bool {
 	d := fastDecoder{
 		data:         in,
-		uo:           uo,
+		flags:        uo.Flags,
 		allowBadUTF8: uo.Flags.Get(jsonflags.AllowInvalidUTF8),
 		legacyMerge:  uo.Flags.Get(jsonflags.MergeWithLegacySemantics),
 	}

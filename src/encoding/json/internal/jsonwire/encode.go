@@ -124,34 +124,81 @@ func AppendQuoteString(dst []byte, src string, flags *jsonflags.Flags) ([]byte, 
 }
 
 func appendQuoteBytes(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
-	var i, n int
-	var hasInvalidUTF8 bool
-	dst = slices.Grow(dst, len(`"`)+len(src)+len(`"`))
-	dst = append(dst, '"')
+	need := len(src) + 2
+	if cap(dst)-len(dst) < need {
+		dst = slices.Grow(dst, need)
+	}
 	escapeHTML := flags.Get(jsonflags.EscapeForHTML)
+	n := 0
+	if !escapeHTML {
+		for len(src)-n >= 8 {
+			if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
+				return appendQuoteBytesSlow(dst, src, n+(bits.TrailingZeros64(m)>>3), flags)
+			}
+			n += 8
+		}
+		for n < len(src) {
+			c := src[n]
+			if c >= utf8.RuneSelf || c < ' ' || c == '"' || c == '\\' {
+				return appendQuoteBytesSlow(dst, src, n, flags)
+			}
+			n++
+		}
+	} else {
+		for len(src)-n >= 8 {
+			if m := escapeMaskHTML(byteorder.LEUint64(src[n:])); m != 0 {
+				return appendQuoteBytesSlow(dst, src, n+(bits.TrailingZeros64(m)>>3), flags)
+			}
+			n += 8
+		}
+		for n < len(src) {
+			c := src[n]
+			if c >= utf8.RuneSelf || escapeASCII[c] > 0 {
+				return appendQuoteBytesSlow(dst, src, n, flags)
+			}
+			n++
+		}
+	}
+	off := len(dst)
+	dst = dst[:off+need]
+	dst[off] = '"'
+	copy(dst[off+1:], src)
+	dst[off+1+len(src)] = '"'
+	return dst, nil
+}
+
+func appendQuoteBytesSlow(dst, src []byte, n int, flags *jsonflags.Flags) ([]byte, error) {
+	var i int
+	var hasInvalidUTF8 bool
+	escapeHTML := flags.Get(jsonflags.EscapeForHTML)
+	dst = append(dst, '"')
+	first := true
 	for uint(len(src)) > uint(n) {
-		if !escapeHTML {
-			for len(src)-n >= 8 {
-				if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
-					n += bits.TrailingZeros64(m) >> 3
-					goto handleByte
+		if !first {
+			if !escapeHTML {
+				for len(src)-n >= 8 {
+					if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
+						n += bits.TrailingZeros64(m) >> 3
+						break
+					}
+					n += 8
 				}
-				n += 8
+			} else {
+				for len(src)-n >= 8 {
+					if m := escapeMaskHTML(byteorder.LEUint64(src[n:])); m != 0 {
+						n += bits.TrailingZeros64(m) >> 3
+						break
+					}
+					n += 8
+				}
 			}
-		} else {
-			for len(src)-n >= 8 {
-				if m := escapeMaskHTML(byteorder.LEUint64(src[n:])); m != 0 {
-					n += bits.TrailingZeros64(m) >> 3
-					goto handleByte
-				}
-				n += 8
+			if uint(len(src)) <= uint(n) {
+				break
 			}
 		}
-		if uint(len(src)) <= uint(n) {
-			break
-		}
-	handleByte:
-		if c := src[n]; c < utf8.RuneSelf {
+		first = false
+		c := src[n]
+		if c < utf8.RuneSelf {
 			// Handle single-byte ASCII.
 			n++
 			if escapeASCII[c] == 0 {
@@ -164,23 +211,40 @@ func appendQuoteBytes(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
 				i = n
 			}
 		} else {
-			// Handle multi-byte Unicode.
-			r, rn := utf8.DecodeRune(src[n:])
-			n += rn
-			if r != utf8.RuneError && r != '\u2028' && r != '\u2029' {
-				continue // no escaping possibly needed
-			}
-			// Handle escaping of multi-byte Unicode.
-			switch {
-			case isInvalidUTF8(r, rn):
-				hasInvalidUTF8 = true
-				dst = append(dst, src[i:n-rn]...)
-				dst = append(dst, "\ufffd"...)
-				i = n
-			case (r == '\u2028' || r == '\u2029') && flags.Get(jsonflags.EscapeForJS):
-				dst = append(dst, src[i:n-rn]...)
-				dst = appendEscapedUnicode(dst, r)
-				i = n
+			// Fast-skip runs of valid 2-byte (0xC2..0xDF) and safe 3-byte (0xE1, 0xE3..0xEC, 0xEE..0xEF) UTF-8.
+			for uint(len(src)) > uint(n) {
+				b0 := src[n]
+				if b0 < utf8.RuneSelf {
+					break
+				}
+				if b0 >= 0xE3 && b0 <= 0xEC || b0 == 0xE1 || b0 == 0xEE || b0 == 0xEF {
+					if n+2 < len(src) && src[n+1]&0xC0 == 0x80 && src[n+2]&0xC0 == 0x80 {
+						n += 3
+						continue
+					}
+				} else if b0 >= 0xC2 && b0 <= 0xDF {
+					if n+1 < len(src) && src[n+1]&0xC0 == 0x80 {
+						n += 2
+						continue
+					}
+				}
+				// Handle remaining / boundary multi-byte Unicode via utf8.DecodeRune.
+				r, rn := utf8.DecodeRune(src[n:])
+				n += rn
+				if r != utf8.RuneError && r != '\u2028' && r != '\u2029' {
+					continue
+				}
+				switch {
+				case isInvalidUTF8(r, rn):
+					hasInvalidUTF8 = true
+					dst = append(dst, src[i:n-rn]...)
+					dst = append(dst, "\ufffd"...)
+					i = n
+				case (r == '\u2028' || r == '\u2029') && flags.Get(jsonflags.EscapeForJS):
+					dst = append(dst, src[i:n-rn]...)
+					dst = appendEscapedUnicode(dst, r)
+					i = n
+				}
 			}
 		}
 	}
@@ -298,13 +362,32 @@ func AppendFloat(dst []byte, src float64, bits int) []byte {
 		src = float64(float32(src))
 	}
 
-	abs := math.Abs(src)
-	fmt := byte('f')
-	if abs != 0 {
-		if bits == 64 && (float64(abs) < 1e-6 || float64(abs) >= 1e21) ||
-			bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
-			fmt = 'e'
+	if src == 0 {
+		if math.Signbit(src) {
+			return append(dst, '-', '0')
 		}
+		return append(dst, '0')
+	}
+
+	abs := math.Abs(src)
+	if bits == 64 {
+		if abs < 1<<52 {
+			if i := int64(src); float64(i) == src {
+				return strconv.AppendInt(dst, i, 10)
+			}
+		}
+	} else {
+		if abs < 1<<23 {
+			if i := int64(src); float64(i) == src {
+				return strconv.AppendInt(dst, i, 10)
+			}
+		}
+	}
+
+	fmt := byte('f')
+	if bits == 64 && (float64(abs) < 1e-6 || float64(abs) >= 1e21) ||
+		bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
+		fmt = 'e'
 	}
 	dst = strconv.AppendFloat(dst, src, fmt, -1, bits)
 	if fmt == 'e' {

@@ -10,7 +10,7 @@ This fork is a personal Go branch maintained by 404Setup.
 > This fork does not modify language syntax or break existing standard library APIs.
 
 ### Standard Library & Runtime
-- **`encoding/json`, `encoding/json/v2`**: Compiled direct-memory marshal/unmarshal fast paths, 8-byte SWAR string/whitespace/HTML scanning, zero-allocation SWAR validation, pooled buffers, and generic `*Of` / `Append*` APIs (`MarshalOf`, `AppendMarshal`, `AppendMarshalOf`, `MarshalIndentOf`, `AppendMarshalIndent`, `AppendMarshalIndentOf`, `UnmarshalOf`, `EncodeOf`, `DecodeOf`, plus v2 `MarshalWriteOf`, `MarshalEncodeOf`, `UnmarshalReadOf`, `UnmarshalDecodeOf`) across both default `jsonv2` and `GOEXPERIMENT=nojsonv2` builds.
+- **`encoding/json`, `encoding/json/v2`**: Compiled direct-memory marshal/unmarshal fast paths (including generic maps via `internal/runtime/maps`, `,string` numeric fields, `[N]byte` base64, `time.Time`, and value-receiver `Marshaler`/`Unmarshaler`), exact IEEE-754 float parsing and integer-float formatting, 8-byte SWAR ASCII/UTF-8/whitespace/HTML scanning, zero-allocation SWAR validation, pooled buffers, and generic `*Of` / `Append*` APIs (`MarshalOf`, `AppendMarshal`, `AppendMarshalOf`, `MarshalIndentOf`, `AppendMarshalIndent`, `AppendMarshalIndentOf`, `UnmarshalOf`, `EncodeOf`, `DecodeOf`, plus v2 `MarshalWriteOf`, `MarshalEncodeOf`, `UnmarshalReadOf`, `UnmarshalDecodeOf`) across both default `jsonv2` and `GOEXPERIMENT=nojsonv2` builds.
 - **`io`**: Pooled overflow buffers and exact-sized final allocations in `ReadAll`.
 - **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with online `Shrink()`), used across standard library internals.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
@@ -403,6 +403,38 @@ xychart-beta
 | Small Struct: `Encoder.Encode` → `EncodeOf` (`json` / `nojsonv2`) | 596.4 / 579.9 ns/op | **484.9 / 447.2 ns/op** | **-18.7% / -22.9%** | 1 (96 B) → **0 (0 B)** |
 
 > *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz) comparing pre-patch `HEAD` (`3d9b976b`) against patched `encoding/json` and `encoding/json/v2`.*
+
+#### Generic Maps, UTF-8, Float, `[N]byte`, `time.Time`, and Custom Marshaler/Unmarshaler Fast Paths
+
+```mermaid
+xychart-beta
+    title "encoding/json & encoding/json/v2 (Wave 2): Baseline (left bar) vs Patched (right bar) — Latency (ms/op, lower is better)"
+    x-axis ["SyntheaFhir Marshal", "SyntheaFhir Unmarshal", "CitmCatalog Unmarshal", "TwitterStatus Unmarshal", "CodeUnmarshal (v1)", "CodeUnmarshal (nojsonv2)"]
+    y-axis "Latency (ms/op)" 0 --> 18
+    bar [16.07, 12.74, 8.01, 3.91, 5.67, 5.47]
+    bar [7.43, 8.64, 3.97, 1.81, 4.75, 4.41]
+```
+
+| Benchmark | Baseline (`e35a63be`) | Patched | Latency Delta | Notes / Allocs |
+| :--- | ---: | ---: | ---: | :---: |
+| `Map/ManySmall` (`v2`, Marshal / Unmarshal) | 14.59 / 24.30 µs/op | **3.60 / 12.12 µs/op** | **-75.3% / -50.1%** | 55→**1** / 114→**60** allocs |
+| `FastV1GenericMap` (`json`, Marshal / Unmarshal) | 47.77 / 70.18 µs/op | **17.19 / 27.88 µs/op** | **-64.0% / -60.3%** | 71→**1** / 78→**76** allocs |
+| `FastV1GenericMap` (`nojsonv2`, Marshal / Unmarshal) | 35.40 / 93.81 µs/op | **17.31 / 27.13 µs/op** | **-51.1% / -71.1%** | 186→**1** / 146→**76** allocs |
+| `StringUnicode/Concrete` (`v2`, Marshal / Unmarshal) | 100.1 / 106.2 µs/op | **40.80 / 42.16 µs/op** | **-59.2% / -60.3%** | 2.45× / 2.52× |
+| `CitmCatalog/Concrete` (`v2`, Marshal / Unmarshal) | 2.23 / 8.01 ms/op | **0.90 / 3.97 ms/op** | **-59.6% / -50.5%** | Marshal: 17→**1** alloc |
+| `TwitterStatus/Concrete` (`v2`, Marshal / Unmarshal) | 1.77 / 3.91 ms/op | **0.75 / 1.81 ms/op** | **-57.3% / -53.6%** | Marshal: 21→**1** alloc |
+| `SyntheaFhir/Concrete` (`v2`, Marshal / Unmarshal) | 16.07 / 12.74 ms/op | **7.43 / 8.64 ms/op** | **-53.8% / -32.2%** | 2.16× / 1.47× |
+| `Bytes/Array` (`v2`, Marshal / Unmarshal) | 281.9 / 373.0 ns/op | **127.3 / 239.5 ns/op** | **-54.8% / -35.8%** | 2.21× / 1.56× |
+| `UnmarshalFloat64` (`json` / `nojsonv2`) | 50.41 / 45.44 ns/op | **26.86 / 22.43 ns/op** | **-46.7% / -50.6%** | 0→0 / 0→0 allocs |
+| `Unmarshal/Float` (`v2`) | 146.2 ns/op | **79.15 ns/op** | **-45.9%** (1.85×) | exact IEEE-754 fast path |
+| `JSONArshalV1` (`v2`, Marshal / Unmarshal) | 269.9 / 258.8 ns/op | **167.1 / 148.3 ns/op** | **-38.1% / -42.7%** | 1.62× / 1.75× |
+| `CanadaGeometry/Unmarshal/Concrete` (`v2`) | 2.50 ms/op | **1.68 ms/op** | **-33.0%** (1.49×) | exact IEEE-754 float path |
+| `GolangSource/Marshal/Interface` (`v2`) | 12.49 ms/op | **8.49 ms/op** | **-32.0%** (1.47×) | 2→**1** alloc |
+| `GolangSource/Concrete` (`v2`, Marshal / Unmarshal) | 4.82 / 9.65 ms/op | **4.50 / 8.01 ms/op** | **-6.5% / -17.1%** | 1.07× / 1.21× |
+| `CodeUnmarshal` (`json` / `nojsonv2`) | 5.67 / 5.47 ms/op | **4.75 / 4.41 ms/op** | **-16.3% / -19.4%** | 1.20× / 1.24× |
+| `CodeEncoder` (`json` / `nojsonv2`) | 2.30 / 2.17 ms/op | **2.07 / 2.04 ms/op** | **-10.0% / -5.8%** | 0→0 / 0→0 allocs |
+
+> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`e35a63be`) against the patched build.*
 
 ---
 

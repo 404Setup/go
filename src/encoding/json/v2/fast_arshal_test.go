@@ -1,0 +1,688 @@
+// Copyright 2026 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+//go:build goexperiment.jsonv2
+
+package json
+
+import (
+	"bytes"
+	"errors"
+	"math"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"encoding/json/internal/jsonflags"
+	"encoding/json/internal/jsonopts"
+	"encoding/json/internal/jsonwire"
+	"encoding/json/jsontext"
+)
+
+func flagOpt(flags ...jsonflags.Bools) *jsonopts.Struct {
+	var o jsonopts.Struct
+	for _, f := range flags {
+		o.Flags.Set(f | 1)
+	}
+	return &o
+}
+
+func TestFastBase64StrictRFC4648(t *testing.T) {
+	badInputs := []string{
+		`"QQ==\r\n\r\n"`,
+		`"\r\n\r\n"`,
+		`"QQ\r\n=="`,
+		`"QQ\n=="`,
+		`"QQ"`,
+		`"QQ="`,
+	}
+	for _, in := range badInputs {
+		var dstSlice []byte
+		if err := Unmarshal([]byte(in), &dstSlice); err == nil {
+			t.Errorf("Unmarshal(%s, &[]byte) succeeded (%x), want RFC 4648 error", in, dstSlice)
+		}
+		var dstArr [1]byte
+		if err := Unmarshal([]byte(in), &dstArr); err == nil {
+			t.Errorf("Unmarshal(%s, &[1]byte) succeeded (%x), want RFC 4648 error", in, dstArr)
+		}
+	}
+
+	// Verify loose RFC 4648 option still accepts CRLF in base64.
+	looseOpt := flagOpt(jsonflags.ParseBytesWithLooseRFC4648)
+	var dstSlice []byte
+	if err := Unmarshal([]byte(`"QQ==\r\n\r\n"`), &dstSlice, looseOpt); err != nil {
+		t.Fatalf("loose Unmarshal([]byte) failed: %v", err)
+	}
+	if string(dstSlice) != "A" {
+		t.Fatalf("loose Unmarshal([]byte) = %q, want %q", dstSlice, "A")
+	}
+	var dstArr [1]byte
+	if err := Unmarshal([]byte(`"QQ==\r\n\r\n"`), &dstArr, looseOpt); err != nil {
+		t.Fatalf("loose Unmarshal([1]byte) failed: %v", err)
+	}
+	if dstArr[0] != 'A' {
+		t.Fatalf("loose Unmarshal([1]byte) = %q, want 'A'", dstArr[0])
+	}
+}
+
+func TestFastDeepNestingIterativeSkip(t *testing.T) {
+	// Test both below and above the 10000 fast-path depth limit.
+	for _, depth := range []int{100, 2000, 10050} {
+		nested := strings.Repeat("[", depth) + "1" + strings.Repeat("]", depth)
+		in := []byte(`{"unknown":` + nested + `,"keep":42}`)
+		type S struct {
+			Keep int `json:"keep"`
+		}
+		var got S
+		err := Unmarshal(in, &got)
+		if depth <= 10000 {
+			if err != nil {
+				t.Errorf("depth=%d: Unmarshal unexpected error: %v", depth, err)
+			}
+			if got.Keep != 42 {
+				t.Errorf("depth=%d: got.Keep = %d, want 42", depth, got.Keep)
+			}
+		} else if err == nil {
+			t.Errorf("depth=%d: expected max depth error, got nil", depth)
+		}
+	}
+}
+
+func TestFastMarshalEncodeMultiValue(t *testing.T) {
+	type item struct {
+		X int `json:"x"`
+	}
+	var buf bytes.Buffer
+	enc := jsontext.NewEncoder(&buf)
+	if err := MarshalEncode(enc, item{X: 1}); err != nil {
+		t.Fatalf("MarshalEncode #1: %v", err)
+	}
+	if err := MarshalEncode(enc, item{X: 2}); err != nil {
+		t.Fatalf("MarshalEncode #2: %v", err)
+	}
+	if got, want := buf.String(), "{\"x\":1}\n{\"x\":2}\n"; got != want {
+		t.Fatalf("MarshalEncode multi-value = %q, want %q", got, want)
+	}
+
+	buf.Reset()
+	enc = jsontext.NewEncoder(&buf)
+	if err := MarshalEncodeOf(enc, item{X: 10}); err != nil {
+		t.Fatalf("MarshalEncodeOf #1: %v", err)
+	}
+	if err := MarshalEncodeOf(enc, item{X: 20}); err != nil {
+		t.Fatalf("MarshalEncodeOf #2: %v", err)
+	}
+	if got, want := buf.String(), "{\"x\":10}\n{\"x\":20}\n"; got != want {
+		t.Fatalf("MarshalEncodeOf multi-value = %q, want %q", got, want)
+	}
+}
+
+func TestFastNonZeroTargetPreservedOnSyntaxError(t *testing.T) {
+	type inner struct {
+		A int `json:"a"`
+	}
+	type target struct {
+		M map[int64]inner `json:"m"`
+		T time.Time       `json:"t"`
+		B [4]byte         `json:"b"`
+		N int64           `json:"n,string"`
+	}
+	origTime := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	dst := target{
+		M: map[int64]inner{7: {A: 99}},
+		T: origTime,
+		B: [4]byte{1, 2, 3, 4},
+		N: 12345,
+	}
+	legacyErrOpt := flagOpt(jsonflags.ReportErrorsWithLegacySemantics)
+	err := Unmarshal([]byte(`{"m":{"7":{"a":1}},"t":"2026-01-01T00:00:00Z","b":"AAAA","n":"9",`), &dst, legacyErrOpt)
+	if err == nil {
+		t.Fatal("expected syntax error, got nil")
+	}
+	if dst.M[7].A != 99 || !dst.T.Equal(origTime) || dst.B != [4]byte{1, 2, 3, 4} || dst.N != 12345 {
+		t.Fatalf("target mutated on syntax error with ReportErrorsWithLegacySemantics: %+v", dst)
+	}
+}
+
+func TestFastReadFloatExact(t *testing.T) {
+	cases := []string{
+		"0", "-0", "0.0", "-0.0", "0e0", "-0e-5",
+		"1", "-1", "42", "-42", "0.5", "-0.5", "0.1", "0.2", "0.3",
+		"3.141592653589793", "-123.456789012345",
+		// float64 exact boundaries (2^53 - 1, 2^53, 2^53 + 1, pow10 ±22/±23)
+		"9007199254740991", "9007199254740992", "9007199254740993",
+		"9007199254740999", "-9007199254740991", "-9007199254740993",
+		"1e22", "1e23", "1e-22", "1e-23", "900719925474099e22", "900719925474099e-22",
+		"123456789012345e22", "123456789012345e23", "123456789012345e-22", "123456789012345e-23",
+		// float32 exact boundaries (2^24 - 1, 2^24, pow10 ±10/±11)
+		"16777215", "16777216", "16777217", "1e10", "1e11", "1e-10", "1e-11",
+		"16777215e10", "16777215e-10", "16777215e11", "16777215e-11",
+		// Subnormals and extremes
+		"5e-324", "2.2250738585072014e-308", "1.7976931348623157e+308",
+		"1.401298464324817e-45", "3.4028234663852886e+38",
+		"0.00000000000000000000001", "99999999999999999999999999",
+	}
+	for _, s := range cases {
+		for _, bits := range []int{64, 32} {
+			want, wantErr := strconv.ParseFloat(s, bits)
+			d := fastDecoder{data: []byte(s)}
+			got, err := d.readFloat(bits)
+			if wantErr != nil {
+				if err == nil {
+					t.Errorf("readFloat(%q, %d) = %v, want error", s, bits, got)
+				}
+				continue
+			}
+			if err != nil {
+				t.Errorf("readFloat(%q, %d) unexpected error: %v", s, bits, err)
+				continue
+			}
+			if d.pos != len(s) {
+				t.Errorf("readFloat(%q, %d) pos = %d, want %d", s, bits, d.pos, len(s))
+			}
+			if bits == 64 {
+				if math.Float64bits(got) != math.Float64bits(want) {
+					t.Errorf("readFloat(%q, 64) = %g (0x%x), want %g (0x%x)",
+						s, got, math.Float64bits(got), want, math.Float64bits(want))
+				}
+			} else {
+				if math.Float32bits(float32(got)) != math.Float32bits(float32(want)) {
+					t.Errorf("readFloat(%q, 32) = %g (0x%x), want %g (0x%x)",
+						s, float32(got), math.Float32bits(float32(got)), float32(want), math.Float32bits(float32(want)))
+				}
+			}
+		}
+	}
+
+	bad := []string{"", "-", "+", "+1", "01", "-01", ".5", "1.", "1e", "1e+", "1e-", "1e309", "NaN", "Inf"}
+	for _, s := range bad {
+		d := fastDecoder{data: []byte(s)}
+		if v, err := d.readFloat(64); err == nil && d.pos == len(s) {
+			t.Errorf("readFloat(%q, 64) = %v, want error", s, v)
+		}
+	}
+}
+
+func TestFastAppendFloatExact(t *testing.T) {
+	f64s := []float64{
+		0, math.Copysign(0, -1), 1, -1, 42, -42,
+		float64(1<<52 - 1), -float64(1<<52 - 1),
+		float64(1 << 52), -float64(1 << 52),
+		float64(1<<53 - 1), float64(1 << 53),
+		1e20, -1e20, 1e21, -1e21, 0.5, -0.125, math.MaxFloat64, math.SmallestNonzeroFloat64,
+	}
+	for _, v := range f64s {
+		got := string(jsonwire.AppendFloat(nil, v, 64))
+		// Compare against strconv using jsonwire's exact non-integer formatting or roundtrip.
+		var parsed float64
+		if err := Unmarshal([]byte(got), &parsed); err != nil {
+			t.Fatalf("AppendFloat(%g, 64) produced invalid JSON %q: %v", v, got, err)
+		}
+		if math.Float64bits(parsed) != math.Float64bits(v) {
+			t.Errorf("AppendFloat(%g, 64) = %q -> %g (0x%x != 0x%x)", v, got, parsed, math.Float64bits(parsed), math.Float64bits(v))
+		}
+		// Ensure -0.0 produces "-0".
+		if v == 0 && math.Signbit(v) && got != "-0" {
+			t.Errorf("AppendFloat(-0.0, 64) = %q, want %q", got, "-0")
+		}
+	}
+	f32s := []float32{
+		0, float32(math.Copysign(0, -1)), 1, -1,
+		float32(1<<23 - 1), -float32(1<<23 - 1),
+		float32(1 << 23), -float32(1 << 23),
+		1e7, -1e7, 0.25, math.MaxFloat32, math.SmallestNonzeroFloat32,
+	}
+	for _, v := range f32s {
+		got := string(jsonwire.AppendFloat(nil, float64(v), 32))
+		var parsed float32
+		if err := Unmarshal([]byte(got), &parsed); err != nil {
+			t.Fatalf("AppendFloat(%g, 32) produced invalid JSON %q: %v", v, got, err)
+		}
+		if math.Float32bits(parsed) != math.Float32bits(v) {
+			t.Errorf("AppendFloat(%g, 32) = %q -> %g", v, got, parsed)
+		}
+	}
+}
+
+func FuzzFastReadFloat(f *testing.F) {
+	for _, seed := range []string{"0", "-0", "1.23456789", "9007199254740991", "9007199254740993", "1e22", "1e-22", "1e23", "16777215e10"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		n, err := jsonwire.ConsumeNumber([]byte(s))
+		if err != nil || n != len(s) {
+			return
+		}
+		for _, bits := range []int{64, 32} {
+			want, wantErr := strconv.ParseFloat(s, bits)
+			d := fastDecoder{data: []byte(s)}
+			got, gotErr := d.readFloat(bits)
+			if wantErr != nil {
+				if gotErr == nil {
+					t.Fatalf("readFloat(%q, %d) succeeded (%v), strconv failed (%v)", s, bits, got, wantErr)
+				}
+				continue
+			}
+			if gotErr != nil || d.pos != len(s) {
+				t.Fatalf("readFloat(%q, %d) failed (%v, pos=%d), strconv=%v", s, bits, gotErr, d.pos, want)
+			}
+			if bits == 64 && math.Float64bits(got) != math.Float64bits(want) {
+				t.Fatalf("readFloat(%q, 64) = 0x%x, want 0x%x", s, math.Float64bits(got), math.Float64bits(want))
+			}
+			if bits == 32 && math.Float32bits(float32(got)) != math.Float32bits(float32(want)) {
+				t.Fatalf("readFloat(%q, 32) = 0x%x, want 0x%x", s, math.Float32bits(float32(got)), math.Float32bits(float32(want)))
+			}
+		}
+	})
+}
+
+func TestFastQuoteUnquoteUTF8(t *testing.T) {
+	stringsToTest := []string{
+		"",
+		"plain ascii string without escapes 0123456789",
+		"with \"quotes\" and \\backslashes\\ and \n\t\r",
+		"<html>&amp;</html>",
+		"2-byte UTF-8: café résumé naïve Привет мир Ελληνικά العربية",
+		"3-byte safe UTF-8: 你好世界 日本語 한국어 हिन्दी ไทย",
+		"3-byte boundary: \u0800 \u0fff \u2027 \u2028 \u2029 \u202a \ud7ff \ue000 \uffff",
+		"4-byte emoji: 😀🚀🎉𝄞𠀀",
+	}
+	for _, s := range stringsToTest {
+		for _, opt := range []Options{DefaultOptionsV2(), jsontext.EscapeForHTML(true), jsontext.EscapeForJS(true)} {
+			out, err := Marshal(s, opt)
+			if err != nil {
+				t.Fatalf("Marshal(%q) error: %v", s, err)
+			}
+			var got string
+			if err := Unmarshal(out, &got); err != nil {
+				t.Fatalf("Unmarshal(%s) error: %v", out, err)
+			}
+			if got != s {
+				t.Errorf("roundtrip(%q) = %q (encoded=%s)", s, got, out)
+			}
+		}
+	}
+
+	// Invalid UTF-8 must be rejected by default and mangled with AllowInvalidUTF8.
+	badUTF8 := "abc\xff\xfe\xc0\xaf\xed\xa0\x80def"
+	if _, err := Marshal(badUTF8); err == nil {
+		t.Error("Marshal(invalid UTF-8) succeeded, want error")
+	}
+	out, err := Marshal(badUTF8, jsontext.AllowInvalidUTF8(true))
+	if err != nil {
+		t.Fatalf("Marshal(invalid UTF-8, AllowInvalidUTF8) error: %v", err)
+	}
+	if !strings.Contains(string(out), "\ufffd") {
+		t.Errorf("AllowInvalidUTF8 output missing replacement char: %s", out)
+	}
+}
+
+func TestFastGenericMaps(t *testing.T) {
+	type smallVal struct {
+		A int    `json:"a"`
+		B string `json:"b"`
+	}
+	// >128 bytes forces IndirectElem in internal/runtime/maps.
+	type bigVal struct {
+		ID   int64   `json:"id"`
+		Data [20]int `json:"data"`
+	}
+	type myKey string
+	type container struct {
+		StrStruct map[string]smallVal          `json:"str_struct"`
+		Nested    map[string]map[string]string `json:"nested"`
+		NamedKey  map[myKey]int                `json:"named_key"`
+		Int64Map  map[int64]smallVal           `json:"int64_map"`
+		Uint64Map map[uint64][]uint64          `json:"uint64_map"`
+		Int8Map   map[int8]string              `json:"int8_map"`
+		Uint16Map map[uint16]bool              `json:"uint16_map"`
+		BigMap    map[int64]bigVal             `json:"big_map"`
+		EmptyOmit map[int64]int                `json:"empty_omit,omitempty"`
+		ZeroOmit  map[string]smallVal          `json:"zero_omit,omitzero"`
+		NilMap    map[uint64]string            `json:"nil_map"`
+	}
+
+	in := container{
+		StrStruct: map[string]smallVal{"b": {A: 2, B: "two"}, "a": {A: 1, B: "one"}},
+		Nested:    map[string]map[string]string{"x": {"k2": "v2", "k1": "v1"}},
+		NamedKey:  map[myKey]int{"k": 7},
+		Int64Map:  map[int64]smallVal{2: {A: 2}, 10: {A: 10}, -1: {A: -1}, -10: {A: -10}},
+		Uint64Map: map[uint64][]uint64{2: {1, 2}, 10: {3}},
+		Int8Map:   map[int8]string{-128: "min", 127: "max"},
+		Uint16Map: map[uint16]bool{65535: true, 2: false},
+		BigMap:    map[int64]bigVal{100: {ID: 100, Data: [20]int{1, 2, 3, 19: 99}}},
+		EmptyOmit: map[int64]int{},
+		ZeroOmit:  nil,
+		NilMap:    nil,
+	}
+
+	out, err := Marshal(in, Deterministic(true))
+	if err != nil {
+		t.Fatalf("Marshal(container) error: %v", err)
+	}
+	// Verify lexicographical ordering of integer keys: "-1" < "-10" < "10" < "2".
+	s := string(out)
+	wantOrder := `"int64_map":{"-1":{"a":-1,"b":""},"-10":{"a":-10,"b":""},"10":{"a":10,"b":""},"2":{"a":2,"b":""}}`
+	if !strings.Contains(s, wantOrder) {
+		t.Fatalf("int64_map deterministic ordering mismatch:\ngot:  %s\nwant substring: %s", s, wantOrder)
+	}
+	wantUintOrder := `"uint64_map":{"10":[3],"2":[1,2]}`
+	if !strings.Contains(s, wantUintOrder) {
+		t.Fatalf("uint64_map deterministic ordering mismatch:\ngot:  %s\nwant substring: %s", s, wantUintOrder)
+	}
+	if strings.Contains(s, `"empty_omit"`) || strings.Contains(s, `"zero_omit"`) {
+		t.Fatalf("omitempty/omitzero failed to omit empty/nil maps: %s", s)
+	}
+
+	var got container
+	if err := Unmarshal(out, &got); err != nil {
+		t.Fatalf("Unmarshal(container) error: %v", err)
+	}
+	got.EmptyOmit = map[int64]int{}
+	got.NilMap = nil
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("roundtrip mismatch:\ngot:  %+v\nwant: %+v", got, in)
+	}
+
+	// Duplicate keys rejected by default (including "0" and "-0").
+	var mInt map[int64]int
+	if err := Unmarshal([]byte(`{"1":1,"1":2}`), &mInt); err == nil {
+		t.Error("expected duplicate key error for {\"1\":1,\"1\":2}")
+	}
+	mInt = nil
+	if err := Unmarshal([]byte(`{"0":1,"-0":2}`), &mInt); err == nil {
+		t.Error("expected duplicate key error for {\"0\":1,\"-0\":2}")
+	}
+
+	// Duplicate keys merge in v2 vs overwrite in legacyMerge.
+	var mMerge map[string]smallVal
+	if err := Unmarshal([]byte(`{"k":{"a":1,"b":"hi"},"k":{"a":2}}`), &mMerge, jsontext.AllowDuplicateNames(true)); err != nil {
+		t.Fatalf("AllowDuplicateNames v2 merge error: %v", err)
+	}
+	if mMerge["k"] != (smallVal{A: 2, B: "hi"}) {
+		t.Fatalf("v2 duplicate merge = %+v, want {A:2 B:hi}", mMerge["k"])
+	}
+	var mLegacy map[string]smallVal
+	legacyMergeOpt := flagOpt(jsonflags.AllowDuplicateNames, jsonflags.MergeWithLegacySemantics)
+	if err := Unmarshal([]byte(`{"k":{"a":1,"b":"hi"},"k":{"a":2}}`), &mLegacy, legacyMergeOpt); err != nil {
+		t.Fatalf("AllowDuplicateNames legacy merge error: %v", err)
+	}
+	if mLegacy["k"] != (smallVal{A: 2, B: ""}) {
+		t.Fatalf("legacy duplicate overwrite = %+v, want {A:2 B:\"\"}", mLegacy["k"])
+	}
+
+	// map[time.Duration]int must NOT take the integer-key fast path.
+	durMap := map[time.Duration]int{time.Second: 1}
+	if _, err := Marshal(durMap); err == nil {
+		t.Error("Marshal(map[time.Duration]int) unexpectedly succeeded without FormatDurationAsNano")
+	}
+}
+
+func TestFastQuotedNumericFields(t *testing.T) {
+	type S struct {
+		I   int     `json:"i,string"`
+		I8  int8    `json:"i8,string"`
+		I16 int16   `json:"i16,string"`
+		I32 int32   `json:"i32,string"`
+		I64 int64   `json:"i64,string"`
+		U   uint    `json:"u,string"`
+		U8  uint8   `json:"u8,string"`
+		U16 uint16  `json:"u16,string"`
+		U32 uint32  `json:"u32,string"`
+		U64 uint64  `json:"u64,string"`
+		F32 float32 `json:"f32,string"`
+		F64 float64 `json:"f64,string"`
+	}
+	in := S{
+		I: -1, I8: -128, I16: -32768, I32: -2147483648, I64: -9223372036854775808,
+		U: 1, U8: 255, U16: 65535, U32: 4294967295, U64: 18446744073709551615,
+		F32: 1.5, F64: -2.25,
+	}
+	out, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal quoted struct: %v", err)
+	}
+	var got S
+	if err := Unmarshal(out, &got); err != nil {
+		t.Fatalf("Unmarshal quoted struct: %v", err)
+	}
+	if got != in {
+		t.Fatalf("quoted roundtrip = %+v, want %+v", got, in)
+	}
+
+	// Unquoted null resets field in v2.
+	got.I64 = 99
+	if err := Unmarshal([]byte(`{"i64":null}`), &got); err != nil {
+		t.Fatalf("Unmarshal unquoted null into ,string: %v", err)
+	}
+	if got.I64 != 0 {
+		t.Fatalf("got.I64 = %d, want 0", got.I64)
+	}
+
+	// Quoted "null" is rejected in v2, accepted in legacy stringify.
+	if err := Unmarshal([]byte(`{"i64":"null"}`), &got); err == nil {
+		t.Error("expected v2 error for quoted \"null\" on ,string field")
+	}
+	legacyStrOpt := flagOpt(jsonflags.StringifyWithLegacySemantics)
+	got.I64 = 77
+	if err := Unmarshal([]byte(`{"i64":"null"}`), &got, legacyStrOpt); err != nil {
+		t.Fatalf("legacy quoted \"null\" failed: %v", err)
+	}
+	if got.I64 != 0 {
+		t.Fatalf("legacy quoted \"null\": got.I64 = %d, want 0", got.I64)
+	}
+
+	// Overflow and unquoted number must fail.
+	if err := Unmarshal([]byte(`{"i8":"128"}`), &got); err == nil {
+		t.Error("expected overflow error for i8=\"128\"")
+	}
+	if err := Unmarshal([]byte(`{"i64":123}`), &got); err == nil {
+		t.Error("expected error for unquoted number on ,string field")
+	}
+}
+
+func TestFastTimeUnmarshal(t *testing.T) {
+	type S struct {
+		T time.Time `json:"t"`
+	}
+	good := []string{
+		"2026-11-22T03:04:05Z",
+		"2026-11-22T03:04:05.123456789Z",
+		"2026-11-22T03:04:05+05:30",
+		"2026-11-22T03:04:05.5-08:00",
+	}
+	for _, ts := range good {
+		var got S
+		if err := Unmarshal([]byte(`{"t":"`+ts+`"}`), &got); err != nil {
+			t.Errorf("Unmarshal(%q) failed: %v", ts, err)
+			continue
+		}
+		want, _ := time.Parse(time.RFC3339Nano, ts)
+		if !got.T.Equal(want) {
+			t.Errorf("Unmarshal(%q) = %v, want %v", ts, got.T, want)
+		}
+	}
+
+	// Strict RFC 3339 rejects comma subsecond, single-digit hour, and out-of-range offsets.
+	strictBad := []string{
+		"2026-11-22T03:04:05,123Z",
+		"2026-11-22T3:04:05Z",
+		"2026-11-22T03:04:05+24:00",
+		"2026-11-22T03:04:05+00:60",
+		"not-a-time",
+	}
+	for _, ts := range strictBad {
+		var got S
+		if err := Unmarshal([]byte(`{"t":"`+ts+`"}`), &got); err == nil {
+			t.Errorf("strict Unmarshal(%q) succeeded (%v), want error", ts, got.T)
+		}
+	}
+
+	// null clears time.Time in v2.
+	got := S{T: time.Now()}
+	if err := Unmarshal([]byte(`{"t":null}`), &got); err != nil {
+		t.Fatalf("Unmarshal null time: %v", err)
+	}
+	if !got.T.IsZero() {
+		t.Fatalf("got.T = %v, want zero", got.T)
+	}
+}
+
+func TestFastByteArray(t *testing.T) {
+	// Test 0-length, 32-byte (stack buffer), and 100-byte (heap buffer).
+	var a0 [0]byte
+	b0, err := Marshal(a0)
+	if err != nil || string(b0) != `""` {
+		t.Fatalf("Marshal([0]byte) = %q, %v", b0, err)
+	}
+	if err := Unmarshal(b0, &a0); err != nil {
+		t.Fatalf("Unmarshal([0]byte): %v", err)
+	}
+
+	var a32 [32]byte
+	for i := range a32 {
+		a32[i] = byte(i * 7)
+	}
+	b32, err := Marshal(a32)
+	if err != nil {
+		t.Fatalf("Marshal([32]byte): %v", err)
+	}
+	var got32 [32]byte
+	if err := Unmarshal(b32, &got32); err != nil {
+		t.Fatalf("Unmarshal([32]byte): %v", err)
+	}
+	if got32 != a32 {
+		t.Fatalf("[32]byte mismatch")
+	}
+
+	var a100 [100]byte
+	for i := range a100 {
+		a100[i] = byte(i)
+	}
+	b100, err := Marshal(a100)
+	if err != nil {
+		t.Fatalf("Marshal([100]byte): %v", err)
+	}
+	var got100 [100]byte
+	if err := Unmarshal(b100, &got100); err != nil {
+		t.Fatalf("Unmarshal([100]byte): %v", err)
+	}
+	if got100 != a100 {
+		t.Fatalf("[100]byte mismatch")
+	}
+
+	// Length mismatch must fail by default.
+	if err := Unmarshal([]byte(`"QQ=="`), &got32); err == nil {
+		t.Error("expected error for decoded length 1 into [32]byte")
+	}
+
+	// FormatByteArrayAsArray produces JSON array of ints.
+	arrOpt := flagOpt(jsonflags.FormatByteArrayAsArray)
+	bArr, err := Marshal([3]byte{1, 2, 3}, arrOpt)
+	if err != nil || string(bArr) != `[1,2,3]` {
+		t.Fatalf("FormatByteArrayAsArray Marshal = %q, %v", bArr, err)
+	}
+	var got3 [3]byte
+	if err := Unmarshal(bArr, &got3, arrOpt); err != nil || got3 != [3]byte{1, 2, 3} {
+		t.Fatalf("FormatByteArrayAsArray Unmarshal = %v, %v", got3, err)
+	}
+}
+
+type badRawMarshaler []byte
+
+func (b badRawMarshaler) MarshalJSON() ([]byte, error) {
+	if string(b) == "ERR" {
+		return nil, errors.New("boom")
+	}
+	return b, nil
+}
+
+func TestFastCustomMarshalerUnmarshaler(t *testing.T) {
+	type doc struct {
+		Raw jsontext.Value `json:"raw"`
+		Opt jsontext.Value `json:"opt,omitempty"`
+		N   int            `json:"n"`
+	}
+	in := doc{
+		Raw: jsontext.Value(` { "a" : 1 , "b" : [ true , false , null , "hi" ] } `),
+		Opt: jsontext.Value(`null`),
+		N:   5,
+	}
+	out, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal(doc): %v", err)
+	}
+	want := `{"raw":{"a":1,"b":[true,false,null,"hi"]},"n":5}`
+	if string(out) != want {
+		t.Fatalf("Marshal(doc) = %s, want %s", out, want)
+	}
+
+	var got doc
+	if err := Unmarshal(out, &got); err != nil {
+		t.Fatalf("Unmarshal(doc): %v", err)
+	}
+	if string(got.Raw) != `{"a":1,"b":[true,false,null,"hi"]}` || got.N != 5 {
+		t.Fatalf("Unmarshal(doc) = %+v", got)
+	}
+
+	// Duplicate keys inside Raw value must be rejected on both Marshal and Unmarshal!
+	type badDoc struct {
+		B badRawMarshaler `json:"b"`
+	}
+	for _, bad := range []string{`{invalid`, `123 456`, `{"a":1,"a":2}`, "ERR", `"\xff"`} {
+		if _, err := Marshal(badDoc{B: badRawMarshaler(bad)}); err == nil {
+			t.Errorf("Marshal(badRawMarshaler(%q)) succeeded, want error", bad)
+		}
+	}
+	if err := Unmarshal([]byte(`{"raw":{"a":1,"a":2},"n":1}`), &got); err == nil {
+		t.Error("Unmarshal with duplicate key inside jsontext.Value succeeded, want error")
+	}
+
+	// UnmarshalRead fast path on *bytes.Buffer.
+	buf := bytes.NewBuffer(out)
+	var gotBuf doc
+	if err := UnmarshalRead(buf, &gotBuf); err != nil {
+		t.Fatalf("UnmarshalRead(*bytes.Buffer): %v", err)
+	}
+	if buf.Len() != 0 || gotBuf.N != 5 {
+		t.Fatalf("UnmarshalRead(*bytes.Buffer): remaining=%d got=%+v", buf.Len(), gotBuf)
+	}
+}
+
+func BenchmarkFastGenericMap(b *testing.B) {
+	type entry struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+		Flag bool   `json:"flag"`
+	}
+	m := make(map[int64]entry, 64)
+	for i := range int64(64) {
+		m[i*13+1] = entry{ID: i, Name: "item_" + strconv.FormatInt(i, 10), Flag: i%2 == 0}
+	}
+	data, err := Marshal(m, Deterministic(true))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run("Marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(data)))
+		for b.Loop() {
+			if _, err := Marshal(m, Deterministic(true)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("Unmarshal", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(data)))
+		for b.Loop() {
+			var dst map[int64]entry
+			if err := Unmarshal(data, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
