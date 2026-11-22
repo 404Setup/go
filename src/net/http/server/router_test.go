@@ -278,3 +278,109 @@ func TestRouterRegistrationPanics(t *testing.T) {
 		})
 	}
 }
+
+func TestRouterOverflowBacktrackingAndCompressionEdgeCases(t *testing.T) {
+	s := server.New()
+
+	// Exercise backtracking after capturing >8 params (maxInlineParams=8):
+	// First branch captures 9 params + requires static "deadend",
+	// fails on "live", then backtracks to wildcard capturing 7 params + rest.
+	s.GET("/p/{a1}/{a2}/{a3}/{a4}/{a5}/{a6}/{a7}/{a8}/{a9}/deadend", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "deadend")
+	})
+	s.GET("/p/{b1}/{b2}/{b3}/{b4}/{b5}/{b6}/{b7}/{rest...}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s|%s",
+			c.Param("b1"), c.Param("b2"), c.Param("b3"), c.Param("b4"),
+			c.Param("b5"), c.Param("b6"), c.Param("b7"), c.Param("rest")))
+	})
+
+	// Register dynamic route BEFORE static route on the same method to verify
+	// compressed dynTree is preserved across static additions.
+	s.GET("/api/v1/v2/items/{id}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "item:"+c.Param("id"))
+	})
+	s.GET("/api/v1/v2/health", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "ok")
+	})
+
+	// Percent-encoded slash in static segment must NOT match unescaped multi-segment path.
+	s.GET("/a%2Fb/{id}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "enc:"+c.Param("id"))
+	})
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/p/1/2/3/4/5/6/7/8/9/live", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "1,2,3,4,5,6,7|8/9/live" {
+		t.Fatalf("overflow backtrack: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/v2/items/99", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "item:99" {
+		t.Fatalf("compressed chain after static add: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/a/b/123", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unescaped /a/b/123 matched /a%%2Fb/{id}: status=%d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/a%2Fb/123", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "enc:123" {
+		t.Fatalf("escaped /a%%2Fb/123: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// RedirectTrailingSlash preserves percent-encoded slashes (%2F).
+	cfg := server.DefaultConfig()
+	cfg.RedirectTrailingSlash = true
+	s2 := server.NewWithConfig(cfg)
+	s2.GET("/items/{id}/", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Param("id"))
+	})
+	rec = httptest.NewRecorder()
+	s2.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/items/a%2Fb", nil))
+	if rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/items/a%2Fb/" {
+		t.Fatalf("escaped trailing slash redirect: status=%d loc=%q", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+func TestRouterMatchMethods(t *testing.T) {
+	s := server.New()
+	s.Match([]string{http.MethodGet, http.MethodPost}, "/multi", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Method())
+	})
+	g := s.Group("/g")
+	g.Match([]string{http.MethodPut, http.MethodPatch}, "/edit", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "g:"+c.Method())
+	})
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		status int
+		body   string
+	}{
+		{http.MethodGet, "/multi", http.StatusOK, http.MethodGet},
+		{http.MethodPost, "/multi", http.StatusOK, http.MethodPost},
+		{http.MethodDelete, "/multi", http.StatusMethodNotAllowed, "method not allowed"},
+		{http.MethodPut, "/g/edit", http.StatusOK, "g:PUT"},
+		{http.MethodPatch, "/g/edit", http.StatusOK, "g:PATCH"},
+		{http.MethodGet, "/g/edit", http.StatusMethodNotAllowed, "method not allowed"},
+	} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		if rec.Code != tc.status || rec.Body.String() != tc.body {
+			t.Errorf("%s %s: status=%d body=%q, want %d %q", tc.method, tc.path, rec.Code, rec.Body.String(), tc.status, tc.body)
+		}
+	}
+
+	// Empty methods slice must panic.
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for empty Match methods")
+		}
+	}()
+	s.Match(nil, "/empty", func(c *server.Context) error { return nil })
+}

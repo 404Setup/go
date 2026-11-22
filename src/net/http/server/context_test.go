@@ -317,3 +317,127 @@ func TestContextBodyBytesAndParseForm(t *testing.T) {
 		t.Fatal("errors.Is failed on WrapError")
 	}
 }
+
+func TestContextDeleteQueryHelpersAndMultipart(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.MaxBodyBytes = 1024
+	s := server.NewWithConfig(cfg)
+
+	s.GET("/delete-and-query", func(c *server.Context) error {
+		// Exercise Delete on both inline (<=4) and overflow map (>4) storage.
+		for i := range 6 {
+			c.Set(fmt.Sprintf("k%d", i), i)
+		}
+		c.Delete("k1") // inline
+		c.Delete("k5") // overflow map
+		c.Delete("missing")
+		if _, ok := c.Get("k1"); ok {
+			return server.NewError(http.StatusInternalServerError, "k1 not deleted")
+		}
+		if _, ok := c.Get("k5"); ok {
+			return server.NewError(http.StatusInternalServerError, "k5 not deleted")
+		}
+		// Remaining inline keys must still be intact.
+		if v, ok := server.GetValue[int](c, "k0"); !ok || v != 0 {
+			return server.NewError(http.StatusInternalServerError, "k0 corrupted")
+		}
+		if v, ok := server.GetValue[int](c, "k3"); !ok || v != 3 {
+			return server.NewError(http.StatusInternalServerError, "k3 corrupted")
+		}
+		// Re-inserting deleted key works.
+		c.Set("k1", 42)
+		if v, ok := server.GetValue[int](c, "k1"); !ok || v != 42 {
+			return server.NewError(http.StatusInternalServerError, "k1 reinsert failed")
+		}
+
+		cursor, err := c.QueryInt64("cursor", 99)
+		if err != nil {
+			return server.NewError(http.StatusBadRequest, "bad cursor")
+		}
+		verbose, err := c.QueryBool("verbose", false)
+		if err != nil {
+			return server.NewError(http.StatusBadRequest, "bad verbose")
+		}
+		msg := c.Query("msg")
+		semi := c.Query("bad")
+		dup := c.Query("dup")
+		return c.JSON(http.StatusOK, map[string]any{
+			"cursor":  cursor,
+			"verbose": verbose,
+			"msg":     msg,
+			"semi":    semi,
+			"dup":     dup,
+			"empty":   c.QueryDefault("flag", "fallback"),
+		})
+	})
+
+	s.POST("/upload", func(c *server.Context) error {
+		form, err := c.ParseMultipartForm(512)
+		if err != nil {
+			return err
+		}
+		f, hdr, err := c.FormFile("doc")
+		if err != nil {
+			return server.NewError(http.StatusBadRequest, "missing file")
+		}
+		defer f.Close()
+		var content bytes.Buffer
+		_, _ = content.ReadFrom(f)
+		return c.Text(http.StatusOK, fmt.Sprintf("%s:%s:%s", form.Value["title"][0], hdr.Filename, content.String()))
+	})
+
+	// Query fast path with percent encoding, +, duplicate keys, semicolon skipped, and defaults.
+	req := httptest.NewRequest(http.MethodGet, "/delete-and-query?cursor=9000000001&verbose=true&msg=hello+world%21&bad=1;2&dup=first&dup=second&flag", nil)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["cursor"] != float64(9000000001) || got["verbose"] != true ||
+		got["msg"] != "hello world!" || got["semi"] != "" || got["dup"] != "first" || got["empty"] != "fallback" {
+		t.Fatalf("unexpected query result: %#v", got)
+	}
+
+	// Invalid QueryBool returns error.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/delete-and-query?verbose=maybe", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid QueryBool status = %d, want 400", rec.Code)
+	}
+
+	// Valid multipart upload.
+	boundary := "testboundary123"
+	mpBody := "--" + boundary + "\r\n" +
+		"Content-Disposition: form-data; name=\"title\"\r\n\r\n" +
+		"report\r\n" +
+		"--" + boundary + "\r\n" +
+		"Content-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n" +
+		"Content-Type: text/plain\r\n\r\n" +
+		"file-content\r\n" +
+		"--" + boundary + "--\r\n"
+	req = httptest.NewRequest(http.MethodPost, "/upload", strings.NewReader(mpBody))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "report:a.txt:file-content" {
+		t.Fatalf("upload ok: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Oversized multipart upload exceeds MaxBodyBytes -> 413.
+	bigMP := "--" + boundary + "\r\n" +
+		"Content-Disposition: form-data; name=\"doc\"; filename=\"big.txt\"\r\n\r\n" +
+		strings.Repeat("x", 2048) + "\r\n" +
+		"--" + boundary + "--\r\n"
+	req = httptest.NewRequest(http.MethodPost, "/upload", strings.NewReader(bigMP))
+	req.ContentLength = -1 // chunked
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized multipart status = %d, want 413", rec.Code)
+	}
+}

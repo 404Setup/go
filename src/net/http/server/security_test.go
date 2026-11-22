@@ -390,3 +390,122 @@ func TestSecurityConcurrentRegistrationAndServe(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// TestSecurityClientIPHardening verifies IPv4-mapped IPv6 TrustedProxies
+// prefixes, IPv6 zone ID rejection in forwarding headers, and that all-trusted
+// X-Forwarded-For chains do not fall through to X-Real-IP.
+func TestSecurityClientIPHardening(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.TrustedProxies = []netip.Prefix{
+		netip.MustParsePrefix("::ffff:10.0.0.0/104"),
+		netip.MustParsePrefix("127.0.0.1/32"),
+	}
+	s := server.NewWithConfig(cfg)
+	s.GET("/ip", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.ClientIP())
+	})
+
+	tests := []struct {
+		name   string
+		remote string
+		xff    string
+		xri    string
+		want   string
+	}{
+		{
+			name:   "ipv4_mapped_ipv6_prefix_matches_ipv4_peer",
+			remote: "10.1.2.3:443",
+			xff:    "198.51.100.10, 10.9.9.9",
+			want:   "198.51.100.10",
+		},
+		{
+			name:   "all_trusted_xff_ignores_spoofed_x_real_ip",
+			remote: "10.0.0.1:443",
+			xff:    "10.0.0.2, 10.0.0.3",
+			xri:    "1.2.3.4",
+			want:   "10.0.0.2",
+		},
+		{
+			name:   "xff_ipv6_zone_rejected",
+			remote: "10.0.0.1:443",
+			xff:    "fe80::1%eth0",
+			want:   "10.0.0.1",
+		},
+		{
+			name:   "x_real_ip_ipv6_zone_rejected",
+			remote: "127.0.0.1:443",
+			xri:    "fe80::1%lo",
+			want:   "127.0.0.1",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+			req.RemoteAddr = tc.remote
+			if tc.xff != "" {
+				req.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if tc.xri != "" {
+				req.Header.Set("X-Real-IP", tc.xri)
+			}
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+			if rec.Body.String() != tc.want {
+				t.Fatalf("ClientIP() = %q, want %q", rec.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
+// TestSecurityMountRawPathAttachmentAndQueryControlChars verifies Mount keeps
+// RawPath synchronized on percent-encoded prefixes, SetAttachment strips
+// Windows backslashes on all platforms, and safeRedirect rejects control chars
+// in RawQuery.
+func TestSecurityMountRawPathAttachmentAndQueryControlChars(t *testing.T) {
+	s := server.New()
+	s.Mount("/legacy", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "path=%s escaped=%s", r.URL.Path, r.URL.EscapedPath())
+	}))
+	s.GET("/win-dl", func(c *server.Context) error {
+		c.SetAttachment(`..\..\Windows\System32\report.pdf`)
+		return c.NoContent()
+	})
+	s.GET("/many-vals", func(c *server.Context) error {
+		for i := range 64 {
+			c.Set(fmt.Sprintf("k%d", i), i)
+		}
+		return c.NoContent()
+	})
+
+	// Percent-encoded mount prefix must not leak unstripped RawPath.
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/leg%61cy/sub/page", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "path=/sub/page escaped=/sub/page" {
+		t.Fatalf("escaped Mount: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Windows-style traversal in SetAttachment is stripped on Linux too.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/win-dl", nil))
+	cd := rec.Header().Get("Content-Disposition")
+	if strings.Contains(cd, "..") || strings.Contains(cd, "System32") || !strings.Contains(cd, "report.pdf") {
+		t.Fatalf("SetAttachment did not strip Windows path: %q", cd)
+	}
+
+	// Control characters in RawQuery during path-cleaning redirect must be rejected.
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.URL.Path = "/a//b"
+	req.URL.RawQuery = "x=1\r\nSet-Cookie: evil=1"
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || rec.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("CRLF RawQuery redirect not rejected: status=%d headers=%v", rec.Code, rec.Header())
+	}
+
+	// Large valuesMap (>32 keys) must not leak into subsequent pooled requests.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/many-vals", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("many-vals status = %d", rec.Code)
+	}
+}

@@ -6,12 +6,22 @@ package server_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -311,5 +321,92 @@ func TestServerHTTPMethodsCoverage(t *testing.T) {
 		} else if rec.Body.String() != strings.ToLower(m) {
 			t.Errorf("%s /m: body = %q", m, rec.Body.String())
 		}
+	}
+}
+
+func TestServerServeTLSContextGracefulShutdown(t *testing.T) {
+	// Generate an ephemeral self-signed localhost cert/key pair in TempDir.
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "cert.pem")
+	keyFile := filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := server.DefaultConfig()
+	cfg.ShutdownTimeout = 2 * time.Second
+	s := server.NewWithConfig(cfg)
+	s.GET("/tls", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "secure")
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ServeTLSContext(ctx, ln, certFile, keyFile)
+	}()
+
+	pool := x509.NewCertPool()
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	pool.AddCert(cert)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	resp, err := client.Get("https://" + ln.Addr().String() + "/tls")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /tls: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "secure" {
+		cancel()
+		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeTLSContext error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for ServeTLSContext shutdown")
 	}
 }

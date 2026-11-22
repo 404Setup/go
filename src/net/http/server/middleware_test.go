@@ -336,3 +336,49 @@ func (w *headerPrefixWriter) Write(p []byte) (int, error) {
 	}
 	return w.ResponseWriter.Write(p)
 }
+
+func TestMiddlewareLoggerWithConfigSkipAndErrorPropagation(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	var outerSawErr error
+	s := server.New()
+	s.Use(func(c *server.Context) error {
+		err := c.Next()
+		outerSawErr = err
+		return err
+	})
+	s.Use(server.LoggerWithConfig(server.LoggerConfig{
+		Logger: logger,
+		Skip: func(c *server.Context) bool {
+			return c.Path() == "/healthz"
+		},
+	}))
+
+	s.GET("/healthz", func(c *server.Context) error {
+		return c.NoContent()
+	})
+	s.GET("/fail", func(c *server.Context) error {
+		return server.NewError(http.StatusBadRequest, "bad request")
+	})
+
+	// Skipped route emits no log.
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusNoContent || buf.Len() != 0 {
+		t.Fatalf("healthz: code=%d log=%q", rec.Code, buf.String())
+	}
+
+	// Error is logged once, handled once, and propagated to outer middleware.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fail", nil))
+	if rec.Code != http.StatusBadRequest || rec.Body.String() != "bad request" {
+		t.Fatalf("fail: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if outerSawErr == nil {
+		t.Fatal("outer middleware did not observe error returned through Logger")
+	}
+	if buf.Len() == 0 {
+		t.Fatal("expected log entry for /fail")
+	}
+}

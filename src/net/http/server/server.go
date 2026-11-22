@@ -128,7 +128,7 @@ type Server struct {
 	methodNotAllow HandlerFunc
 	snap           atomic.Pointer[routerSnapshot]
 	httpSrv        *http.Server
-	staticRoots    []*staticRootCloser
+	staticRoots    []staticRootCloser
 }
 
 type staticRootCloser interface {
@@ -168,9 +168,21 @@ func NewWithConfig(cfg Config) *Server {
 
 	var proxies []netip.Prefix
 	if len(cfg.TrustedProxies) > 0 {
-		proxies = make([]netip.Prefix, len(cfg.TrustedProxies))
-		for i, p := range cfg.TrustedProxies {
-			proxies[i] = netip.PrefixFrom(p.Addr().Unmap(), p.Bits())
+		proxies = make([]netip.Prefix, 0, len(cfg.TrustedProxies))
+		for _, p := range cfg.TrustedProxies {
+			if !p.IsValid() {
+				continue
+			}
+			addr := p.Addr()
+			bits := p.Bits()
+			if addr.Is4In6() {
+				if bits < 96 {
+					continue
+				}
+				addr = addr.Unmap()
+				bits -= 96
+			}
+			proxies = append(proxies, netip.PrefixFrom(addr, bits))
 		}
 	}
 
@@ -249,7 +261,7 @@ func (s *Server) MethodNotAllowed(h HandlerFunc) {
 }
 
 func (s *Server) rebuildFallbackChainsLocked() {
-	next := s.snap.Load().clone()
+	next := s.snap.Load().cloneShallow()
 	next.notFoundChain = buildChain(s.root.middlewares, []HandlerFunc{s.notFound})
 	next.methodNotAllowed = buildChain(s.root.middlewares, []HandlerFunc{s.methodNotAllow})
 	s.snap.Store(next)
@@ -272,6 +284,11 @@ func (s *Server) Group(prefix string, middlewares ...HandlerFunc) *Group {
 // method-specific routes.
 func (s *Server) Handle(method, pattern string, handlers ...HandlerFunc) {
 	s.root.Handle(method, pattern, handlers...)
+}
+
+// Match registers handlers for each HTTP method in methods matching pattern.
+func (s *Server) Match(methods []string, pattern string, handlers ...HandlerFunc) {
+	s.root.Match(methods, pattern, handlers...)
 }
 
 // GET registers handlers for HTTP GET requests matching pattern.
@@ -423,8 +440,9 @@ func (g *Group) Handle(method, pattern string, handlers ...HandlerFunc) {
 		chain:      chain,
 	}
 
-	next := g.server.snap.Load().clone()
-	mr := next.getOrCreateMethodRouter(method)
+	cur := g.server.snap.Load()
+	next := cur.cloneShallow()
+	mr := next.cloneOrCreateMethodRouter(method, parsed.isStatic)
 	if err := mr.add(parsed, entry); err != nil {
 		panic("server: " + err.Error())
 	}
@@ -432,11 +450,25 @@ func (g *Group) Handle(method, pattern string, handlers ...HandlerFunc) {
 	if displayMethod == "" {
 		displayMethod = "*"
 	}
-	next.routes = append(next.routes, RouteInfo{
+	routes := make([]RouteInfo, len(cur.routes)+1)
+	copy(routes, cur.routes)
+	routes[len(cur.routes)] = RouteInfo{
 		Method:  displayMethod,
 		Pattern: fullPattern,
-	})
+	}
+	next.routes = routes
 	g.server.snap.Store(next)
+}
+
+// Match registers handlers on the group for each HTTP method in methods
+// matching pattern. It panics if methods is empty.
+func (g *Group) Match(methods []string, pattern string, handlers ...HandlerFunc) {
+	if len(methods) == 0 {
+		panic("server: Match requires at least one HTTP method")
+	}
+	for _, m := range methods {
+		g.Handle(m, pattern, handlers...)
+	}
 }
 
 // GET registers handlers for HTTP GET requests matching pattern.
@@ -486,9 +518,7 @@ var anyMethods = []string{
 
 // Any registers handlers for GET, HEAD, POST, PUT, PATCH, DELETE, and OPTIONS.
 func (g *Group) Any(pattern string, handlers ...HandlerFunc) {
-	for _, m := range anyMethods {
-		g.Handle(m, pattern, handlers...)
-	}
+	g.Match(anyMethods, pattern, handlers...)
 }
 
 // HandleHTTP registers a standard [http.Handler] for method and pattern.
@@ -499,12 +529,12 @@ func (g *Group) HandleHTTP(method, pattern string, h http.Handler) {
 	g.Handle(method, pattern, func(c *Context) error {
 		for i, name := range c.paramNames {
 			var val string
-			if len(c.paramExtra) > 0 {
-				if i < len(c.paramExtra) {
-					val = c.paramExtra[i]
+			if i < c.nParams {
+				if i < maxInlineParams {
+					val = c.paramBuf[i]
+				} else {
+					val = c.paramExtra[i-maxInlineParams]
 				}
-			} else if i < c.nParams {
-				val = c.paramBuf[i]
 			}
 			c.req.SetPathValue(name, val)
 		}
@@ -537,11 +567,18 @@ func (g *Group) Mount(prefix string, h http.Handler) {
 			}
 			u2.Path = p
 			if u2.RawPath != "" {
-				rp := strings.TrimPrefix(u2.RawPath, cleanPref)
-				if rp == "" {
-					rp = "/"
+				if strings.HasPrefix(u2.RawPath, cleanPref) &&
+					(len(u2.RawPath) == len(cleanPref) || u2.RawPath[len(cleanPref)] == '/') {
+					rp := u2.RawPath[len(cleanPref):]
+					if rp == "" {
+						rp = "/"
+					}
+					u2.RawPath = rp
+				} else {
+					// Escaped prefix cannot be stripped verbatim; clear RawPath
+					// so URL.EscapedPath() stays synchronized with Path.
+					u2.RawPath = ""
 				}
-				u2.RawPath = rp
 			}
 		}
 		r2.URL = u2
@@ -643,11 +680,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		extra: &c.paramExtra,
 	}
 
+	mIdx := methodIndex(r.Method)
 	var entry *routeEntry
 	if !escaped {
-		entry = snap.matchAfterStatic(r.Method, matchPath, &pc)
+		entry = snap.matchAfterStaticIdx(mIdx, r.Method, matchPath, &pc)
 	} else {
-		entry = snap.match(r.Method, matchPath, true, &pc)
+		entry = snap.matchIdx(mIdx, r.Method, matchPath, true, &pc)
 	}
 	if entry != nil {
 		c.nParams = pc.n
@@ -675,15 +713,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			alt = matchPath + "/"
 		}
-		if snap.match(r.Method, alt, escaped, nil) != nil {
+		if snap.matchIdx(mIdx, r.Method, alt, escaped, nil) != nil {
 			releaseContext(c)
-			target := reqPath
-			if target[len(target)-1] == '/' {
-				target = target[:len(target)-1]
-			} else {
-				target = target + "/"
-			}
-			s.safeRedirect(w, r, target)
+			// Preserve percent-encoding when RawPath was set so encoded
+			// slashes (%2F) are not flattened by the redirect.
+			s.safeRedirect(w, r, alt)
 			return
 		}
 	}
@@ -709,6 +743,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	releaseContext(c)
 }
 
+func hasASCIIControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) safeRedirect(w http.ResponseWriter, r *http.Request, targetPath string) {
 	// Ensure redirect target is strictly a relative path with a single leading
 	// slash and no backslash or control character (prevents open redirects like
@@ -721,11 +764,9 @@ func (s *Server) safeRedirect(w http.ResponseWriter, r *http.Request, targetPath
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	for i := 0; i < len(targetPath); i++ {
-		if targetPath[i] < 0x20 || targetPath[i] == 0x7f {
-			http.Error(w, "invalid path", http.StatusBadRequest)
-			return
-		}
+	if hasASCIIControl(targetPath) || hasASCIIControl(r.URL.RawQuery) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
 	}
 	target := targetPath
 	if r.URL.RawQuery != "" {
@@ -857,13 +898,40 @@ func (s *Server) ListenAndServeContext(ctx context.Context, addr string) error {
 	return s.ServeContext(ctx, ln)
 }
 
+// ListenAndServeTLSContext listens on addr and serves HTTPS requests until ctx
+// is canceled, then performs a graceful shutdown bounded by Config.ShutdownTimeout.
+// Returns nil when shutdown completes cleanly after ctx cancellation.
+func (s *Server) ListenAndServeTLSContext(ctx context.Context, addr, certFile, keyFile string) error {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.ServeTLSContext(ctx, ln, certFile, keyFile)
+}
+
 // ServeContext serves requests on ln until ctx is canceled, then performs a
 // graceful shutdown bounded by Config.ShutdownTimeout. Returns nil when
 // shutdown completes cleanly after ctx cancellation.
 func (s *Server) ServeContext(ctx context.Context, ln net.Listener) error {
+	return s.serveWithContext(ctx, func() error {
+		return s.Serve(ln)
+	})
+}
+
+// ServeTLSContext serves HTTPS requests on ln until ctx is canceled, then
+// performs a graceful shutdown bounded by Config.ShutdownTimeout. Returns nil
+// when shutdown completes cleanly after ctx cancellation.
+func (s *Server) ServeTLSContext(ctx context.Context, ln net.Listener, certFile, keyFile string) error {
+	return s.serveWithContext(ctx, func() error {
+		return s.ServeTLS(ln, certFile, keyFile)
+	})
+}
+
+func (s *Server) serveWithContext(ctx context.Context, serveFn func() error) error {
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- s.Serve(ln)
+		errCh <- serveFn()
 	}()
 
 	select {
@@ -903,7 +971,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 	for _, rc := range roots {
-		if err := (*rc).Close(); err != nil {
+		if err := rc.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -926,7 +994,7 @@ func (s *Server) Close() error {
 		}
 	}
 	for _, rc := range roots {
-		if err := (*rc).Close(); err != nil {
+		if err := rc.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

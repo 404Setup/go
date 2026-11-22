@@ -73,6 +73,17 @@ func RecoverWithConfig(cfg RecoverConfig) HandlerFunc {
 	}
 }
 
+// LoggerConfig configures [LoggerWithConfig].
+type LoggerConfig struct {
+	// Logger is the structured logger used to emit request logs.
+	// Default is [slog.Default].
+	Logger *slog.Logger
+
+	// Skip optionally skips logging for matching requests (for example,
+	// health-check endpoints).
+	Skip func(*Context) bool
+}
+
 // Logger returns structured request logging middleware backed by [log/slog].
 // If logger is nil, [slog.Default] is used.
 //
@@ -80,10 +91,20 @@ func RecoverWithConfig(cfg RecoverConfig) HandlerFunc {
 // been written, Logger invokes [Context.HandleError] before logging so the
 // recorded status code and byte count match what was sent to the client.
 func Logger(logger *slog.Logger) HandlerFunc {
+	return LoggerWithConfig(LoggerConfig{Logger: logger})
+}
+
+// LoggerWithConfig returns structured request logging middleware configured
+// with cfg.
+func LoggerWithConfig(cfg LoggerConfig) HandlerFunc {
+	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return func(c *Context) error {
+		if cfg.Skip != nil && cfg.Skip(c) {
+			return c.Next()
+		}
 		start := time.Now()
 		err := c.Next()
 		if err != nil && !c.errHandled {
@@ -93,14 +114,16 @@ func Logger(logger *slog.Logger) HandlerFunc {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		attrs := []slog.Attr{
+		var attrBuf [9]slog.Attr
+		attrs := attrBuf[:0]
+		attrs = append(attrs,
 			slog.String("method", c.Method()),
 			slog.String("path", c.Path()),
 			slog.Int("status", status),
 			slog.Int64("bytes", c.BytesWritten()),
 			slog.Duration("duration", time.Since(start)),
 			slog.String("client_ip", c.ClientIP()),
-		}
+		)
 		if pat := c.RoutePattern(); pat != "" {
 			attrs = append(attrs, slog.String("route", pat))
 		}
@@ -117,7 +140,7 @@ func Logger(logger *slog.Logger) HandlerFunc {
 			level = slog.LevelWarn
 		}
 		logger.LogAttrs(c.Context(), level, "http request", attrs...)
-		return nil
+		return err
 	}
 }
 
@@ -202,7 +225,7 @@ func BodyLimit(maxBytes int64) HandlerFunc {
 			return WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
 		}
 		if c.req.Body != nil {
-			c.req.Body = http.MaxBytesReader(c.writer, c.req.Body, maxBytes)
+			c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, maxBytes)
 		}
 		return c.Next()
 	}
@@ -265,7 +288,7 @@ func SecurityHeadersWithConfig(cfg SecurityHeadersConfig) HandlerFunc {
 		cfg.ReferrerPolicy = "strict-origin-when-cross-origin"
 	}
 	return func(c *Context) error {
-		h := c.writer.Header()
+		h := c.respHeader()
 		h.Set("X-Content-Type-Options", cfg.ContentTypeOptions)
 		h.Set("X-Frame-Options", cfg.FrameOptions)
 		h.Set("Referrer-Policy", cfg.ReferrerPolicy)
@@ -316,6 +339,9 @@ type CORSConfig struct {
 
 // CORS returns Cross-Origin Resource Sharing middleware.
 //
+// Install CORS via [Server.Use] so preflight OPTIONS requests are handled even
+// when no explicit OPTIONS route is registered.
+//
 // It panics if AllowCredentials is true and AllowOrigins contains "*",
 // preventing a common CORS security misconfiguration.
 func CORS(cfg CORSConfig) HandlerFunc {
@@ -363,11 +389,11 @@ func CORS(cfg CORSConfig) HandlerFunc {
 	}
 
 	return func(c *Context) error {
-		h := c.writer.Header()
+		h := c.respHeader()
 		h.Add("Vary", "Origin")
 
 		origin := c.Header("Origin")
-		if origin == "" || strings.ContainsAny(origin, "\r\n") {
+		if origin == "" || hasASCIIControl(origin) {
 			return c.Next()
 		}
 
@@ -480,7 +506,7 @@ func Adapt(mw func(http.Handler) http.Handler) HandlerFunc {
 			}()
 			nextErr = c.Next()
 		})
-		mw(next).ServeHTTP(c.writer, c.req)
+		mw(next).ServeHTTP(c.ResponseWriter(), c.req)
 		if !called {
 			return nil
 		}

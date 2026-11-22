@@ -4,6 +4,8 @@ pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80
 pkg net/http/server, func BasicAuth(string, func(string, string) bool) HandlerFunc #80000
 pkg net/http/server, func BodyLimit(int64) HandlerFunc #80000
 pkg net/http/server, func CORS(CORSConfig) HandlerFunc #80000
+pkg net/http/server, func Compress() HandlerFunc #80000
+pkg net/http/server, func CompressWithConfig(CompressConfig) HandlerFunc #80000
 pkg net/http/server, func ConstantTimeEqual(string, string) bool #80000
 pkg net/http/server, func CrossOriginProtection(*http.CrossOriginProtection) HandlerFunc #80000
 pkg net/http/server, func DefaultConfig() Config #80000
@@ -11,6 +13,7 @@ pkg net/http/server, func DefaultErrorHandler(*Context, error) #80000
 pkg net/http/server, func GetValue[$0 interface{}](*Context, string) ($0, bool) #80000
 pkg net/http/server, func JSONErrorHandler(*Context, error) #80000
 pkg net/http/server, func Logger(*slog.Logger) HandlerFunc #80000
+pkg net/http/server, func LoggerWithConfig(LoggerConfig) HandlerFunc #80000
 pkg net/http/server, func New() *Server #80000
 pkg net/http/server, func NewError(int, string) *HTTPError #80000
 pkg net/http/server, func NewWithConfig(Config) *Server #80000
@@ -31,9 +34,11 @@ pkg net/http/server, method (*Context) BytesWritten() int64 #80000
 pkg net/http/server, method (*Context) ClientIP() string #80000
 pkg net/http/server, method (*Context) Context() context.Context #80000
 pkg net/http/server, method (*Context) Cookie(string) (*http.Cookie, error) #80000
+pkg net/http/server, method (*Context) Delete(string) #80000
 pkg net/http/server, method (*Context) File(string) error #80000
 pkg net/http/server, method (*Context) FileFS(fs.FS, string) error #80000
 pkg net/http/server, method (*Context) Flush() error #80000
+pkg net/http/server, method (*Context) FormFile(string) (multipart.File, *multipart.FileHeader, error) #80000
 pkg net/http/server, method (*Context) Get(string) (interface{}, bool) #80000
 pkg net/http/server, method (*Context) HTML(int, string) error #80000
 pkg net/http/server, method (*Context) HandleError(error) #80000
@@ -47,10 +52,13 @@ pkg net/http/server, method (*Context) Param(string) string #80000
 pkg net/http/server, method (*Context) ParamInt(string) (int, error) #80000
 pkg net/http/server, method (*Context) ParamInt64(string) (int64, error) #80000
 pkg net/http/server, method (*Context) ParseForm() (url.Values, error) #80000
+pkg net/http/server, method (*Context) ParseMultipartForm(int64) (*multipart.Form, error) #80000
 pkg net/http/server, method (*Context) Path() string #80000
 pkg net/http/server, method (*Context) Query(string) string #80000
+pkg net/http/server, method (*Context) QueryBool(string, bool) (bool, error) #80000
 pkg net/http/server, method (*Context) QueryDefault(string, string) string #80000
 pkg net/http/server, method (*Context) QueryInt(string, int) (int, error) #80000
+pkg net/http/server, method (*Context) QueryInt64(string, int64) (int64, error) #80000
 pkg net/http/server, method (*Context) QueryValues() url.Values #80000
 pkg net/http/server, method (*Context) Redirect(int, string) error #80000
 pkg net/http/server, method (*Context) Request() *http.Request #80000
@@ -74,6 +82,7 @@ pkg net/http/server, method (*Group) Group(string, ...HandlerFunc) *Group #80000
 pkg net/http/server, method (*Group) HEAD(string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Group) Handle(string, string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Group) HandleHTTP(string, string, http.Handler) #80000
+pkg net/http/server, method (*Group) Match([]string, string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Group) Mount(string, http.Handler) #80000
 pkg net/http/server, method (*Group) OPTIONS(string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Group) PATCH(string, ...HandlerFunc) #80000
@@ -96,6 +105,8 @@ pkg net/http/server, method (*Server) HandleHTTP(string, string, http.Handler) #
 pkg net/http/server, method (*Server) ListenAndServe(string) error #80000
 pkg net/http/server, method (*Server) ListenAndServeContext(context.Context, string) error #80000
 pkg net/http/server, method (*Server) ListenAndServeTLS(string, string, string) error #80000
+pkg net/http/server, method (*Server) ListenAndServeTLSContext(context.Context, string, string, string) error #80000
+pkg net/http/server, method (*Server) Match([]string, string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Server) MethodNotAllowed(HandlerFunc) #80000
 pkg net/http/server, method (*Server) Mount(string, http.Handler) #80000
 pkg net/http/server, method (*Server) NotFound(HandlerFunc) #80000
@@ -108,6 +119,7 @@ pkg net/http/server, method (*Server) Serve(net.Listener) error #80000
 pkg net/http/server, method (*Server) ServeContext(context.Context, net.Listener) error #80000
 pkg net/http/server, method (*Server) ServeHTTP(http.ResponseWriter, *http.Request) #80000
 pkg net/http/server, method (*Server) ServeTLS(net.Listener, string, string) error #80000
+pkg net/http/server, method (*Server) ServeTLSContext(context.Context, net.Listener, string, string) error #80000
 pkg net/http/server, method (*Server) Shutdown(context.Context) error #80000
 pkg net/http/server, method (*Server) StaticDir(string, string, ...StaticConfig) error #80000
 pkg net/http/server, method (*Server) StaticFS(string, fs.FS, ...StaticConfig) #80000
@@ -120,6 +132,10 @@ pkg net/http/server, type CORSConfig struct, AllowOriginFunc func(string) bool #
 pkg net/http/server, type CORSConfig struct, AllowOrigins []string #80000
 pkg net/http/server, type CORSConfig struct, ExposeHeaders []string #80000
 pkg net/http/server, type CORSConfig struct, MaxAge time.Duration #80000
+pkg net/http/server, type CompressConfig struct #80000
+pkg net/http/server, type CompressConfig struct, Level int #80000
+pkg net/http/server, type CompressConfig struct, MinLength int #80000
+pkg net/http/server, type CompressConfig struct, Skip func(*Context) bool #80000
 pkg net/http/server, type Config struct #80000
 pkg net/http/server, type Config struct, BaseContext func(net.Listener) context.Context #80000
 pkg net/http/server, type Config struct, DisablePathCleaning bool #80000
@@ -143,6 +159,9 @@ pkg net/http/server, type HTTPError struct, Code int #80000
 pkg net/http/server, type HTTPError struct, Err error #80000
 pkg net/http/server, type HTTPError struct, Message string #80000
 pkg net/http/server, type HandlerFunc func(*Context) error #80000
+pkg net/http/server, type LoggerConfig struct #80000
+pkg net/http/server, type LoggerConfig struct, Logger *slog.Logger #80000
+pkg net/http/server, type LoggerConfig struct, Skip func(*Context) bool #80000
 pkg net/http/server, type RecoverConfig struct #80000
 pkg net/http/server, type RecoverConfig struct, Logger *slog.Logger #80000
 pkg net/http/server, type RecoverConfig struct, OnPanic func(*Context, interface{}, []uint8) #80000

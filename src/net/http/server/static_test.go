@@ -141,3 +141,44 @@ func TestStaticFSIndexAndBrowse(t *testing.T) {
 		t.Fatalf("/custom/app/: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 }
+
+// TestStaticNoBrowseIndexDirectoryBypass verifies that a subdirectory named
+// "index.html" (or matching StaticConfig.Index) cannot bypass Browse: false
+// and expose a directory listing.
+func TestStaticNoBrowseIndexDirectoryBypass(t *testing.T) {
+	dir := t.TempDir()
+	// Create a directory named "index.html" and a secret sibling file.
+	if err := os.MkdirAll(filepath.Join(dir, "sub", "index.html"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "index.html"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "private-listing-target.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := server.New()
+	if err := s.StaticDir("/files", dir); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, target := range []string{"/files", "/files/", "/files/sub/", "/files/sub/index.html/"} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code == http.StatusOK || strings.Contains(rec.Body.String(), "private-listing-target.txt") {
+			t.Fatalf("Browse=false bypassed for %q: status=%d body=%q", target, rec.Code, rec.Body.String())
+		}
+	}
+
+	// StaticDir with invalid prefix panics without leaking the opened os.Root.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for parameterized static prefix")
+			}
+		}()
+		_ = s.StaticDir("/bad/{id}", dir)
+	}()
+}

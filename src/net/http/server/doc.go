@@ -51,8 +51,8 @@
 //   - Non-zero ReadHeaderTimeout, IdleTimeout, and MaxHeaderBytes on the
 //     underlying [http.Server].
 //   - Bounded request body reading via Config.MaxBodyBytes (default 4 MiB) for
-//     [Context.BindJSON], [Context.BindJSONStrict], [Context.ParseForm], and
-//     [Context.BodyBytes].
+//     [Context.BindJSON], [Context.BindJSONStrict], [Context.ParseForm],
+//     [Context.ParseMultipartForm], [Context.FormFile], and [Context.BodyBytes].
 //   - [Context.ClientIP] ignores X-Forwarded-For and X-Real-IP unless the
 //     direct peer matches Config.TrustedProxies.
 //   - [Server.StaticDir] confines filesystem access using [os.OpenRoot] and

@@ -313,6 +313,12 @@ type treeNode struct {
 	slashChild    *treeNode
 	paramChild    *treeNode
 	wildcardChild *treeNode
+
+	// chainPrefix and chainTarget accelerate unescaped dynamic matching by
+	// collapsing pass-through single-static-child chains (e.g. "/api/v1") into
+	// a single prefix comparison. Only populated on dynTree via compressChains.
+	chainPrefix string
+	chainTarget *treeNode
 }
 
 func (n *treeNode) clone() *treeNode {
@@ -337,6 +343,42 @@ func (n *treeNode) clone() *treeNode {
 		}
 	}
 	return c
+}
+
+// compressChains computes chainPrefix/chainTarget shortcuts across the tree
+// for fast unescaped traversal.
+func (n *treeNode) compressChains() {
+	if n == nil {
+		return
+	}
+	n.chainPrefix = ""
+	n.chainTarget = nil
+
+	if n.leaf == nil && n.slashChild == nil && n.paramChild == nil && n.wildcardChild == nil &&
+		n.staticMap == nil && len(n.staticSlice) == 1 && strings.IndexByte(n.staticSlice[0].seg, '/') < 0 {
+		var sb strings.Builder
+		cur := n
+		for cur.leaf == nil && cur.slashChild == nil && cur.paramChild == nil && cur.wildcardChild == nil &&
+			cur.staticMap == nil && len(cur.staticSlice) == 1 && strings.IndexByte(cur.staticSlice[0].seg, '/') < 0 {
+			sb.WriteByte('/')
+			sb.WriteString(cur.staticSlice[0].seg)
+			cur = cur.staticSlice[0].node
+		}
+		n.chainPrefix = sb.String()
+		n.chainTarget = cur
+		cur.compressChains()
+		return
+	}
+
+	for i := range n.staticSlice {
+		n.staticSlice[i].node.compressChains()
+	}
+	for _, child := range n.staticMap {
+		child.compressChains()
+	}
+	n.slashChild.compressChains()
+	n.paramChild.compressChains()
+	n.wildcardChild.compressChains()
 }
 
 func (n *treeNode) findStatic(seg string) *treeNode {
@@ -417,21 +459,28 @@ func (pc *paramCapture) push(val string) int {
 		if pc.n < maxInlineParams {
 			pc.buf[pc.n] = val
 		} else {
-			if len(*pc.extra) == 0 {
-				*pc.extra = make([]string, maxInlineParams, maxInlineParams*2)
-				copy(*pc.extra, pc.buf[:])
-			}
-			*pc.extra = append(*pc.extra, val)
+			pc.pushOverflow(val)
 		}
 	}
 	pc.n++
 	return mark
 }
 
+//go:noinline
+func (pc *paramCapture) pushOverflow(val string) {
+	*pc.extra = append(*pc.extra, val)
+}
+
 func (pc *paramCapture) rollback(mark int) {
 	pc.n = mark
-	if pc.extra != nil && len(*pc.extra) > mark {
-		*pc.extra = (*pc.extra)[:mark]
+	if pc.extra != nil {
+		extraLen := mark - maxInlineParams
+		if extraLen < 0 {
+			extraLen = 0
+		}
+		if len(*pc.extra) > extraLen {
+			*pc.extra = (*pc.extra)[:extraLen]
+		}
 	}
 }
 
@@ -458,7 +507,106 @@ func nextSegment(path string, escaped bool) (seg, rest string, ok bool) {
 	return seg, rest, true
 }
 
+// matchUnescaped matches a clean, unescaped path iteratively, falling back to
+// recursion only when a node has ambiguous backtracking branches.
+func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
+	for {
+		if path == "" {
+			return n.leaf
+		}
+		if path == "/" {
+			if n.slashChild != nil && n.slashChild.leaf != nil {
+				return n.slashChild.leaf
+			}
+			if n.wildcardChild != nil && n.wildcardChild.leaf != nil {
+				if pc != nil {
+					pc.push("")
+				}
+				return n.wildcardChild.leaf
+			}
+			return nil
+		}
+
+		if n.chainTarget != nil {
+			p := n.chainPrefix
+			if len(path) < len(p) || path[:len(p)] != p {
+				return nil
+			}
+			if len(path) == len(p) {
+				return n.chainTarget.leaf
+			}
+			if path[len(p)] != '/' {
+				return nil
+			}
+			path = path[len(p):]
+			n = n.chainTarget
+			continue
+		}
+
+		s := path[1:]
+		if len(n.staticSlice) > 0 || n.staticMap != nil || n.paramChild != nil {
+			var seg, rest string
+			if slash := strings.IndexByte(s, '/'); slash >= 0 {
+				seg = s[:slash]
+				rest = s[slash:]
+			} else {
+				seg = s
+			}
+			if len(n.staticSlice) > 0 || n.staticMap != nil {
+				if child := n.findStatic(seg); child != nil {
+					if n.paramChild == nil && n.wildcardChild == nil {
+						n = child
+						path = rest
+						continue
+					}
+					var mark int
+					if pc != nil {
+						mark = pc.n
+					}
+					if e := child.matchUnescaped(rest, pc); e != nil {
+						return e
+					}
+					if pc != nil {
+						pc.rollback(mark)
+					}
+				}
+			}
+			if n.paramChild != nil && seg != "" {
+				if n.wildcardChild == nil {
+					if pc != nil {
+						pc.push(seg)
+					}
+					n = n.paramChild
+					path = rest
+					continue
+				}
+				var mark int
+				if pc != nil {
+					mark = pc.push(seg)
+				}
+				if e := n.paramChild.matchUnescaped(rest, pc); e != nil {
+					return e
+				}
+				if pc != nil {
+					pc.rollback(mark)
+				}
+			}
+		}
+
+		if n.wildcardChild != nil && n.wildcardChild.leaf != nil {
+			if pc != nil {
+				pc.push(s)
+			}
+			return n.wildcardChild.leaf
+		}
+		return nil
+	}
+}
+
 func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntry {
+	if !escaped {
+		return n.matchUnescaped(path, pc)
+	}
 	if path == "" {
 		return n.leaf
 	}
@@ -476,14 +624,21 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 	}
 
 	if len(n.staticSlice) > 0 || n.staticMap != nil || n.paramChild != nil {
-		seg, rest, ok := nextSegment(path, escaped)
+		seg, rest, ok := nextSegment(path, true)
 		if !ok {
 			return nil
 		}
 		if len(n.staticSlice) > 0 || n.staticMap != nil {
 			if child := n.findStatic(seg); child != nil {
-				if e := child.match(rest, escaped, pc); e != nil {
+				var mark int
+				if pc != nil {
+					mark = pc.n
+				}
+				if e := child.match(rest, true, pc); e != nil {
 					return e
+				}
+				if pc != nil {
+					pc.rollback(mark)
 				}
 			}
 		}
@@ -492,7 +647,7 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 			if pc != nil {
 				mark = pc.push(seg)
 			}
-			if e := n.paramChild.match(rest, escaped, pc); e != nil {
+			if e := n.paramChild.match(rest, true, pc); e != nil {
 				return e
 			}
 			if pc != nil {
@@ -503,7 +658,7 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 
 	if n.wildcardChild != nil && n.wildcardChild.leaf != nil {
 		rem := path[1:]
-		if escaped && strings.IndexByte(rem, '%') >= 0 {
+		if strings.IndexByte(rem, '%') >= 0 {
 			u, err := url.PathUnescape(rem)
 			if err != nil {
 				return nil
@@ -532,16 +687,22 @@ func newMethodRouter() *methodRouter {
 	}
 }
 
-func (mr *methodRouter) clone() *methodRouter {
+func (mr *methodRouter) cloneFor(isStatic bool) *methodRouter {
 	if mr == nil {
 		return nil
 	}
-	return &methodRouter{
+	c := &methodRouter{
 		static:     mr.static.clone(),
 		tree:       mr.tree.clone(),
-		dynTree:    mr.dynTree.clone(),
 		onlyStatic: mr.onlyStatic,
 	}
+	if isStatic {
+		// dynTree is immutable and unmodified when adding a static route.
+		c.dynTree = mr.dynTree
+	} else {
+		c.dynTree = mr.dynTree.clone()
+	}
+	return c
 }
 
 func (mr *methodRouter) add(p parsedPattern, entry *routeEntry) error {
@@ -557,6 +718,7 @@ func (mr *methodRouter) add(p parsedPattern, entry *routeEntry) error {
 		if err := mr.dynTree.insert(p, entry); err != nil {
 			return err
 		}
+		mr.dynTree.compressChains()
 		mr.onlyStatic = false
 	}
 	return nil
@@ -573,7 +735,7 @@ func (mr *methodRouter) match(path string, escaped bool, pc *paramCapture) *rout
 		if mr.onlyStatic {
 			return nil
 		}
-		return mr.dynTree.match(path, false, pc)
+		return mr.dynTree.matchUnescaped(path, pc)
 	}
 	return mr.tree.match(path, true, pc)
 }
@@ -582,7 +744,7 @@ func (mr *methodRouter) matchDynamic(path string, pc *paramCapture) *routeEntry 
 	if mr == nil || mr.onlyStatic {
 		return nil
 	}
-	return mr.dynTree.match(path, false, pc)
+	return mr.dynTree.matchUnescaped(path, pc)
 }
 
 type routerSnapshot struct {
@@ -594,51 +756,45 @@ type routerSnapshot struct {
 	routes           []RouteInfo
 }
 
-func (rs *routerSnapshot) clone() *routerSnapshot {
+// cloneShallow copies the top-level snapshot structure while sharing immutable
+// methodRouter pointers. Callers must clone any specific methodRouter before
+// mutating it.
+func (rs *routerSnapshot) cloneShallow() *routerSnapshot {
 	if rs == nil {
 		return &routerSnapshot{}
 	}
 	c := &routerSnapshot{
-		anyMethod:        rs.anyMethod.clone(),
-		notFoundChain:    slices.Clone(rs.notFoundChain),
-		methodNotAllowed: slices.Clone(rs.methodNotAllowed),
-		routes:           slices.Clone(rs.routes),
-	}
-	for i := range rs.methods {
-		c.methods[i] = rs.methods[i].clone()
+		methods:          rs.methods,
+		anyMethod:        rs.anyMethod,
+		notFoundChain:    rs.notFoundChain,
+		methodNotAllowed: rs.methodNotAllowed,
+		routes:           rs.routes,
 	}
 	if rs.custom != nil {
 		c.custom = make(map[string]*methodRouter, len(rs.custom))
 		for k, v := range rs.custom {
-			c.custom[k] = v.clone()
+			c.custom[k] = v
 		}
 	}
 	return c
 }
 
-func (rs *routerSnapshot) getMethodRouter(method string) *methodRouter {
-	if method == "" {
-		return rs.anyMethod
-	}
-	if idx := methodIndex(method); idx >= 0 {
-		return rs.methods[idx]
-	}
-	if rs.custom != nil {
-		return rs.custom[method]
-	}
-	return nil
-}
-
-func (rs *routerSnapshot) getOrCreateMethodRouter(method string) *methodRouter {
+// cloneOrCreateMethodRouter clones the methodRouter for method in place on a
+// freshly shallow-cloned routerSnapshot, creating it if absent.
+func (rs *routerSnapshot) cloneOrCreateMethodRouter(method string, isStatic bool) *methodRouter {
 	if method == "" {
 		if rs.anyMethod == nil {
 			rs.anyMethod = newMethodRouter()
+		} else {
+			rs.anyMethod = rs.anyMethod.cloneFor(isStatic)
 		}
 		return rs.anyMethod
 	}
 	if idx := methodIndex(method); idx >= 0 {
 		if rs.methods[idx] == nil {
 			rs.methods[idx] = newMethodRouter()
+		} else {
+			rs.methods[idx] = rs.methods[idx].cloneFor(isStatic)
 		}
 		return rs.methods[idx]
 	}
@@ -648,14 +804,26 @@ func (rs *routerSnapshot) getOrCreateMethodRouter(method string) *methodRouter {
 	mr := rs.custom[method]
 	if mr == nil {
 		mr = newMethodRouter()
-		rs.custom[method] = mr
+	} else {
+		mr = mr.cloneFor(isStatic)
 	}
+	rs.custom[method] = mr
 	return mr
 }
 
 func (rs *routerSnapshot) matchStatic(method, path string) *routeEntry {
-	if idx := methodIndex(method); idx >= 0 {
-		mr := rs.methods[idx]
+	if method == http.MethodGet {
+		if mr := rs.methods[methodGET]; mr != nil {
+			return mr.static.lookup(path)
+		}
+		return nil
+	}
+	return rs.matchStaticSlow(method, path)
+}
+
+func (rs *routerSnapshot) matchStaticSlow(method, path string) *routeEntry {
+	if mIdx := methodIndex(method); mIdx >= 0 {
+		mr := rs.methods[mIdx]
 		if mr != nil {
 			if e := mr.static.lookup(path); e != nil {
 				return e
@@ -663,7 +831,7 @@ func (rs *routerSnapshot) matchStatic(method, path string) *routeEntry {
 		}
 		// Only fall back to GET static routes if no dynamic HEAD routes could
 		// take precedence over GET.
-		if idx == methodHEAD && (mr == nil || mr.onlyStatic) {
+		if mIdx == methodHEAD && (mr == nil || mr.onlyStatic) {
 			if gmr := rs.methods[methodGET]; gmr != nil {
 				if e := gmr.static.lookup(path); e != nil {
 					return e
@@ -680,12 +848,11 @@ func (rs *routerSnapshot) matchStatic(method, path string) *routeEntry {
 	return nil
 }
 
-// matchAfterStatic matches a clean, unescaped path after matchStatic has
-// already returned nil. It avoids redundant staticTable lookups on the method
-// router.
-func (rs *routerSnapshot) matchAfterStatic(method, path string, pc *paramCapture) *routeEntry {
-	if idx := methodIndex(method); idx >= 0 {
-		if mr := rs.methods[idx]; mr != nil {
+// matchAfterStaticIdx matches a clean, unescaped path after matchStaticIdx has
+// already returned nil. It avoids redundant staticTable and methodIndex lookups.
+func (rs *routerSnapshot) matchAfterStaticIdx(mIdx int, method, path string, pc *paramCapture) *routeEntry {
+	if mIdx >= 0 {
+		if mr := rs.methods[mIdx]; mr != nil {
 			if e := mr.matchDynamic(path, pc); e != nil {
 				return e
 			}
@@ -693,7 +860,7 @@ func (rs *routerSnapshot) matchAfterStatic(method, path string, pc *paramCapture
 				pc.rollback(0)
 			}
 		}
-		if idx == methodHEAD {
+		if mIdx == methodHEAD {
 			if gmr := rs.methods[methodGET]; gmr != nil {
 				if e := gmr.match(path, false, pc); e != nil {
 					return e
@@ -722,8 +889,12 @@ func (rs *routerSnapshot) matchAfterStatic(method, path string, pc *paramCapture
 }
 
 func (rs *routerSnapshot) match(method, path string, escaped bool, pc *paramCapture) *routeEntry {
-	if idx := methodIndex(method); idx >= 0 {
-		if mr := rs.methods[idx]; mr != nil {
+	return rs.matchIdx(methodIndex(method), method, path, escaped, pc)
+}
+
+func (rs *routerSnapshot) matchIdx(mIdx int, method, path string, escaped bool, pc *paramCapture) *routeEntry {
+	if mIdx >= 0 {
+		if mr := rs.methods[mIdx]; mr != nil {
 			if e := mr.match(path, escaped, pc); e != nil {
 				return e
 			}
@@ -732,7 +903,7 @@ func (rs *routerSnapshot) match(method, path string, escaped bool, pc *paramCapt
 			}
 		}
 		// RFC 9110: HEAD falls back to GET if no explicit HEAD route matched.
-		if idx == methodHEAD {
+		if mIdx == methodHEAD {
 			if mr := rs.methods[methodGET]; mr != nil {
 				if e := mr.match(path, escaped, pc); e != nil {
 					return e

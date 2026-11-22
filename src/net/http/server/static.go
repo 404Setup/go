@@ -36,16 +36,23 @@ func (g *Group) StaticDir(prefix, dir string, cfg ...StaticConfig) error {
 	if err != nil {
 		return err
 	}
+	registered := false
+	defer func() {
+		if !registered {
+			_ = root.Close()
+		}
+	}()
+
 	var c StaticConfig
 	if len(cfg) > 0 {
 		c = cfg[0]
 	}
-	var closer staticRootCloser = root
-	g.server.mu.Lock()
-	g.server.staticRoots = append(g.server.staticRoots, &closer)
-	g.server.mu.Unlock()
-
 	g.StaticFS(prefix, root.FS(), c)
+
+	g.server.mu.Lock()
+	g.server.staticRoots = append(g.server.staticRoots, root)
+	g.server.mu.Unlock()
+	registered = true
 	return nil
 }
 
@@ -102,8 +109,8 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 			rw = &cacheControlWriter{ResponseWriter: rw, value: c.CacheControl}
 		}
 
-		// When serving a custom index name (other than "index.html"), redirect
-		// or serve the directory index explicitly.
+		// When serving a custom index name (other than "index.html"), serve
+		// the directory index file explicitly when present.
 		if c.Index != "index.html" {
 			name := strings.TrimPrefix(path.Clean(u2.Path), "/")
 			if name == "" {
@@ -114,7 +121,7 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 				if name != "." {
 					idxPath = name + "/" + c.Index
 				}
-				if _, err := fs.Stat(effectiveFS, idxPath); err == nil {
+				if idxInfo, err := fs.Stat(effectiveFS, idxPath); err == nil && !idxInfo.IsDir() {
 					http.ServeFileFS(rw, r2, effectiveFS, idxPath)
 					return nil
 				}
@@ -134,9 +141,9 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 	}
 	relBase := strings.TrimPrefix(cleanPref, g.prefix)
 	g.GET(relBase, func(ctx *Context) error {
-		// Redirect bare prefix "/static" -> "/static/" so relative links work,
-		// or serve index if present.
-		if _, err := fs.Stat(effectiveFS, c.Index); err == nil {
+		// Serve index file if present as a non-directory, redirect when Browse
+		// is enabled, or return 404.
+		if idxInfo, err := fs.Stat(effectiveFS, c.Index); err == nil && !idxInfo.IsDir() {
 			rw := ctx.ResponseWriter()
 			if c.CacheControl != "" {
 				rw = &cacheControlWriter{ResponseWriter: rw, value: c.CacheControl}
@@ -161,7 +168,7 @@ type cacheControlWriter struct {
 func (w *cacheControlWriter) WriteHeader(code int) {
 	if !w.written {
 		w.written = true
-		if code >= 200 && code < 400 && w.Header().Get("Cache-Control") == "" {
+		if ((code >= 200 && code < 300) || code == http.StatusNotModified) && w.Header().Get("Cache-Control") == "" {
 			w.Header().Set("Cache-Control", w.value)
 		}
 	}
@@ -179,8 +186,8 @@ func (w *cacheControlWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-// noBrowseFS wraps an fs.FS and hides directories that do not contain an index
-// file, preventing directory listing via http.FileServerFS.
+// noBrowseFS wraps an fs.FS and hides directories that do not contain a
+// non-directory index file, preventing directory listing via http.FileServerFS.
 type noBrowseFS struct {
 	fs    fs.FS
 	index string
@@ -206,7 +213,12 @@ func (n noBrowseFS) Open(name string) (fs.File, error) {
 			f.Close()
 			return nil, fs.ErrNotExist
 		}
+		idxInfo, statErr := idxFile.Stat()
 		idxFile.Close()
+		if statErr != nil || idxInfo.IsDir() {
+			f.Close()
+			return nil, fs.ErrNotExist
+		}
 	}
 	return f, nil
 }

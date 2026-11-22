@@ -326,3 +326,57 @@ func BenchmarkBindJSON(b *testing.B) {
 		s.ServeHTTP(&w, req)
 	}
 }
+
+func BenchmarkQueryParam(b *testing.B) {
+	s := server.New()
+	s.GET("/search", func(c *server.Context) error {
+		_ = c.Query("page")
+		_ = c.Query("sort")
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/search?q=golang&page=2&sort=desc&limit=50", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}
+
+func BenchmarkServeMuxQueryParam(b *testing.B) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /search", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		_ = q.Get("page")
+		_ = q.Get("sort")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/search?q=golang&page=2&sort=desc&limit=50", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		mux.ServeHTTP(&w, req)
+	}
+}
+
+func BenchmarkCompressGzip(b *testing.B) {
+	s := server.New()
+	s.Use(server.Compress())
+	payload := strings.Repeat(`{"id":42,"name":"example","active":true},`, 64)
+	s.GET("/data", func(c *server.Context) error {
+		return c.Text(http.StatusOK, payload)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/data", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := &discardResponseWriter{header: make(http.Header, 8)}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		clear(w.header)
+		s.ServeHTTP(w, req)
+	}
+}
