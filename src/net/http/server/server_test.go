@@ -265,6 +265,18 @@ func TestServerServeContextGracefulShutdown(t *testing.T) {
 		t.Fatalf("expected secure default limits on HTTPServer, got ReadHeaderTimeout=%v IdleTimeout=%v MaxHeaderBytes=%d",
 			hs.ReadHeaderTimeout, hs.IdleTimeout, hs.MaxHeaderBytes)
 	}
+
+	// Calling ServeContext with an already-canceled context must return cleanly without deadlocking.
+	s2 := server.New()
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preCanceled, preCancel := context.WithCancel(context.Background())
+	preCancel()
+	if err := s2.ServeContext(preCanceled, ln2); err != nil {
+		t.Fatalf("ServeContext with pre-canceled context returned error: %v", err)
+	}
 }
 
 func TestServer1xxInformationalStatusDoesNotFinalizeResponse(t *testing.T) {

@@ -131,6 +131,7 @@ func DefaultErrorHandler(c *Context, err error) {
 	}
 	h := c.respHeader()
 	delete(h, "Content-Length")
+	delete(h, "Content-Encoding")
 	h["X-Content-Type-Options"] = headerValNosniff
 	h["Content-Type"] = contentTypeText
 	c.writeHeader(code)
@@ -163,6 +164,7 @@ func JSONErrorHandler(c *Context, err error) {
 	}
 	h := c.respHeader()
 	delete(h, "Content-Length")
+	delete(h, "Content-Encoding")
 	h["X-Content-Type-Options"] = headerValNosniff
 	_ = c.JSON(code, jsonErrorBody{Error: msg})
 }

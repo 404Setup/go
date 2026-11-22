@@ -83,7 +83,7 @@ func CompressWithConfig(cfg CompressConfig) HandlerFunc {
 		// Always advertise Vary: Accept-Encoding so caches key on encoding.
 		addVaryToken(c.respHeader(), "Accept-Encoding")
 
-		if !acceptsGzip(c.canonicalReqHeader("Accept-Encoding")) {
+		if !acceptsGzip(c.req.Header["Accept-Encoding"]) {
 			return c.Next()
 		}
 
@@ -124,6 +124,9 @@ func CompressWithConfig(cfg CompressConfig) HandlerFunc {
 		}()
 
 		err := c.Next()
+		if err != nil && !c.errHandled {
+			c.HandleError(err)
+		}
 		panicked = false
 		return err
 	}
@@ -431,41 +434,51 @@ func addVaryToken(h http.Header, token string) {
 	h["Vary"] = append(existing, token)
 }
 
-// acceptsGzip reports whether an Accept-Encoding header permits gzip encoding
-// per RFC 9110 Section 12.5.3 (respecting q=0 rejection).
-func acceptsGzip(header string) bool {
-	if header == "" {
+// acceptsGzip reports whether the Accept-Encoding header values permit gzip
+// encoding per RFC 9110 Section 12.5.3 (respecting q=0 rejection).
+func acceptsGzip(headers []string) bool {
+	if len(headers) == 0 {
 		return false
 	}
 	gzipSpecified := false
 	gzipAllowed := false
+	gzipDenied := false
 	starAllowed := false
-	for header != "" {
-		var item string
-		item, header, _ = strings.Cut(header, ",")
-		item = trimOWS(item)
-		if item == "" {
-			continue
-		}
-		coding, params, hasParams := strings.Cut(item, ";")
-		coding = trimOWS(coding)
-		qOK := true
-		if hasParams {
-			qOK = parseQualityPositive(params)
-		}
-		if asciiEqualFold(coding, "gzip") || asciiEqualFold(coding, "x-gzip") {
-			gzipSpecified = true
-			if qOK {
-				gzipAllowed = true
+	starDenied := false
+	for _, header := range headers {
+		for header != "" {
+			var item string
+			item, header, _ = strings.Cut(header, ",")
+			item = trimOWS(item)
+			if item == "" {
+				continue
 			}
-		} else if coding == "*" {
-			starAllowed = qOK
+			coding, params, hasParams := strings.Cut(item, ";")
+			coding = trimOWS(coding)
+			qOK := true
+			if hasParams {
+				qOK = parseQualityPositive(params)
+			}
+			if asciiEqualFold(coding, "gzip") || asciiEqualFold(coding, "x-gzip") {
+				gzipSpecified = true
+				if qOK {
+					gzipAllowed = true
+				} else {
+					gzipDenied = true
+				}
+			} else if coding == "*" {
+				if qOK {
+					starAllowed = true
+				} else {
+					starDenied = true
+				}
+			}
 		}
 	}
 	if gzipSpecified {
-		return gzipAllowed
+		return gzipAllowed && !gzipDenied
 	}
-	return starAllowed
+	return starAllowed && !starDenied
 }
 
 func parseQualityPositive(params string) bool {

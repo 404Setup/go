@@ -398,4 +398,46 @@ func TestMiddlewareCompressLoggerInnerAndPartialWriteErrorIsolation(t *testing.T
 	if got := gunzipBody(t, rec.Body); got != bigText {
 		t.Fatalf("big-string decompressed len=%d, want %d", len(got), len(bigText))
 	}
+
+	// 4. Multiple Accept-Encoding header lines: second line enabling gzip works,
+	// and a subsequent line with gzip;q=0 overrides and disables gzip.
+	req = httptest.NewRequest(http.MethodGet, "/big-string", nil)
+	req.Header.Add("Accept-Encoding", "deflate")
+	req.Header.Add("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("multi-header Accept-Encoding should enable gzip, got %q", rec.Header().Get("Content-Encoding"))
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/big-string", nil)
+	req.Header.Add("Accept-Encoding", "gzip")
+	req.Header.Add("Accept-Encoding", "gzip;q=0")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("multi-header gzip;q=0 should disable gzip, got %q", rec.Header().Get("Content-Encoding"))
+	}
+
+	// 5. Outer Logger + inner Compress + handler returning error or pre-setting Content-Encoding.
+	logBuf.Reset()
+	s2 := server.New()
+	s2.Use(server.Logger(logger), server.Compress())
+	s2.GET("/stale-ce-err", func(c *server.Context) error {
+		c.SetHeader("Content-Encoding", "br")
+		return server.NewError(http.StatusBadRequest, "bad input")
+	})
+	req = httptest.NewRequest(http.MethodGet, "/stale-ce-err", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s2.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || rec.Header().Get("Content-Encoding") != "" || rec.Body.String() != "bad input" {
+		t.Fatalf("stale-ce-err: code=%d ce=%q body=%q", rec.Code, rec.Header().Get("Content-Encoding"), rec.Body.String())
+	}
+	if err := json.Unmarshal(logBuf.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["status"] != float64(http.StatusBadRequest) || entry["bytes"] != float64(len("bad input")) {
+		t.Fatalf("outer Logger recorded wrong status/bytes: %#v", entry)
+	}
 }

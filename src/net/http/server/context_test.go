@@ -534,3 +534,60 @@ func TestContextContentTypeBearerTokenSchemeAndFormValue(t *testing.T) {
 		t.Fatalf("sniff: code=%d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
 	}
 }
+
+func TestContextSetDeleteOverflowConsistencyAndQueryEdgeCases(t *testing.T) {
+	s := server.New()
+
+	s.GET("/kv", func(c *server.Context) error {
+		// Fill 4 inline values + 2 overflow map values.
+		for i := range 6 {
+			c.Set(fmt.Sprintf("k%d", i), i)
+		}
+		// Delete one inline value so nValues drops below maxInlineValues (3 < 4).
+		c.Delete("k0")
+		// Update an existing overflow map key ("k4"). It must update in place in
+		// valuesMap and not create a duplicate entry in inlineValues.
+		c.Set("k4", 400)
+		if v, ok := server.GetValue[int](c, "k4"); !ok || v != 400 {
+			return server.NewError(http.StatusInternalServerError, fmt.Sprintf("k4=%v ok=%v, want 400", v, ok))
+		}
+		// Deleting "k4" now must completely remove it.
+		c.Delete("k4")
+		if v, ok := c.Get("k4"); ok {
+			return server.NewError(http.StatusInternalServerError, fmt.Sprintf("deleted k4 still present: %v", v))
+		}
+		return c.NoContent()
+	})
+
+	s.GET("/q", func(c *server.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{
+			"page":      c.Query("page"),
+			"page_size": c.Query("page_size"),
+			"p":         c.Query("p"),
+			"flag":      c.Query("flag"),
+			"esc_key":   c.Query("a b"),
+			"recover":   c.Query("k"),
+		})
+	})
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/kv", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("/kv failed: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/q?page_size=25&p=1&flag&page=7&a+b=ok&k=%ZZ&k=semi;bad&k=good", nil)
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/q status = %d", rec.Code)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["page"] != "7" || got["page_size"] != "25" || got["p"] != "1" ||
+		got["flag"] != "" || got["esc_key"] != "ok" || got["recover"] != "good" {
+		t.Fatalf("unexpected query values: %#v", got)
+	}
+}

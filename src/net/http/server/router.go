@@ -211,7 +211,7 @@ func parsePattern(raw string) (parsedPattern, error) {
 			if err != nil {
 				return parsedPattern{}, fmt.Errorf("route pattern %q has invalid percent-encoding in segment %q: %w", raw, part, err)
 			}
-			if u == "" || u == "." || u == ".." || hasASCIIControl(u) {
+			if hasInvalidSegment(u) || hasASCIIControl(u) {
 				return parsedPattern{}, fmt.Errorf("route pattern %q has unsafe unescaped segment %q", raw, part)
 			}
 			literal = u
@@ -220,6 +220,40 @@ func parsePattern(raw string) (parsedPattern, error) {
 		p.segments = append(p.segments, patternSegment{kind: segStatic, literal: literal})
 	}
 	return p, nil
+}
+
+// hasInvalidSegment reports whether s is empty, contains a NUL byte, or
+// contains any '/'-separated segment that is "", ".", or "..".
+func hasInvalidSegment(s string) bool {
+	if s == "" {
+		return true
+	}
+	for {
+		slash := -1
+		for i := 0; i < len(s); i++ {
+			b := s[i]
+			if b == 0 {
+				return true
+			}
+			if b == '/' {
+				slash = i
+				break
+			}
+		}
+		var seg string
+		if slash >= 0 {
+			seg = s[:slash]
+		} else {
+			seg = s
+		}
+		if seg == "" || (seg[0] == '.' && (len(seg) == 1 || (len(seg) == 2 && seg[1] == '.'))) {
+			return true
+		}
+		if slash < 0 {
+			return false
+		}
+		s = s[slash+1:]
+	}
 }
 
 type routeEntry struct {
@@ -309,6 +343,12 @@ type childEntry struct {
 	node *treeNode
 }
 
+type radixEdge struct {
+	prefix    string
+	target    *treeNode
+	firstByte byte
+}
+
 type treeNode struct {
 	leaf          *routeEntry
 	staticSlice   []childEntry
@@ -317,11 +357,13 @@ type treeNode struct {
 	paramChild    *treeNode
 	wildcardChild *treeNode
 
-	// chainPrefix and chainTarget accelerate unescaped dynamic matching by
-	// collapsing pass-through single-static-child chains (e.g. "/api/v1") into
-	// a single prefix comparison. Only populated on dynTree via compressChains.
+	// chainPrefix, chainTarget, and radixEdges accelerate unescaped dynamic
+	// matching by collapsing pass-through single-static-child chains (e.g.
+	// "/api/v1") into prefix comparisons without intermediate slash scans.
+	// Only populated on dynTree via compressChains.
 	chainPrefix string
 	chainTarget *treeNode
+	radixEdges  []radixEdge
 }
 
 func (n *treeNode) clone() *treeNode {
@@ -348,40 +390,12 @@ func (n *treeNode) clone() *treeNode {
 	return c
 }
 
-// compressChains computes chainPrefix/chainTarget shortcuts across the tree
-// for fast unescaped traversal.
+// compressChains computes bottom-up chainPrefix/chainTarget and radixEdges
+// shortcuts across the tree for fast unescaped traversal.
 func (n *treeNode) compressChains() {
 	if n == nil {
 		return
 	}
-	n.chainPrefix = ""
-	n.chainTarget = nil
-
-	if n.paramChild == nil && n.wildcardChild == nil &&
-		n.staticMap == nil && len(n.staticSlice) == 1 && strings.IndexByte(n.staticSlice[0].seg, '/') < 0 {
-		first := n.staticSlice[0]
-		cur := first.node
-		if cur.leaf == nil && cur.slashChild == nil && cur.paramChild == nil && cur.wildcardChild == nil &&
-			cur.staticMap == nil && len(cur.staticSlice) == 1 && strings.IndexByte(cur.staticSlice[0].seg, '/') < 0 {
-			var sb strings.Builder
-			sb.WriteByte('/')
-			sb.WriteString(first.seg)
-			for cur.leaf == nil && cur.slashChild == nil && cur.paramChild == nil && cur.wildcardChild == nil &&
-				cur.staticMap == nil && len(cur.staticSlice) == 1 && strings.IndexByte(cur.staticSlice[0].seg, '/') < 0 {
-				sb.WriteByte('/')
-				sb.WriteString(cur.staticSlice[0].seg)
-				cur = cur.staticSlice[0].node
-			}
-			n.chainPrefix = sb.String()
-		} else {
-			n.chainPrefix = "/" + first.seg
-		}
-		n.chainTarget = cur
-		n.slashChild.compressChains()
-		cur.compressChains()
-		return
-	}
-
 	for i := range n.staticSlice {
 		n.staticSlice[i].node.compressChains()
 	}
@@ -391,6 +405,52 @@ func (n *treeNode) compressChains() {
 	n.slashChild.compressChains()
 	n.paramChild.compressChains()
 	n.wildcardChild.compressChains()
+
+	n.chainPrefix = ""
+	n.chainTarget = nil
+	n.radixEdges = nil
+
+	if n.paramChild != nil || n.wildcardChild != nil || n.staticMap != nil || len(n.staticSlice) == 0 {
+		return
+	}
+	for i := range n.staticSlice {
+		if strings.IndexByte(n.staticSlice[i].seg, '/') >= 0 {
+			return
+		}
+	}
+
+	if len(n.staticSlice) == 1 {
+		first := n.staticSlice[0]
+		cur := first.node
+		if cur.leaf == nil && cur.slashChild == nil && cur.chainTarget != nil {
+			n.chainPrefix = "/" + first.seg + cur.chainPrefix
+			n.chainTarget = cur.chainTarget
+		} else {
+			n.chainPrefix = "/" + first.seg
+			n.chainTarget = cur
+		}
+		return
+	}
+
+	edges := make([]radixEdge, len(n.staticSlice))
+	for i, e := range n.staticSlice {
+		cur := e.node
+		var pref string
+		var target *treeNode
+		if cur.leaf == nil && cur.slashChild == nil && cur.chainTarget != nil {
+			pref = "/" + e.seg + cur.chainPrefix
+			target = cur.chainTarget
+		} else {
+			pref = "/" + e.seg
+			target = cur
+		}
+		edges[i] = radixEdge{
+			prefix:    pref,
+			target:    target,
+			firstByte: pref[1],
+		}
+	}
+	n.radixEdges = edges
 }
 
 func (n *treeNode) findStatic(seg string) *treeNode {
@@ -555,7 +615,67 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 			continue
 		}
 
+		if len(n.radixEdges) > 0 {
+			b := path[1]
+			var matched *treeNode
+			for i := range n.radixEdges {
+				edge := &n.radixEdges[i]
+				if edge.firstByte != b {
+					continue
+				}
+				p := edge.prefix
+				if len(path) >= len(p) && path[:len(p)] == p {
+					if len(path) == len(p) {
+						return edge.target.leaf
+					}
+					if path[len(p)] == '/' {
+						path = path[len(p):]
+						matched = edge.target
+						break
+					}
+				}
+			}
+			if matched != nil {
+				n = matched
+				continue
+			}
+			return nil
+		}
+
 		s := path[1:]
+		if len(n.staticSlice) == 0 && n.staticMap == nil && n.paramChild != nil && n.wildcardChild == nil {
+			slash := -1
+			for i := 0; i < len(s); i++ {
+				b := s[i]
+				if b == '/' {
+					slash = i
+					break
+				}
+				if b == 0 {
+					return nil
+				}
+			}
+			var seg, rest string
+			if slash >= 0 {
+				seg = s[:slash]
+				rest = s[slash:]
+			} else {
+				seg = s
+			}
+			if seg == "" || (seg[0] == '.' && (len(seg) == 1 || (len(seg) == 2 && seg[1] == '.'))) {
+				return nil
+			}
+			if pc != nil {
+				pc.push(seg)
+			}
+			if rest == "" {
+				return n.paramChild.leaf
+			}
+			n = n.paramChild
+			path = rest
+			continue
+		}
+
 		if len(n.staticSlice) > 0 || n.staticMap != nil || n.paramChild != nil {
 			var seg, rest string
 			if slash := strings.IndexByte(s, '/'); slash >= 0 {
@@ -659,9 +779,7 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 				}
 			}
 		}
-		if n.paramChild != nil && seg != "" &&
-			(seg[0] != '.' || (len(seg) > 2 || (len(seg) == 2 && seg[1] != '.'))) &&
-			strings.IndexByte(seg, 0) < 0 {
+		if n.paramChild != nil && !hasInvalidSegment(seg) {
 			var mark int
 			if pc != nil {
 				mark = pc.push(seg)
@@ -684,7 +802,7 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 			}
 			rem = u
 		}
-		if strings.IndexByte(rem, 0) >= 0 {
+		if rem != "" && hasInvalidSegment(rem) {
 			return nil
 		}
 		if pc != nil {

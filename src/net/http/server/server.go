@@ -629,32 +629,58 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// dynTree was validated by parsePattern to be clean and NUL-free, and
 	// matchUnescaped validates captured parameters and wildcards inline.
 	if rawPath == "" {
-		if entry := snap.matchStatic(r.Method, reqPath); entry != nil {
-			c := acquireContext(s, w, r)
-			c.routePattern = entry.pattern
-			var err error
-			if len(entry.chain) == 1 {
-				err = entry.chain[0](c)
-			} else {
-				c.handlers = entry.chain
-				err = c.Next()
+		if r.Method == http.MethodGet {
+			if mr := snap.methods[methodGET]; mr != nil {
+				if entry := mr.static.lookup(reqPath); entry != nil {
+					c := acquireContext(s, w, r)
+					c.routePattern = entry.pattern
+					var err error
+					if len(entry.chain) == 1 {
+						err = entry.chain[0](c)
+					} else {
+						c.handlers = entry.chain
+						err = c.Next()
+					}
+					if err != nil {
+						c.HandleError(err)
+					}
+					releaseContext(c)
+					return
+				}
+				if !mr.onlyStatic && len(reqPath) > 0 && reqPath[0] == '/' {
+					c := acquireContext(s, w, r)
+					pc := paramCapture{
+						buf:   &c.paramBuf,
+						extra: &c.paramExtra,
+					}
+					if entry := mr.dynTree.matchUnescaped(reqPath, &pc); entry != nil {
+						c.nParams = pc.n
+						c.paramNames = entry.paramNames
+						c.routePattern = entry.pattern
+						var err error
+						if len(entry.chain) == 1 {
+							err = entry.chain[0](c)
+						} else {
+							c.handlers = entry.chain
+							err = c.Next()
+						}
+						if err != nil {
+							c.HandleError(err)
+						}
+						releaseContext(c)
+						return
+					}
+					releaseContext(c)
+				}
 			}
-			if err != nil {
-				c.HandleError(err)
+			if snap.anyMethod != nil && len(reqPath) > 0 && reqPath[0] == '/' {
+				if s.tryServeUnescapedAny(snap, w, r, reqPath) {
+					return
+				}
 			}
-			releaseContext(c)
-			return
-		}
-		if len(reqPath) > 0 && reqPath[0] == '/' {
-			c := acquireContext(s, w, r)
-			pc := paramCapture{
-				buf:   &c.paramBuf,
-				extra: &c.paramExtra,
-			}
-			mIdx := methodIndex(r.Method)
-			if entry := snap.matchAfterStaticIdx(mIdx, r.Method, reqPath, &pc); entry != nil {
-				c.nParams = pc.n
-				c.paramNames = entry.paramNames
+		} else {
+			if entry := snap.matchStaticSlow(r.Method, reqPath); entry != nil {
+				c := acquireContext(s, w, r)
 				c.routePattern = entry.pattern
 				var err error
 				if len(entry.chain) == 1 {
@@ -669,10 +695,68 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				releaseContext(c)
 				return
 			}
-			releaseContext(c)
+			if len(reqPath) > 0 && reqPath[0] == '/' {
+				c := acquireContext(s, w, r)
+				pc := paramCapture{
+					buf:   &c.paramBuf,
+					extra: &c.paramExtra,
+				}
+				mIdx := methodIndex(r.Method)
+				if entry := snap.matchAfterStaticIdx(mIdx, r.Method, reqPath, &pc); entry != nil {
+					c.nParams = pc.n
+					c.paramNames = entry.paramNames
+					c.routePattern = entry.pattern
+					var err error
+					if len(entry.chain) == 1 {
+						err = entry.chain[0](c)
+					} else {
+						c.handlers = entry.chain
+						err = c.Next()
+					}
+					if err != nil {
+						c.HandleError(err)
+					}
+					releaseContext(c)
+					return
+				}
+				releaseContext(c)
+			}
 		}
 	}
 
+	s.serveSlow(snap, w, r, reqPath, rawPath)
+}
+
+//go:noinline
+func (s *Server) tryServeUnescapedAny(snap *routerSnapshot, w http.ResponseWriter, r *http.Request, reqPath string) bool {
+	c := acquireContext(s, w, r)
+	pc := paramCapture{
+		buf:   &c.paramBuf,
+		extra: &c.paramExtra,
+	}
+	if entry := snap.anyMethod.match(reqPath, false, &pc); entry != nil {
+		c.nParams = pc.n
+		c.paramNames = entry.paramNames
+		c.routePattern = entry.pattern
+		var err error
+		if len(entry.chain) == 1 {
+			err = entry.chain[0](c)
+		} else {
+			c.handlers = entry.chain
+			err = c.Next()
+		}
+		if err != nil {
+			c.HandleError(err)
+		}
+		releaseContext(c)
+		return true
+	}
+	releaseContext(c)
+	return false
+}
+
+//go:noinline
+func (s *Server) serveSlow(snap *routerSnapshot, w http.ResponseWriter, r *http.Request, reqPath, rawPath string) {
 	// Single-pass NUL + canonical path check on reqPath.
 	clean, hasNul := checkPath(reqPath)
 	if hasNul {
@@ -701,34 +785,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := acquireContext(s, w, r)
-	pc := paramCapture{
-		buf:   &c.paramBuf,
-		extra: &c.paramExtra,
-	}
-
 	mIdx := methodIndex(r.Method)
-	var entry *routeEntry
-	if !escaped {
-		entry = snap.matchAfterStaticIdx(mIdx, r.Method, matchPath, &pc)
-	} else {
-		entry = snap.matchIdx(mIdx, r.Method, matchPath, true, &pc)
-	}
-	if entry != nil {
-		c.nParams = pc.n
-		c.paramNames = entry.paramNames
-		c.routePattern = entry.pattern
-		var err error
-		if len(entry.chain) == 1 {
-			err = entry.chain[0](c)
-		} else {
-			c.handlers = entry.chain
-			err = c.Next()
+	if escaped {
+		pc := paramCapture{
+			buf:   &c.paramBuf,
+			extra: &c.paramExtra,
 		}
-		if err != nil {
-			c.HandleError(err)
+		if entry := snap.matchIdx(mIdx, r.Method, matchPath, true, &pc); entry != nil {
+			c.nParams = pc.n
+			c.paramNames = entry.paramNames
+			c.routePattern = entry.pattern
+			var err error
+			if len(entry.chain) == 1 {
+				err = entry.chain[0](c)
+			} else {
+				c.handlers = entry.chain
+				err = c.Next()
+			}
+			if err != nil {
+				c.HandleError(err)
+			}
+			releaseContext(c)
+			return
 		}
-		releaseContext(c)
-		return
 	}
 
 	// Optional trailing-slash redirect (safe against open redirects).
@@ -955,6 +1034,7 @@ func (s *Server) ServeTLSContext(ctx context.Context, ln net.Listener, certFile,
 }
 
 func (s *Server) serveWithContext(ctx context.Context, serveFn func() error) error {
+	_ = s.HTTPServer()
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- serveFn()

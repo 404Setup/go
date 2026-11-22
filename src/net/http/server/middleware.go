@@ -169,7 +169,9 @@ func RequestID() HandlerFunc {
 func RequestIDWithConfig(cfg RequestIDConfig) HandlerFunc {
 	header := cfg.Header
 	if header == "" {
-		header = "X-Request-ID"
+		header = "X-Request-Id"
+	} else {
+		header = http.CanonicalHeaderKey(header)
 	}
 	gen := cfg.Generator
 	if gen == nil {
@@ -178,7 +180,7 @@ func RequestIDWithConfig(cfg RequestIDConfig) HandlerFunc {
 	return func(c *Context) error {
 		var id string
 		if cfg.TrustIncoming {
-			if incoming := c.Header(header); isValidRequestID(incoming) {
+			if incoming := c.canonicalReqHeader(header); isValidRequestID(incoming) {
 				id = incoming
 			}
 		}
@@ -186,7 +188,7 @@ func RequestIDWithConfig(cfg RequestIDConfig) HandlerFunc {
 			id = gen()
 		}
 		c.Set(RequestIDKey, id)
-		c.SetHeader(header, id)
+		c.respHeader()[header] = []string{id}
 		return c.Next()
 	}
 }
@@ -231,9 +233,7 @@ func BodyLimit(maxBytes int64) HandlerFunc {
 			c.markRequestTooLarge()
 			return WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
 		}
-		if c.req.Body != nil && c.req.Body != http.NoBody {
-			c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, maxBytes)
-		}
+		c.wrapBodyLimit(maxBytes)
 		return c.Next()
 	}
 }
@@ -412,7 +412,11 @@ func CORS(cfg CORSConfig) HandlerFunc {
 		h := c.respHeader()
 		addVaryToken(h, "Origin")
 
-		origin := c.canonicalReqHeader("Origin")
+		originHeaders := c.req.Header["Origin"]
+		if len(originHeaders) != 1 {
+			return c.Next()
+		}
+		origin := originHeaders[0]
 		if origin == "" || hasASCIIControl(origin) {
 			return c.Next()
 		}

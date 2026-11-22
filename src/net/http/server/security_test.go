@@ -509,3 +509,68 @@ func TestSecurityMountRawPathAttachmentAndQueryControlChars(t *testing.T) {
 		t.Fatalf("many-vals status = %d", rec.Code)
 	}
 }
+
+// TestSecurityDisablePathCleaningEscapedTraversalAndMultiHeaderSmuggling
+// verifies that even when DisablePathCleaning is enabled, percent-encoded dot
+// or empty segments inside parameters or wildcards are rejected, and multiple
+// Content-Type or Origin headers are rejected against header smuggling.
+func TestSecurityDisablePathCleaningEscapedTraversalAndMultiHeaderSmuggling(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.DisablePathCleaning = true
+	s := server.NewWithConfig(cfg)
+	s.Use(server.CORS(server.CORSConfig{
+		AllowOrigins: []string{"https://app.example.com"},
+	}))
+
+	s.GET("/users/{id}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "user:"+c.Param("id"))
+	})
+	s.GET("/files/{filepath...}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "file:"+c.Param("filepath"))
+	})
+	s.POST("/json", func(c *server.Context) error {
+		var dst map[string]any
+		if err := c.BindJSON(&dst); err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, c.ContentType())
+	})
+
+	// 1. Escaped dot/empty segments must not match {id} or {filepath...} even with DisablePathCleaning.
+	for _, target := range []string{
+		"/users/..%2Fadmin",
+		"/users/a%2F..%2Fb",
+		"/users/a%2F.%2Fb",
+		"/users/a%2F%2Fb",
+		"/users/%2F",
+		"/files/%2e%2e/secret",
+		"/files/a%2F..%2Fb",
+		"/files/a%2F%2Fb",
+	} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("escaped traversal %q should be rejected with 404, got %d (%q)", target, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 2. Multiple Content-Type headers must be rejected by BindJSON (415) and ContentType() ("").
+	req := httptest.NewRequest(http.MethodPost, "/json", strings.NewReader(`{"a":1}`))
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("multiple Content-Type headers should return 415, got %d", rec.Code)
+	}
+
+	// 3. Multiple Origin headers must not receive Access-Control-Allow-Origin.
+	req = httptest.NewRequest(http.MethodGet, "/users/42", nil)
+	req.Header.Add("Origin", "https://app.example.com")
+	req.Header.Add("Origin", "https://evil.example.com")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("multiple Origin headers granted ACAO=%q", got)
+	}
+}

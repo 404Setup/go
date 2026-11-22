@@ -123,7 +123,8 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 			}
 			if info, err := fs.Stat(effectiveFS, name); err == nil && info.IsDir() {
 				if !strings.HasSuffix(u2.Path, "/") {
-					return ctx.Redirect(http.StatusMovedPermanently, ctx.req.URL.Path+"/")
+					g.server.safeRedirect(ctx.ResponseWriter(), ctx.req, ctx.req.URL.Path+"/")
+					return nil
 				}
 				idxPath := c.Index
 				if name != "." {
@@ -160,7 +161,8 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 			return nil
 		}
 		if c.Browse {
-			return ctx.Redirect(http.StatusMovedPermanently, cleanPref+"/")
+			g.server.safeRedirect(ctx.ResponseWriter(), ctx.req, cleanPref+"/")
+			return nil
 		}
 		return NewError(http.StatusNotFound, "not found")
 	})

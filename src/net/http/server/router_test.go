@@ -247,6 +247,10 @@ func TestRouterRegistrationPanics(t *testing.T) {
 		"/users/%00",
 		"/users/%2e",
 		"/users/%2e%2e",
+		"/users/a%2F..",
+		"/users/a%2F.",
+		"/users/a%2F%2Fb",
+		"/users/%2F",
 		"/users/%ZZ",
 	}
 	for _, pat := range badPatterns {

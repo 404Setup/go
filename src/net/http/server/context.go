@@ -91,11 +91,11 @@ func (rw *responseWriter) WriteString(s string) (int, error) {
 }
 
 func (rw *responseWriter) ReadFrom(r io.Reader) (int64, error) {
-	if !rw.written {
-		rw.status = http.StatusOK
-		rw.written = true
-	}
 	if rf, ok := rw.w.(io.ReaderFrom); ok {
+		if !rw.written {
+			rw.status = http.StatusOK
+			rw.written = true
+		}
 		n, err := rf.ReadFrom(r)
 		rw.size += n
 		return n, err
@@ -143,6 +143,7 @@ type Context struct {
 	queryParsed bool
 
 	maxBodyBytes int64
+	bodyLimited  bool
 	errHandled   bool
 }
 
@@ -209,13 +210,16 @@ func releaseContext(c *Context) {
 		c.writer = nil
 		c.cw = nil
 	}
-	c.handlers = nil
+	if c.handlers != nil {
+		c.handlers = nil
+	}
 	c.routePattern = ""
 	if c.queryParsed {
 		c.query = nil
 		c.queryParsed = false
 	}
 	c.maxBodyBytes = 0
+	c.bodyLimited = false
 	c.errHandled = false
 	contextPool.Put(c)
 }
@@ -320,13 +324,10 @@ func (c *Context) HandleError(err error) {
 func (c *Context) Param(name string) string {
 	for i, k := range c.paramNames {
 		if k == name {
-			if i < c.nParams {
-				if i < maxInlineParams {
-					return c.paramBuf[i]
-				}
-				return c.paramExtra[i-maxInlineParams]
+			if uint(i) < maxInlineParams {
+				return c.paramBuf[i]
 			}
-			return ""
+			return c.paramExtra[i-maxInlineParams]
 		}
 	}
 	return ""
@@ -363,25 +364,19 @@ func (c *Context) QueryValues() url.Values {
 const maxRawQueryFastScan = 4096
 
 // Query returns the first value associated with the given query key, or "".
-func (c *Context) Query(key string) string {
+func (c *Context) Query(target string) string {
 	if c.queryParsed {
-		return c.query.Get(key)
+		return c.query.Get(target)
 	}
 	raw := c.req.URL.RawQuery
-	if raw == "" {
+	n := len(raw)
+	if n == 0 {
 		return ""
 	}
-	if len(raw) > maxRawQueryFastScan {
-		return c.QueryValues().Get(key)
+	if n > maxRawQueryFastScan {
+		return c.QueryValues().Get(target)
 	}
-	return lookupRawQuery(raw, key)
-}
-
-// lookupRawQuery scans raw in a single pass for the first valid occurrence of
-// target without allocating a url.Values map, matching net/url.ParseQuery
-// semantics.
-func lookupRawQuery(raw, target string) string {
-	n := len(raw)
+	tlen := len(target)
 	for i := 0; i < n; {
 		start := i
 		eq := -1
@@ -390,18 +385,55 @@ func lookupRawQuery(raw, target string) string {
 		valEsc := false
 		for i < n {
 			b := raw[i]
-			if b == '&' {
-				break
-			}
-			if b == '=' && eq < 0 {
-				eq = i
-			} else if b == ';' {
-				hasSemi = true
-			} else if b == '%' || b == '+' {
-				if eq < 0 {
-					keyEsc = true
-				} else {
-					valEsc = true
+			// All query delimiter and escape characters ('%'=37, '&'=38, '+'=43,
+			// ';'=59, '='=61) have ASCII values <= '=' (61).
+			if b <= '=' {
+				if b == '&' {
+					break
+				}
+				if b == '=' && eq < 0 {
+					if !keyEsc && !hasSemi {
+						if i-start != tlen || raw[start:i] != target {
+							for i++; i < n && raw[i] != '&'; i++ {
+							}
+							hasSemi = true
+							break
+						}
+						valStart := i + 1
+						for i = valStart; i < n; i++ {
+							vb := raw[i]
+							if vb <= '=' {
+								if vb == '&' {
+									break
+								}
+								if vb == ';' {
+									hasSemi = true
+								} else if vb == '%' || vb == '+' {
+									valEsc = true
+								}
+							}
+						}
+						if !hasSemi {
+							v := raw[valStart:i]
+							if !valEsc {
+								return v
+							}
+							if u, err := url.QueryUnescape(v); err == nil {
+								return u
+							}
+						}
+						hasSemi = true
+						break
+					}
+					eq = i
+				} else if b == ';' {
+					hasSemi = true
+				} else if b == '%' || b == '+' {
+					if eq < 0 {
+						keyEsc = true
+					} else {
+						valEsc = true
+					}
 				}
 			}
 			i++
@@ -425,7 +457,7 @@ func lookupRawQuery(raw, target string) string {
 			}
 			k = u
 		}
-		if k != target {
+		if len(k) != tlen || k != target {
 			continue
 		}
 		if valEsc {
@@ -495,7 +527,11 @@ func (c *Context) canonicalReqHeader(canonicalKey string) string {
 // header (for example, "application/json"), stripped of parameters and
 // converted to lower case, or "" if the header is absent or malformed.
 func (c *Context) ContentType() string {
-	ct := c.canonicalReqHeader("Content-Type")
+	ctHeaders := c.req.Header["Content-Type"]
+	if len(ctHeaders) != 1 {
+		return ""
+	}
+	ct := ctHeaders[0]
 	if ct == "" {
 		return ""
 	}
@@ -644,6 +680,22 @@ func (c *Context) Set(key string, val any) {
 			return
 		}
 	}
+	if c.nValues < maxInlineValues && c.valuesMap == nil {
+		c.inlineValues[c.nValues] = contextKV{key: key, val: val}
+		c.nValues++
+		return
+	}
+	c.setSlow(key, val)
+}
+
+//go:noinline
+func (c *Context) setSlow(key string, val any) {
+	if len(c.valuesMap) > 0 {
+		if _, ok := c.valuesMap[key]; ok {
+			c.valuesMap[key] = val
+			return
+		}
+	}
 	if c.nValues < maxInlineValues {
 		c.inlineValues[c.nValues] = contextKV{key: key, val: val}
 		c.nValues++
@@ -715,11 +767,21 @@ func (c *Context) effectiveMaxBodyBytes() int64 {
 // markRequestTooLarge notifies the underlying net/http server to close the
 // connection after an oversized request body, matching http.MaxBytesReader.
 func (c *Context) markRequestTooLarge() {
-	if c.req.Body == nil {
+	if c.req.Body == nil || c.req.Body == http.NoBody {
 		return
 	}
+	mbr := http.MaxBytesReader(c.ResponseWriter(), c.req.Body, 0)
+	c.req.Body = mbr
+	c.bodyLimited = true
 	var b [1]byte
-	_, _ = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, 0).Read(b[:])
+	_, _ = mbr.Read(b[:])
+}
+
+func (c *Context) wrapBodyLimit(limit int64) {
+	if !c.bodyLimited && c.req.Body != nil && c.req.Body != http.NoBody {
+		c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, limit)
+		c.bodyLimited = true
+	}
 }
 
 // readBodyInto reads c.req.Body into jrb.buf using jrb.lr (zero heap
@@ -774,7 +836,6 @@ func (c *Context) BodyBytes() ([]byte, error) {
 	err := c.readBodyInto(jrb, limit)
 	if err != nil {
 		if jrb.buf.Cap() <= maxPooledJSONSize {
-			jrb.buf.Reset()
 			jsonReadBufPool.Put(jrb)
 		}
 		return nil, err
@@ -782,7 +843,6 @@ func (c *Context) BodyBytes() ([]byte, error) {
 	out := make([]byte, jrb.buf.Len())
 	copy(out, jrb.buf.Bytes())
 	if jrb.buf.Cap() <= maxPooledJSONSize {
-		jrb.buf.Reset()
 		jsonReadBufPool.Put(jrb)
 	}
 	return out, nil
@@ -797,7 +857,7 @@ func (c *Context) ParseForm() (url.Values, error) {
 			c.markRequestTooLarge()
 			return nil, WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
 		}
-		c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, limit)
+		c.wrapBodyLimit(limit)
 	}
 	if err := c.req.ParseForm(); err != nil {
 		var maxErr *http.MaxBytesError
@@ -820,7 +880,7 @@ func (c *Context) FormValue(key string) string {
 				c.markRequestTooLarge()
 				return ""
 			}
-			c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, limit)
+			c.wrapBodyLimit(limit)
 		}
 	}
 	return c.req.FormValue(key)
@@ -846,7 +906,7 @@ func (c *Context) ParseMultipartForm(maxMemory int64) (*multipart.Form, error) {
 				c.markRequestTooLarge()
 				return nil, WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
 			}
-			c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, limit)
+			c.wrapBodyLimit(limit)
 		}
 	}
 	if err := c.req.ParseMultipartForm(maxMemory); err != nil {
@@ -886,7 +946,7 @@ func (c *Context) BindJSONStrict(dst any) error {
 }
 
 func (c *Context) bindJSON(dst any, strict bool) error {
-	if ct := c.canonicalReqHeader("Content-Type"); ct != "" && !isJSONContentType(ct) {
+	if ctHeaders := c.req.Header["Content-Type"]; len(ctHeaders) > 1 || (len(ctHeaders) == 1 && ctHeaders[0] != "" && !isJSONContentType(ctHeaders[0])) {
 		return WrapError(http.StatusUnsupportedMediaType, "content-type must be application/json", ErrUnsupportedMediaType)
 	}
 	if c.req.Body == nil || c.req.Body == http.NoBody {
@@ -898,7 +958,6 @@ func (c *Context) bindJSON(dst any, strict bool) error {
 	jrb.buf.Reset()
 	if err := c.readBodyInto(jrb, limit); err != nil {
 		if jrb.buf.Cap() <= maxPooledJSONSize {
-			jrb.buf.Reset()
 			jsonReadBufPool.Put(jrb)
 		}
 		var he *HTTPError
@@ -911,7 +970,6 @@ func (c *Context) bindJSON(dst any, strict bool) error {
 	raw := trimJSONSpace(jrb.buf.Bytes())
 	if len(raw) == 0 {
 		if jrb.buf.Cap() <= maxPooledJSONSize {
-			jrb.buf.Reset()
 			jsonReadBufPool.Put(jrb)
 		}
 		return WrapError(http.StatusBadRequest, "request body is empty", ErrInvalidJSON)
@@ -932,7 +990,6 @@ func (c *Context) bindJSON(dst any, strict bool) error {
 	}
 
 	if jrb.buf.Cap() <= maxPooledJSONSize {
-		jrb.buf.Reset()
 		jsonReadBufPool.Put(jrb)
 	}
 
@@ -1183,7 +1240,6 @@ func (c *Context) JSON(code int, v any) error {
 	err := jeb.enc.Encode(v)
 	if err != nil {
 		if jeb.buf.Cap() <= maxPooledJSONSize {
-			jeb.buf.Reset()
 			jsonBufPool.Put(jeb)
 		}
 		return err
@@ -1197,7 +1253,6 @@ func (c *Context) JSON(code int, v any) error {
 	c.writeHeader(code)
 	_, werr := c.writeBytes(b)
 	if jeb.buf.Cap() <= maxPooledJSONSize {
-		jeb.buf.Reset()
 		jsonBufPool.Put(jeb)
 	}
 	return werr

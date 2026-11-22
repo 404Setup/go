@@ -132,13 +132,13 @@ func TestStaticFSIndexAndBrowse(t *testing.T) {
 		t.Fatalf("/browse/docs/ with Browse=true: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 
-	// Custom index filename works and redirects unslashed directory requests.
+	// Custom index filename works and redirects unslashed directory requests while preserving query params.
 	s3 := server.New()
 	s3.StaticFS("/custom", fsys, server.StaticConfig{Index: "start.html"})
 	rec = httptest.NewRecorder()
-	s3.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/custom/app", nil))
-	if rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/custom/app/" {
-		t.Fatalf("/custom/app: status=%d loc=%q, want 301 /custom/app/", rec.Code, rec.Header().Get("Location"))
+	s3.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/custom/app?v=1", nil))
+	if rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/custom/app/?v=1" {
+		t.Fatalf("/custom/app?v=1: status=%d loc=%q, want 301 /custom/app/?v=1", rec.Code, rec.Header().Get("Location"))
 	}
 	rec = httptest.NewRecorder()
 	s3.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/custom/app/", nil))
