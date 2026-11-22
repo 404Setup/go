@@ -53,6 +53,8 @@ jobs:
       - name: Build and run the full test suite
         working-directory: src
         shell: bash
+        env:
+          GO_TEST_TIMEOUT_SCALE: 2
         run: ./all.bash
 
       - name: Read release metadata

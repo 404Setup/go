@@ -256,7 +256,6 @@ func TestServerContentLengthMismatchAndForbiddenTrailers(t *testing.T) {
 				":method":        {"POST"},
 				"content-length": {"5", "10"},
 			}))
-			reqStream.Flush()
 
 			reqStream.wantError(quic.StreamError(errH3MessageError))
 			if called {
@@ -279,7 +278,6 @@ func TestServerContentLengthMismatchAndForbiddenTrailers(t *testing.T) {
 				":method":        {"POST"},
 				"content-length": {"not-a-number"},
 			}))
-			reqStream.Flush()
 
 			reqStream.wantError(quic.StreamError(errH3MessageError))
 			if called {
