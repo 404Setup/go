@@ -186,4 +186,14 @@ func TestStaticNoBrowseIndexDirectoryBypass(t *testing.T) {
 		}()
 		_ = s.StaticDir("/bad/{id}", dir)
 	}()
+
+	// StaticFS with control characters in Index panics.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for control character in StaticConfig.Index")
+			}
+		}()
+		s.StaticFS("/ctrl", fstest.MapFS{}, server.StaticConfig{Index: "index\x00.html"})
+	}()
 }

@@ -86,7 +86,7 @@ func classifyError(err error) (code int, msg string, internal bool) {
 	var he *HTTPError
 	if errors.As(err, &he) {
 		code = he.Code
-		if code < 100 || code > 599 {
+		if code < 400 || code > 599 {
 			code = http.StatusInternalServerError
 		}
 		msg = he.Message

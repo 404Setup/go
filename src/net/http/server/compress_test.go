@@ -386,7 +386,8 @@ func TestMiddlewareCompressLoggerInnerAndPartialWriteErrorIsolation(t *testing.T
 		t.Fatalf("partial-then-err corrupted body: code=%d body=%q", rec.Code, rec.Body.String())
 	}
 
-	// 3. Multi-chunk WriteString (> 4 KiB) compresses and decompresses cleanly.
+	// 3. Multi-chunk WriteString (> 4 KiB) compresses and decompresses cleanly,
+	// and inner Logger records the full uncompressed payload byte count.
 	logBuf.Reset()
 	req = httptest.NewRequest(http.MethodGet, "/big-string", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
@@ -397,6 +398,12 @@ func TestMiddlewareCompressLoggerInnerAndPartialWriteErrorIsolation(t *testing.T
 	}
 	if got := gunzipBody(t, rec.Body); got != bigText {
 		t.Fatalf("big-string decompressed len=%d, want %d", len(got), len(bigText))
+	}
+	if err := json.Unmarshal(logBuf.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["bytes"] != float64(len(bigText)) {
+		t.Fatalf("inner Logger bytes for /big-string = %v, want %d", entry["bytes"], len(bigText))
 	}
 
 	// 4. Multiple Accept-Encoding header lines: second line enabling gzip works,
@@ -427,6 +434,10 @@ func TestMiddlewareCompressLoggerInnerAndPartialWriteErrorIsolation(t *testing.T
 		c.SetHeader("Content-Encoding", "br")
 		return server.NewError(http.StatusBadRequest, "bad input")
 	})
+	s2.GET("/partial-content", func(c *server.Context) error {
+		c.SetHeader("Content-Range", "bytes 0-1999/5000")
+		return c.Text(http.StatusPartialContent, bigText)
+	})
 	req = httptest.NewRequest(http.MethodGet, "/stale-ce-err", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 	rec = httptest.NewRecorder()
@@ -439,5 +450,14 @@ func TestMiddlewareCompressLoggerInnerAndPartialWriteErrorIsolation(t *testing.T
 	}
 	if entry["status"] != float64(http.StatusBadRequest) || entry["bytes"] != float64(len("bad input")) {
 		t.Fatalf("outer Logger recorded wrong status/bytes: %#v", entry)
+	}
+
+	// 6. 206 Partial Content / Content-Range responses must never be compressed.
+	req = httptest.NewRequest(http.MethodGet, "/partial-content", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s2.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent || rec.Header().Get("Content-Encoding") != "" || rec.Body.String() != bigText {
+		t.Fatalf("206 Partial Content should bypass compression: code=%d ce=%q", rec.Code, rec.Header().Get("Content-Encoding"))
 	}
 }

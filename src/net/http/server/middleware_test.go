@@ -163,6 +163,15 @@ func TestMiddlewareBodyLimitAndTimeout(t *testing.T) {
 		}
 	})
 
+	var outerCtxErr error
+	s.GET("/fast", func(c *server.Context) error {
+		err := c.Next()
+		outerCtxErr = c.Context().Err()
+		return err
+	}, server.Timeout(time.Second), func(c *server.Context) error {
+		return c.Text(http.StatusOK, "fast")
+	})
+
 	rec := httptest.NewRecorder()
 	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/small", strings.NewReader("12345678901")))
 	if rec.Code != http.StatusRequestEntityTooLarge {
@@ -173,6 +182,12 @@ func TestMiddlewareBodyLimitAndTimeout(t *testing.T) {
 	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slow", nil))
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("Timeout status = %d, want 504", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fast", nil))
+	if rec.Code != http.StatusOK || outerCtxErr != nil {
+		t.Fatalf("outer middleware saw canceled context after Timeout: code=%d err=%v", rec.Code, outerCtxErr)
 	}
 }
 

@@ -302,11 +302,8 @@ func (st *staticTable) add(path string, entry *routeEntry) {
 }
 
 func (st *staticTable) lookup(path string) *routeEntry {
-	if st.count == 0 {
-		return nil
-	}
 	l := len(path)
-	if l < st.minLen || l > st.maxLen || (st.lenMask&(1<<(uint(l)&63))) == 0 {
+	if (st.lenMask&(1<<(uint(l)&63))) == 0 || l < st.minLen || l > st.maxLen {
 		return nil
 	}
 	if st.m != nil {
@@ -672,6 +669,21 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 				return n.paramChild.leaf
 			}
 			n = n.paramChild
+			if n.chainTarget != nil && len(rest) > 1 {
+				p := n.chainPrefix
+				if len(rest) < len(p) || rest[:len(p)] != p {
+					return nil
+				}
+				if len(rest) == len(p) {
+					return n.chainTarget.leaf
+				}
+				if rest[len(p)] != '/' {
+					return nil
+				}
+				path = rest[len(p):]
+				n = n.chainTarget
+				continue
+			}
 			path = rest
 			continue
 		}
@@ -802,7 +814,11 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 			}
 			rem = u
 		}
-		if rem != "" && hasInvalidSegment(rem) {
+		checkRem := rem
+		if len(checkRem) > 1 && checkRem[len(checkRem)-1] == '/' {
+			checkRem = checkRem[:len(checkRem)-1]
+		}
+		if checkRem != "" && hasInvalidSegment(checkRem) {
 			return nil
 		}
 		if pc != nil {
@@ -865,7 +881,7 @@ func (mr *methodRouter) add(p parsedPattern, entry *routeEntry) error {
 }
 
 func (mr *methodRouter) match(path string, escaped bool, pc *paramCapture) *routeEntry {
-	if mr == nil {
+	if mr == nil || len(path) == 0 || path[0] != '/' {
 		return nil
 	}
 	if !escaped {
@@ -881,7 +897,7 @@ func (mr *methodRouter) match(path string, escaped bool, pc *paramCapture) *rout
 }
 
 func (mr *methodRouter) matchDynamic(path string, pc *paramCapture) *routeEntry {
-	if mr == nil || mr.onlyStatic {
+	if mr == nil || mr.onlyStatic || len(path) == 0 || path[0] != '/' {
 		return nil
 	}
 	return mr.dynTree.matchUnescaped(path, pc)

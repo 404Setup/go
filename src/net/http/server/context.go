@@ -5,6 +5,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -101,6 +102,22 @@ func (rw *responseWriter) ReadFrom(r io.Reader) (int64, error) {
 		return n, err
 	}
 	return io.Copy(writerOnly{rw}, r)
+}
+
+func (rw *responseWriter) FlushError() error {
+	if !rw.written {
+		rw.status = http.StatusOK
+		rw.written = true
+	}
+	return http.NewResponseController(rw.w).Flush()
+}
+
+func (rw *responseWriter) Flush() {
+	_ = rw.FlushError()
+}
+
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(rw.w).Hijack()
 }
 
 // Unwrap returns the underlying [http.ResponseWriter] for [http.ResponseController].
@@ -285,10 +302,10 @@ func (c *Context) StatusCode() int {
 
 // BytesWritten returns the number of response body bytes written so far.
 func (c *Context) BytesWritten() int64 {
-	if c.rw.size > 0 || c.cw == nil {
-		return c.rw.size
+	if c.cw != nil {
+		return c.cw.writtenBytes
 	}
-	return c.cw.writtenBytes
+	return c.rw.size
 }
 
 // Written reports whether the response header has been written.
@@ -517,7 +534,7 @@ func (c *Context) Header(key string) string {
 }
 
 func (c *Context) canonicalReqHeader(canonicalKey string) string {
-	if v := c.req.Header[canonicalKey]; len(v) > 0 {
+	if v := c.req.Header[canonicalKey]; len(v) == 1 {
 		return v[0]
 	}
 	return ""

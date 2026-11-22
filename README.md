@@ -157,19 +157,19 @@ xychart-beta
     x-axis ["StaticRoute", "ParallelParam1", "Param1Route", "Param3Route", "JSONResponse", "QueryParam"]
     y-axis "Latency (ns/op)" 0 --> 1000
     bar [83.19, 118.1, 214.4, 375.7, 572.8, 944.7]
-    bar [73.99, 46.79, 91.23, 152.6, 512.8, 136.9]
+    bar [73.99, 46.76, 90.60, 141.5, 512.8, 136.9]
 ```
 
 | Benchmark | `net/http.ServeMux` | `net/http/server` | Latency Delta | Allocs (`ServeMux` → `server`) |
 | :--- | ---: | ---: | ---: | :---: |
 | `StaticRoute` (50+ routes) | 83.19 ns/op | **73.99 ns/op** | **-11.1%** (1.12×) | 0 → 0 |
-| `Param1Route` (`/api/v1/users/{id}`) | 214.4 ns/op | **91.23 ns/op** | **-57.4%** (2.35×) | 1 (16 B) → **0 (0 B)** |
-| `Param3Route` (3 params) | 375.7 ns/op | **152.6 ns/op** | **-59.4%** (2.46×) | 1 (48 B) → **0 (0 B)** |
-| `ParallelParamRoute` (`-cpu=2`) | 118.1 ns/op | **46.79 ns/op** | **-60.4%** (2.52×) | 1 (16 B) → **0 (0 B)** |
+| `Param1Route` (`/api/v1/users/{id}`) | 214.4 ns/op | **90.60 ns/op** | **-57.7%** (2.37×) | 1 (16 B) → **0 (0 B)** |
+| `Param3Route` (3 params) | 375.7 ns/op | **141.5 ns/op** | **-62.3%** (2.66×) | 1 (48 B) → **0 (0 B)** |
+| `ParallelParamRoute` (`-cpu=2`) | 118.1 ns/op | **46.76 ns/op** | **-60.4%** (2.53×) | 1 (16 B) → **0 (0 B)** |
 | `QueryParam` (2 keys) | 944.7 ns/op | **136.9 ns/op** | **-85.5%** (6.90×) | 6 (464 B) → **0 (0 B)** |
 | `JSONResponse` (`c.JSON` vs `json.Marshal`) | 572.8 ns/op | **512.8 ns/op** | **-10.5%** (1.12×) | 2 (64 B) → **0 (0 B)** |
 
-> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz). Additional `net/http/server` medians: `WildcardRoute` **106.8 ns/op** (0 allocs), `MiddlewareChain5` **129.6 ns/op** (0 allocs), `BindJSON` **936.0 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **12.43 µs/op** (0 allocs, 54 B).*
+> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz). Additional `net/http/server` medians: `WildcardRoute` **104.2 ns/op** (0 allocs), `MiddlewareChain5` **129.6 ns/op** (0 allocs), `BindJSON` **936.0 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **12.19 µs/op** (0 allocs, 54 B).*
 
 ---
 

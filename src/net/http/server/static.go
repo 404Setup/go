@@ -6,6 +6,7 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -68,7 +69,7 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 	if c.Index == "" {
 		c.Index = "index.html"
 	}
-	if strings.ContainsAny(c.Index, "/\\") || c.Index == "." || c.Index == ".." {
+	if strings.ContainsAny(c.Index, "/\\") || c.Index == "." || c.Index == ".." || hasASCIIControl(c.Index) {
 		panic(fmt.Sprintf("server: invalid static index filename %q", c.Index))
 	}
 
@@ -187,6 +188,10 @@ type cacheControlWriter struct {
 }
 
 func (w *cacheControlWriter) WriteHeader(code int) {
+	if code >= 100 && code <= 199 && code != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
 	if !w.written {
 		w.written = true
 		if (code >= 200 && code < 300) || code == http.StatusNotModified {
@@ -208,6 +213,46 @@ func (w *cacheControlWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return w.ResponseWriter.Write(p)
+}
+
+func (w *cacheControlWriter) WriteString(s string) (int, error) {
+	if !w.written {
+		w.written = true
+		h := w.Header()
+		if len(h["Cache-Control"]) == 0 {
+			h["Cache-Control"] = w.value
+		}
+	}
+	return io.WriteString(w.ResponseWriter, s)
+}
+
+func (w *cacheControlWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !w.written {
+		w.written = true
+		h := w.Header()
+		if len(h["Cache-Control"]) == 0 {
+			h["Cache-Control"] = w.value
+		}
+	}
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(writerOnly{w.ResponseWriter}, r)
+}
+
+func (w *cacheControlWriter) FlushError() error {
+	if !w.written {
+		w.written = true
+		h := w.Header()
+		if len(h["Cache-Control"]) == 0 {
+			h["Cache-Control"] = w.value
+		}
+	}
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *cacheControlWriter) Flush() {
+	_ = w.FlushError()
 }
 
 func (w *cacheControlWriter) Unwrap() http.ResponseWriter {

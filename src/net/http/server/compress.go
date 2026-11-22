@@ -165,6 +165,9 @@ func (w *compressResponseWriter) shouldBypassHeaders() bool {
 	if len(h["Content-Encoding"]) > 0 && h["Content-Encoding"][0] != "" {
 		return true
 	}
+	if len(h["Content-Range"]) > 0 && h["Content-Range"][0] != "" {
+		return true
+	}
 	if len(h["Upgrade"]) > 0 && h["Upgrade"][0] != "" {
 		return true
 	}
@@ -188,6 +191,7 @@ func (w *compressResponseWriter) WriteHeader(code int) {
 
 	if code == http.StatusSwitchingProtocols ||
 		code == http.StatusNoContent ||
+		code == http.StatusPartialContent ||
 		code == http.StatusNotModified ||
 		w.shouldBypassHeaders() {
 		w.mode = compressBypassed

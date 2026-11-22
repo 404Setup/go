@@ -391,3 +391,37 @@ func TestRouterMatchMethods(t *testing.T) {
 	}()
 	s.Match(nil, "/empty", func(c *server.Context) error { return nil })
 }
+
+func TestRouterEscapedWildcardTrailingSlashAndParamChainFusion(t *testing.T) {
+	s := server.New()
+	s.GET("/files/{filepath...}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "wild:"+c.Param("filepath"))
+	})
+	s.GET("/orgs/{org}/repos", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "repos-list:"+c.Param("org"))
+	})
+	s.GET("/orgs/{org}/repos/{repo}/issues/{issue}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Param("org")+"/"+c.Param("repo")+"#"+c.Param("issue"))
+	})
+
+	cases := []struct {
+		target string
+		status int
+		body   string
+	}{
+		{"/files/a/b/c/", http.StatusOK, "wild:a/b/c/"},
+		{"/files/a%2Fb/c/", http.StatusOK, "wild:a/b/c/"},
+		{"/orgs/golang/repos", http.StatusOK, "repos-list:golang"},
+		{"/orgs/golang/repos/go/issues/42", http.StatusOK, "golang/go#42"},
+		{"/orgs/golang/other", http.StatusNotFound, "not found"},
+		{"/orgs/golang/reposx", http.StatusNotFound, "not found"},
+		{"/orgs/golang/", http.StatusNotFound, "not found"},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.target, nil))
+		if rec.Code != tc.status || rec.Body.String() != tc.body {
+			t.Errorf("GET %s: status=%d body=%q, want %d %q", tc.target, rec.Code, rec.Body.String(), tc.status, tc.body)
+		}
+	}
+}

@@ -574,3 +574,76 @@ func TestSecurityDisablePathCleaningEscapedTraversalAndMultiHeaderSmuggling(t *t
 		t.Fatalf("multiple Origin headers granted ACAO=%q", got)
 	}
 }
+
+// TestSecurityNonSlashPathAndSingleHeaderSmuggling verifies that malformed
+// non-slash paths (such as 1-byte or authority-form paths on CONNECT or with
+// DisablePathCleaning) never panic or falsely match root parameters, and that
+// duplicate single-value headers (Authorization, X-Real-IP, X-Forwarded-Proto,
+// X-Request-ID) are rejected.
+func TestSecurityNonSlashPathAndSingleHeaderSmuggling(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.DisablePathCleaning = true
+	cfg.RedirectTrailingSlash = true
+	cfg.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	s := server.NewWithConfig(cfg)
+	s.Use(server.RequestIDWithConfig(server.RequestIDConfig{TrustIncoming: true}))
+
+	// Populate both radixEdges (>1 static branches) and a root param route.
+	s.GET("/alpha/{id}", func(c *server.Context) error { return c.NoContent() })
+	s.GET("/beta/{id}", func(c *server.Context) error { return c.NoContent() })
+	s.GET("/{rootParam}", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Param("rootParam"))
+	})
+	s.GET("/inspect", func(c *server.Context) error {
+		tok, ok := c.BearerToken()
+		id, _ := server.GetValue[string](c, server.RequestIDKey)
+		return c.Text(http.StatusOK, fmt.Sprintf("ip=%s;scheme=%s;tok=%s:%v;id=%s",
+			c.ClientIP(), c.Scheme(), tok, ok, id))
+	})
+	s.GET("/basic", server.BasicAuth("test", func(u, p string) bool {
+		return u == "admin" && p == "pass"
+	}), func(c *server.Context) error {
+		return c.Text(http.StatusOK, "authed")
+	})
+
+	// 1. Non-slash paths ("", "a", "alpha/1") must return 404 without panicking or matching /{rootParam} (405).
+	for _, method := range []string{http.MethodConnect, http.MethodGet, http.MethodPost} {
+		for _, p := range []string{"", "a", "alpha/1", "example.com:443"} {
+			req := httptest.NewRequest(method, "http://example.com/", nil)
+			req.URL.Path = p
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s path=%q: status=%d, want 404", method, p, rec.Code)
+			}
+		}
+	}
+
+	// 2. Duplicate Authorization, X-Real-IP, X-Forwarded-Proto, and X-Request-ID headers must be ignored/rejected.
+	req := httptest.NewRequest(http.MethodGet, "/inspect", nil)
+	req.RemoteAddr = "10.0.0.1:1234"
+	req.Header.Add("Authorization", "Bearer tok1")
+	req.Header.Add("Authorization", "Bearer tok2")
+	req.Header.Add("X-Real-IP", "203.0.113.1")
+	req.Header.Add("X-Real-IP", "203.0.113.2")
+	req.Header.Add("X-Forwarded-Proto", "https")
+	req.Header.Add("X-Forwarded-Proto", "http")
+	req.Header.Add("X-Request-ID", "custom-id-1")
+	req.Header.Add("X-Request-ID", "custom-id-2")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "ip=10.0.0.1;scheme=http;tok=:false;") || strings.Contains(body, "custom-id") {
+		t.Fatalf("duplicate single-value headers were not rejected: %q", body)
+	}
+
+	// 3. Duplicate Authorization headers on BasicAuth must return 401.
+	req = httptest.NewRequest(http.MethodGet, "/basic", nil)
+	req.SetBasicAuth("admin", "pass")
+	req.Header.Add("Authorization", "Basic YWRtaW46cGFzcw==")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("duplicate BasicAuth Authorization header should return 401, got %d", rec.Code)
+	}
+}

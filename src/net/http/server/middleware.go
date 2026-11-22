@@ -245,8 +245,12 @@ func Timeout(d time.Duration) HandlerFunc {
 		panic("server: Timeout duration must be positive")
 	}
 	return func(c *Context) error {
-		ctx, cancel := context.WithTimeout(c.Context(), d)
-		defer cancel()
+		prevReq := c.req
+		ctx, cancel := context.WithTimeout(prevReq.Context(), d)
+		defer func() {
+			cancel()
+			c.req = prevReq
+		}()
 		c.SetContext(ctx)
 		return c.Next()
 	}
@@ -437,11 +441,7 @@ func CORS(cfg CORSConfig) HandlerFunc {
 			}
 			originSlice = []string{origin}
 		} else if allowAll {
-			if cfg.AllowCredentials {
-				originSlice = []string{origin}
-			} else {
-				originSlice = headerValWildcard
-			}
+			originSlice = headerValWildcard
 		} else {
 			var ok bool
 			originSlice, ok = allowedSet[origin]
@@ -513,6 +513,10 @@ func BasicAuth(realm string, validator func(username, password string) bool) Han
 	wwwAuthSlice := []string{`Basic realm="` + safeRealm + `", charset="UTF-8"`}[:1:1]
 
 	return func(c *Context) error {
+		if len(c.req.Header["Authorization"]) != 1 {
+			c.respHeader()["Www-Authenticate"] = wwwAuthSlice
+			return NewError(http.StatusUnauthorized, "unauthorized")
+		}
 		user, pass, ok := c.req.BasicAuth()
 		if !ok || !validator(user, pass) {
 			c.respHeader()["Www-Authenticate"] = wwwAuthSlice

@@ -170,6 +170,56 @@ func TestServerJSONErrorHandlerAndCustomHandlers(t *testing.T) {
 	if body["error"] != "custom method not allowed" {
 		t.Fatalf("body = %v", body)
 	}
+
+	// Non-error HTTPError status codes (< 400, e.g. 204 or 103) must fall back to 500
+	// so error handlers never write a body after 1xx/204/304.
+	s.GET("/bad-err-code", func(c *server.Context) error {
+		return server.NewError(http.StatusNoContent, "invalid error code")
+	})
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/bad-err-code", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("HTTPError(204) status = %d, want 500", rec.Code)
+	}
+
+	// Direct http.Flusher and http.Hijacker assertions on c.ResponseWriter() must succeed.
+	s.GET("/iface", func(c *server.Context) error {
+		rw := c.ResponseWriter()
+		flusher, okF := rw.(http.Flusher)
+		_, okH := rw.(http.Hijacker)
+		if !okF || !okH {
+			return server.NewError(http.StatusInternalServerError, "missing Flusher or Hijacker")
+		}
+		_, _ = io.WriteString(rw, "flushed")
+		flusher.Flush()
+		return nil
+	})
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/iface", nil))
+	if rec.Code != http.StatusOK || !rec.Flushed || rec.Body.String() != "flushed" {
+		t.Fatalf("/iface: code=%d flushed=%v body=%q", rec.Code, rec.Flushed, rec.Body.String())
+	}
+
+	// Use(valid, nil) must panic atomically without appending the first middleware.
+	sAtomic := server.New()
+	ranPartial := false
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic on nil middleware")
+			}
+		}()
+		sAtomic.Use(func(c *server.Context) error {
+			ranPartial = true
+			return c.Next()
+		}, nil)
+	}()
+	sAtomic.GET("/check", func(c *server.Context) error { return c.NoContent() })
+	rec = httptest.NewRecorder()
+	sAtomic.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/check", nil))
+	if ranPartial {
+		t.Fatal("Use appended partial middleware before panicking on nil")
+	}
 }
 
 func TestServerHandleHTTPAndMountAndRoutes(t *testing.T) {

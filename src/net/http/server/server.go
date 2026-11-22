@@ -226,14 +226,14 @@ func (s *Server) isTrustedProxy(ip netip.Addr) bool {
 // Root middleware runs on subsequently registered routes, subsequently created
 // groups, and 404/405 responses.
 func (s *Server) Use(middlewares ...HandlerFunc) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, mw := range middlewares {
 		if mw == nil {
 			panic("server: nil middleware")
 		}
-		s.root.middlewares = append(s.root.middlewares, mw)
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.root.middlewares = append(s.root.middlewares, middlewares...)
 	s.rebuildFallbackChainsLocked()
 }
 
@@ -372,14 +372,14 @@ type Group struct {
 // Use appends middleware to the group for subsequently registered routes and
 // child groups.
 func (g *Group) Use(middlewares ...HandlerFunc) {
-	g.server.mu.Lock()
-	defer g.server.mu.Unlock()
 	for _, mw := range middlewares {
 		if mw == nil {
 			panic("server: nil middleware")
 		}
-		g.middlewares = append(g.middlewares, mw)
 	}
+	g.server.mu.Lock()
+	defer g.server.mu.Unlock()
+	g.middlewares = append(g.middlewares, middlewares...)
 	if g == g.server.root {
 		g.server.rebuildFallbackChainsLocked()
 	}
@@ -811,7 +811,7 @@ func (s *Server) serveSlow(snap *routerSnapshot, w http.ResponseWriter, r *http.
 	}
 
 	// Optional trailing-slash redirect (safe against open redirects).
-	if s.cfg.RedirectTrailingSlash && matchPath != "/" && r.Method != http.MethodConnect {
+	if s.cfg.RedirectTrailingSlash && len(matchPath) > 1 && matchPath[0] == '/' && r.Method != http.MethodConnect {
 		var alt string
 		if matchPath[len(matchPath)-1] == '/' {
 			alt = matchPath[:len(matchPath)-1]
@@ -828,16 +828,18 @@ func (s *Server) serveSlow(snap *routerSnapshot, w http.ResponseWriter, r *http.
 	}
 
 	// Check if other HTTP methods match this path (405 Method Not Allowed).
-	var allowBuf [numStdMethods]string
-	allowed := snap.allowedMethods(matchPath, escaped, allowBuf[:0])
-	if len(allowed) > 0 {
-		w.Header().Set("Allow", strings.Join(allowed, ", "))
-		c.handlers = snap.methodNotAllowed
-		if err := c.Next(); err != nil {
-			c.HandleError(err)
+	if len(matchPath) > 0 && matchPath[0] == '/' {
+		var allowBuf [numStdMethods]string
+		allowed := snap.allowedMethods(matchPath, escaped, allowBuf[:0])
+		if len(allowed) > 0 {
+			c.respHeader()["Allow"] = []string{strings.Join(allowed, ", ")}
+			c.handlers = snap.methodNotAllowed
+			if err := c.Next(); err != nil {
+				c.HandleError(err)
+			}
+			releaseContext(c)
+			return
 		}
-		releaseContext(c)
-		return
 	}
 
 	// 404 Not Found.
