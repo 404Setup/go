@@ -206,15 +206,20 @@ func Marshal(v any) ([]byte, error) {
 // Each JSON element in the output will begin on a new line beginning with prefix
 // followed by one or more copies of indent according to the indentation nesting.
 func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
-	b, err := Marshal(v)
+	bp := getIndentScratch()
+	b, err := AppendMarshal(*bp, v)
+	if err != nil {
+		*bp = b[:0]
+		putIndentScratch(bp)
+		return nil, err
+	}
+	*bp = b
+	out, err := appendIndent(nil, b, prefix, indent)
+	putIndentScratch(bp)
 	if err != nil {
 		return nil, err
 	}
-	b, err = appendIndent(nil, b, prefix, indent)
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
+	return out, nil
 }
 
 // Marshaler is the interface implemented by types that

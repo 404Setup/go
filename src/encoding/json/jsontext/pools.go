@@ -87,6 +87,21 @@ func putBufferedEncoder(e *Encoder) {
 	bufferedEncoderPool.Put(e)
 }
 
+var appendEncoderPool = &sync.Pool[*Encoder]{New: func() *Encoder { return new(Encoder) }}
+
+func getAppendEncoder(dst []byte, opts ...Options) *Encoder {
+	e := appendEncoderPool.Get()
+	e.s.reset(dst, nil, opts...)
+	return e
+}
+func putAppendEncoder(e *Encoder) {
+	if cap(e.s.availBuffer) > 64<<10 {
+		e.s.availBuffer = nil
+	}
+	e.s.Buf = nil // do not pin caller's buffer
+	appendEncoderPool.Put(e)
+}
+
 func getStreamingEncoder(w io.Writer, opts ...Options) *Encoder {
 	if _, ok := w.(*bytes.Buffer); ok {
 		e := bytesBufferEncoderPool.Get()

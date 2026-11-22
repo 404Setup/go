@@ -288,7 +288,7 @@ func makeStringMarshaler(t reflect.Type) *marshaler {
 		if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !stringify && !xe.Tokens.Last.NeedObjectName() {
 			b := xe.Buf
 			b = xe.Tokens.MayAppendDelim(b, '"')
-			b, err := jsonwire.AppendQuote(b, []byte(s), &mo.Flags)
+			b, err := jsonwire.AppendQuoteString(b, s, &mo.Flags)
 			if err == nil {
 				xe.CommitBuffer(b)
 				xe.Tokens.Last.Increment()
@@ -302,7 +302,7 @@ func makeStringMarshaler(t reflect.Type) *marshaler {
 		}
 
 		if stringify {
-			b, err := jsonwire.AppendQuote(nil, []byte(s), &mo.Flags)
+			b, err := jsonwire.AppendQuoteString(nil, s, &mo.Flags)
 			if err != nil {
 				return newMarshalErrorBefore(enc, t, &jsontext.SyntacticError{Err: err})
 			}
@@ -555,9 +555,11 @@ func makeBytesUnmarshaler(t reflect.Type, fnc *unmarshaler) *unmarshaler {
 				// specifies that non-alphabet characters must be rejected.
 				// Unfortunately, the "base32" and "base64" packages allow
 				// '\r' and '\n' characters by default.
-				i := bytes.IndexAny(val, "\r\n")
-				err := fmt.Errorf("illegal character %s at offset %d", jsonwire.QuoteRune(val[i:]), i)
-				return newUnmarshalErrorAfter(dec, t, err)
+				if i := bytes.IndexAny(val, "\r\n"); i >= 0 {
+					err := fmt.Errorf("illegal character %s at offset %d", jsonwire.QuoteRune(val[i:]), i)
+					return newUnmarshalErrorAfter(dec, t, err)
+				}
+				return newUnmarshalErrorAfter(dec, t, fmt.Errorf("illegal encoding length %d", len(val)))
 			}
 
 			if va.Kind() == reflect.Array {
@@ -1417,7 +1419,7 @@ func makeStructMarshaler(t reflect.Type) *marshaler {
 				if !f.nameNeedEscape {
 					b = append(b, f.quotedName...)
 				} else {
-					b, _ = jsonwire.AppendQuote(b, []byte(f.name), &mo.Flags)
+					b, _ = jsonwire.AppendQuoteString(b, f.name, &mo.Flags)
 				}
 				xe.CommitBuffer(b)
 				xe.Names.ReplaceLastQuotedOffset(n0)

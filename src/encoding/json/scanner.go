@@ -22,9 +22,7 @@ import (
 
 // Valid reports whether data is a valid JSON encoding.
 func Valid(data []byte) bool {
-	scan := newScanner()
-	defer freeScanner(scan)
-	return checkValid(data, scan) == nil
+	return v1CheckValidFast(data)
 }
 
 // checkValid verifies that data is valid JSON-encoded data.

@@ -13,12 +13,15 @@ import (
 	"encoding"
 	"encoding/base64"
 	"fmt"
+	"internal/abi"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // Unmarshal parses the JSON-encoded data and stores the result
@@ -106,13 +109,23 @@ import (
 // Instead, they are replaced by the Unicode replacement
 // character U+FFFD.
 func Unmarshal(data []byte, v any) error {
+	e := (*v1Eface)(unsafe.Pointer(&v))
+	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
+		if tryV1FastUnmarshal(data, e.typ.Elem(), e.data, false, false, false) {
+			runtime.KeepAlive(&v)
+			return nil
+		}
+		runtime.KeepAlive(&v)
+	}
+
 	// Check for well-formedness.
 	// Avoids filling out half a data structure
 	// before discovering a JSON syntax error.
 	var d decodeState
-	err := checkValid(data, &d.scan)
-	if err != nil {
-		return err
+	if !v1CheckValidFast(data) {
+		if err := checkValid(data, &d.scan); err != nil {
+			return err
+		}
 	}
 
 	d.init(data)

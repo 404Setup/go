@@ -156,9 +156,13 @@ func (d *Decoder) Reset(r io.Reader, opts ...Options) {
 func (d *decoderState) reset(b []byte, r io.Reader, opts ...Options) {
 	d.state.reset()
 	d.decodeBuffer = decodeBuffer{buf: b, rd: r}
-	opts2 := jsonopts.Struct{} // avoid mutating d.Struct in case it is part of opts
-	opts2.Join(opts...)
-	d.Struct = opts2
+	if len(opts) == 0 {
+		d.Struct = jsonopts.Struct{}
+	} else {
+		opts2 := jsonopts.Struct{} // avoid mutating d.Struct in case it is part of opts
+		opts2.Join(opts...)
+		d.Struct = opts2
+	}
 }
 
 // Options returns the options used to construct the decoder and

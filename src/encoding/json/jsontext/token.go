@@ -267,7 +267,7 @@ func (t Token) appendString(dst []byte, flags *jsonflags.Flags) ([]byte, error) 
 		}
 	} else if len(t.str) != 0 && t.num == 0 {
 		// Handle exact string value.
-		return jsonwire.AppendQuote(dst, []byte(t.str), flags)
+		return jsonwire.AppendQuoteString(dst, t.str, flags)
 	}
 
 	panic("invalid JSON token kind: " + t.Kind().String())

@@ -119,8 +119,10 @@ func appendIndent(dst, src []byte, prefix, indent string) ([]byte, error) {
 			n := len(b) - len(bytes.TrimLeft(b, " ")) // len(prefix)+n*len(indent)
 			spaces := b[:n]
 			spaces = spaces[copy(spaces, invalidPrefix):]
-			for len(spaces) > 0 {
-				spaces = spaces[copy(spaces, invalidIndent):]
+			if len(invalidIndent) > 0 {
+				for len(spaces) > 0 {
+					spaces = spaces[copy(spaces, invalidIndent):]
+				}
 			}
 			b = b[n:]
 		}

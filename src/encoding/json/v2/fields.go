@@ -15,7 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/v2"
 	"unicode"
 	"unicode/utf8"
 
@@ -83,11 +83,13 @@ type structFieldsCacheEntry struct {
 	err    *SemanticError
 }
 
-var structFieldsCache sync.Map // map[reflect.Type]*structFieldsCacheEntry
+var structFieldsCache sync.Map[reflect.Type, *structFieldsCacheEntry]
 
 func lookupStructFields(t reflect.Type) (*structFields, *SemanticError) {
-	entry, _ := structFieldsCache.LoadOrStore(t, new(structFieldsCacheEntry))
-	cached := entry.(*structFieldsCacheEntry)
+	cached, ok := structFieldsCache.Load(t)
+	if !ok {
+		cached, _ = structFieldsCache.LoadOrStore(t, new(structFieldsCacheEntry))
+	}
 	cached.once.Do(func() {
 		cached.fields, cached.err = makeStructFields(t)
 	})

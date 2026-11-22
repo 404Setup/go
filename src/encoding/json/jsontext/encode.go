@@ -127,11 +127,15 @@ func (e *encoderState) reset(b []byte, w io.Writer, opts ...Options) {
 	if bb, ok := w.(*bytes.Buffer); ok && bb != nil {
 		e.Buf = bb.AvailableBuffer() // alias the unused buffer of bb
 	}
-	opts2 := jsonopts.Struct{} // avoid mutating e.Struct in case it is part of opts
-	opts2.Join(opts...)
-	e.Struct = opts2
-	if e.Struct.Flags.Get(jsonflags.Multiline) {
-		e.Struct.InitializeMultiline()
+	if len(opts) == 0 {
+		e.Struct = jsonopts.Struct{}
+	} else {
+		opts2 := jsonopts.Struct{} // avoid mutating e.Struct in case it is part of opts
+		opts2.Join(opts...)
+		e.Struct = opts2
+		if e.Struct.Flags.Get(jsonflags.Multiline) {
+			e.Struct.InitializeMultiline()
+		}
 	}
 }
 

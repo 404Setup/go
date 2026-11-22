@@ -9,7 +9,10 @@ package json
 import (
 	"bytes"
 	"errors"
+	"internal/abi"
 	"io"
+	"runtime"
+	"unsafe"
 )
 
 // A Decoder reads and decodes JSON values from an input stream.
@@ -66,8 +69,20 @@ func (dec *Decoder) Decode(v any) error {
 	if err != nil {
 		return err
 	}
-	dec.d.init(dec.buf[dec.scanp : dec.scanp+n])
+	raw := dec.buf[dec.scanp : dec.scanp+n]
 	dec.scanp += n
+
+	e := (*v1Eface)(unsafe.Pointer(&v))
+	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
+		if tryV1FastUnmarshal(raw, e.typ.Elem(), e.data, true, dec.d.useNumber, dec.d.disallowUnknownFields) {
+			runtime.KeepAlive(&v)
+			dec.tokenValueEnd()
+			return nil
+		}
+		runtime.KeepAlive(&v)
+	}
+
+	dec.d.init(raw)
 
 	// Don't save err from unmarshal into dec.err:
 	// the connection is still usable since we read a complete JSON
@@ -216,6 +231,51 @@ func NewEncoder(w io.Writer) *Encoder {
 func (enc *Encoder) Encode(v any) error {
 	if enc.err != nil {
 		return enc.err
+	}
+
+	at, ptr := v1EfacePtr(&v)
+	if at == nil {
+		b := []byte("null\n")
+		if enc.indentPrefix != "" || enc.indentValue != "" {
+			var err error
+			enc.indentBuf, err = appendIndent(enc.indentBuf[:0], b, enc.indentPrefix, enc.indentValue)
+			if err != nil {
+				return err
+			}
+			b = enc.indentBuf
+		}
+		if _, err := enc.w.Write(b); err != nil {
+			enc.err = err
+			return err
+		}
+		return nil
+	}
+	plan := lookupV1FastMarshalPlan(at)
+	if plan.canFast {
+		fb := getV1FastBuf()
+		if b, err := plan.marshal(fb.b, ptr, enc.escapeHTML, 0); err == nil {
+			runtime.KeepAlive(&v)
+			b = append(b, '\n')
+			fb.b = b
+			out := b
+			if enc.indentPrefix != "" || enc.indentValue != "" {
+				var ierr error
+				enc.indentBuf, ierr = appendIndent(enc.indentBuf[:0], b, enc.indentPrefix, enc.indentValue)
+				if ierr != nil {
+					putV1FastBuf(fb)
+					return ierr
+				}
+				out = enc.indentBuf
+			}
+			_, werr := enc.w.Write(out)
+			putV1FastBuf(fb)
+			if werr != nil {
+				enc.err = werr
+			}
+			return werr
+		}
+		runtime.KeepAlive(&v)
+		putV1FastBuf(fb)
 	}
 
 	e := newEncodeState()
@@ -390,6 +450,9 @@ func (dec *Decoder) Token() (Token, error) {
 			if !dec.tokenValueAllowed() {
 				return dec.tokenError(c)
 			}
+			if len(dec.tokenStack) >= maxNestingDepth {
+				return nil, &SyntaxError{"exceeded max depth", dec.InputOffset()}
+			}
 			dec.scanp++
 			dec.tokenStack = append(dec.tokenStack, dec.tokenState)
 			dec.tokenState = tokenArrayStart
@@ -408,6 +471,9 @@ func (dec *Decoder) Token() (Token, error) {
 		case '{':
 			if !dec.tokenValueAllowed() {
 				return dec.tokenError(c)
+			}
+			if len(dec.tokenStack) >= maxNestingDepth {
+				return nil, &SyntaxError{"exceeded max depth", dec.InputOffset()}
 			}
 			dec.scanp++
 			dec.tokenStack = append(dec.tokenStack, dec.tokenState)

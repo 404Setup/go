@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"sync"
+	"sync/v2"
 
 	"encoding/json/internal/jsonflags"
 	"encoding/json/internal/jsonopts"
@@ -73,7 +73,7 @@ type typedArshalers[Coder, Value any] struct {
 	nonComparable
 
 	fncVals  []typedArshaler[Coder, Value]
-	fncCache sync.Map // map[reflect.Type]arshaler
+	fncCache sync.Map[reflect.Type, func(*Coder, Value, *jsonopts.Struct) error]
 
 	// fromAny reports whether any of Go types used to represent arbitrary JSON
 	// (i.e., any, bool, string, float64, map[string]any, or []any) matches
@@ -118,7 +118,7 @@ func (a *typedArshalers[Coder, Value]) lookup(fnc func(*Coder, Value, *jsonopts.
 		if v == nil {
 			return fnc, false
 		}
-		return v.(func(*Coder, Value, *jsonopts.Struct) error), true
+		return v, true
 	}
 
 	// Collect a list of arshalers that can be called for this type.
@@ -152,7 +152,7 @@ func (a *typedArshalers[Coder, Value]) lookup(fnc func(*Coder, Value, *jsonopts.
 
 	// Use the first stored so duplicate work can be garbage collected.
 	v, _ := a.fncCache.LoadOrStore(t, fnc)
-	return v.(func(*Coder, Value, *jsonopts.Struct) error), true
+	return v, true
 }
 
 // MarshalFunc constructs a type-specific marshaler that

@@ -113,7 +113,7 @@ func marshalEmbeddedFallbackAll(enc *jsontext.Encoder, vm maybeAddressableValue,
 		mka := newAddressableValue(m.Type().Key())  // temporary addressable key for each map entry
 		mva := newAddressableValue(m.Type().Elem()) // temporary addressable value for each map entry
 		marshalKey := func(vm maybeAddressableValue) error {
-			b, err := jsonwire.AppendQuote(enc.AvailableBuffer(), []byte(vm.String()), &mo.Flags)
+			b, err := jsonwire.AppendQuoteString(enc.AvailableBuffer(), vm.String(), &mo.Flags)
 			if err != nil {
 				return newMarshalErrorBefore(enc, m.Type().Key(), err)
 			}

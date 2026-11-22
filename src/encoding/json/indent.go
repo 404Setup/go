@@ -6,7 +6,11 @@
 
 package json
 
-import "bytes"
+import (
+	"bytes"
+	"internal/byteorder"
+	"math/bits"
+)
 
 // HTMLEscape appends to dst the JSON-encoded src with <, >, &, U+2028 and U+2029
 // characters inside string literals changed to \u003c, \u003e, \u0026, \u2028, \u2029
@@ -20,20 +24,47 @@ func HTMLEscape(dst *bytes.Buffer, src []byte) {
 
 func appendHTMLEscape(dst, src []byte) []byte {
 	// The characters can only appear in string literals,
-	// so just scan the string one byte at a time.
+	// so scan with 8-byte SWAR for '<', '>', '&', or 0xE2 (lead byte of U+2028/U+2029).
+	const e2Mask8 = 0xe2e2e2e2e2e2e2e2
 	start := 0
-	for i, c := range src {
+	i := 0
+	for i < len(src) {
+		for len(src)-i >= 8 {
+			w := byteorder.LEUint64(src[i:])
+			xl := w ^ v1SwarLt8
+			xg := w ^ v1SwarGt8
+			xa := w ^ v1SwarAmp8
+			xe := w ^ e2Mask8
+			m := ((xl - v1SwarLo8) &^ xl & v1SwarHi8) |
+				((xg - v1SwarLo8) &^ xg & v1SwarHi8) |
+				((xa - v1SwarLo8) &^ xa & v1SwarHi8) |
+				((xe - v1SwarLo8) &^ xe & v1SwarHi8)
+			if m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				break
+			}
+			i += 8
+		}
+		if i >= len(src) {
+			break
+		}
+		c := src[i]
 		if c == '<' || c == '>' || c == '&' {
 			dst = append(dst, src[start:i]...)
 			dst = append(dst, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xF])
-			start = i + 1
+			i++
+			start = i
+			continue
 		}
 		// Convert U+2028 and U+2029 (E2 80 A8 and E2 80 A9).
 		if c == 0xE2 && i+2 < len(src) && src[i+1] == 0x80 && src[i+2]&^1 == 0xA8 {
 			dst = append(dst, src[start:i]...)
 			dst = append(dst, '\\', 'u', '2', '0', '2', hex[src[i+2]&0xF])
-			start = i + len("\u2029")
+			i += len("\u2029")
+			start = i
+			continue
 		}
+		i++
 	}
 	return append(dst, src[start:]...)
 }

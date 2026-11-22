@@ -7,8 +7,10 @@
 package jsonwire
 
 import (
+	"internal/byteorder"
 	"io"
 	"math"
+	"math/bits"
 	"slices"
 	"strconv"
 	"unicode/utf16"
@@ -32,7 +34,7 @@ func (f ValueFlags) IsCanonical() bool   { return f&stringNonCanonical == 0 }
 // ConsumeWhitespace consumes leading JSON whitespace per RFC 7159, section 2.
 func ConsumeWhitespace(b []byte) (n int) {
 	// NOTE: The arguments and logic are kept simple to keep this inlinable.
-	for len(b) > n && (b[n] == ' ' || b[n] == '\t' || b[n] == '\r' || b[n] == '\n') {
+	for len(b) > n && b[n] <= ' ' && (b[n] == ' ' || b[n] == '\t' || b[n] == '\r' || b[n] == '\n') {
 		n++
 	}
 	return n
@@ -135,13 +137,22 @@ func ConsumeStringResumable(flags *ValueFlags, b []byte, resumeOffset int, valid
 
 	// Consume every character in the string.
 	for uint(len(b)) > uint(n) {
-		// Optimize for long sequences of unescaped characters.
-		noEscape := func(c byte) bool {
-			return c < utf8.RuneSelf && ' ' <= c && c != '\\' && c != '"'
+		// Optimize for long sequences of unescaped characters using SWAR.
+		for len(b)-n >= 8 {
+			if m := escapeMaskNoHTML(byteorder.LEUint64(b[n:])); m != 0 {
+				n += bits.TrailingZeros64(m) >> 3
+				goto checkSpecial
+			}
+			n += 8
 		}
-		for uint(len(b)) > uint(n) && noEscape(b[n]) {
+		for uint(len(b)) > uint(n) {
+			c := b[n]
+			if c >= utf8.RuneSelf || c < ' ' || c == '\\' || c == '"' {
+				break
+			}
 			n++
 		}
+	checkSpecial:
 		if uint(len(b)) <= uint(n) {
 			return n, io.ErrUnexpectedEOF
 		}
@@ -270,13 +281,22 @@ func AppendUnquote(dst, src []byte) (v []byte, err error) {
 
 	// Consume every character in the string.
 	for uint(len(src)) > uint(n) {
-		// Optimize for long sequences of unescaped characters.
-		noEscape := func(c byte) bool {
-			return c < utf8.RuneSelf && ' ' <= c && c != '\\' && c != '"'
+		// Optimize for long sequences of unescaped characters using SWAR.
+		for len(src)-n >= 8 {
+			if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
+				n += bits.TrailingZeros64(m) >> 3
+				goto checkUnquoteSpecial
+			}
+			n += 8
 		}
-		for uint(len(src)) > uint(n) && noEscape(src[n]) {
+		for uint(len(src)) > uint(n) {
+			c := src[n]
+			if c >= utf8.RuneSelf || c < ' ' || c == '\\' || c == '"' {
+				break
+			}
 			n++
 		}
+	checkUnquoteSpecial:
 		if uint(len(src)) <= uint(n) {
 			dst = append(dst, src[i:n]...)
 			return dst, io.ErrUnexpectedEOF

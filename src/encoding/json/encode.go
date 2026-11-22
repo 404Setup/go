@@ -50,14 +50,18 @@ import (
 	"encoding"
 	"encoding/base64"
 	"fmt"
+	"internal/byteorder"
 	"math"
+	"math/bits"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync/v2"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // Marshal returns the JSON encoding of v.
@@ -197,6 +201,19 @@ import (
 // handle them. Passing cyclic structures to Marshal will result in
 // an error.
 func Marshal(v any) ([]byte, error) {
+	at, ptr := v1EfacePtr(&v)
+	if at == nil {
+		return []byte("null"), nil
+	}
+	plan := lookupV1FastMarshalPlan(at)
+	if plan.canFast {
+		if out, ok := v1MarshalFastAlloc(plan, ptr, true); ok {
+			runtime.KeepAlive(&v)
+			return out, nil
+		}
+		runtime.KeepAlive(&v)
+	}
+
 	e := newEncodeState()
 	defer encodeStatePool.Put(e)
 
@@ -213,12 +230,17 @@ func Marshal(v any) ([]byte, error) {
 // Each JSON element in the output will begin on a new line beginning with prefix
 // followed by one or more copies of indent according to the indentation nesting.
 func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
-	b, err := Marshal(v)
+	fb := getV1FastBuf()
+	b, err := AppendMarshal(fb.b, v)
 	if err != nil {
+		fb.b = b[:0]
+		putV1FastBuf(fb)
 		return nil, err
 	}
+	fb.b = b
 	b2 := make([]byte, 0, indentGrowthFactor*len(b))
 	b2, err = appendIndent(b2, b, prefix, indent)
+	putV1FastBuf(fb)
 	if err != nil {
 		return nil, err
 	}
@@ -992,8 +1014,38 @@ func resolveKeyName(k reflect.Value) (string, error) {
 
 func appendString[Bytes []byte | string](dst []byte, src Bytes, escapeHTML bool) []byte {
 	dst = append(dst, '"')
+	var raw []byte
+	if len(src) >= 8 {
+		if s, ok := any(src).(string); ok {
+			raw = unsafe.Slice(unsafe.StringData(s), len(s))
+		} else {
+			raw = any(src).([]byte)
+		}
+	}
 	start := 0
 	for i := 0; i < len(src); {
+		if len(raw)-i >= 8 {
+			if escapeHTML {
+				for len(raw)-i >= 8 {
+					if m := v1EscapeMaskHTML(byteorder.LEUint64(raw[i:])); m != 0 {
+						i += bits.TrailingZeros64(m) >> 3
+						break
+					}
+					i += 8
+				}
+			} else {
+				for len(raw)-i >= 8 {
+					if m := v1EscapeMaskNoHTML(byteorder.LEUint64(raw[i:])); m != 0 {
+						i += bits.TrailingZeros64(m) >> 3
+						break
+					}
+					i += 8
+				}
+			}
+			if i >= len(src) {
+				break
+			}
+		}
 		if b := src[i]; b < utf8.RuneSelf {
 			if htmlSafeSet[b] || (!escapeHTML && safeSet[b]) {
 				i++

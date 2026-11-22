@@ -64,6 +64,13 @@ func (export) PutBufferedEncoder(e *Encoder) {
 	putBufferedEncoder(e)
 }
 
+func (export) GetAppendEncoder(dst []byte, o ...Options) *Encoder {
+	return getAppendEncoder(dst, o...)
+}
+func (export) PutAppendEncoder(e *Encoder) {
+	putAppendEncoder(e)
+}
+
 func (export) GetStreamingEncoder(w io.Writer, o ...Options) *Encoder {
 	return getStreamingEncoder(w, o...)
 }

@@ -18,7 +18,7 @@ import (
 // and an error is returned at the end indicating the presence of invalid UTF-8.
 // The dst must not overlap with the src.
 func AppendQuote[Bytes ~[]byte | ~string](dst []byte, src Bytes) ([]byte, error) {
-	dst, err := jsonwire.AppendQuote(dst, []byte(src), &jsonflags.Flags{})
+	dst, err := jsonwire.AppendQuote(dst, src, &jsonflags.Flags{})
 	if err != nil {
 		err = &SyntacticError{Err: err}
 	}

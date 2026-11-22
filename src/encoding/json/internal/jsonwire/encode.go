@@ -7,14 +7,56 @@
 package jsonwire
 
 import (
+	"internal/byteorder"
 	"math"
+	"math/bits"
 	"slices"
 	"strconv"
 	"unicode/utf16"
 	"unicode/utf8"
+	"unsafe"
 
 	"encoding/json/internal/jsonflags"
 )
+
+const (
+	swarLo8  = 0x0101010101010101
+	swarHi8  = 0x8080808080808080
+	swarSp8  = 0x2020202020202020
+	swarQt8  = 0x2222222222222222 // '"'
+	swarBs8  = 0x5c5c5c5c5c5c5c5c // '\\'
+	swarLt8  = 0x3c3c3c3c3c3c3c3c // '<'
+	swarGt8  = 0x3e3e3e3e3e3e3e3e // '>'
+	swarAmp8 = 0x2626262626262626 // '&'
+)
+
+// escapeMaskNoHTML returns a bitmask with bit 7 set in each byte lane of w
+// that is >= 0x80, < 0x20, '"', or '\\'.
+func escapeMaskNoHTML(w uint64) uint64 {
+	xq := w ^ swarQt8
+	xb := w ^ swarBs8
+	return (w & swarHi8) |
+		((w - swarSp8) & swarHi8) |
+		((xq - swarLo8) &^ xq & swarHi8) |
+		((xb - swarLo8) &^ xb & swarHi8)
+}
+
+// escapeMaskHTML returns a bitmask with bit 7 set in each byte lane of w
+// that is >= 0x80, < 0x20, '"', '\\', '<', '>', or '&'.
+func escapeMaskHTML(w uint64) uint64 {
+	xq := w ^ swarQt8
+	xb := w ^ swarBs8
+	xl := w ^ swarLt8
+	xg := w ^ swarGt8
+	xa := w ^ swarAmp8
+	return (w & swarHi8) |
+		((w - swarSp8) & swarHi8) |
+		((xq - swarLo8) &^ xq & swarHi8) |
+		((xb - swarLo8) &^ xb & swarHi8) |
+		((xl - swarLo8) &^ xl & swarHi8) |
+		((xg - swarLo8) &^ xg & swarHi8) |
+		((xa - swarLo8) &^ xa & swarHi8)
+}
 
 // escapeASCII reports whether the ASCII character needs to be escaped.
 // It conservatively assumes EscapeForHTML.
@@ -34,6 +76,13 @@ var escapeASCII = [...]uint8{
 // It reports true for inputs with invalid UTF-8.
 func NeedEscape(src []byte) bool {
 	var i int
+	for len(src)-i >= 8 {
+		if m := escapeMaskHTML(byteorder.LEUint64(src[i:])); m != 0 {
+			i += bits.TrailingZeros64(m) >> 3
+			break
+		}
+		i += 8
+	}
 	for uint(len(src)) > uint(i) {
 		if c := src[i]; c < utf8.RuneSelf {
 			if escapeASCII[c] > 0 {
@@ -62,12 +111,46 @@ func NeedEscape(src []byte) bool {
 // invalid bytes are replaced with the Unicode replacement character ('\ufffd').
 // If no escape flags are set, then the shortest representable form is used,
 // which is also the canonical form for strings (RFC 8785, section 3.2.2.2).
-func AppendQuote(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
+func AppendQuote[Bytes ~[]byte | ~string](dst []byte, src Bytes, flags *jsonflags.Flags) ([]byte, error) {
+	if s, ok := any(src).(string); ok {
+		return appendQuoteBytes(dst, unsafe.Slice(unsafe.StringData(s), len(s)), flags)
+	}
+	return appendQuoteBytes(dst, []byte(src), flags)
+}
+
+// AppendQuoteString appends src to dst as a JSON string without converting src to []byte.
+func AppendQuoteString(dst []byte, src string, flags *jsonflags.Flags) ([]byte, error) {
+	return appendQuoteBytes(dst, unsafe.Slice(unsafe.StringData(src), len(src)), flags)
+}
+
+func appendQuoteBytes(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
 	var i, n int
 	var hasInvalidUTF8 bool
 	dst = slices.Grow(dst, len(`"`)+len(src)+len(`"`))
 	dst = append(dst, '"')
+	escapeHTML := flags.Get(jsonflags.EscapeForHTML)
 	for uint(len(src)) > uint(n) {
+		if !escapeHTML {
+			for len(src)-n >= 8 {
+				if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
+					n += bits.TrailingZeros64(m) >> 3
+					goto handleByte
+				}
+				n += 8
+			}
+		} else {
+			for len(src)-n >= 8 {
+				if m := escapeMaskHTML(byteorder.LEUint64(src[n:])); m != 0 {
+					n += bits.TrailingZeros64(m) >> 3
+					goto handleByte
+				}
+				n += 8
+			}
+		}
+		if uint(len(src)) <= uint(n) {
+			break
+		}
+	handleByte:
 		if c := src[n]; c < utf8.RuneSelf {
 			// Handle single-byte ASCII.
 			n++
@@ -75,7 +158,7 @@ func AppendQuote(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
 				continue // no escaping possibly needed
 			}
 			// Handle escaping of single-byte ASCII.
-			if !(c == '<' || c == '>' || c == '&') || flags.Get(jsonflags.EscapeForHTML) {
+			if !(c == '<' || c == '>' || c == '&') || escapeHTML {
 				dst = append(dst, src[i:n-1]...)
 				dst = appendEscapedASCII(dst, c)
 				i = n

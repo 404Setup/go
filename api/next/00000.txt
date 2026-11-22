@@ -1,3 +1,20 @@
+pkg encoding/json, func AppendMarshal([]uint8, interface{}) ([]uint8, error) #80000
+pkg encoding/json, func AppendMarshalIndent([]uint8, interface{}, string, string) ([]uint8, error) #80000
+pkg encoding/json, func AppendMarshalIndentOf[$0 interface{}]([]uint8, $0, string, string) ([]uint8, error) #80000
+pkg encoding/json, func AppendMarshalOf[$0 interface{}]([]uint8, $0) ([]uint8, error) #80000
+pkg encoding/json, func DecodeOf[$0 interface{}](*Decoder, *$0) error #80000
+pkg encoding/json, func EncodeOf[$0 interface{}](*Encoder, $0) error #80000
+pkg encoding/json, func MarshalIndentOf[$0 interface{}]($0, string, string) ([]uint8, error) #80000
+pkg encoding/json, func MarshalOf[$0 interface{}]($0) ([]uint8, error) #80000
+pkg encoding/json, func UnmarshalOf[$0 interface{}]([]uint8, *$0) error #80000
+pkg encoding/json/v2, func AppendMarshal([]uint8, interface{}, ...jsonopts.Options) ([]uint8, error) #80000
+pkg encoding/json/v2, func AppendMarshalOf[$0 interface{}]([]uint8, $0, ...jsonopts.Options) ([]uint8, error) #80000
+pkg encoding/json/v2, func MarshalEncodeOf[$0 interface{}](*jsontext.Encoder, $0, ...jsonopts.Options) error #80000
+pkg encoding/json/v2, func MarshalOf[$0 interface{}]($0, ...jsonopts.Options) ([]uint8, error) #80000
+pkg encoding/json/v2, func MarshalWriteOf[$0 interface{}](io.Writer, $0, ...jsonopts.Options) error #80000
+pkg encoding/json/v2, func UnmarshalDecodeOf[$0 interface{}](*jsontext.Decoder, *$0, ...jsonopts.Options) error #80000
+pkg encoding/json/v2, func UnmarshalOf[$0 interface{}]([]uint8, *$0, ...jsonopts.Options) error #80000
+pkg encoding/json/v2, func UnmarshalReadOf[$0 interface{}](io.Reader, *$0, ...jsonopts.Options) error #80000
 pkg net/http/server, const RequestIDKey = "server.request_id" #80000
 pkg net/http/server, const RequestIDKey ideal-string #80000
 pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80000

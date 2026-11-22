@@ -10,6 +10,7 @@ This fork is a personal Go branch maintained by 404Setup.
 > This fork does not modify language syntax or break existing standard library APIs.
 
 ### Standard Library & Runtime
+- **`encoding/json`, `encoding/json/v2`**: Compiled direct-memory marshal/unmarshal fast paths, 8-byte SWAR string/whitespace/HTML scanning, zero-allocation SWAR validation, pooled buffers, and generic `*Of` / `Append*` APIs (`MarshalOf`, `AppendMarshal`, `AppendMarshalOf`, `MarshalIndentOf`, `AppendMarshalIndent`, `AppendMarshalIndentOf`, `UnmarshalOf`, `EncodeOf`, `DecodeOf`, plus v2 `MarshalWriteOf`, `MarshalEncodeOf`, `UnmarshalReadOf`, `UnmarshalDecodeOf`) across both default `jsonv2` and `GOEXPERIMENT=nojsonv2` builds.
 - **`io`**: Pooled overflow buffers and exact-sized final allocations in `ReadAll`.
 - **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with online `Shrink()`), used across standard library internals.
 - **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
@@ -351,6 +352,57 @@ xychart-beta
 | `GCSweepSmallObjects` (fused inline-mark sweep + full-span skip) | 526.2 ns/op | **517.3 ns/op** | **-1.7%** (1.02×) | 0 → 0 |
 
 > *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`70d635fc`) against the patched runtime.*
+
+---
+
+### 7. `encoding/json` and `encoding/json/v2`
+
+```mermaid
+xychart-beta
+    title "encoding/json & encoding/json/v2: Baseline (left bar) vs Patched (right bar) — Latency (ms/op, lower is better)"
+    x-axis ["CodeMarshal (v1/v2)", "CodeEncoder (v1/v2)", "CodeUnmarshal (v1/v2)", "GolangSrc Marshal (v2)", "GolangSrc Unmarshal (v2)", "CodeUnmarshal (nojsonv2)"]
+    y-axis "Latency (ms/op)" 0 --> 25
+    bar [4.55, 4.26, 13.59, 9.67, 21.13, 23.65]
+    bar [2.88, 2.27, 5.79, 5.02, 10.36, 5.55]
+```
+
+#### `encoding/json` (default `jsonv2`) and `encoding/json/v2`
+
+| Benchmark | Baseline (`3d9b976b`) | Patched | Latency Delta | Allocs (`Baseline` → `Patched`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `CodeEncoder` (`encoding/json`) | 4.26 ms/op | **2.27 ms/op** | **-46.7%** (1.88×) | 0 → 0 |
+| `CodeMarshal` (`encoding/json`) | 4.55 ms/op | **2.88 ms/op** | **-36.8%** (1.58×) | 1 → 1 |
+| `CodeUnmarshal` (`encoding/json`) | 13.59 ms/op | **5.79 ms/op** | **-57.4%** (2.35×) | 26,771 → 26,770 |
+| `CodeUnmarshalReuse` (`encoding/json`) | 13.92 ms/op | **5.79 ms/op** | **-58.4%** (2.40×) | 12,823 → **12,088** |
+| `UnmarshalString` (`encoding/json`) | 154.8 ns/op | **43.98 ns/op** | **-71.6%** (3.52×) | 0 → 0 |
+| `UnmarshalInt64` (`encoding/json`) | 138.8 ns/op | **49.98 ns/op** | **-64.0%** (2.78×) | 0 → 0 |
+| `UnmarshalFloat64` (`encoding/json`) | 172.5 ns/op | **76.79 ns/op** | **-55.5%** (2.25×) | 0 → 0 |
+| `UnmarshalMap` (`encoding/json`) | 941.5 ns/op | **288.3 ns/op** | **-69.4%** (3.27×) | 8 (104 B) → **3 (24 B)** |
+| `GolangSource/Marshal/Concrete` (`v2`) | 9.67 ms/op | **5.02 ms/op** | **-48.1%** (1.93×) | 2 → **1** |
+| `GolangSource/Unmarshal/Concrete` (`v2`) | 21.13 ms/op | **10.36 ms/op** | **-51.0%** (2.04×) | 13,948 → 13,947 |
+| `MarshalRecords/1` / `10000` (`v2`) | 874.1 ns / 7.24 ms | **416.3 ns / 4.01 ms** | **-52.4% / -44.6%** | 1 / 1 → 1 / 1 |
+| `MarshalMapRecords` (`v2`) | 860.2 µs/op | **300.6 µs/op** | **-65.0%** (2.86×) | 2,001 (106 KB) → **1 (74 KB)** |
+| `MarshalAny` (`Ints` / `Mixed` / `Map`, `v2`) | 884.9 / 1,295 / 2,230 ns | **290.6 / 343.6 / 649.8 ns** | **-67.2% / -73.5% / -70.9%** | 1 / 1 / 3 → **1 / 1 / 1** |
+| `Marshal` (`String` / `Int`, `v2`) | 180.7 / 176.0 ns/op | **89.82 / 84.73 ns/op** | **-50.3% / -51.9%** | 1 / 1 → 1 / 1 |
+| `Unmarshal` (`String` / `Int`, `v2`) | 219.1 / 224.8 ns/op | **117.0 / 71.70 ns/op** | **-46.6% / -68.1%** | 1 / 1 → 1 / 1 |
+
+#### Legacy `encoding/json` (`GOEXPERIMENT=nojsonv2`) and Generic `*Of` / `Append*` APIs
+
+| Benchmark | Baseline (`3d9b976b`) / `any` API | Patched / Generic API | Latency Delta | Allocs (`Before` → `After`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `CodeEncoder` (`nojsonv2`) | 3.62 ms/op | **2.25 ms/op** | **-37.8%** (1.61×) | 0 → 0 |
+| `CodeMarshal` (`nojsonv2`) | 4.35 ms/op | **2.86 ms/op** | **-34.2%** (1.52×) | 1 → 1 |
+| `CodeUnmarshal` (`nojsonv2`) | 23.65 ms/op | **5.55 ms/op** | **-76.5%** (4.26×) | 39,990 → **26,770** |
+| `CodeUnmarshalReuse` (`nojsonv2`) | 22.21 ms/op | **5.49 ms/op** | **-75.3%** (4.04×) | 26,935 → **12,065** |
+| `MarshalMapRecords` (`nojsonv2`) | 790.8 µs/op | **462.7 µs/op** | **-41.5%** (1.71×) | 5,001 (218 KB) → **1 (74 KB)** |
+| `UnmarshalString` / `Int64` (`nojsonv2`) | 256.1 / 180.0 ns/op | **40.47 / 20.38 ns/op** | **-84.2% / -88.7%** | 2 / 1 → **0 / 0** |
+| `UnmarshalFloat64` / `Map` (`nojsonv2`) | 203.6 / 1,274 ns/op | **45.29 / 278.9 ns/op** | **-77.8% / -78.1%** | 1 / 12 → **0 / 3** |
+| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`v2`) | 625.3 ns/op | **527.6 / 395.5 ns/op** | **-15.6% / -36.8%** | 2 (256 B) → **1 (160 B) / 0 (0 B)** |
+| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`json`) | 678.8 ns/op | **645.5 / 412.7 ns/op** | **-4.9% / -39.2%** | 2 (256 B) → **1 (160 B) / 0 (0 B)** |
+| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`nojsonv2`) | 723.2 ns/op | **597.5 / 410.9 ns/op** | **-17.4% / -43.2%** | 2 (256 B) → **1 (160 B) / 0 (0 B)** |
+| Small Struct: `Encoder.Encode` → `EncodeOf` (`json` / `nojsonv2`) | 596.4 / 579.9 ns/op | **484.9 / 447.2 ns/op** | **-18.7% / -22.9%** | 1 (96 B) → **0 (0 B)** |
+
+> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz) comparing pre-patch `HEAD` (`3d9b976b`) against patched `encoding/json` and `encoding/json/v2`.*
 
 ---
 

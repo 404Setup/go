@@ -10,10 +10,13 @@ import (
 	"bytes"
 	"encoding"
 	"errors"
+	"internal/abi"
 	"io"
 	"reflect"
+	"runtime"
 	"sync/v2"
 	"time"
+	"unsafe"
 
 	"encoding/json/internal"
 	"encoding/json/internal/jsonflags"
@@ -161,6 +164,23 @@ var export = jsontext.Internal.Export(&internal.AllowInternalUse)
 //
 // JSON cannot represent cyclic data structures and Marshal does not handle them.
 func Marshal(in any, opts ...Options) (out []byte, err error) {
+	var moBuf jsonopts.Struct
+	mo := fastOpts(opts, &moBuf)
+	if canFastMarshalFlags(mo) {
+		at, ptr := efacePtr(&in)
+		if at == nil {
+			return []byte("null"), nil
+		}
+		plan := lookupFastMarshalPlan(at)
+		if plan.canFast {
+			if out, ok := marshalFastAlloc(plan, ptr, mo); ok {
+				runtime.KeepAlive(&in)
+				return out, nil
+			}
+			runtime.KeepAlive(&in)
+		}
+	}
+
 	enc := export.GetBufferedEncoder(opts...)
 	defer export.PutBufferedEncoder(enc)
 	xe := export.Encoder(enc)
@@ -184,11 +204,40 @@ func MarshalWrite(out io.Writer, in any, opts ...Options) (err error) {
 	defer export.PutStreamingEncoder(enc)
 	xe := export.Encoder(enc)
 	xe.Flags.Set(jsonflags.OmitTopLevelNewline | 1)
+	if canFastMarshalFlags(&xe.Struct) && isFastWritable(out) {
+		at, ptr := efacePtr(&in)
+		if at != nil {
+			plan := lookupFastMarshalPlan(at)
+			if plan.canFast {
+				origBuf := xe.Buf
+				if b, ferr := plan.marshal(origBuf, ptr, &xe.Struct, 0); ferr == nil {
+					runtime.KeepAlive(&in)
+					xe.CommitBuffer(b)
+					xe.Tokens.Last.Increment()
+					err = xe.Flush()
+					if err != nil && xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+						return internal.TransformMarshalError(in, err)
+					}
+					return err
+				}
+				runtime.KeepAlive(&in)
+				xe.Buf = origBuf
+			}
+		}
+	}
 	err = marshalEncode(enc, in, &xe.Struct)
 	if err != nil && xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
 		return internal.TransformMarshalError(in, err)
 	}
 	return err
+}
+
+func isFastWritable(w io.Writer) bool {
+	if w == io.Discard {
+		return true
+	}
+	bb, ok := w.(*bytes.Buffer)
+	return ok && bb != nil
 }
 
 // MarshalEncode serializes a Go value into an [jsontext.Encoder] according to
@@ -202,6 +251,30 @@ func MarshalEncode(out *jsontext.Encoder, in any, opts ...Options) (err error) {
 		panic("nil jsontext.Encoder")
 	}
 	xe := export.Encoder(out)
+	if len(opts) == 0 && xe.Tokens.Depth() == 1 && !xe.NeedFlush() && canFastMarshalFlags(&xe.Struct) {
+		at, ptr := efacePtr(&in)
+		if at != nil {
+			plan := lookupFastMarshalPlan(at)
+			if plan.canFast {
+				origBuf := xe.Buf
+				if b, ferr := plan.marshal(origBuf, ptr, &xe.Struct, 0); ferr == nil {
+					runtime.KeepAlive(&in)
+					xe.CommitBuffer(b)
+					xe.Tokens.Last.Increment()
+					if xe.NeedFlush() {
+						err = xe.Flush()
+						if err != nil && xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+							return internal.TransformMarshalError(in, err)
+						}
+						return err
+					}
+					return nil
+				}
+				runtime.KeepAlive(&in)
+				xe.Buf = origBuf
+			}
+		}
+	}
 	if len(opts) > 0 {
 		optsOriginal := xe.Struct
 		defer func() { xe.Struct = optsOriginal }()
@@ -386,6 +459,16 @@ func marshalEncode(out *jsontext.Encoder, in any, mo *jsonopts.Struct) (err erro
 // For JSON objects, the input object is merged into the destination value
 // where matching object members recursively apply merge semantics.
 func Unmarshal(in []byte, out any, opts ...Options) (err error) {
+	e := (*eface)(unsafe.Pointer(&out))
+	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
+		var uoBuf jsonopts.Struct
+		uo := fastOpts(opts, &uoBuf)
+		if tryFastUnmarshal(in, e.typ.Elem(), e.data, uo) {
+			runtime.KeepAlive(&out)
+			return nil
+		}
+		runtime.KeepAlive(&out)
+	}
 	dec := export.GetBufferedDecoder(in, opts...)
 	defer export.PutBufferedDecoder(dec)
 	xd := export.Decoder(dec)
