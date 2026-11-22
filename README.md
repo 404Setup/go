@@ -436,6 +436,66 @@ xychart-beta
 
 > *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`e35a63be`) against the patched build.*
 
+#### Comparison Against Upstream Go `1.27.3` and Third-Party JSON Libraries
+
+```mermaid
+xychart-beta
+    title "JSON Unmarshal Throughput (MB/s, higher is better)"
+    x-axis ["SmallStruct", "TwitterStatus", "CitmCatalog", "GolangSource", "CanadaGeometry", "SyntheaFhir"]
+    y-axis "Throughput (MB/s)" 0 --> 450
+    bar [65.4, 153.6, 201.5, 88.0, 66.4, 141.7]
+    bar [154.0, 315.6, 412.0, 239.2, 159.0, 231.4]
+    bar [177.2, 289.7, 410.3, 226.3, 241.3, 219.7]
+    bar [140.2, 286.1, 356.4, 153.7, 224.0, 196.6]
+    bar [122.0, 172.4, 343.1, 192.6, 106.0, 148.5]
+```
+> *Bars per dataset (left to right): **Go `1.27.3` `encoding/json/v2`**, **Illium `encoding/json/v2`**, **`goccy/go-json/v2`**, **`bytedance/sonic`**, and **`segmentio/encoding/json`**.*
+
+```mermaid
+xychart-beta
+    title "JSON Marshal Throughput (MB/s, higher is better)"
+    x-axis ["SmallStruct", "TwitterStatus", "CitmCatalog", "GolangSource", "CanadaGeometry", "SyntheaFhir"]
+    y-axis "Throughput (MB/s)" 0 --> 1050
+    bar [127.2, 228.1, 161.2, 173.0, 130.5, 143.7]
+    bar [273.1, 590.8, 550.9, 426.1, 187.4, 433.4]
+    bar [361.3, 802.6, 604.7, 429.1, 225.3, 395.2]
+    bar [353.2, 1014.2, 625.2, 220.7, 229.7, 189.7]
+    bar [270.6, 433.1, 370.9, 339.7, 182.0, 321.0]
+```
+> *Bars per dataset (left to right): **Go `1.27.3` `encoding/json/v2`**, **Illium `encoding/json/v2`**, **`goccy/go-json/v2`**, **`bytedance/sonic`**, and **`segmentio/encoding/json`**.*
+
+##### Marshal (Median Latency & Allocs/op — lower is better)
+
+| Implementation | `SmallStruct` | `TwitterStatus` | `CitmCatalog` | `GolangSource` | `CanadaGeometry` | `SyntheaFhir` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Illium** `encoding/json/v2` | 538.3 ns (1) | 837.2 µs (1) | 907.1 µs (1) | 4.55 ms (1) | 1.44 ms (1) | 7.21 ms (2,530) |
+| **Illium** `encoding/json` (`jsonv2`) | 526.1 ns (1) | 907.8 µs (1) | 982.4 µs (1) | 5.00 ms (1) | 1.55 ms (1) | 16.13 ms (2,598) |
+| **Illium** `encoding/json` (`nojsonv2`) | 493.0 ns (1) | 824.1 µs (1) | 941.3 µs (1) | 4.59 ms (1) | 1.41 ms (1) | 20.61 ms (18,022) |
+| Go `1.27.3` `encoding/json/v2` | 1.16 µs (1) | 2.17 ms (49) | 3.10 ms (125) | 11.22 ms (1) | 2.07 ms (1) | 21.75 ms (2,556) |
+| Go `1.27.3` `encoding/json` (`jsonv2`) | 1.15 µs (1) | 2.14 ms (89) | 2.99 ms (447) | 11.17 ms (1) | 2.05 ms (1) | 22.34 ms (2,586) |
+| Go `1.27.3` `encoding/json` (`nojsonv2`) | 870.7 ns (1) | 1.56 ms (141) | 2.05 ms (890) | 8.87 ms (1) | 1.87 ms (1) | 21.42 ms (18,010) |
+| `goccy/go-json/v2` `v0.12.0` | **406.9 ns (1)** | 616.3 µs (1) | 826.4 µs (2) | 4.52 ms (1) | 1.20 ms (1) | 7.91 ms (2,543) |
+| `goccy/go-json` `v0.12.0` (v1) | 417.3 ns (1) | 602.1 µs (1) | 877.5 µs (1) | **4.47 ms (1)** | 1.24 ms (1) | **7.09 ms (2,530)** |
+| `bytedance/sonic` `v1.15.5` | 416.2 ns (2) | **490.2 µs (22)** | **799.3 µs (10)** | 8.79 ms (30) | **1.18 ms (2)** | 16.97 ms (17,984) |
+| `segmentio/encoding/json` `v0.5.4` | 543.2 ns (1) | 1.16 ms (121) | 1.35 ms (616) | 5.71 ms (1) | 1.49 ms (1) | 9.94 ms (5,338) |
+
+##### Unmarshal (Median Latency & Allocs/op — lower is better)
+
+| Implementation | `SmallStruct` | `TwitterStatus` | `CitmCatalog` | `GolangSource` | `CanadaGeometry` | `SyntheaFhir` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Illium** `encoding/json/v2` | 954.5 ns (4) | 2.00 ms (2,939) | 4.19 ms (7,264) | 8.11 ms (13,946) | 1.70 ms (1,628) | 8.68 ms (14,538) |
+| **Illium** `encoding/json` (`jsonv2`) | 992.2 ns (4) | **1.85 ms (2,939)** | 3.97 ms (7,264) | 8.16 ms (13,946) | 1.69 ms (1,628) | 8.60 ms (13,610) |
+| **Illium** `encoding/json` (`nojsonv2`) | 848.4 ns (4) | 2.68 ms (2,939) | 3.68 ms (7,264) | **7.78 ms (13,946)** | 1.64 ms (1,628) | **8.21 ms (13,610)** |
+| Go `1.27.3` `encoding/json/v2` | 2.25 µs (4) | 4.11 ms (2,981) | 8.57 ms (7,284) | 22.04 ms (13,946) | 4.07 ms (1,628) | 14.18 ms (14,562) |
+| Go `1.27.3` `encoding/json` (`jsonv2`) | 2.61 µs (4) | 5.38 ms (3,058) | 10.57 ms (7,392) | 25.86 ms (13,946) | 4.54 ms (1,628) | 18.42 ms (13,636) |
+| Go `1.27.3` `encoding/json` (`nojsonv2`) | 4.18 µs (14) | 9.63 ms (7,054) | 23.41 ms (16,734) | 41.46 ms (27,166) | 6.06 ms (1,641) | 33.41 ms (29,340) |
+| `goccy/go-json/v2` `v0.12.0` | 829.8 ns (7) | 2.18 ms (4,897) | 4.21 ms (4,519) | 8.58 ms (14,169) | 1.12 ms (750) | 9.14 ms (29,622) |
+| `goccy/go-json` `v0.12.0` (v1) | **798.7 ns (7)** | 1.97 ms (4,877) | **3.67 ms (4,504)** | 8.29 ms (14,169) | **1.01 ms (750)** | 8.56 ms (28,921) |
+| `bytedance/sonic` `v1.15.5` | 1.05 µs (5) | 2.21 ms (814) | 4.85 ms (5,363) | 12.63 ms (1,735) | 1.21 ms (1,147) | 10.22 ms (7,084) |
+| `segmentio/encoding/json` `v0.5.4` | 1.20 µs (7) | 3.66 ms (5,673) | 5.03 ms (3,297) | 10.08 ms (13,885) | 2.55 ms (606) | 13.52 ms (28,576) |
+
+> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz, AVX2). Third-party libraries (`github.com/goccy/go-json` `v0.12.0` v1 & `v2`, `github.com/bytedance/sonic` `v1.15.5`, `github.com/segmentio/encoding/json` `v0.5.4`) and upstream `encoding/json` / `encoding/json/v2` were measured on Go `1.27.3` (where `sonic`'s native JIT/AVX2 backend is active; `sonic` `v1.15.5` falls back to `encoding/json` on `go1.28+`). Datasets: `SmallStruct` (147 B) and the canonical `encoding/json/internal/jsontest` concrete-type payloads (`TwitterStatus` 632 KB, `CitmCatalog` 1.73 MB, `GolangSource` 1.94 MB, `CanadaGeometry` 270 KB, `SyntheaFhir` 2.01 MB).*
+
 ---
 
 ## Notes & Policy
