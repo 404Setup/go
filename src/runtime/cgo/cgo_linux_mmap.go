@@ -2,19 +2,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.runtimecgopurego && !msan && !tsan && linux && (amd64 || arm64)
+//go:build goexperiment.runtimecgopurego && !msan && !tsan && linux && (amd64 || arm64 || loong64 || riscv64)
 
 package cgo
 
 import "unsafe"
 
-//go:linkname _libc_mmap libc_mmap
-var _libc_mmap byte
-var libc_mmap = unsafe.Pointer(&_libc_mmap)
+//go:linkname _cgo_libc_mmap _cgo_libc_mmap
+var _cgo_libc_mmap byte
+var libc_mmap = unsafe.Pointer(&_cgo_libc_mmap)
 
-//go:linkname _libc_munmap libc_munmap
-var _libc_munmap byte
-var libc_munmap = unsafe.Pointer(&_libc_munmap)
+//go:linkname _cgo_libc_munmap _cgo_libc_munmap
+var _cgo_libc_munmap byte
+var libc_munmap = unsafe.Pointer(&_cgo_libc_munmap)
 
 //go:linknamestd _cgoMmap runtime.cgoMmap
 var _cgoMmap = cgoMmap

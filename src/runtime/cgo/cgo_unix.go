@@ -2,76 +2,108 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.runtimecgopurego && !msan && !tsan && (darwin || (linux && (amd64 || arm64)))
+//go:build goexperiment.runtimecgopurego && !msan && !tsan && (darwin || netbsd || openbsd || (linux && (386 || amd64 || arm || arm64 || loong64 || riscv64)))
 
 package cgo
 
 import (
-	"internal/abi"
+	"internal/goos"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
 )
 
-//go:linkname _libc_setenv libc_setenv
-var _libc_setenv byte
-var libc_setenv = unsafe.Pointer(&_libc_setenv)
+//go:linkname _cgo_libc_setenv _cgo_libc_setenv
+var _cgo_libc_setenv byte
+var libc_setenv = unsafe.Pointer(&_cgo_libc_setenv)
 
-//go:linkname _libc_unsetenv libc_unsetenv
-var _libc_unsetenv byte
-var libc_unsetenv = unsafe.Pointer(&_libc_unsetenv)
+//go:linkname _cgo_libc_unsetenv _cgo_libc_unsetenv
+var _cgo_libc_unsetenv byte
+var libc_unsetenv = unsafe.Pointer(&_cgo_libc_unsetenv)
 
-//go:linkname _libc_pthread_create libc_pthread_create
-var _libc_pthread_create byte
-var libc_pthread_create = unsafe.Pointer(&_libc_pthread_create)
+//go:linkname _cgo_libc_pthread_create _cgo_libc_pthread_create
+var _cgo_libc_pthread_create byte
+var libc_pthread_create = unsafe.Pointer(&_cgo_libc_pthread_create)
 
-//go:linkname _libc_pthread_attr_init libc_pthread_attr_init
-var _libc_pthread_attr_init byte
-var libc_pthread_attr_init = unsafe.Pointer(&_libc_pthread_attr_init)
+//go:linkname _cgo_libc_pthread_attr_init _cgo_libc_pthread_attr_init
+var _cgo_libc_pthread_attr_init byte
+var libc_pthread_attr_init = unsafe.Pointer(&_cgo_libc_pthread_attr_init)
 
-//go:linkname _libc_pthread_attr_setdetachstate libc_pthread_attr_setdetachstate
-var _libc_pthread_attr_setdetachstate byte
-var libc_pthread_attr_setdetachstate = unsafe.Pointer(&_libc_pthread_attr_setdetachstate)
+//go:linkname _cgo_libc_pthread_attr_setdetachstate _cgo_libc_pthread_attr_setdetachstate
+var _cgo_libc_pthread_attr_setdetachstate byte
+var libc_pthread_attr_setdetachstate = unsafe.Pointer(&_cgo_libc_pthread_attr_setdetachstate)
 
-//go:linkname _libc_pthread_attr_destroy libc_pthread_attr_destroy
-var _libc_pthread_attr_destroy byte
-var libc_pthread_attr_destroy = unsafe.Pointer(&_libc_pthread_attr_destroy)
+//go:linkname _cgo_libc_pthread_attr_getstacksize _cgo_libc_pthread_attr_getstacksize
+var _cgo_libc_pthread_attr_getstacksize byte
+var libc_pthread_attr_getstacksize = unsafe.Pointer(&_cgo_libc_pthread_attr_getstacksize)
 
-//go:linkname _libc_pthread_key_create libc_pthread_key_create
-var _libc_pthread_key_create byte
-var libc_pthread_key_create = unsafe.Pointer(&_libc_pthread_key_create)
+//go:linkname _cgo_libc_pthread_attr_setstacksize _cgo_libc_pthread_attr_setstacksize
+var _cgo_libc_pthread_attr_setstacksize byte
+var libc_pthread_attr_setstacksize = unsafe.Pointer(&_cgo_libc_pthread_attr_setstacksize)
 
-//go:linkname _libc_pthread_setspecific libc_pthread_setspecific
-var _libc_pthread_setspecific byte
-var libc_pthread_setspecific = unsafe.Pointer(&_libc_pthread_setspecific)
+//go:linkname _cgo_libc_pthread_attr_getstack _cgo_libc_pthread_attr_getstack
+var _cgo_libc_pthread_attr_getstack byte
+var libc_pthread_attr_getstack = unsafe.Pointer(&_cgo_libc_pthread_attr_getstack)
 
-//go:linkname _libc_pthread_self libc_pthread_self
-var _libc_pthread_self byte
-var libc_pthread_self = unsafe.Pointer(&_libc_pthread_self)
+//go:linkname _cgo_libc_pthread_attr_destroy _cgo_libc_pthread_attr_destroy
+var _cgo_libc_pthread_attr_destroy byte
+var libc_pthread_attr_destroy = unsafe.Pointer(&_cgo_libc_pthread_attr_destroy)
 
-//go:linkname _libc_pthread_sigmask libc_pthread_sigmask
-var _libc_pthread_sigmask byte
-var libc_pthread_sigmask = unsafe.Pointer(&_libc_pthread_sigmask)
+//go:linkname _cgo_libc_pthread_key_create _cgo_libc_pthread_key_create
+var _cgo_libc_pthread_key_create byte
+var libc_pthread_key_create = unsafe.Pointer(&_cgo_libc_pthread_key_create)
 
-//go:linkname _libc_sigfillset libc_sigfillset
-var _libc_sigfillset byte
-var libc_sigfillset = unsafe.Pointer(&_libc_sigfillset)
+//go:linkname _cgo_libc_pthread_setspecific _cgo_libc_pthread_setspecific
+var _cgo_libc_pthread_setspecific byte
+var libc_pthread_setspecific = unsafe.Pointer(&_cgo_libc_pthread_setspecific)
 
-// libc_dlopen, libc_dlsym, and libc_dlerror are imported only when the
-// cgobindings experiment is enabled (see library_linux.go and
-// library_darwin.go), for Open.
+//go:linkname _cgo_libc_pthread_self _cgo_libc_pthread_self
+var _cgo_libc_pthread_self byte
+var libc_pthread_self = unsafe.Pointer(&_cgo_libc_pthread_self)
 
-//go:linkname _libc_dlopen libc_dlopen
-var _libc_dlopen byte
-var libc_dlopen = unsafe.Pointer(&_libc_dlopen)
+//go:linkname _cgo_libc_pthread_get_stackaddr_np _cgo_libc_pthread_get_stackaddr_np
+var _cgo_libc_pthread_get_stackaddr_np byte
+var libc_pthread_get_stackaddr_np = unsafe.Pointer(&_cgo_libc_pthread_get_stackaddr_np)
 
-//go:linkname _libc_dlsym libc_dlsym
-var _libc_dlsym byte
-var libc_dlsym = unsafe.Pointer(&_libc_dlsym)
+//go:linkname _cgo_libc_pthread_get_stacksize_np _cgo_libc_pthread_get_stacksize_np
+var _cgo_libc_pthread_get_stacksize_np byte
+var libc_pthread_get_stacksize_np = unsafe.Pointer(&_cgo_libc_pthread_get_stacksize_np)
 
-//go:linkname _libc_dlerror libc_dlerror
-var _libc_dlerror byte
-var libc_dlerror = unsafe.Pointer(&_libc_dlerror)
+//go:linkname _cgo_libc_pthread_getattr_np _cgo_libc_pthread_getattr_np
+var _cgo_libc_pthread_getattr_np byte
+var libc_pthread_getattr_np = unsafe.Pointer(&_cgo_libc_pthread_getattr_np)
+
+//go:linkname _cgo_libc_pthread_attr_get_np _cgo_libc_pthread_attr_get_np
+var _cgo_libc_pthread_attr_get_np byte
+var libc_pthread_attr_get_np = unsafe.Pointer(&_cgo_libc_pthread_attr_get_np)
+
+//go:linkname _cgo_libc_pthread_sigmask _cgo_libc_pthread_sigmask
+var _cgo_libc_pthread_sigmask byte
+var libc_pthread_sigmask = unsafe.Pointer(&_cgo_libc_pthread_sigmask)
+
+//go:linkname _cgo_libc_sigfillset _cgo_libc_sigfillset
+var _cgo_libc_sigfillset byte
+var libc_sigfillset = unsafe.Pointer(&_cgo_libc_sigfillset)
+
+//go:linkname _cgo_libc_sigaltstack _cgo_libc_sigaltstack
+var _cgo_libc_sigaltstack byte
+var libc_sigaltstack = unsafe.Pointer(&_cgo_libc_sigaltstack)
+
+// libc_dlopen, libc_dlsym, and libc_dlerror are imported for
+// Open only when the cgobindings experiment is enabled (see library_*.go),
+// except on Android, where runtime/cgo initialization uses them.
+
+//go:linkname _cgo_libc_dlopen _cgo_libc_dlopen
+var _cgo_libc_dlopen byte
+var libc_dlopen = unsafe.Pointer(&_cgo_libc_dlopen)
+
+//go:linkname _cgo_libc_dlsym _cgo_libc_dlsym
+var _cgo_libc_dlsym byte
+var libc_dlsym = unsafe.Pointer(&_cgo_libc_dlsym)
+
+//go:linkname _cgo_libc_dlerror _cgo_libc_dlerror
+var _cgo_libc_dlerror byte
+var libc_dlerror = unsafe.Pointer(&_cgo_libc_dlerror)
 
 //go:linknamestd runtime_setg runtime.setg
 func runtime_setg(gg uintptr)
@@ -88,10 +120,6 @@ func runtime_writeErrStr(s string)
 
 //go:linkname runtime_abort runtime.abort
 func runtime_abort()
-
-// pthreadKeyDestructor and x_cgo_threadentry are C-callable assembly entrypoints.
-func pthreadKeyDestructor()
-func x_cgo_threadentry()
 
 //go:linknamestd _cgoSetenv runtime.cgoSetenv
 var _cgoSetenv = cgoSetenv
@@ -139,6 +167,73 @@ var (
 
 //go:nosplit
 //go:norace
+//go:nocheckptr
+func cgoThreadStackSize(attr *pthreadAttr) uintptr {
+	if goos.IsDarwin|goos.IsIos != 0 {
+		// Copy stack size from parent thread instead of using the
+		// non-main thread default stack size.
+		self := asmcgocall(uintptr(libc_pthread_self), 0, 0, 0, 0, 0, 0)
+		size := asmcgocall(uintptr(libc_pthread_get_stacksize_np), self, 0, 0, 0, 0, 0)
+		asmcgocall(uintptr(libc_pthread_attr_setstacksize), uintptr(unsafe.Pointer(attr)), size, 0, 0, 0, 0)
+		return size
+	}
+	var size uintptr
+	asmcgocall(uintptr(libc_pthread_attr_getstacksize), uintptr(unsafe.Pointer(attr)), uintptr(unsafe.Pointer(&size)), 0, 0, 0, 0)
+	if goos.IsSolaris|goos.IsIllumos != 0 && size == 0 {
+		// Solaris can report 0 stack size; fix it.
+		size = 2 << 20
+		if int32(asmcgocall(uintptr(libc_pthread_attr_setstacksize), uintptr(unsafe.Pointer(attr)), size, 0, 0, 0, 0)) != 0 {
+			runtime_writeErrStr("runtime/cgo: pthread_attr_setstacksize failed\n")
+			runtime_abort()
+		}
+	}
+	return size
+}
+
+// cgoGetStackBound returns the current OS thread's stack bounds [lo, hi).
+// It must be called while pinned to the M (or on a system/C stack) so
+// pthread_self refers to a fixed OS thread.
+//
+//go:nosplit
+//go:norace
+//go:nocheckptr
+func cgoGetStackBound() (uintptr, uintptr) {
+	switch {
+	case goos.IsDarwin|goos.IsIos != 0:
+		self := asmcgocallNoG(uintptr(libc_pthread_self), 0, 0, 0, 0, 0, 0)
+		high := asmcgocallNoG(uintptr(libc_pthread_get_stackaddr_np), self, 0, 0, 0, 0, 0)
+		size := asmcgocallNoG(uintptr(libc_pthread_get_stacksize_np), self, 0, 0, 0, 0, 0)
+		return high - size, high
+
+	case goos.IsLinux|goos.IsAndroid|goos.IsSolaris|goos.IsIllumos != 0:
+		var attr pthreadAttr
+		var addr, size uintptr
+		// Use if/else rather than overwriting a default so that
+		// -gcflags=-N does not keep a reference to the function
+		// missing on the other OS.
+		var getattr unsafe.Pointer
+		if goos.IsIllumos != 0 {
+			getattr = libc_pthread_attr_get_np
+		} else {
+			getattr = libc_pthread_getattr_np
+		}
+		// Needed before pthread_getattr_np, too, since before glibc 2.32
+		// it did not call pthread_attr_init in all cases (see #65625).
+		asmcgocallNoG(uintptr(libc_pthread_attr_init), uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0, 0)
+		self := asmcgocallNoG(uintptr(libc_pthread_self), 0, 0, 0, 0, 0, 0)
+		if int32(asmcgocallNoG(uintptr(getattr), self, uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0)) == 0 {
+			asmcgocallNoG(uintptr(libc_pthread_attr_getstack), uintptr(unsafe.Pointer(&attr)), uintptr(unsafe.Pointer(&addr)), uintptr(unsafe.Pointer(&size)), 0, 0, 0)
+		}
+		asmcgocallNoG(uintptr(libc_pthread_attr_destroy), uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0, 0)
+		return addr, addr + size
+
+	default:
+		return 0, 0
+	}
+}
+
+//go:nosplit
+//go:norace
 func cgoYieldWaitRuntimeInit() {
 	runtime_cgoUsleep(100) // 100us
 }
@@ -146,14 +241,26 @@ func cgoYieldWaitRuntimeInit() {
 //go:norace
 //go:nocheckptr
 func cgoNotifyRuntimeInitDoneOS() {
-	var key pthreadKey
-	tsanAcquire()
-	r := asmcgocall(uintptr(libc_pthread_key_create),
-		uintptr(unsafe.Pointer(&key)),
-		abi.FuncPCABI0(pthreadKeyDestructor), 0, 0, 0, 0)
-	tsanRelease()
+	var r, keyVal uintptr
+	if goos.IsDarwin|goos.IsIos != 0 {
+		var key uintptr
+		tsanAcquire()
+		r = asmcgocall(uintptr(libc_pthread_key_create),
+			uintptr(unsafe.Pointer(&key)),
+			pthreadKeyDestructorPC(), 0, 0, 0, 0)
+		tsanRelease()
+		keyVal = key
+	} else {
+		var key uint32
+		tsanAcquire()
+		r = asmcgocall(uintptr(libc_pthread_key_create),
+			uintptr(unsafe.Pointer(&key)),
+			pthreadKeyDestructorPC(), 0, 0, 0, 0)
+		tsanRelease()
+		keyVal = uintptr(key)
+	}
 	if int32(r) == 0 {
-		atomic.Storeuintptr(&pthread_g, uintptr(key))
+		atomic.Storeuintptr(&pthread_g, keyVal)
 		atomic.Storeuintptr(&pthread_key_created, 1)
 	}
 }
@@ -217,14 +324,20 @@ func cgoDestroyThreadAttr(attr *pthreadAttr) {
 //go:nosplit
 //go:norace
 //go:nocheckptr
-func cgoPthreadCreate(noG bool, thread *uintptr, attr *pthreadAttr, pfn, arg uintptr) int32 {
-	if noG {
-		return int32(asmcgocallNoG(uintptr(libc_pthread_create),
-			uintptr(unsafe.Pointer(thread)),
-			uintptr(unsafe.Pointer(attr)),
-			pfn, arg, 0, 0))
-	}
+func cgoPthreadCreate(thread *uintptr, attr *pthreadAttr, pfn, arg uintptr) int32 {
 	return int32(asmcgocall(uintptr(libc_pthread_create),
+		uintptr(unsafe.Pointer(thread)),
+		uintptr(unsafe.Pointer(attr)),
+		pfn, arg, 0, 0))
+}
+
+// cgoPthreadCreateNoG is like cgoPthreadCreate, but for callers without a g.
+//
+//go:nosplit
+//go:norace
+//go:nocheckptr
+func cgoPthreadCreateNoG(thread *uintptr, attr *pthreadAttr, pfn, arg uintptr) int32 {
+	return int32(asmcgocallNoG(uintptr(libc_pthread_create),
 		uintptr(unsafe.Pointer(thread)),
 		uintptr(unsafe.Pointer(attr)),
 		pfn, arg, 0, 0))
@@ -247,7 +360,7 @@ func cgoThreadStart(gp *g) (int32, string) {
 	}
 	gp.stackhi = cgoThreadStackSize(&attr)
 
-	err := cgoTryPthreadCreate(false, &thread, &attr, abi.FuncPCABI0(x_cgo_threadentry), uintptr(unsafe.Pointer(gp)))
+	err := cgoTryPthreadCreate(&thread, &attr, threadentryPC(), uintptr(unsafe.Pointer(gp)))
 	cgoDestroyThreadAttr(&attr)
 	cgoRestoreSigs(&oset)
 
@@ -261,6 +374,21 @@ func cgoThreadStart(gp *g) (int32, string) {
 //go:norace
 //go:nocheckptr
 func threadentry(v unsafe.Pointer) {
+	if goos.IsNetbsd != 0 {
+		// On NetBSD, a new thread inherits the signal stack of the
+		// creating thread. Remove that signal stack before mstart so
+		// minit can install the new thread's own signal stack.
+		// Do this before setting g: the g0 stack bounds are not
+		// set up yet, so we cannot switch stacks with asmcgocall.
+		const _SS_DISABLE = 4
+		ss := struct {
+			sp    uintptr
+			size  uintptr
+			flags int32
+		}{flags: _SS_DISABLE}
+		msanUnpoisonNoG(unsafe.Pointer(&ss), unsafe.Sizeof(ss))
+		asmcgocallNoG(uintptr(libc_sigaltstack), uintptr(unsafe.Pointer(&ss)), 0, 0, 0, 0, 0)
+	}
 	runtime_setg(uintptr(v))
 	runtime_mstart()
 }
@@ -280,7 +408,7 @@ func cgoSysThreadCreate(fn unsafe.Pointer) int32 {
 		asmcgocallNoG(uintptr(libc_pthread_attr_destroy), uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0, 0)
 		return err
 	}
-	err := cgoTryPthreadCreate(true, &p, &attr, uintptr(fn), 0)
+	err := cgoTryPthreadCreateNoG(&p, &attr, uintptr(fn), 0)
 	asmcgocallNoG(uintptr(libc_pthread_attr_destroy), uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0, 0)
 	return err
 }
@@ -288,9 +416,31 @@ func cgoSysThreadCreate(fn unsafe.Pointer) int32 {
 //go:nosplit
 //go:norace
 //go:nocheckptr
-func cgoTryPthreadCreate(noG bool, thread *uintptr, attr *pthreadAttr, pfn, arg uintptr) int32 {
+func cgoTryPthreadCreate(thread *uintptr, attr *pthreadAttr, pfn, arg uintptr) int32 {
 	for tries := uint32(0); tries < 20; tries++ {
-		err := cgoPthreadCreate(noG, thread, attr, pfn, arg)
+		err := cgoPthreadCreate(thread, attr, pfn, arg)
+		if err == 0 {
+			return 0
+		}
+		if err != _EAGAIN {
+			return err
+		}
+		runtime_cgoUsleep((tries + 1) * 1000) // Milliseconds.
+	}
+	return _EAGAIN
+}
+
+// cgoTryPthreadCreateNoG is like cgoTryPthreadCreate, but for callers
+// without a g. It is separate, rather than taking a flag, so that those
+// callers do not statically reach asmcgocall: the linker's nosplit check
+// would count it, as dead branches remain with -gcflags=-N.
+//
+//go:nosplit
+//go:norace
+//go:nocheckptr
+func cgoTryPthreadCreateNoG(thread *uintptr, attr *pthreadAttr, pfn, arg uintptr) int32 {
+	for tries := uint32(0); tries < 20; tries++ {
+		err := cgoPthreadCreateNoG(thread, attr, pfn, arg)
 		if err == 0 {
 			return 0
 		}
