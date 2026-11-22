@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 )
 
 // TestSecurityPooledContextIsolation verifies that pooled Context instances
@@ -645,5 +646,76 @@ func TestSecurityNonSlashPathAndSingleHeaderSmuggling(t *testing.T) {
 	s.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("duplicate BasicAuth Authorization header should return 401, got %d", rec.Code)
+	}
+}
+
+// TestSecurityNestedTighterBodyLimitAndEncodedPrefixRejection verifies that a
+// tighter inner BodyLimit or SetMaxBodyBytes is enforced even when an outer
+// BodyLimit middleware already wrapped the request body, that Mount/StaticFS
+// reject percent-encoded prefixes, and that custom-index directory redirects
+// preserve percent-encoding.
+func TestSecurityNestedTighterBodyLimitAndEncodedPrefixRejection(t *testing.T) {
+	s := server.New()
+	s.Use(server.BodyLimit(4096))
+
+	s.POST("/tight-form", server.BodyLimit(16), func(c *server.Context) error {
+		vals, err := c.ParseForm()
+		if err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, vals.Get("k"))
+	})
+	s.POST("/tight-formvalue", func(c *server.Context) error {
+		c.SetMaxBodyBytes(16)
+		return c.Text(http.StatusOK, c.FormValue("k"))
+	})
+
+	// Chunked (ContentLength = -1) 64-byte form body must be rejected by inner 16-byte BodyLimit.
+	req := httptest.NewRequest(http.MethodPost, "/tight-form", strings.NewReader("k="+strings.Repeat("a", 64)))
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("nested tighter BodyLimit bypassed on chunked form: status=%d body=%q, want 413", rec.Code, rec.Body.String())
+	}
+
+	// Tighter SetMaxBodyBytes in handler must bound FormValue even after outer BodyLimit(4096).
+	req = httptest.NewRequest(http.MethodPost, "/tight-formvalue", strings.NewReader("k="+strings.Repeat("b", 64)))
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Body.String() != "" {
+		t.Fatalf("tighter SetMaxBodyBytes bypassed in FormValue: got %q", rec.Body.String())
+	}
+
+	// Percent-encoded Mount and StaticFS prefixes must panic at registration.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for percent-encoded Mount prefix")
+			}
+		}()
+		s.Mount("/%61pi", http.NotFoundHandler())
+	}()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for percent-encoded StaticFS prefix")
+			}
+		}()
+		s.StaticFS("/%61ssets", fstest.MapFS{})
+	}()
+
+	// StaticFS custom index redirect preserves percent-encoded directory names.
+	s2 := server.New()
+	s2.StaticFS("/docs", fstest.MapFS{
+		"my dir/start.html": {Data: []byte("ok")},
+	}, server.StaticConfig{Index: "start.html"})
+	rec = httptest.NewRecorder()
+	s2.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/docs/my%20dir?x=1", nil))
+	if rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/docs/my%20dir/?x=1" {
+		t.Fatalf("custom index encoded dir redirect: status=%d loc=%q", rec.Code, rec.Header().Get("Location"))
 	}
 }

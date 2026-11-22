@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -252,6 +253,30 @@ func Timeout(d time.Duration) HandlerFunc {
 			c.req = prevReq
 		}()
 		c.SetContext(ctx)
+		return c.Next()
+	}
+}
+
+// MaxInFlight returns middleware that limits the number of concurrent in-flight
+// requests to limit. Excess requests are rejected immediately with 503 Service
+// Unavailable. It panics if limit <= 0.
+func MaxInFlight(limit int) HandlerFunc {
+	if limit <= 0 {
+		panic("server: MaxInFlight limit must be positive")
+	}
+	var active atomic.Int64
+	max := int64(limit)
+	return func(c *Context) error {
+		for {
+			cur := active.Load()
+			if cur >= max {
+				return NewError(http.StatusServiceUnavailable, "service unavailable")
+			}
+			if active.CompareAndSwap(cur, cur+1) {
+				break
+			}
+		}
+		defer active.Add(-1)
 		return c.Next()
 	}
 }

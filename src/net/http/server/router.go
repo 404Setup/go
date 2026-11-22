@@ -346,21 +346,31 @@ type radixEdge struct {
 	firstByte byte
 }
 
+type nodeFastKind uint8
+
+const (
+	nodeGeneric nodeFastKind = iota
+	nodeChain
+	nodeRadix
+	nodeParamOnly
+	nodeWildcardOnly
+)
+
 type treeNode struct {
-	leaf          *routeEntry
+	// Hot matching fields are packed into the first 64-byte cache line
+	// (radixEdges.cap at offset 64 is never read during matching).
+	fastKind    nodeFastKind
+	leaf        *routeEntry
+	paramChild  *treeNode
+	chainTarget *treeNode
+	chainPrefix string
+	radixEdges  []radixEdge
+
+	// Cold / generic traversal and registration fields.
+	slashChild    *treeNode
+	wildcardChild *treeNode
 	staticSlice   []childEntry
 	staticMap     map[string]*treeNode
-	slashChild    *treeNode
-	paramChild    *treeNode
-	wildcardChild *treeNode
-
-	// chainPrefix, chainTarget, and radixEdges accelerate unescaped dynamic
-	// matching by collapsing pass-through single-static-child chains (e.g.
-	// "/api/v1") into prefix comparisons without intermediate slash scans.
-	// Only populated on dynTree via compressChains.
-	chainPrefix string
-	chainTarget *treeNode
-	radixEdges  []radixEdge
 }
 
 func (n *treeNode) clone() *treeNode {
@@ -387,8 +397,8 @@ func (n *treeNode) clone() *treeNode {
 	return c
 }
 
-// compressChains computes bottom-up chainPrefix/chainTarget and radixEdges
-// shortcuts across the tree for fast unescaped traversal.
+// compressChains computes bottom-up chainPrefix/chainTarget, radixEdges, and
+// fastKind shortcuts across the tree for fast unescaped traversal.
 func (n *treeNode) compressChains() {
 	if n == nil {
 		return
@@ -403,11 +413,21 @@ func (n *treeNode) compressChains() {
 	n.paramChild.compressChains()
 	n.wildcardChild.compressChains()
 
+	n.fastKind = nodeGeneric
 	n.chainPrefix = ""
 	n.chainTarget = nil
 	n.radixEdges = nil
 
-	if n.paramChild != nil || n.wildcardChild != nil || n.staticMap != nil || len(n.staticSlice) == 0 {
+	if len(n.staticSlice) == 0 && n.staticMap == nil {
+		if n.paramChild != nil && n.wildcardChild == nil {
+			n.fastKind = nodeParamOnly
+		} else if n.paramChild == nil && n.wildcardChild != nil {
+			n.fastKind = nodeWildcardOnly
+		}
+		return
+	}
+
+	if n.paramChild != nil || n.wildcardChild != nil || n.staticMap != nil {
 		return
 	}
 	for i := range n.staticSlice {
@@ -426,6 +446,7 @@ func (n *treeNode) compressChains() {
 			n.chainPrefix = "/" + first.seg
 			n.chainTarget = cur
 		}
+		n.fastKind = nodeChain
 		return
 	}
 
@@ -448,6 +469,7 @@ func (n *treeNode) compressChains() {
 		}
 	}
 	n.radixEdges = edges
+	n.fastKind = nodeRadix
 }
 
 func (n *treeNode) findStatic(seg string) *treeNode {
@@ -524,14 +546,12 @@ type paramCapture struct {
 
 func (pc *paramCapture) push(val string) int {
 	mark := pc.n
-	if pc.buf != nil {
-		if pc.n < maxInlineParams {
-			pc.buf[pc.n] = val
-		} else {
-			pc.pushOverflow(val)
-		}
+	if uint(mark) < maxInlineParams {
+		pc.buf[mark] = val
+	} else {
+		pc.pushOverflow(val)
 	}
-	pc.n++
+	pc.n = mark + 1
 	return mark
 }
 
@@ -596,7 +616,8 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 			return nil
 		}
 
-		if n.chainTarget != nil {
+		switch n.fastKind {
+		case nodeChain:
 			p := n.chainPrefix
 			if len(path) < len(p) || path[:len(p)] != p {
 				return nil
@@ -610,9 +631,8 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 			path = path[len(p):]
 			n = n.chainTarget
 			continue
-		}
 
-		if len(n.radixEdges) > 0 {
+		case nodeRadix:
 			b := path[1]
 			var matched *treeNode
 			for i := range n.radixEdges {
@@ -637,10 +657,9 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 				continue
 			}
 			return nil
-		}
 
-		s := path[1:]
-		if len(n.staticSlice) == 0 && n.staticMap == nil && n.paramChild != nil && n.wildcardChild == nil {
+		case nodeParamOnly:
+			s := path[1:]
 			slash := -1
 			for i := 0; i < len(s); i++ {
 				b := s[i]
@@ -663,13 +682,19 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 				return nil
 			}
 			if pc != nil {
-				pc.push(seg)
+				if idx := pc.n; uint(idx) < maxInlineParams {
+					pc.buf[idx] = seg
+					pc.n = idx + 1
+				} else {
+					pc.pushOverflow(seg)
+					pc.n = idx + 1
+				}
 			}
 			if rest == "" {
 				return n.paramChild.leaf
 			}
 			n = n.paramChild
-			if n.chainTarget != nil && len(rest) > 1 {
+			if n.fastKind == nodeChain && len(rest) > 1 {
 				p := n.chainPrefix
 				if len(rest) < len(p) || rest[:len(p)] != p {
 					return nil
@@ -686,8 +711,27 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 			}
 			path = rest
 			continue
+
+		case nodeWildcardOnly:
+			if n.wildcardChild.leaf != nil {
+				if clean, hasNul := checkPath(path); !clean || hasNul {
+					return nil
+				}
+				if pc != nil {
+					if idx := pc.n; uint(idx) < maxInlineParams {
+						pc.buf[idx] = path[1:]
+						pc.n = idx + 1
+					} else {
+						pc.pushOverflow(path[1:])
+						pc.n = idx + 1
+					}
+				}
+				return n.wildcardChild.leaf
+			}
+			return nil
 		}
 
+		s := path[1:]
 		if len(n.staticSlice) > 0 || n.staticMap != nil || n.paramChild != nil {
 			var seg, rest string
 			if slash := strings.IndexByte(s, '/'); slash >= 0 {

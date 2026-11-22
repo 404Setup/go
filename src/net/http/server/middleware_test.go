@@ -15,6 +15,7 @@ import (
 	"net/http/server"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -447,5 +448,72 @@ func TestMiddlewareAdaptErrorAndTrustedProxyHSTSAndCORSWildcardHeaders(t *testin
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "X-Custom-Auth, Content-Type" {
 		t.Fatalf("Access-Control-Allow-Headers = %q", got)
+	}
+}
+
+func TestMiddlewareMaxInFlight(t *testing.T) {
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for non-positive MaxInFlight limit")
+			}
+		}()
+		server.MaxInFlight(0)
+	}()
+
+	s := server.New()
+	s.Use(server.Recover(), server.MaxInFlight(2))
+
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	s.GET("/hold", func(c *server.Context) error {
+		started <- struct{}{}
+		<-release
+		return c.Text(http.StatusOK, "held")
+	})
+	s.GET("/panic", func(c *server.Context) error {
+		panic("boom")
+	})
+	s.GET("/ok", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "ok")
+	})
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/hold", nil))
+			if rec.Code != http.StatusOK {
+				t.Errorf("held request status = %d, want 200", rec.Code)
+			}
+		}()
+	}
+	<-started
+	<-started
+
+	// 3rd concurrent request must immediately receive 503 Service Unavailable.
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("saturated request status = %d, want 503", rec.Code)
+	}
+
+	close(release)
+	wg.Wait()
+
+	// Panicking request must not leak in-flight slots.
+	for range 3 {
+		rec = httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panic", nil))
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("panic status = %d, want 500", rec.Code)
+		}
+	}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Fatalf("post-panic request failed: code=%d body=%q", rec.Code, rec.Body.String())
 	}
 }

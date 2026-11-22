@@ -472,3 +472,80 @@ func TestServerServeTLSContextGracefulShutdown(t *testing.T) {
 		t.Fatal("timed out waiting for ServeTLSContext shutdown")
 	}
 }
+
+func TestServerAndGroupRouteScopedRegistration(t *testing.T) {
+	s := server.New()
+	s.Route("/api", func(api *server.Group) {
+		api.Use(func(c *server.Context) error {
+			c.SetHeader("X-API", "1")
+			return c.Next()
+		})
+		api.GET("/status", func(c *server.Context) error {
+			return c.Text(http.StatusOK, "api-ok")
+		})
+		api.Route("/v1", func(v1 *server.Group) {
+			v1.Use(func(c *server.Context) error {
+				c.SetHeader("X-V1", "1")
+				return c.Next()
+			})
+			v1.GET("/users/{id}", func(c *server.Context) error {
+				return c.Text(http.StatusOK, "user:"+c.Param("id"))
+			})
+		})
+	})
+	s.GET("/public", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "public")
+	})
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/users/9", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "user:9" ||
+		rec.Header().Get("X-API") != "1" || rec.Header().Get("X-V1") != "1" {
+		t.Fatalf("/api/v1/users/9: code=%d body=%q headers=%v", rec.Code, rec.Body.String(), rec.Header())
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "api-ok" ||
+		rec.Header().Get("X-API") != "1" || rec.Header().Get("X-V1") != "" {
+		t.Fatalf("/api/status: code=%d body=%q headers=%v", rec.Code, rec.Body.String(), rec.Header())
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/public", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("X-API") != "" {
+		t.Fatalf("/public leaked group middleware: code=%d headers=%v", rec.Code, rec.Header())
+	}
+
+	// Nil callback must panic.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for nil Route callback")
+			}
+		}()
+		s.Route("/nil", nil)
+	}()
+}
+
+func TestServerJSONErrorHandlerClearsStaleContentType(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.ErrorHandler = server.JSONErrorHandler
+	s := server.NewWithConfig(cfg)
+	s.GET("/xss", func(c *server.Context) error {
+		c.SetHeader("Content-Type", "text/html; charset=utf-8")
+		return server.NewError(http.StatusBadRequest, "<b>bad</b>")
+	})
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/xss", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want application/json; charset=utf-8", ct)
+	}
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("missing nosniff header")
+	}
+}

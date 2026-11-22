@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	syncv2 "sync/v2"
 )
@@ -171,6 +170,9 @@ func (w *compressResponseWriter) shouldBypassHeaders() bool {
 	if len(h["Upgrade"]) > 0 && h["Upgrade"][0] != "" {
 		return true
 	}
+	if cc := h["Cache-Control"]; len(cc) > 0 && hasCacheDirective(cc, "no-transform") {
+		return true
+	}
 	if ct := h["Content-Type"]; len(ct) > 0 && ct[0] != "" && isIncompressibleContentType(ct[0]) {
 		return true
 	}
@@ -247,6 +249,12 @@ func (w *compressResponseWriter) startGzip() error {
 	h := w.rw.Header()
 	delete(h, "Content-Length")
 	delete(h, "Accept-Ranges")
+	// RFC 9110 Section 8.8.3.3: weaken strong ETag when applying content coding.
+	if etags := h["Etag"]; len(etags) == 1 {
+		if et := etags[0]; len(et) >= 2 && et[0] == '"' {
+			h["Etag"] = []string{"W/" + et}
+		}
+	}
 	h["Content-Encoding"] = headerValGzip
 
 	code := w.status
@@ -274,17 +282,21 @@ func (w *compressResponseWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	w.writtenBytes += int64(len(p))
 	switch w.mode {
 	case compressBypassed:
-		return w.rw.Write(p)
+		n, err := w.rw.Write(p)
+		w.writtenBytes += int64(n)
+		return n, err
 	case compressEnabled:
-		return w.gz.Write(p)
+		n, err := w.gz.Write(p)
+		w.writtenBytes += int64(n)
+		return n, err
 	}
 
 	// Still undecided: buffer until reaching minLength.
 	if len(w.buf)+len(p) < w.minLength {
 		w.buf = append(w.buf, p...)
+		w.writtenBytes += int64(len(p))
 		return len(p), nil
 	}
 
@@ -306,12 +318,16 @@ func (w *compressResponseWriter) Write(p []byte) (int, error) {
 		h["Content-Type"] = []string{http.DetectContentType(sample)}
 	}
 	if w.shouldBypassHeaders() {
-		return w.bypassAndFlush(p)
+		n, err := w.bypassAndFlush(p)
+		w.writtenBytes += int64(n)
+		return n, err
 	}
 	if err := w.startGzip(); err != nil {
 		return 0, err
 	}
-	return w.gz.Write(p)
+	n, err := w.gz.Write(p)
+	w.writtenBytes += int64(n)
+	return n, err
 }
 
 func (w *compressResponseWriter) writeGzipString(s string) (int, error) {
@@ -337,16 +353,20 @@ func (w *compressResponseWriter) WriteString(s string) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	w.writtenBytes += int64(len(s))
 	switch w.mode {
 	case compressBypassed:
-		return io.WriteString(w.rw, s)
+		n, err := io.WriteString(w.rw, s)
+		w.writtenBytes += int64(n)
+		return n, err
 	case compressEnabled:
-		return w.writeGzipString(s)
+		n, err := w.writeGzipString(s)
+		w.writtenBytes += int64(n)
+		return n, err
 	}
 
 	if len(w.buf)+len(s) < w.minLength {
 		w.buf = append(w.buf, s...)
+		w.writtenBytes += int64(len(s))
 		return len(s), nil
 	}
 
@@ -360,12 +380,16 @@ func (w *compressResponseWriter) WriteString(s string) (int, error) {
 		h["Content-Type"] = []string{http.DetectContentType(sniffBuf[:n])}
 	}
 	if w.shouldBypassHeaders() {
-		return w.bypassAndFlushString(s)
+		n, err := w.bypassAndFlushString(s)
+		w.writtenBytes += int64(n)
+		return n, err
 	}
 	if err := w.startGzip(); err != nil {
 		return 0, err
 	}
-	return w.writeGzipString(s)
+	n, err := w.writeGzipString(s)
+	w.writtenBytes += int64(n)
+	return n, err
 }
 
 // FlushError implements the interface recognized by [http.ResponseController.Flush].
@@ -444,6 +468,9 @@ func acceptsGzip(headers []string) bool {
 	if len(headers) == 0 {
 		return false
 	}
+	if len(headers) == 1 && headers[0] == "gzip" {
+		return true
+	}
 	gzipSpecified := false
 	gzipAllowed := false
 	gzipDenied := false
@@ -485,7 +512,51 @@ func acceptsGzip(headers []string) bool {
 	return starAllowed && !starDenied
 }
 
-func parseQualityPositive(params string) bool {
+// parseQValue parses an RFC 9110 Section 12.4.2 qvalue ("0".."1" with up to 3
+// fractional digits) into an integer in [0, 1000].
+func parseQValue(v string) (int, bool) {
+	v = trimOWS(v)
+	if len(v) == 0 || len(v) > 5 {
+		return 0, false
+	}
+	switch v[0] {
+	case '1':
+		if len(v) == 1 {
+			return 1000, true
+		}
+		if v[1] != '.' {
+			return 0, false
+		}
+		for i := 2; i < len(v); i++ {
+			if v[i] != '0' {
+				return 0, false
+			}
+		}
+		return 1000, true
+	case '0':
+		if len(v) == 1 {
+			return 0, true
+		}
+		if v[1] != '.' {
+			return 0, false
+		}
+		q := 0
+		scale := 100
+		for i := 2; i < len(v); i++ {
+			d := v[i]
+			if d < '0' || d > '9' {
+				return 0, false
+			}
+			q += int(d-'0') * scale
+			scale /= 10
+		}
+		return q, true
+	default:
+		return 0, false
+	}
+}
+
+func parseQualityParam(params string) (int, bool) {
 	for params != "" {
 		var p string
 		p, params, _ = strings.Cut(params, ";")
@@ -497,13 +568,28 @@ func parseQualityPositive(params string) bool {
 		if len(k) != 1 || (k[0] != 'q' && k[0] != 'Q') {
 			continue
 		}
-		f, err := strconv.ParseFloat(trimOWS(v), 64)
-		if err != nil {
-			return false
-		}
-		return f > 0
+		return parseQValue(v)
 	}
-	return true
+	return 1000, true
+}
+
+func parseQualityPositive(params string) bool {
+	q, ok := parseQualityParam(params)
+	return ok && q > 0
+}
+
+func hasCacheDirective(headers []string, directive string) bool {
+	for _, h := range headers {
+		for h != "" {
+			var item string
+			item, h, _ = strings.Cut(h, ",")
+			name, _, _ := strings.Cut(item, "=")
+			if asciiEqualFold(trimOWS(name), directive) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isIncompressibleContentType(ct string) bool {

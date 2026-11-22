@@ -13,8 +13,9 @@
 // # Routing
 //
 // Routes are registered on a [*Server] or [*Group] using method helpers such as
-// [Server.GET], [Server.POST], or [Server.Handle]. Patterns must start with "/"
-// and support three segment forms:
+// [Server.GET], [Server.POST], or [Server.Handle], and can be organized into
+// prefixed middleware scopes with [Server.Group] or [Server.Route]. Patterns
+// must start with "/" and support three segment forms:
 //
 //   - Static literal segments: "/api/v1/health"
 //   - Single-segment parameters: "/users/{id}/posts/{postID}"

@@ -461,3 +461,73 @@ func TestMiddlewareCompressLoggerInnerAndPartialWriteErrorIsolation(t *testing.T
 		t.Fatalf("206 Partial Content should bypass compression: code=%d ce=%q", rec.Code, rec.Header().Get("Content-Encoding"))
 	}
 }
+
+func TestMiddlewareCompressETagWeakeningNoTransformAndStrictQValue(t *testing.T) {
+	s := server.New()
+	s.Use(server.CompressWithConfig(server.CompressConfig{MinLength: 32}))
+
+	large := strings.Repeat("compressible-etag-payload-", 10)
+	s.GET("/strong-etag", func(c *server.Context) error {
+		c.SetHeader("ETag", `"v1-strong"`)
+		return c.Text(http.StatusOK, large)
+	})
+	s.GET("/weak-etag", func(c *server.Context) error {
+		c.SetHeader("ETag", `W/"v1-weak"`)
+		return c.Text(http.StatusOK, large)
+	})
+	s.GET("/small-etag", func(c *server.Context) error {
+		c.SetHeader("ETag", `"v1-small"`)
+		return c.Text(http.StatusOK, "tiny")
+	})
+	s.GET("/no-transform", func(c *server.Context) error {
+		c.SetHeader("Cache-Control", "public, no-transform, max-age=60")
+		return c.Text(http.StatusOK, large)
+	})
+
+	// Strong ETag is weakened when compressed.
+	req := httptest.NewRequest(http.MethodGet, "/strong-etag", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Header().Get("Content-Encoding") != "gzip" || rec.Header().Get("ETag") != `W/"v1-strong"` {
+		t.Fatalf("strong ETag not weakened: ce=%q etag=%q", rec.Header().Get("Content-Encoding"), rec.Header().Get("ETag"))
+	}
+
+	// Already-weak ETag stays weak without double prefixing.
+	req = httptest.NewRequest(http.MethodGet, "/weak-etag", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Header().Get("Content-Encoding") != "gzip" || rec.Header().Get("ETag") != `W/"v1-weak"` {
+		t.Fatalf("weak ETag altered: ce=%q etag=%q", rec.Header().Get("Content-Encoding"), rec.Header().Get("ETag"))
+	}
+
+	// Below MinLength: uncompressed strong ETag stays strong.
+	req = httptest.NewRequest(http.MethodGet, "/small-etag", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Header().Get("Content-Encoding") != "" || rec.Header().Get("ETag") != `"v1-small"` {
+		t.Fatalf("small ETag altered: ce=%q etag=%q", rec.Header().Get("Content-Encoding"), rec.Header().Get("ETag"))
+	}
+
+	// Cache-Control: no-transform bypasses compression.
+	req = httptest.NewRequest(http.MethodGet, "/no-transform", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Header().Get("Content-Encoding") != "" || rec.Body.String() != large {
+		t.Fatalf("no-transform compressed unexpectedly: ce=%q", rec.Header().Get("Content-Encoding"))
+	}
+
+	// Invalid RFC 9110 qvalues (+Inf, >1, negative, >3 decimals) must not enable gzip.
+	for _, ae := range []string{"gzip;q=+Inf", "gzip;q=1.5", "gzip;q=-0.5", "gzip;q=0.1234", "gzip;q=1.001"} {
+		req := httptest.NewRequest(http.MethodGet, "/strong-etag", nil)
+		req.Header.Set("Accept-Encoding", ae)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Header().Get("Content-Encoding") != "" {
+			t.Errorf("Accept-Encoding=%q enabled gzip unexpectedly", ae)
+		}
+	}
+}

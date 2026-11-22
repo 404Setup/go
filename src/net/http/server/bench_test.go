@@ -380,3 +380,36 @@ func BenchmarkCompressGzip(b *testing.B) {
 		s.ServeHTTP(w, req)
 	}
 }
+
+func BenchmarkAccepts(b *testing.B) {
+	s := server.New()
+	s.GET("/neg", func(c *server.Context) error {
+		_ = c.Accepts("application/json", "text/html", "text/plain")
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/neg", nil)
+	req.Header.Set("Accept", "text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8")
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}
+
+func BenchmarkMaxInFlight(b *testing.B) {
+	s := server.New()
+	s.Use(server.MaxInFlight(1024))
+	s.GET("/ok", func(c *server.Context) error {
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}

@@ -279,6 +279,12 @@ func (s *Server) Group(prefix string, middlewares ...HandlerFunc) *Group {
 	return s.root.Group(prefix, middlewares...)
 }
 
+// Route creates a subgroup at prefix and passes it to fn for scoped route
+// registration. It panics if fn is nil.
+func (s *Server) Route(prefix string, fn func(*Group)) {
+	s.root.Route(prefix, fn)
+}
+
 // Handle registers handlers for method and pattern.
 // If method is "", the route matches any HTTP method as a fallback after
 // method-specific routes.
@@ -409,6 +415,15 @@ func (g *Group) Group(prefix string, middlewares ...HandlerFunc) *Group {
 	}
 }
 
+// Route creates a nested subgroup at prefix and passes it to fn for scoped
+// route registration. It panics if fn is nil.
+func (g *Group) Route(prefix string, fn func(*Group)) {
+	if fn == nil {
+		panic("server: nil Route callback")
+	}
+	fn(g.Group(prefix))
+}
+
 // Handle registers handlers on the group for method and pattern.
 func (g *Group) Handle(method, pattern string, handlers ...HandlerFunc) {
 	if method != "" && !isValidHTTPMethod(method) {
@@ -527,16 +542,18 @@ func (g *Group) HandleHTTP(method, pattern string, h http.Handler) {
 		panic("server: nil http.Handler")
 	}
 	g.Handle(method, pattern, func(c *Context) error {
-		for i, name := range c.paramNames {
-			var val string
-			if i < c.nParams {
-				if i < maxInlineParams {
-					val = c.paramBuf[i]
-				} else {
-					val = c.paramExtra[i-maxInlineParams]
+		if c.entry != nil {
+			for i, name := range c.entry.paramNames {
+				var val string
+				if i < c.nParams {
+					if i < maxInlineParams {
+						val = c.paramBuf[i]
+					} else {
+						val = c.paramExtra[i-maxInlineParams]
+					}
 				}
+				c.req.SetPathValue(name, val)
 			}
-			c.req.SetPathValue(name, val)
 		}
 		h.ServeHTTP(c.ResponseWriter(), c.req)
 		return nil
@@ -550,8 +567,8 @@ func (g *Group) Mount(prefix string, h http.Handler) {
 		panic("server: nil http.Handler")
 	}
 	fullPrefix := joinPattern(g.prefix, prefix)
-	if strings.ContainsAny(fullPrefix, "{}") {
-		panic(fmt.Sprintf("server: mount prefix %q must not contain parameters", fullPrefix))
+	if strings.ContainsAny(fullPrefix, "{}%") {
+		panic(fmt.Sprintf("server: mount prefix %q must not contain parameters or percent-encoding", fullPrefix))
 	}
 	cleanPref := strings.TrimRight(fullPrefix, "/")
 
@@ -633,7 +650,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if mr := snap.methods[methodGET]; mr != nil {
 				if entry := mr.static.lookup(reqPath); entry != nil {
 					c := acquireContext(s, w, r)
-					c.routePattern = entry.pattern
+					c.entry = entry
 					var err error
 					if len(entry.chain) == 1 {
 						err = entry.chain[0](c)
@@ -655,8 +672,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					}
 					if entry := mr.dynTree.matchUnescaped(reqPath, &pc); entry != nil {
 						c.nParams = pc.n
-						c.paramNames = entry.paramNames
-						c.routePattern = entry.pattern
+						c.entry = entry
 						var err error
 						if len(entry.chain) == 1 {
 							err = entry.chain[0](c)
@@ -681,7 +697,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			if entry := snap.matchStaticSlow(r.Method, reqPath); entry != nil {
 				c := acquireContext(s, w, r)
-				c.routePattern = entry.pattern
+				c.entry = entry
 				var err error
 				if len(entry.chain) == 1 {
 					err = entry.chain[0](c)
@@ -704,8 +720,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				mIdx := methodIndex(r.Method)
 				if entry := snap.matchAfterStaticIdx(mIdx, r.Method, reqPath, &pc); entry != nil {
 					c.nParams = pc.n
-					c.paramNames = entry.paramNames
-					c.routePattern = entry.pattern
+					c.entry = entry
 					var err error
 					if len(entry.chain) == 1 {
 						err = entry.chain[0](c)
@@ -736,8 +751,7 @@ func (s *Server) tryServeUnescapedAny(snap *routerSnapshot, w http.ResponseWrite
 	}
 	if entry := snap.anyMethod.match(reqPath, false, &pc); entry != nil {
 		c.nParams = pc.n
-		c.paramNames = entry.paramNames
-		c.routePattern = entry.pattern
+		c.entry = entry
 		var err error
 		if len(entry.chain) == 1 {
 			err = entry.chain[0](c)
@@ -793,8 +807,7 @@ func (s *Server) serveSlow(snap *routerSnapshot, w http.ResponseWriter, r *http.
 		}
 		if entry := snap.matchIdx(mIdx, r.Method, matchPath, true, &pc); entry != nil {
 			c.nParams = pc.n
-			c.paramNames = entry.paramNames
-			c.routePattern = entry.pattern
+			c.entry = entry
 			var err error
 			if len(entry.chain) == 1 {
 				err = entry.chain[0](c)

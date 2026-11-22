@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
@@ -589,5 +591,147 @@ func TestContextSetDeleteOverflowConsistencyAndQueryEdgeCases(t *testing.T) {
 	if got["page"] != "7" || got["page_size"] != "25" || got["p"] != "1" ||
 		got["flag"] != "" || got["esc_key"] != "ok" || got["recover"] != "good" {
 		t.Fatalf("unexpected query values: %#v", got)
+	}
+}
+
+func TestContextAcceptsAndDelHeader(t *testing.T) {
+	s := server.New()
+	s.Use(func(c *server.Context) error {
+		c.SetHeader("X-Temp", "remove-me")
+		return c.Next()
+	})
+	s.GET("/negotiate", func(c *server.Context) error {
+		c.DelHeader("X-Temp")
+		best := c.Accepts("application/json", "text/html", "text/plain")
+		return c.Text(http.StatusOK, best)
+	})
+	s.GET("/empty-offers", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Accepts())
+	})
+
+	cases := []struct {
+		name    string
+		accepts []string
+		want    string
+	}{
+		{"absent", nil, "application/json"},
+		{"empty", []string{""}, "application/json"},
+		{"wildcard", []string{"*/*"}, "application/json"},
+		{"exact_fast", []string{"text/html"}, "text/html"},
+		{"exact_case_insensitive", []string{"Application/JSON"}, "application/json"},
+		{"quality_preference", []string{"text/plain;q=0.5, text/html;q=0.9, application/json;q=0.8"}, "text/html"},
+		{"browser_accept", []string{"text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8"}, "text/html"},
+		{"specificity_overrides_wildcard", []string{"application/json;q=0, */*;q=1"}, "text/html"},
+		{"subtype_wildcard_vs_exact", []string{"text/html;q=0.5, text/*;q=0.9"}, "text/plain"},
+		{"params_before_q", []string{"text/plain;charset=utf-8;q=0.4, text/html;level=1;q=0.8"}, "text/html"},
+		{"multi_header_lines", []string{"text/plain;q=0.3", "application/json;q=0.7"}, "application/json"},
+		{"invalid_qvalue_ignored", []string{"application/json;q=+Inf, text/plain;q=1.5, text/html;q=0.6"}, "text/html"},
+		{"no_match", []string{"image/png, audio/mpeg"}, ""},
+		{"all_zero", []string{"*/*;q=0"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/negotiate", nil)
+			for _, a := range tc.accepts {
+				req.Header.Add("Accept", a)
+			}
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK || rec.Body.String() != tc.want {
+				t.Fatalf("Accept=%v: code=%d body=%q, want %q", tc.accepts, rec.Code, rec.Body.String(), tc.want)
+			}
+			if rec.Header().Get("X-Temp") != "" {
+				t.Fatalf("DelHeader failed to remove X-Temp: %q", rec.Header().Get("X-Temp"))
+			}
+		})
+	}
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/empty-offers", nil))
+	if rec.Body.String() != "" {
+		t.Fatalf("empty offers = %q, want empty", rec.Body.String())
+	}
+}
+
+func TestContextHeadAndNoBodyStatusLiveServer(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	cfg := server.DefaultConfig()
+	cfg.Logger = logger
+	s := server.NewWithConfig(cfg)
+	s.Use(server.Logger(logger))
+
+	s.GET("/text", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "hello world")
+	})
+	s.GET("/html", func(c *server.Context) error {
+		return c.HTML(http.StatusOK, "<p>hi</p>")
+	})
+	s.GET("/bytes", func(c *server.Context) error {
+		return c.Bytes(http.StatusOK, "application/octet-stream", []byte{1, 2, 3, 4})
+	})
+	s.GET("/json", func(c *server.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"ok": "yes"})
+	})
+	s.GET("/indent", func(c *server.Context) error {
+		return c.JSONIndented(http.StatusOK, map[string]int{"a": 1}, "", "  ")
+	})
+	s.GET("/stream", func(c *server.Context) error {
+		return c.Stream(http.StatusOK, "text/plain", strings.NewReader("streamed"))
+	})
+	s.GET("/err", func(c *server.Context) error {
+		return server.NewError(http.StatusNotFound, "missing")
+	})
+	s.GET("/not-modified", func(c *server.Context) error {
+		return c.Text(http.StatusNotModified, "ignored")
+	})
+
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	client := ts.Client()
+
+	headCases := []struct {
+		path   string
+		status int
+		wantCL int64
+	}{
+		{"/text", http.StatusOK, int64(len("hello world"))},
+		{"/html", http.StatusOK, int64(len("<p>hi</p>"))},
+		{"/bytes", http.StatusOK, 4},
+		{"/json", http.StatusOK, int64(len(`{"ok":"yes"}`))},
+		{"/indent", http.StatusOK, int64(len("{\n  \"a\": 1\n}"))},
+		{"/stream", http.StatusOK, -1},
+		{"/err", http.StatusNotFound, int64(len("missing"))},
+	}
+	for _, tc := range headCases {
+		resp, err := client.Head(ts.URL + tc.path)
+		if err != nil {
+			t.Fatalf("HEAD %s: %v", tc.path, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.status || len(b) != 0 {
+			t.Fatalf("HEAD %s: status=%d body=%q, want %d empty", tc.path, resp.StatusCode, b, tc.status)
+		}
+		if tc.wantCL >= 0 && resp.ContentLength != tc.wantCL {
+			t.Fatalf("HEAD %s: Content-Length=%d, want %d", tc.path, resp.ContentLength, tc.wantCL)
+		}
+	}
+
+	// 304 Not Modified on GET must not write body or trigger ErrBodyNotAllowed.
+	resp, err := client.Get(ts.URL + "/not-modified")
+	if err != nil {
+		t.Fatalf("GET /not-modified: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotModified || len(b) != 0 {
+		t.Fatalf("GET /not-modified: status=%d body=%q", resp.StatusCode, b)
+	}
+
+	// Verify no http.ErrBodyNotAllowed / 500 internal error was logged.
+	if strings.Contains(logBuf.String(), "does not allow body") || strings.Contains(logBuf.String(), `"status":500`) {
+		t.Fatalf("unexpected error logged during HEAD/304 requests: %s", logBuf.String())
 	}
 }

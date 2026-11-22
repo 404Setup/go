@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 )
 
 // Sentinel errors returned by request decoding helpers.
@@ -103,10 +104,10 @@ func classifyError(err error) (code int, msg string, internal bool) {
 }
 
 var (
-	headerValNosniff   = []string{"nosniff"}[:1:1]
-	contentTypeText    = []string{"text/plain; charset=utf-8"}[:1:1]
-	contentTypeHTML    = []string{"text/html; charset=utf-8"}[:1:1]
-	contentTypeJSON    = []string{"application/json; charset=utf-8"}[:1:1]
+	headerValNosniff = []string{"nosniff"}[:1:1]
+	contentTypeText  = []string{"text/plain; charset=utf-8"}[:1:1]
+	contentTypeHTML  = []string{"text/html; charset=utf-8"}[:1:1]
+	contentTypeJSON  = []string{"application/json; charset=utf-8"}[:1:1]
 )
 
 // DefaultErrorHandler writes a plain-text error response with
@@ -134,6 +135,11 @@ func DefaultErrorHandler(c *Context, err error) {
 	delete(h, "Content-Encoding")
 	h["X-Content-Type-Options"] = headerValNosniff
 	h["Content-Type"] = contentTypeText
+	if c.req.Method == http.MethodHead {
+		h["Content-Length"] = []string{strconv.Itoa(len(msg))}
+		c.writeHeader(code)
+		return
+	}
 	c.writeHeader(code)
 	_, _ = c.writeString(msg)
 }
@@ -165,6 +171,7 @@ func JSONErrorHandler(c *Context, err error) {
 	h := c.respHeader()
 	delete(h, "Content-Length")
 	delete(h, "Content-Encoding")
+	delete(h, "Content-Type")
 	h["X-Content-Type-Options"] = headerValNosniff
 	_ = c.JSON(code, jsonErrorBody{Error: msg})
 }

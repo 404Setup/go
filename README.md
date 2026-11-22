@@ -155,21 +155,21 @@ xychart-beta
 xychart-beta
     title "net/http.ServeMux (left bar) vs net/http/server (right bar) — Latency (ns/op, lower is better)"
     x-axis ["StaticRoute", "ParallelParam1", "Param1Route", "Param3Route", "JSONResponse", "QueryParam"]
-    y-axis "Latency (ns/op)" 0 --> 1000
-    bar [83.19, 118.1, 214.4, 375.7, 572.8, 944.7]
-    bar [73.99, 46.76, 90.60, 141.5, 512.8, 136.9]
+    y-axis "Latency (ns/op)" 0 --> 950
+    bar [82.87, 117.0, 227.0, 378.3, 563.2, 874.7]
+    bar [66.96, 41.55, 83.05, 129.5, 509.9, 132.1]
 ```
 
 | Benchmark | `net/http.ServeMux` | `net/http/server` | Latency Delta | Allocs (`ServeMux` → `server`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `StaticRoute` (50+ routes) | 83.19 ns/op | **73.99 ns/op** | **-11.1%** (1.12×) | 0 → 0 |
-| `Param1Route` (`/api/v1/users/{id}`) | 214.4 ns/op | **90.60 ns/op** | **-57.7%** (2.37×) | 1 (16 B) → **0 (0 B)** |
-| `Param3Route` (3 params) | 375.7 ns/op | **141.5 ns/op** | **-62.3%** (2.66×) | 1 (48 B) → **0 (0 B)** |
-| `ParallelParamRoute` (`-cpu=2`) | 118.1 ns/op | **46.76 ns/op** | **-60.4%** (2.53×) | 1 (16 B) → **0 (0 B)** |
-| `QueryParam` (2 keys) | 944.7 ns/op | **136.9 ns/op** | **-85.5%** (6.90×) | 6 (464 B) → **0 (0 B)** |
-| `JSONResponse` (`c.JSON` vs `json.Marshal`) | 572.8 ns/op | **512.8 ns/op** | **-10.5%** (1.12×) | 2 (64 B) → **0 (0 B)** |
+| `StaticRoute` (50+ routes) | 82.87 ns/op | **66.96 ns/op** | **-19.2%** (1.24×) | 0 → 0 |
+| `Param1Route` (`/api/v1/users/{id}`) | 227.0 ns/op | **83.05 ns/op** | **-63.4%** (2.73×) | 1 (16 B) → **0 (0 B)** |
+| `Param3Route` (3 params) | 378.3 ns/op | **129.5 ns/op** | **-65.8%** (2.92×) | 1 (48 B) → **0 (0 B)** |
+| `ParallelParamRoute` (`-cpu=2`) | 117.0 ns/op | **41.55 ns/op** | **-64.5%** (2.82×) | 1 (16 B) → **0 (0 B)** |
+| `QueryParam` (2 keys) | 874.7 ns/op | **132.1 ns/op** | **-84.9%** (6.62×) | 6 (464 B) → **0 (0 B)** |
+| `JSONResponse` (`c.JSON` vs `json.Marshal`) | 563.2 ns/op | **509.9 ns/op** | **-9.5%** (1.10×) | 2 (64 B) → **0 (0 B)** |
 
-> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz). Additional `net/http/server` medians: `WildcardRoute` **104.2 ns/op** (0 allocs), `MiddlewareChain5` **129.6 ns/op** (0 allocs), `BindJSON` **936.0 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **12.19 µs/op** (0 allocs, 54 B).*
+> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz). Additional `net/http/server` medians: `WildcardRoute` **95.76 ns/op** (0 allocs), `MiddlewareChain5` **116.5 ns/op** (0 allocs), `MaxInFlight` **74.75 ns/op** (0 allocs), `Accepts` **648.8 ns/op** (0 allocs), `BindJSON` **904.7 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **11.86 µs/op** (0 allocs, 52 B).*
 
 ---
 

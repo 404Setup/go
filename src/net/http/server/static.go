@@ -74,8 +74,8 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 	}
 
 	fullPrefix := joinPattern(g.prefix, prefix)
-	if strings.ContainsAny(fullPrefix, "{}") {
-		panic(fmt.Sprintf("server: static prefix %q must not contain parameters", fullPrefix))
+	if strings.ContainsAny(fullPrefix, "{}%") {
+		panic(fmt.Sprintf("server: static prefix %q must not contain parameters or percent-encoding", fullPrefix))
 	}
 	cleanPref := strings.TrimRight(fullPrefix, "/")
 
@@ -124,7 +124,7 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 			}
 			if info, err := fs.Stat(effectiveFS, name); err == nil && info.IsDir() {
 				if !strings.HasSuffix(u2.Path, "/") {
-					g.server.safeRedirect(ctx.ResponseWriter(), ctx.req, ctx.req.URL.Path+"/")
+					g.server.safeRedirect(ctx.ResponseWriter(), ctx.req, ctx.req.URL.EscapedPath()+"/")
 					return nil
 				}
 				idxPath := c.Index

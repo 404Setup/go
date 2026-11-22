@@ -143,25 +143,24 @@ type Context struct {
 	writer http.ResponseWriter
 	cw     *compressResponseWriter
 
-	handlers     []HandlerFunc
-	index        int
-	routePattern string
+	handlers []HandlerFunc
+	index    int
+	entry    *routeEntry
 
-	paramNames []string
-	paramBuf   [maxInlineParams]string
-	paramExtra []string
-	nParams    int
+	nParams          int
+	nValues          int
+	valuesMap        map[string]any
+	maxBodyBytes     int64
+	bodyLimitApplied int64
+	queryParsed      bool
+	errHandled       bool
 
+	// Large inline buffers and cold fields sit after the hot control fields so
+	// static routes without params/values never touch these cache lines.
+	paramBuf     [maxInlineParams]string
+	paramExtra   []string
 	inlineValues [maxInlineValues]contextKV
-	nValues      int
-	valuesMap    map[string]any
-
-	query       url.Values
-	queryParsed bool
-
-	maxBodyBytes int64
-	bodyLimited  bool
-	errHandled   bool
+	query        url.Values
 }
 
 type jsonReadBuf struct {
@@ -205,7 +204,6 @@ func releaseContext(c *Context) {
 			}
 		}
 		c.nParams = 0
-		c.paramNames = nil
 	}
 	if c.nValues > 0 {
 		for i := 0; i < c.nValues; i++ {
@@ -230,13 +228,13 @@ func releaseContext(c *Context) {
 	if c.handlers != nil {
 		c.handlers = nil
 	}
-	c.routePattern = ""
+	c.entry = nil
 	if c.queryParsed {
 		c.query = nil
 		c.queryParsed = false
 	}
 	c.maxBodyBytes = 0
-	c.bodyLimited = false
+	c.bodyLimitApplied = 0
 	c.errHandled = false
 	contextPool.Put(c)
 }
@@ -285,7 +283,10 @@ func (c *Context) Path() string {
 // RoutePattern returns the matched route pattern (for example, "/users/{id}"),
 // or "" if no route matched.
 func (c *Context) RoutePattern() string {
-	return c.routePattern
+	if c.entry == nil {
+		return ""
+	}
+	return c.entry.pattern
 }
 
 // StatusCode returns the HTTP status code written to the response, or 0 if no
@@ -339,7 +340,10 @@ func (c *Context) HandleError(err error) {
 
 // Param returns the value of the named path parameter, or "" if not present.
 func (c *Context) Param(name string) string {
-	for i, k := range c.paramNames {
+	if c.entry == nil {
+		return ""
+	}
+	for i, k := range c.entry.paramNames {
 		if k == name {
 			if uint(i) < maxInlineParams {
 				return c.paramBuf[i]
@@ -669,6 +673,182 @@ func (c *Context) Scheme() string {
 	return "http"
 }
 
+// Accepts negotiates the best media type from offers based on the request's
+// Accept header per RFC 9110 Section 12.5.1.
+//
+// If the request has no Accept header, offers[0] is returned. When multiple
+// offers share the highest acceptable quality factor, the earliest entry in
+// offers wins. Returns "" if offers is empty or no offer is acceptable.
+func (c *Context) Accepts(offers ...string) string {
+	if len(offers) == 0 {
+		return ""
+	}
+	acceptHeaders := c.req.Header["Accept"]
+	if len(acceptHeaders) == 0 {
+		return offers[0]
+	}
+	if len(acceptHeaders) == 1 {
+		hdr := trimOWS(acceptHeaders[0])
+		if hdr == "" || hdr == "*/*" {
+			return offers[0]
+		}
+		if strings.IndexByte(hdr, ',') < 0 && strings.IndexByte(hdr, ';') < 0 && strings.IndexByte(hdr, '*') < 0 {
+			for _, offer := range offers {
+				if ot, os, ok := splitMediaType(offer); ok {
+					if ht, hs, hok := splitMediaType(hdr); hok && asciiEqualFold(ot, ht) && asciiEqualFold(os, hs) {
+						return offer
+					}
+				}
+			}
+			return ""
+		}
+	}
+
+	if len(offers) <= 8 {
+		var offerTypes [8]string
+		var offerSubs [8]string
+		var offerValid [8]bool
+		var bestSpecs [8]int
+		var offerQs [8]int
+		for i, offer := range offers {
+			offerTypes[i], offerSubs[i], offerValid[i] = splitMediaType(offer)
+		}
+		hasAnyRange := false
+		for _, hdr := range acceptHeaders {
+			for hdr != "" {
+				var item string
+				item, hdr, _ = strings.Cut(hdr, ",")
+				item = trimOWS(item)
+				if item == "" {
+					continue
+				}
+				hasAnyRange = true
+				mediaRange, params, hasParams := strings.Cut(item, ";")
+				rt, rs, rok := splitMediaType(mediaRange)
+				if !rok {
+					continue
+				}
+				q := 1000
+				if hasParams {
+					var qok bool
+					q, qok = parseQualityParam(params)
+					if !qok {
+						continue
+					}
+				}
+				isAny := rt == "*" && rs == "*"
+				isSubAny := !isAny && rs == "*"
+				for i := range offers {
+					if !offerValid[i] {
+						continue
+					}
+					var spec int
+					if isAny {
+						spec = 1
+					} else if isSubAny {
+						if asciiEqualFold(rt, offerTypes[i]) {
+							spec = 2
+						}
+					} else if asciiEqualFold(rt, offerTypes[i]) && asciiEqualFold(rs, offerSubs[i]) {
+						spec = 3
+					}
+					if spec > bestSpecs[i] || (spec == bestSpecs[i] && spec > 0 && q > offerQs[i]) {
+						bestSpecs[i] = spec
+						offerQs[i] = q
+					}
+				}
+			}
+		}
+		if !hasAnyRange {
+			return offers[0]
+		}
+		bestOffer := ""
+		bestQ := 0
+		for i, offer := range offers {
+			if bestSpecs[i] > 0 && offerQs[i] > bestQ {
+				bestQ = offerQs[i]
+				bestOffer = offer
+			}
+		}
+		return bestOffer
+	}
+
+	bestOffer := ""
+	bestQ := 0
+	hasAnyRange := false
+	for _, offer := range offers {
+		ot, os, ok := splitMediaType(offer)
+		if !ok {
+			continue
+		}
+		bestSpec := 0
+		offerQ := 0
+		for _, hdr := range acceptHeaders {
+			for hdr != "" {
+				var item string
+				item, hdr, _ = strings.Cut(hdr, ",")
+				item = trimOWS(item)
+				if item == "" {
+					continue
+				}
+				hasAnyRange = true
+				mediaRange, params, hasParams := strings.Cut(item, ";")
+				rt, rs, rok := splitMediaType(mediaRange)
+				if !rok {
+					continue
+				}
+				var spec int
+				if rt == "*" && rs == "*" {
+					spec = 1
+				} else if rs == "*" && asciiEqualFold(rt, ot) {
+					spec = 2
+				} else if asciiEqualFold(rt, ot) && asciiEqualFold(rs, os) {
+					spec = 3
+				} else {
+					continue
+				}
+				q := 1000
+				if hasParams {
+					var qok bool
+					q, qok = parseQualityParam(params)
+					if !qok {
+						continue
+					}
+				}
+				if spec > bestSpec || (spec == bestSpec && q > offerQ) {
+					bestSpec = spec
+					offerQ = q
+				}
+			}
+		}
+		if bestSpec > 0 && offerQ > bestQ {
+			bestQ = offerQ
+			bestOffer = offer
+		}
+	}
+	if !hasAnyRange {
+		return offers[0]
+	}
+	return bestOffer
+}
+
+func splitMediaType(mt string) (typ, sub string, ok bool) {
+	if semi := strings.IndexByte(mt, ';'); semi >= 0 {
+		mt = mt[:semi]
+	}
+	mt = trimOWS(mt)
+	slash := strings.IndexByte(mt, '/')
+	if slash <= 0 || slash >= len(mt)-1 {
+		return "", "", false
+	}
+	typ = trimOWS(mt[:slash])
+	sub = trimOWS(mt[slash+1:])
+	if typ == "" || sub == "" || strings.IndexByte(sub, '/') >= 0 {
+		return "", "", false
+	}
+	return typ, sub, true
+}
+
 // SetHeader sets a response header.
 func (c *Context) SetHeader(key, value string) {
 	c.respHeader().Set(key, value)
@@ -677,6 +857,11 @@ func (c *Context) SetHeader(key, value string) {
 // AddHeader appends a value to a response header.
 func (c *Context) AddHeader(key, value string) {
 	c.respHeader().Add(key, value)
+}
+
+// DelHeader deletes a response header.
+func (c *Context) DelHeader(key string) {
+	c.respHeader().Del(key)
 }
 
 // Cookie returns the named cookie from the request.
@@ -789,15 +974,15 @@ func (c *Context) markRequestTooLarge() {
 	}
 	mbr := http.MaxBytesReader(c.ResponseWriter(), c.req.Body, 0)
 	c.req.Body = mbr
-	c.bodyLimited = true
+	c.bodyLimitApplied = 1
 	var b [1]byte
 	_, _ = mbr.Read(b[:])
 }
 
 func (c *Context) wrapBodyLimit(limit int64) {
-	if !c.bodyLimited && c.req.Body != nil && c.req.Body != http.NoBody {
+	if limit > 0 && (c.bodyLimitApplied == 0 || limit < c.bodyLimitApplied) && c.req.Body != nil && c.req.Body != http.NoBody {
 		c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, limit)
-		c.bodyLimited = true
+		c.bodyLimitApplied = limit
 	}
 }
 
@@ -1212,28 +1397,56 @@ func (c *Context) WriteStatus(code int) error {
 
 // NoContent writes a 204 No Content response.
 func (c *Context) NoContent() error {
-	if c.writer == nil {
-		c.rw.WriteHeader(http.StatusNoContent)
-		return nil
+	w := c.writer
+	if w == nil {
+		if c.rw.written {
+			return nil
+		}
+		c.rw.status = http.StatusNoContent
+		c.rw.written = true
+		w = c.rw.w
 	}
-	c.writer.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+func bodyAllowedForStatus(status int) bool {
+	return status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified
+}
+
+//go:noinline
+func (c *Context) writeNoBody(code, bodyLen int) {
+	if bodyAllowedForStatus(code) {
+		h := c.respHeader()
+		if len(h["Content-Length"]) == 0 && len(h["Content-Encoding"]) == 0 && len(h["Transfer-Encoding"]) == 0 {
+			h["Content-Length"] = []string{strconv.Itoa(bodyLen)}
+		}
+	}
+	c.writeHeader(code)
 }
 
 // Text writes a UTF-8 plain-text response with status code.
 func (c *Context) Text(code int, s string) error {
 	c.setDefaultContentTypeSlice(contentTypeText)
-	c.writeHeader(code)
-	_, err := c.writeString(s)
-	return err
+	if c.req.Method != http.MethodHead && bodyAllowedForStatus(code) {
+		c.writeHeader(code)
+		_, err := c.writeString(s)
+		return err
+	}
+	c.writeNoBody(code, len(s))
+	return nil
 }
 
 // HTML writes a UTF-8 HTML response with status code.
 func (c *Context) HTML(code int, html string) error {
 	c.setDefaultContentTypeSlice(contentTypeHTML)
-	c.writeHeader(code)
-	_, err := c.writeString(html)
-	return err
+	if c.req.Method != http.MethodHead && bodyAllowedForStatus(code) {
+		c.writeHeader(code)
+		_, err := c.writeString(html)
+		return err
+	}
+	c.writeNoBody(code, len(html))
+	return nil
 }
 
 // Bytes writes raw bytes with the given content type and status code.
@@ -1241,12 +1454,16 @@ func (c *Context) Bytes(code int, contentType string, data []byte) error {
 	if contentType != "" {
 		c.setDefaultContentType(contentType)
 	}
-	c.writeHeader(code)
-	if len(data) == 0 {
-		return nil
+	if c.req.Method != http.MethodHead && bodyAllowedForStatus(code) {
+		c.writeHeader(code)
+		if len(data) == 0 {
+			return nil
+		}
+		_, err := c.writeBytes(data)
+		return err
 	}
-	_, err := c.writeBytes(data)
-	return err
+	c.writeNoBody(code, len(data))
+	return nil
 }
 
 // JSON serializes v as JSON into a pooled buffer before writing the response.
@@ -1267,8 +1484,13 @@ func (c *Context) JSON(code int, v any) error {
 		b = b[:len(b)-1]
 	}
 	c.setDefaultContentTypeSlice(contentTypeJSON)
-	c.writeHeader(code)
-	_, werr := c.writeBytes(b)
+	var werr error
+	if c.req.Method != http.MethodHead && bodyAllowedForStatus(code) {
+		c.writeHeader(code)
+		_, werr = c.writeBytes(b)
+	} else {
+		c.writeNoBody(code, len(b))
+	}
 	if jeb.buf.Cap() <= maxPooledJSONSize {
 		jsonBufPool.Put(jeb)
 	}
@@ -1282,9 +1504,13 @@ func (c *Context) JSONIndented(code int, v any, prefix, indent string) error {
 		return err
 	}
 	c.setDefaultContentTypeSlice(contentTypeJSON)
-	c.writeHeader(code)
-	_, err = c.writeBytes(data)
-	return err
+	if c.req.Method != http.MethodHead && bodyAllowedForStatus(code) {
+		c.writeHeader(code)
+		_, err = c.writeBytes(data)
+		return err
+	}
+	c.writeNoBody(code, len(data))
+	return nil
 }
 
 // Stream copies data from r to the response with the given status code and
@@ -1294,6 +1520,9 @@ func (c *Context) Stream(code int, contentType string, r io.Reader) error {
 		c.setDefaultContentType(contentType)
 	}
 	c.writeHeader(code)
+	if c.req.Method == http.MethodHead || !bodyAllowedForStatus(code) {
+		return nil
+	}
 	_, err := io.Copy(c.ResponseWriter(), r)
 	return err
 }
