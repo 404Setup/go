@@ -207,11 +207,14 @@ func Marshal(v any) ([]byte, error) {
 	}
 	plan := lookupV1FastMarshalPlan(at)
 	if plan.canFast {
-		if out, ok := v1MarshalFastAlloc(plan, ptr, true); ok {
-			runtime.KeepAlive(&v)
+		out, err := v1MarshalFastAlloc(plan, ptr, true)
+		runtime.KeepAlive(&v)
+		if err == nil {
 			return out, nil
 		}
-		runtime.KeepAlive(&v)
+		if err != errV1FastFallback {
+			return nil, err
+		}
 	}
 
 	e := newEncodeState()

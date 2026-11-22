@@ -8,13 +8,22 @@ package json
 
 import (
 	"bytes"
+	"encoding/json/internal"
 	"errors"
+	"internal/abi"
 	"io"
 	"reflect"
+	"runtime"
+	"unsafe"
 
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 )
+
+type v2StreamEface struct {
+	typ  *abi.Type
+	data unsafe.Pointer
+}
 
 // A Decoder reads and decodes JSON values from an input stream.
 type Decoder struct {
@@ -74,6 +83,18 @@ func (dec *Decoder) DisallowUnknownFields() {
 func (dec *Decoder) Decode(v any) error {
 	if dec.err != nil {
 		return dec.err
+	}
+	if !dec.hadPeeked && !dec.hadEOF {
+		e := (*v2StreamEface)(unsafe.Pointer(&v))
+		if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
+			handled, err := internal.FastUnmarshalDecode(dec.dec, dec.opts, uintptr(unsafe.Pointer(e.typ.Elem())), e.data)
+			runtime.KeepAlive(&v)
+			if handled {
+				dec.hadPeeked = false
+				dec.hadEOF = false
+				return err
+			}
+		}
 	}
 	b, err := dec.dec.ReadValue()
 	if err != nil {

@@ -382,6 +382,8 @@ type v1FastUnmarshalPlan struct {
 	kind           v1FastKind
 	keyBits        uint8
 	canFast        bool
+	hasCustom      bool
+	hasCycle       bool
 	hasQuoted      bool
 	elemSize       uintptr
 	arrayLen       int
@@ -422,22 +424,52 @@ func finalizeV1FastUnmarshalPlans(visiting map[*abi.Type]*v1FastUnmarshalPlan) {
 	for changed := true; changed; {
 		changed = false
 		for _, p := range visiting {
-			if !p.canFast {
-				continue
-			}
 			switch p.kind {
-			case v1fkPtr, v1fkSlice, v1fkArray, v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
+			case v1fkPtr, v1fkSlice, v1fkArray:
 				if p.elemPlan == nil || !p.elemPlan.canFast {
-					p.canFast = false
-					changed = true
+					if p.canFast {
+						p.canFast = false
+						changed = true
+					}
+				} else {
+					if p.elemPlan.hasCustom && !p.hasCustom {
+						p.hasCustom = true
+						changed = true
+					}
+					if p.elemPlan.hasCycle && !p.hasCycle {
+						p.hasCycle = true
+						changed = true
+					}
+				}
+			case v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
+				if p.elemPlan == nil || !p.elemPlan.canFast || p.elemPlan.hasCustom {
+					if p.canFast {
+						p.canFast = false
+						changed = true
+					}
+				} else {
+					if p.elemPlan.hasCycle && !p.hasCycle {
+						p.hasCycle = true
+						changed = true
+					}
 				}
 			case v1fkStruct:
 				for i := range p.fields {
 					f := &p.fields[i]
-					if f.plan != nil && !f.plan.canFast {
-						p.canFast = false
-						changed = true
+					if f.plan == nil || !f.plan.canFast {
+						if p.canFast {
+							p.canFast = false
+							changed = true
+						}
 						break
+					}
+					if f.plan.hasCustom && !p.hasCustom {
+						p.hasCustom = true
+						changed = true
+					}
+					if f.plan.hasCycle && !p.hasCycle {
+						p.hasCycle = true
+						changed = true
 					}
 				}
 			}
@@ -450,6 +482,7 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 		return p
 	}
 	if p, ok := visiting[at]; ok {
+		p.hasCycle = true
 		return p
 	}
 	p := &v1FastUnmarshalPlan{typ: at, rt: rt}
@@ -468,6 +501,7 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 			u := reflect.New(rt).Interface().(Unmarshaler)
 			p.ifaceTab = (*[2]unsafe.Pointer)(unsafe.Pointer(&u))[0]
 			p.kind = v1fkUnmarshaler
+			p.hasCustom = true
 			p.canFast = true
 			return p
 		}
@@ -670,16 +704,38 @@ type v1FastDecoder struct {
 	strCache              *v1StringCache
 	useNumber             bool
 	disallowUnknownFields bool
+	invokedCustom         int
 }
 
 func (d *v1FastDecoder) skipWS() {
+	if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+		d.v1SkipWSSlow()
+	}
+}
+
+//go:noinline
+func (d *v1FastDecoder) v1SkipWSSlow() {
 	data, pos := d.data, d.pos
+	if data[pos] == ' ' {
+		pos++
+		if pos < len(data) && data[pos] > ' ' {
+			d.pos = pos
+			return
+		}
+	}
 	for pos < len(data) {
 		c := data[pos]
-		if c > ' ' || !isSpace(c) {
-			break
+		if c == ' ' || c == '\n' || c == '\r' || c == '\t' {
+			pos++
+			for len(data)-pos >= 8 && byteorder.LEUint64(data[pos:]) == 0x2020202020202020 {
+				pos += 8
+			}
+			if len(data)-pos >= 4 && byteorder.LEUint32(data[pos:]) == 0x20202020 {
+				pos += 4
+			}
+			continue
 		}
-		pos++
+		break
 	}
 	d.pos = pos
 }
@@ -1385,16 +1441,39 @@ func (d *v1FastDecoder) unmarshal(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, de
 	return errV1FastFallback
 }
 
+type v1DirectError struct {
+	err error
+}
+
+func (e *v1DirectError) Error() string { return e.err.Error() }
+
+type v1CustomTypeError struct {
+	err *UnmarshalTypeError
+}
+
+func (e *v1CustomTypeError) Error() string { return e.err.Error() }
+
 func (d *v1FastDecoder) unmarshalTime(ptr unsafe.Pointer) error {
 	c := d.data[d.pos]
 	if c == 'n' {
 		if d.consumeNull() {
+			d.invokedCustom++
 			return nil
 		}
 		return errV1FastFallback
 	}
 	if c != '"' {
-		return errV1FastFallback
+		start := d.pos
+		if err := d.skipValue(0); err != nil {
+			return err
+		}
+		var tt time.Time
+		if err := tt.UnmarshalJSON(d.data[start:d.pos]); err != nil {
+			return &v1DirectError{err: err}
+		}
+		*(*time.Time)(ptr) = tt
+		d.invokedCustom++
+		return nil
 	}
 	end := v1ScanStringEnd(d.data, d.pos)
 	if end < 0 {
@@ -1402,10 +1481,11 @@ func (d *v1FastDecoder) unmarshalTime(ptr unsafe.Pointer) error {
 	}
 	var tt time.Time
 	if err := tt.UnmarshalJSON(d.data[d.pos:end]); err != nil {
-		return errV1FastFallback
+		return &v1DirectError{err: err}
 	}
 	*(*time.Time)(ptr) = tt
 	d.pos = end
+	d.invokedCustom++
 	return nil
 }
 
@@ -1420,8 +1500,12 @@ func (d *v1FastDecoder) unmarshalCustomUnmarshaler(p *v1FastUnmarshalPlan, ptr u
 	ip[0] = p.ifaceTab
 	ip[1] = ptr
 	if err := u.UnmarshalJSON(raw); err != nil {
-		return errV1FastFallback
+		if ute, ok := err.(*UnmarshalTypeError); ok {
+			return &v1CustomTypeError{err: ute}
+		}
+		return &v1DirectError{err: err}
 	}
+	d.invokedCustom++
 	return nil
 }
 
@@ -2463,6 +2547,33 @@ func (d *v1FastDecoder) unmarshalArray(p *v1FastUnmarshalPlan, ptr unsafe.Pointe
 	d.skipWS()
 	n := p.arrayLen
 	elemPlan := p.elemPlan
+	if elemPlan.kind == v1fkFloat64 && n == 2 && d.pos < len(d.data) {
+		savedPos := d.pos
+		if c0 := d.data[d.pos]; c0 == '-' || ('0' <= c0 && c0 <= '9') {
+			if v0, err := d.readFloat(64); err == nil {
+				d.skipWS()
+				if d.pos < len(d.data) && d.data[d.pos] == ',' {
+					d.pos++
+					d.skipWS()
+					if d.pos < len(d.data) {
+						if c1 := d.data[d.pos]; c1 == '-' || ('0' <= c1 && c1 <= '9') {
+							if v1, err := d.readFloat(64); err == nil {
+								d.skipWS()
+								if d.pos < len(d.data) && d.data[d.pos] == ']' {
+									arr := (*[2]float64)(ptr)
+									arr[0] = v0
+									arr[1] = v1
+									d.pos++
+									return nil
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		d.pos = savedPos
+	}
 	elemSize := p.elemSize
 	i := 0
 	if d.pos < len(d.data) && d.data[d.pos] == ']' {
@@ -3086,23 +3197,23 @@ func v1IsTargetZero(p *v1FastUnmarshalPlan, ptr unsafe.Pointer) bool {
 
 // tryV1FastUnmarshal attempts to unmarshal valid JSON data into (at, ptr).
 // Caller MUST ensure data is syntactically valid (or pass validated=false to validate when needed).
-func tryV1FastUnmarshal(data []byte, at *abi.Type, ptr unsafe.Pointer, validated, useNumber, disallowUnknown bool) bool {
+func tryV1FastUnmarshal(data []byte, at *abi.Type, ptr unsafe.Pointer, validated, useNumber, disallowUnknown bool) (bool, error) {
 	plan := lookupV1FastUnmarshalPlan(at)
 	if !plan.canFast {
-		return false
+		return false, nil
 	}
 
 	switch plan.kind {
 	case v1fkBool, v1fkString, v1fkInt, v1fkInt8, v1fkInt16, v1fkInt32, v1fkInt64,
 		v1fkUint, v1fkUint8, v1fkUint16, v1fkUint32, v1fkUint64, v1fkUintptr,
 		v1fkFloat32, v1fkFloat64:
-		return tryV1FastUnmarshalScalar(data, plan, ptr)
+		return tryV1FastUnmarshalScalar(data, plan, ptr), nil
 	}
 
 	wasZero := v1IsTargetZero(plan, ptr)
-	if !validated && !wasZero {
+	if !validated && (!wasZero || plan.hasCustom) {
 		if !v1CheckValidFast(data) {
-			return false
+			return false, nil
 		}
 	}
 
@@ -3118,14 +3229,38 @@ func tryV1FastUnmarshal(data []byte, at *abi.Type, ptr unsafe.Pointer, validated
 		d.skipWS()
 		if d.pos == len(data) {
 			v1StringCachePool.Put(sc)
-			return true
+			return true, nil
 		}
 	}
 	v1StringCachePool.Put(sc)
+	if de, ok := err.(*v1DirectError); ok {
+		if !validated && wasZero && !plan.hasCustom && !v1CheckValidFast(data) {
+			reflect.NewAt(plan.rt, ptr).Elem().SetZero()
+			return false, nil
+		}
+		return true, de.err
+	}
+	if cte, ok := err.(*v1CustomTypeError); ok {
+		return true, v1ReplayUnmarshal(data, plan.rt, ptr, useNumber, disallowUnknown, d.invokedCustom, cte.err)
+	}
+	if d.invokedCustom > 0 {
+		return true, v1ReplayUnmarshal(data, plan.rt, ptr, useNumber, disallowUnknown, d.invokedCustom, nil)
+	}
 	if wasZero {
 		reflect.NewAt(plan.rt, ptr).Elem().SetZero()
 	}
-	return false
+	return false, nil
+}
+
+//go:noinline
+func v1ReplayUnmarshal(data []byte, rt reflect.Type, ptr unsafe.Pointer, useNumber, disallowUnknown bool, skipUnmarshaler int, replayErr error) error {
+	var d decodeState
+	d.init(data)
+	d.useNumber = useNumber
+	d.disallowUnknownFields = disallowUnknown
+	d.skipUnmarshaler = skipUnmarshaler
+	d.replayErr = replayErr
+	return d.unmarshal(reflect.NewAt(rt, ptr).Interface())
 }
 
 func tryV1FastUnmarshalScalar(data []byte, plan *v1FastUnmarshalPlan, ptr unsafe.Pointer) bool {

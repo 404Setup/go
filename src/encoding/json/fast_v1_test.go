@@ -5,9 +5,13 @@
 package json_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"math"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -258,6 +262,370 @@ func BenchmarkFastV1GenericMap(b *testing.B) {
 			if err := json.Unmarshal(data, &dst); err != nil {
 				b.Fatal(err)
 			}
+		}
+	})
+}
+
+type fastV1CountMarshaler struct {
+	calls *int
+	out   []byte
+	err   error
+}
+
+func (m fastV1CountMarshaler) MarshalJSON() ([]byte, error) {
+	*m.calls++
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.out, nil
+}
+
+type fastV1DirectMarshaler struct {
+	calls *int
+}
+
+func (m fastV1DirectMarshaler) MarshalJSON() ([]byte, error) {
+	*m.calls++
+	return []byte(`{"ok":"<tag>\u0020\u2028&end"}`), nil
+}
+
+type fastV1CountUnmarshaler struct {
+	calls *int
+	err   error
+	val   string
+}
+
+func (u *fastV1CountUnmarshaler) UnmarshalJSON(data []byte) error {
+	if u.calls != nil {
+		*u.calls++
+	}
+	if u.err != nil {
+		return u.err
+	}
+	u.val = string(data)
+	return nil
+}
+
+func fastV1GrowStack(depth int, fn func()) {
+	var buf [256]byte
+	buf[depth&255] = byte(depth)
+	if depth > 0 {
+		fastV1GrowStack(depth-1, fn)
+		runtime.KeepAlive(buf)
+		return
+	}
+	fn()
+}
+
+func TestFastV1CustomSingleInvocationAndErrors(t *testing.T) {
+	sentinel := errors.New("boom")
+
+	t.Run("MarshalErrorAndInvalidJSONSingleCall", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			out  []byte
+			err  error
+		}{
+			{"methodErr", nil, sentinel},
+			{"invalidJSON", []byte(`{bad`), nil},
+			{"trailingToken", []byte(`1 2`), nil},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				calls := 0
+				v := struct {
+					A fastV1CountMarshaler `json:"a"`
+				}{A: fastV1CountMarshaler{calls: &calls, out: tc.out, err: tc.err}}
+
+				if _, err := json.Marshal(v); err == nil {
+					t.Fatal("Marshal succeeded, want error")
+				}
+				if calls != 1 {
+					t.Fatalf("Marshal calls = %d, want 1", calls)
+				}
+
+				calls = 0
+				if _, err := json.MarshalOf(v); err == nil {
+					t.Fatal("MarshalOf succeeded, want error")
+				}
+				if calls != 1 {
+					t.Fatalf("MarshalOf calls = %d, want 1", calls)
+				}
+
+				calls = 0
+				prefix := []byte("PRE:")
+				got, err := json.AppendMarshalOf(prefix, v)
+				if err == nil {
+					t.Fatal("AppendMarshalOf succeeded, want error")
+				}
+				if string(got) != "PRE:" {
+					t.Fatalf("AppendMarshalOf truncated buf = %q, want %q", got, "PRE:")
+				}
+				if calls != 1 {
+					t.Fatalf("AppendMarshalOf calls = %d, want 1", calls)
+				}
+
+				calls = 0
+				var buf bytes.Buffer
+				if err := json.EncodeOf(json.NewEncoder(&buf), v); err == nil {
+					t.Fatal("EncodeOf succeeded, want error")
+				}
+				if calls != 1 {
+					t.Fatalf("EncodeOf calls = %d, want 1", calls)
+				}
+			})
+		}
+	})
+
+	t.Run("MarshalHTMLAndManyKeysAndSiblingFailSingleCall", func(t *testing.T) {
+		calls := 0
+		rawMany := `{"k1":"<a&b>\u0020","k2":"x\u2028y","k3":1e2,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9,"k10":10}`
+		v1 := struct {
+			A fastV1CountMarshaler `json:"a"`
+			B float64              `json:"b"`
+		}{
+			A: fastV1CountMarshaler{calls: &calls, out: []byte(rawMany)},
+			B: 1.5,
+		}
+		out, err := json.Marshal(v1)
+		if err != nil {
+			t.Fatalf("Marshal(v1): %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("Marshal(v1) calls = %d, want 1", calls)
+		}
+		if !strings.Contains(string(out), `\u003ca\u0026b\u003e`) || !strings.Contains(string(out), `\u2028`) {
+			t.Fatalf("Marshal(v1) missing expected HTML/JS escapes: %s", out)
+		}
+
+		// DirectIface custom marshaler with failing NaN sibling must run once.
+		calls = 0
+		vBad := struct {
+			A fastV1DirectMarshaler `json:"a"`
+			B float64               `json:"b"`
+		}{A: fastV1DirectMarshaler{calls: &calls}, B: math.NaN()}
+		if _, err := json.MarshalOf(vBad); err == nil {
+			t.Fatal("MarshalOf(vBad) succeeded, want error")
+		}
+		if calls != 1 {
+			t.Fatalf("MarshalOf(vBad) calls = %d, want 1", calls)
+		}
+
+		// Sibling inside []any with NaN must run once.
+		calls = 0
+		sBad := []any{fastV1DirectMarshaler{calls: &calls}, math.Inf(1)}
+		if _, err := json.Marshal(sBad); err == nil {
+			t.Fatal("Marshal(sBad) succeeded, want error")
+		}
+		if calls != 1 {
+			t.Fatalf("Marshal(sBad) calls = %d, want 1", calls)
+		}
+
+		// Bad time.Time year after custom marshaler.
+		calls = 0
+		tBad := struct {
+			A fastV1DirectMarshaler `json:"a"`
+			T time.Time             `json:"t"`
+		}{A: fastV1DirectMarshaler{calls: &calls}, T: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)}
+		if _, err := json.MarshalOf(tBad); err == nil {
+			t.Fatal("MarshalOf(tBad) succeeded, want error")
+		}
+		if calls != 1 {
+			t.Fatalf("MarshalOf(tBad) calls = %d, want 1", calls)
+		}
+	})
+
+	t.Run("UnmarshalInvalidNeverCallsCustom", func(t *testing.T) {
+		tooDeep := strings.Repeat("[", 10005) + "1" + strings.Repeat("]", 10005)
+		for _, bad := range []string{`{invalid`, `{"a":1} trailing`, `{"a":1`, tooDeep} {
+			calls := 0
+			dst := struct {
+				A fastV1CountUnmarshaler `json:"a"`
+			}{A: fastV1CountUnmarshaler{calls: &calls}}
+			if err := json.Unmarshal([]byte(bad), &dst); err == nil {
+				t.Fatalf("Unmarshal(%q) succeeded, want error", bad)
+			}
+			if calls != 0 {
+				t.Fatalf("Unmarshal(%q) invoked UnmarshalJSON %d times, want 0", bad, calls)
+			}
+			if err := json.UnmarshalOf([]byte(bad), &dst); err == nil {
+				t.Fatalf("UnmarshalOf(%q) succeeded, want error", bad)
+			}
+			if calls != 0 {
+				t.Fatalf("UnmarshalOf(%q) invoked UnmarshalJSON %d times, want 0", bad, calls)
+			}
+		}
+	})
+
+	t.Run("UnmarshalSiblingAndTypeErrorSingleCall", func(t *testing.T) {
+		type S struct {
+			A fastV1CountUnmarshaler `json:"a"`
+			B int                    `json:"b"`
+		}
+		calls := 0
+		dst := S{A: fastV1CountUnmarshaler{calls: &calls}}
+		if err := json.UnmarshalOf([]byte(`{"a":{"x":1},"b":"not-int"}`), &dst); err == nil {
+			t.Fatal("expected UnmarshalTypeError")
+		}
+		if calls != 1 || dst.A.val != `{"x":1}` {
+			t.Fatalf("calls=%d val=%q, want 1 / {\"x\":1}", calls, dst.A.val)
+		}
+
+		// Custom returning *UnmarshalTypeError inside struct.
+		calls = 0
+		dst2 := S{A: fastV1CountUnmarshaler{
+			calls: &calls,
+			err:   &json.UnmarshalTypeError{Value: "string", Type: reflect.TypeFor[int]()},
+		}}
+		err := json.Unmarshal([]byte(`{"a":"hi","b":2}`), &dst2)
+		var ute *json.UnmarshalTypeError
+		if !errors.As(err, &ute) {
+			t.Fatalf("err = %v, want *UnmarshalTypeError", err)
+		}
+		if calls != 1 {
+			t.Fatalf("calls = %d, want 1", calls)
+		}
+
+		// Null behavior on value vs pointer custom unmarshaler.
+		calls = 0
+		type P struct {
+			Val fastV1CountUnmarshaler  `json:"val"`
+			Ptr *fastV1CountUnmarshaler `json:"ptr"`
+		}
+		pVal := fastV1CountUnmarshaler{val: "keep"}
+		p := P{Val: fastV1CountUnmarshaler{calls: &calls}, Ptr: &pVal}
+		if err := json.Unmarshal([]byte(`{"val":null,"ptr":null}`), &p); err != nil {
+			t.Fatalf("Unmarshal null: %v", err)
+		}
+		if calls != 1 || p.Val.val != "null" || p.Ptr != nil {
+			t.Fatalf("unexpected null custom result: calls=%d val=%q ptr=%v", calls, p.Val.val, p.Ptr)
+		}
+	})
+
+	t.Run("CycleWithCustomMarshaler", func(t *testing.T) {
+		type node struct {
+			calls *int
+			Next  *node
+		}
+		// Ensure cyclic struct with custom marshaler does not hang or panic.
+		type customNode struct {
+			C    fastV1DirectMarshaler `json:"c"`
+			Next *customNode           `json:"next"`
+		}
+		calls := 0
+		n := &customNode{C: fastV1DirectMarshaler{calls: &calls}}
+		n.Next = n
+		if _, err := json.Marshal(n); err == nil {
+			t.Fatal("expected cycle error")
+		}
+	})
+}
+
+func TestFastV1EdgeCasesAndGCStress(t *testing.T) {
+	t.Run("QuotedStringTagAndNegZeroOmitZero", func(t *testing.T) {
+		type S struct {
+			Bar    string  `json:"bar,string"`
+			Empty  string  `json:"empty,string,omitempty"`
+			Long   string  `json:"long,string"`
+			NegF64 float64 `json:"negf64,omitzero"`
+			NegF32 float32 `json:"negf32,omitzero"`
+			PosF64 float64 `json:"posf64,omitzero"`
+		}
+		longStr := strings.Repeat(`a<b>"`, 40)
+		in := S{
+			Bar:    `foo"bar`,
+			Empty:  "",
+			Long:   longStr,
+			NegF64: math.Copysign(0, -1),
+			NegF32: float32(math.Copysign(0, -1)),
+			PosF64: 1.25,
+		}
+		b, err := json.MarshalOf(in)
+		if err != nil {
+			t.Fatalf("MarshalOf: %v", err)
+		}
+		if strings.Contains(string(b), "negf64") || strings.Contains(string(b), "negf32") || strings.Contains(string(b), "empty") {
+			t.Fatalf("unexpected non-omitted zero/empty field in %s", b)
+		}
+		var out S
+		if err := json.UnmarshalOf(b, &out); err != nil {
+			t.Fatalf("UnmarshalOf: %v", err)
+		}
+		if out.Bar != in.Bar || out.Long != in.Long || out.PosF64 != 1.25 {
+			t.Fatalf("roundtrip mismatch: got %+v", out)
+		}
+	})
+
+	t.Run("Float2ArrayAndStreamingDecode", func(t *testing.T) {
+		type geo struct {
+			Coords [][2]float64 `json:"coords"`
+		}
+		in := geo{Coords: [][2]float64{{-75.6972, 45.4215}, {0, -0.0}, {1.5e-4, -2.5e3}}}
+		b, err := json.MarshalOf(in)
+		if err != nil {
+			t.Fatalf("MarshalOf(geo): %v", err)
+		}
+		var out geo
+		if err := json.UnmarshalOf(b, &out); err != nil {
+			t.Fatalf("UnmarshalOf(geo): %v", err)
+		}
+		if len(out.Coords) != len(in.Coords) || out.Coords[0] != in.Coords[0] || out.Coords[2] != in.Coords[2] {
+			t.Fatalf("geo mismatch: %+v vs %+v", out, in)
+		}
+
+		// Multi-value stream + reuse + InputOffset + trailing truncated value.
+		stream := ` {"coords":[[-1.5,2.5]]}  {"coords":[[3.25,-4.75]]} {"coords":[`
+		dec := json.NewDecoder(bytes.NewReader([]byte(stream)))
+		var d1, d2, d3 geo
+		if err := json.DecodeOf(dec, &d1); err != nil {
+			t.Fatalf("DecodeOf 1: %v", err)
+		}
+		if !dec.More() {
+			t.Fatal("expected dec.More() = true before 2nd object")
+		}
+		if err := dec.Decode(&d2); err != nil {
+			t.Fatalf("Decode 2: %v", err)
+		}
+		if d1.Coords[0] != [2]float64{-1.5, 2.5} || d2.Coords[0] != [2]float64{3.25, -4.75} {
+			t.Fatalf("stream values mismatch: d1=%+v d2=%+v", d1, d2)
+		}
+		if err := json.DecodeOf(dec, &d3); err != io.ErrUnexpectedEOF {
+			t.Fatalf("DecodeOf 3 err = %v, want io.ErrUnexpectedEOF", err)
+		}
+	})
+
+	t.Run("NoescapeStackGrowthGCStress", func(t *testing.T) {
+		calls := 0
+		type stackCustom struct {
+			m fastV1CountMarshaler
+			u fastV1CountUnmarshaler
+		}
+		var sc stackCustom
+		sc.m = fastV1CountMarshaler{calls: &calls, out: []byte(`42`)}
+		sc.u = fastV1CountUnmarshaler{calls: &calls}
+		_ = sc
+		for i := range 200 {
+			type box struct {
+				C fastV1DirectMarshaler `json:"c"`
+				N int                   `json:"n"`
+			}
+			v := box{C: fastV1DirectMarshaler{calls: &calls}, N: i}
+			fastV1GrowStack(64, func() {
+				runtime.GC()
+				b, err := json.MarshalOf(v)
+				if err != nil {
+					t.Fatalf("MarshalOf during GC: %v", err)
+				}
+				var out struct {
+					C map[string]string `json:"c"`
+					N int               `json:"n"`
+				}
+				if err := json.UnmarshalOf(b, &out); err != nil || out.N != i {
+					t.Fatalf("UnmarshalOf during GC = %+v, %v", out, err)
+				}
+			})
+		}
+		if calls != 200 {
+			t.Fatalf("calls = %d, want 200", calls)
 		}
 	})
 }

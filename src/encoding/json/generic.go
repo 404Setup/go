@@ -20,11 +20,18 @@ func MarshalOf[T any](v T) ([]byte, error) {
 	if at.Kind() != abi.Interface {
 		plan := lookupV1FastMarshalPlan(at)
 		if plan.canFast {
-			if out, ok := v1MarshalFastAlloc(plan, v1Noescape(unsafe.Pointer(&v)), true); ok {
-				runtime.KeepAlive(&v)
+			ptr := unsafe.Pointer(&v)
+			if !plan.hasCustom {
+				ptr = v1Noescape(ptr)
+			}
+			out, err := v1MarshalFastAlloc(plan, ptr, true)
+			runtime.KeepAlive(&v)
+			if err == nil {
 				return out, nil
 			}
-			runtime.KeepAlive(&v)
+			if err != errV1FastFallback {
+				return nil, err
+			}
 		}
 	}
 	return Marshal(v)
@@ -40,12 +47,15 @@ func AppendMarshal(dst []byte, v any) ([]byte, error) {
 	}
 	plan := lookupV1FastMarshalPlan(at)
 	if plan.canFast {
-		if out, err := plan.marshal(dst, ptr, true, 0); err == nil {
-			runtime.KeepAlive(&v)
+		out, err := plan.marshal(dst, ptr, true, 0)
+		runtime.KeepAlive(&v)
+		if err == nil {
 			return out, nil
 		}
-		runtime.KeepAlive(&v)
 		dst = dst[:origLen]
+		if err != errV1FastFallback {
+			return dst, err
+		}
 	}
 
 	e := newEncodeState()
@@ -65,12 +75,19 @@ func AppendMarshalOf[T any](dst []byte, v T) ([]byte, error) {
 	if at.Kind() != abi.Interface {
 		plan := lookupV1FastMarshalPlan(at)
 		if plan.canFast {
-			if out, err := plan.marshal(dst, v1Noescape(unsafe.Pointer(&v)), true, 0); err == nil {
-				runtime.KeepAlive(&v)
+			ptr := unsafe.Pointer(&v)
+			if !plan.hasCustom {
+				ptr = v1Noescape(ptr)
+			}
+			out, err := plan.marshal(dst, ptr, true, 0)
+			runtime.KeepAlive(&v)
+			if err == nil {
 				return out, nil
 			}
-			runtime.KeepAlive(&v)
 			dst = dst[:origLen]
+			if err != errV1FastFallback {
+				return dst, err
+			}
 		}
 	}
 	return AppendMarshal(dst, v)
@@ -150,8 +167,8 @@ func UnmarshalOf[T any](data []byte, v *T) error {
 		}
 		return &InvalidUnmarshalError{reflect.TypeFor[*T]()}
 	}
-	if tryV1FastUnmarshal(data, abi.TypeFor[T](), unsafe.Pointer(v), false, false, false) {
-		return nil
+	if handled, err := tryV1FastUnmarshal(data, abi.TypeFor[T](), unsafe.Pointer(v), false, false, false); handled {
+		return err
 	}
 	return Unmarshal(data, v)
 }
@@ -170,8 +187,13 @@ func EncodeOf[T any](enc *Encoder, v T) error {
 		plan := lookupV1FastMarshalPlan(at)
 		if plan.canFast {
 			fb := getV1FastBuf()
-			if b, err := plan.marshal(fb.b, v1Noescape(unsafe.Pointer(&v)), enc.escapeHTML, 0); err == nil {
-				runtime.KeepAlive(&v)
+			ptr := unsafe.Pointer(&v)
+			if !plan.hasCustom {
+				ptr = v1Noescape(ptr)
+			}
+			b, err := plan.marshal(fb.b, ptr, enc.escapeHTML, 0)
+			runtime.KeepAlive(&v)
+			if err == nil {
 				b = append(b, '\n')
 				fb.b = b
 				out := b
@@ -191,8 +213,10 @@ func EncodeOf[T any](enc *Encoder, v T) error {
 				}
 				return werr
 			}
-			runtime.KeepAlive(&v)
 			putV1FastBuf(fb)
+			if err != errV1FastFallback {
+				return err
+			}
 		}
 	}
 	return enc.Encode(v)
@@ -221,9 +245,11 @@ func DecodeOf[T any](dec *Decoder, v *T) error {
 	raw := dec.buf[dec.scanp : dec.scanp+n]
 	dec.scanp += n
 
-	if v != nil && tryV1FastUnmarshal(raw, abi.TypeFor[T](), unsafe.Pointer(v), true, dec.d.useNumber, dec.d.disallowUnknownFields) {
-		dec.tokenValueEnd()
-		return nil
+	if v != nil {
+		if handled, err := tryV1FastUnmarshal(raw, abi.TypeFor[T](), unsafe.Pointer(v), true, dec.d.useNumber, dec.d.disallowUnknownFields); handled {
+			dec.tokenValueEnd()
+			return err
+		}
 	}
 
 	dec.d.init(raw)

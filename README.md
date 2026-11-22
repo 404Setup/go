@@ -496,6 +496,34 @@ xychart-beta
 
 > *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz, AVX2). Third-party libraries (`github.com/goccy/go-json` `v0.12.0` v1 & `v2`, `github.com/bytedance/sonic` `v1.15.5`, `github.com/segmentio/encoding/json` `v0.5.4`) and upstream `encoding/json` / `encoding/json/v2` were measured on Go `1.27.3` (where `sonic`'s native JIT/AVX2 backend is active; `sonic` `v1.15.5` falls back to `encoding/json` on `go1.28+`). Datasets: `SmallStruct` (147 B) and the canonical `encoding/json/internal/jsontest` concrete-type payloads (`TwitterStatus` 632 KB, `CitmCatalog` 1.73 MB, `GolangSource` 1.94 MB, `CanadaGeometry` 270 KB, `SyntheaFhir` 2.01 MB).*
 
+#### Cumulative `encoding/json` & `encoding/json/v2` Hardening & Fast Paths (`3d9b976b` → Current)
+
+| Benchmark | Baseline (`3d9b976b`) | Illium | Latency Delta | Package / Mode |
+| :--- | ---: | ---: | ---: | :--- |
+| `UnmarshalInt64` | 196.8 ns/op | **18.82 ns/op** | **-90.4%** (10.46×) | `encoding/json` (`nojsonv2`) |
+| `UnmarshalFloat64` | 234.3 ns/op | **23.44 ns/op** | **-90.0%** (10.00×) | `encoding/json` (`nojsonv2`) |
+| `UnmarshalString` | 269.3 ns/op | **41.13 ns/op** | **-84.7%** (6.55×) | `encoding/json` (`nojsonv2`) |
+| `UnmarshalFloat64` | 153.6 ns/op | **28.76 ns/op** | **-81.3%** (5.34×) | `encoding/json` (`jsonv2`) |
+| `CodeUnmarshal` | 23.28 ms/op | **4.65 ms/op** | **-80.0%** (5.01×) | `encoding/json` (`nojsonv2`) |
+| `UnmarshalInt64` | 122.7 ns/op | **25.92 ns/op** | **-78.9%** (4.73×) | `encoding/json` (`jsonv2`) |
+| `Marshal/Pointer` | 316.6 ns/op | **74.87 ns/op** | **-76.4%** (4.23×) | `encoding/json/v2` |
+| `Marshal/Map/ManySmall` | 16.03 µs/op | **3.88 µs/op** | **-75.8%** (4.13×) | `encoding/json/v2` |
+| `Unmarshal/Struct/ManySmall` | 8.44 µs/op | **2.26 µs/op** | **-73.3%** (3.74×) | `encoding/json/v2` |
+| `DecoderStream` | 550.0 ns/op | **152.2 ns/op** | **-72.3%** (3.61×) | `encoding/json` (`jsonv2`) |
+| `UnmarshalString` | 152.0 ns/op | **45.30 ns/op** | **-70.2%** (3.36×) | `encoding/json` (`jsonv2`) |
+| `CodeUnmarshalReuse` | 13.91 ms/op | **4.92 ms/op** | **-64.7%** (2.83×) | `encoding/json` (`jsonv2`) |
+| `GolangSource/Unmarshal/Concrete` | 22.90 ms/op | **8.62 ms/op** | **-62.4%** (2.66×) | `encoding/json/v2` |
+| `CodeUnmarshal` | 14.16 ms/op | **5.34 ms/op** | **-62.3%** (2.65×) | `encoding/json` (`jsonv2`) |
+| `CanadaGeometry/Unmarshal/Concrete` | 4.02 ms/op | **1.60 ms/op** | **-60.3%** (2.52×) | `encoding/json/v2` |
+| `Issue34127` | 315.9 ns/op | **134.4 ns/op** | **-57.5%** (2.35×) | `encoding/json` (`jsonv2`) |
+| `CitmCatalog/Unmarshal/Concrete` | 8.27 ms/op | **4.09 ms/op** | **-50.5%** (2.02×) | `encoding/json/v2` |
+| `TwitterStatus/Unmarshal/Concrete` | 3.85 ms/op | **1.93 ms/op** | **-49.8%** (1.99×) | `encoding/json/v2` |
+| `CodeEncoder` | 4.10 ms/op | **2.17 ms/op** | **-47.0%** (1.89×) | `encoding/json` (`jsonv2`) |
+| `CodeMarshal` | 4.83 ms/op | **2.91 ms/op** | **-39.8%** (1.66×) | `encoding/json` (`jsonv2`) |
+| **Package Geomean** (`json` / `nojsonv2` / `v2` core / `v2` testdata) | — | — | **-49.7% / -49.8% / -39.1% / -19.9%** | Interleaved 5-round medians |
+
+> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-JSON-work `HEAD` (`3d9b976b`) against the current build.*
+
 ---
 
 ## Notes & Policy

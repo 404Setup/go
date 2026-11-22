@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"internal/abi"
 	"internal/byteorder"
 	"internal/runtime/maps"
@@ -431,6 +432,8 @@ type v1FastMarshalPlan struct {
 	kind      v1FastKind
 	keyBits   uint8
 	canFast   bool
+	hasCustom bool
+	hasCycle  bool
 	hasOmit   bool
 	hasQuoted bool
 	minSize   int
@@ -469,24 +472,46 @@ func finalizeV1FastMarshalPlans(visiting map[*abi.Type]*v1FastMarshalPlan) {
 	for changed := true; changed; {
 		changed = false
 		for _, p := range visiting {
-			if !p.canFast {
-				continue
-			}
 			switch p.kind {
 			case v1fkPtr, v1fkSlice, v1fkArray, v1fkMapStringElem, v1fkMapIntElem, v1fkMapUintElem:
 				if p.elemPlan == nil || !p.elemPlan.canFast {
-					p.canFast = false
-					changed = true
+					if p.canFast {
+						p.canFast = false
+						changed = true
+					}
+				} else {
+					if p.elemPlan.hasCustom && !p.hasCustom {
+						p.hasCustom = true
+						changed = true
+					}
+					if p.elemPlan.hasCycle && !p.hasCycle {
+						p.hasCycle = true
+						changed = true
+					}
 				}
 			case v1fkStruct:
 				for i := range p.fields {
 					f := &p.fields[i]
-					if f.plan != nil && !f.plan.canFast {
-						p.canFast = false
-						changed = true
+					if f.plan == nil || !f.plan.canFast {
+						if p.canFast {
+							p.canFast = false
+							changed = true
+						}
 						break
 					}
+					if f.plan.hasCustom && !p.hasCustom {
+						p.hasCustom = true
+						changed = true
+					}
+					if f.plan.hasCycle && !p.hasCycle {
+						p.hasCycle = true
+						changed = true
+					}
 				}
+			}
+			if p.canFast && p.hasCustom && p.hasCycle {
+				p.canFast = false
+				changed = true
 			}
 		}
 	}
@@ -524,6 +549,7 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 		return p
 	}
 	if p, ok := visiting[at]; ok {
+		p.hasCycle = true
 		return p
 	}
 	p := &v1FastMarshalPlan{typ: at, rt: rt}
@@ -542,6 +568,7 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 			m := reflect.New(rt).Interface().(Marshaler)
 			p.ifaceTab = (*[2]unsafe.Pointer)(unsafe.Pointer(&m))[0]
 			p.kind = v1fkMarshaler
+			p.hasCustom = true
 			p.canFast = true
 			return p
 		}
@@ -646,6 +673,7 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 	case reflect.Interface:
 		if rt == reflect.TypeFor[any]() {
 			p.kind = v1fkAny
+			p.hasCustom = true
 			p.canFast = true
 		}
 
@@ -658,6 +686,7 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 			p.canFast = true
 		} else if rt == reflect.TypeFor[map[string]any]() {
 			p.kind = v1fkMapStringAny
+			p.hasCustom = true
 			p.canFast = true
 		} else {
 			kt := rt.Key()
@@ -699,7 +728,7 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 			}
 			fp := buildV1FastMarshalPlan(actualType, v1AbiTypeOfReflect(actualType), visiting)
 			if f.quoted {
-				if !v1IsFastNumericKind(fp.kind) {
+				if !v1IsFastNumericKind(fp.kind) && fp.kind != v1fkString {
 					return p
 				}
 				hasQuoted = true
@@ -738,7 +767,7 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 }
 
 func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML bool, depth int) ([]byte, error) {
-	if depth > startDetectingCyclesAfter {
+	if depth > 64 {
 		return nil, errV1FastFallback
 	}
 	switch p.kind {
@@ -774,19 +803,21 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 	case v1fkFloat32:
 		fv := float64(*(*float32)(ptr))
 		if math.IsNaN(fv) || math.IsInf(fv, 0) {
-			return nil, errV1FastFallback
+			return nil, v1UnsupportedFloatError(p.rt, ptr, fv, 32)
 		}
 		return v1AppendFloat(b, fv, 32), nil
 	case v1fkFloat64:
 		fv := *(*float64)(ptr)
 		if math.IsNaN(fv) || math.IsInf(fv, 0) {
-			return nil, errV1FastFallback
+			return nil, v1UnsupportedFloatError(p.rt, ptr, fv, 64)
 		}
 		return v1AppendFloat(b, fv, 64), nil
 	case v1fkTime:
 		t := *(*time.Time)(ptr)
 		if y := t.Year(); y < 0 || y >= 10000 {
-			return nil, errV1FastFallback
+			if _, err := t.MarshalJSON(); err != nil {
+				return nil, &MarshalerError{v1TimeType, err, "MarshalJSON"}
+			}
 		}
 		b = append(b, '"')
 		b = t.AppendFormat(b, time.RFC3339Nano)
@@ -903,7 +934,7 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 				b = append(b, ',')
 			}
 			if math.IsNaN(v) || math.IsInf(v, 0) {
-				return nil, errV1FastFallback
+				return nil, v1UnsupportedFloatError(p.elemPlan.rt, unsafe.Pointer(&s[i]), v, 64)
 			}
 			b = v1AppendFloat(b, v, 64)
 		}
@@ -923,7 +954,7 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 			}
 			fv := float64(v)
 			if math.IsNaN(fv) || math.IsInf(fv, 0) {
-				return nil, errV1FastFallback
+				return nil, v1UnsupportedFloatError(p.elemPlan.rt, unsafe.Pointer(&s[i]), fv, 32)
 			}
 			b = v1AppendFloat(b, fv, 32)
 		}
@@ -956,8 +987,19 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 		if n == 0 {
 			return append(b, "[]"...), nil
 		}
-		b = append(b, '[')
 		elemPlan := p.elemPlan
+		if elemPlan.kind == v1fkFloat64 && n == 2 {
+			arr := (*[2]float64)(ptr)
+			v0, v1 := arr[0], arr[1]
+			if !math.IsNaN(v0) && !math.IsInf(v0, 0) && !math.IsNaN(v1) && !math.IsInf(v1, 0) {
+				b = append(b, '[')
+				b = v1AppendFloat(b, v0, 64)
+				b = append(b, ',')
+				b = v1AppendFloat(b, v1, 64)
+				return append(b, ']'), nil
+			}
+		}
+		b = append(b, '[')
 		elemSize := p.elemSize
 		var err error
 		for i := range n {
@@ -992,6 +1034,13 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 	return nil, errV1FastFallback
 }
 
+func v1UnsupportedFloatError(rt reflect.Type, ptr unsafe.Pointer, fv float64, bits int) error {
+	return &UnsupportedValueError{
+		Value: reflect.NewAt(rt, ptr).Elem(),
+		Str:   strconv.FormatFloat(fv, 'g', -1, bits),
+	}
+}
+
 func (p *v1FastMarshalPlan) marshalCustomMarshaler(b []byte, ptr unsafe.Pointer, escapeHTML bool) ([]byte, error) {
 	if ptr == nil {
 		return nil, errV1FastFallback
@@ -999,13 +1048,20 @@ func (p *v1FastMarshalPlan) marshalCustomMarshaler(b []byte, ptr unsafe.Pointer,
 	var m Marshaler
 	ip := (*[2]unsafe.Pointer)(unsafe.Pointer(&m))
 	ip[0] = p.ifaceTab
-	ip[1] = v1Noescape(ptr)
+	ip[1] = ptr
 	val, err := m.MarshalJSON()
 	runtime.KeepAlive(ptr)
 	if err != nil {
-		return nil, errV1FastFallback
+		return nil, &MarshalerError{p.rt, err, "MarshalJSON"}
 	}
-	return v1AppendCompactValidJSON(b, val, escapeHTML)
+	if out, cerr := v1AppendCompactValidJSON(b, val, escapeHTML); cerr == nil {
+		return out, nil
+	}
+	out, cerr := appendCompact(b, val, escapeHTML)
+	if cerr != nil {
+		return nil, &MarshalerError{p.rt, cerr, "MarshalJSON"}
+	}
+	return out, nil
 }
 
 func v1AppendCompactValidJSON(dst, src []byte, escapeHTML bool) ([]byte, error) {
@@ -1224,13 +1280,13 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 			case v1fkFloat64:
 				fv := *(*float64)(fp)
 				if math.IsNaN(fv) || math.IsInf(fv, 0) {
-					return nil, errV1FastFallback
+					return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 64)
 				}
 				b = v1AppendFloat(b, fv, 64)
 			case v1fkFloat32:
 				fv := float64(*(*float32)(fp))
 				if math.IsNaN(fv) || math.IsInf(fv, 0) {
-					return nil, errV1FastFallback
+					return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 32)
 				}
 				b = v1AppendFloat(b, fv, 32)
 			case v1fkBool:
@@ -1269,12 +1325,18 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 		} else {
 			b = append(b, f.nameNonEsc...)
 		}
-		if f.quoted {
+		if f.quoted && f.kind != v1fkString {
 			b = append(b, '"')
 		}
 		switch f.kind {
 		case v1fkString:
-			b = v1AppendQuoteString(b, *(*string)(fp), escapeHTML)
+			if f.quoted {
+				var innerBuf [128]byte
+				inner := v1AppendQuoteString(innerBuf[:0], *(*string)(fp), escapeHTML)
+				b = v1AppendQuoteString(b, unsafe.String(unsafe.SliceData(inner), len(inner)), false)
+			} else {
+				b = v1AppendQuoteString(b, *(*string)(fp), escapeHTML)
+			}
 		case v1fkInt:
 			b = strconv.AppendInt(b, int64(*(*int)(fp)), 10)
 		case v1fkInt32:
@@ -1290,13 +1352,13 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 		case v1fkFloat64:
 			fv := *(*float64)(fp)
 			if math.IsNaN(fv) || math.IsInf(fv, 0) {
-				return nil, errV1FastFallback
+				return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 64)
 			}
 			b = v1AppendFloat(b, fv, 64)
 		case v1fkFloat32:
 			fv := float64(*(*float32)(fp))
 			if math.IsNaN(fv) || math.IsInf(fv, 0) {
-				return nil, errV1FastFallback
+				return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 32)
 			}
 			b = v1AppendFloat(b, fv, 32)
 		case v1fkBool:
@@ -1310,7 +1372,7 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 				return nil, err
 			}
 		}
-		if f.quoted {
+		if f.quoted && f.kind != v1fkString {
 			b = append(b, '"')
 		}
 	}
@@ -1417,9 +1479,9 @@ func v1IsFastZero(k v1FastKind, plan *v1FastMarshalPlan, ptr unsafe.Pointer) boo
 	case v1fkUintptr:
 		return *(*uintptr)(ptr) == 0
 	case v1fkFloat32:
-		return math.Float32bits(*(*float32)(ptr)) == 0
+		return *(*float32)(ptr) == 0
 	case v1fkFloat64:
-		return math.Float64bits(*(*float64)(ptr)) == 0
+		return *(*float64)(ptr) == 0
 	case v1fkTime:
 		return (*time.Time)(ptr).IsZero()
 	case v1fkBytes:
@@ -1780,7 +1842,7 @@ func v1MarshalFastMapStringInt(b []byte, m map[string]int, escapeHTML bool) ([]b
 
 func v1MarshalFastMapStringAny(b []byte, m map[string]any, escapeHTML bool, depth int) ([]byte, error) {
 	if depth > startDetectingCyclesAfter {
-		return nil, errV1FastFallback
+		return v1MarshalReflect(b, m, escapeHTML, depth)
 	}
 	if m == nil {
 		return append(b, "null"...), nil
@@ -1825,7 +1887,7 @@ func v1MarshalFastMapStringAny(b []byte, m map[string]any, escapeHTML bool, dept
 
 func v1MarshalFastAny(b []byte, val any, escapeHTML bool, depth int) ([]byte, error) {
 	if depth > startDetectingCyclesAfter {
-		return nil, errV1FastFallback
+		return v1MarshalReflect(b, val, escapeHTML, depth)
 	}
 	switch v := val.(type) {
 	case nil:
@@ -1851,13 +1913,13 @@ func v1MarshalFastAny(b []byte, val any, escapeHTML bool, depth int) ([]byte, er
 		return strconv.AppendUint(b, uint64(v), 10), nil
 	case float64:
 		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return nil, errV1FastFallback
+			return nil, &UnsupportedValueError{Value: reflect.ValueOf(v), Str: strconv.FormatFloat(v, 'g', -1, 64)}
 		}
 		return v1AppendFloat(b, v, 64), nil
 	case float32:
 		fv := float64(v)
 		if math.IsNaN(fv) || math.IsInf(fv, 0) {
-			return nil, errV1FastFallback
+			return nil, &UnsupportedValueError{Value: reflect.ValueOf(v), Str: strconv.FormatFloat(fv, 'g', -1, 32)}
 		}
 		return v1AppendFloat(b, fv, 32), nil
 	case []any:
@@ -1913,26 +1975,50 @@ func v1MarshalFastAny(b []byte, val any, escapeHTML bool, depth int) ([]byte, er
 	case map[string]string:
 		return v1MarshalFastMapStringString(b, v, escapeHTML)
 	case Number:
-		return nil, errV1FastFallback
+		numStr := string(v)
+		if numStr == "" {
+			numStr = "0"
+		}
+		if !isValidNumber(numStr) {
+			return nil, fmt.Errorf("json: invalid number literal %q", numStr)
+		}
+		return append(b, numStr...), nil
 	}
+	return v1MarshalFastAnyEface(b, val, escapeHTML, depth)
+}
+
+//go:noinline
+func v1MarshalFastAnyEface(b []byte, val any, escapeHTML bool, depth int) ([]byte, error) {
 	at, ptr := v1EfacePtr(&val)
 	if at == nil {
 		return append(b, "null"...), nil
 	}
 	plan := lookupV1FastMarshalPlan(at)
-	if !plan.canFast {
-		return nil, errV1FastFallback
+	if plan.canFast {
+		out, err := plan.marshal(b, ptr, escapeHTML, depth+1)
+		runtime.KeepAlive(&val)
+		if err != errV1FastFallback {
+			return out, err
+		}
 	}
-	b, err := plan.marshal(b, ptr, escapeHTML, depth+1)
-	runtime.KeepAlive(&val)
-	return b, err
+	return v1MarshalReflect(b, val, escapeHTML, depth+1)
 }
 
-func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML bool) ([]byte, bool) {
+func v1MarshalReflect(b []byte, val any, escapeHTML bool, depth int) ([]byte, error) {
+	e := newEncodeState()
+	defer encodeStatePool.Put(e)
+	e.ptrLevel = uint(depth)
+	if err := e.marshal(val, encOpts{escapeHTML: escapeHTML}); err != nil {
+		return nil, err
+	}
+	return append(b, e.Bytes()...), nil
+}
+
+func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML bool) ([]byte, error) {
 	for depth := 0; plan.kind == v1fkPtr && depth < startDetectingCyclesAfter; depth++ {
 		p := *(*unsafe.Pointer)(ptr)
 		if p == nil {
-			return []byte("null"), true
+			return []byte("null"), nil
 		}
 		ptr = p
 		plan = plan.elemPlan
@@ -1940,9 +2026,9 @@ func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML 
 	switch plan.kind {
 	case v1fkBool:
 		if *(*bool)(ptr) {
-			return []byte("true"), true
+			return []byte("true"), nil
 		}
-		return []byte("false"), true
+		return []byte("false"), nil
 	case v1fkString:
 		s := *(*string)(ptr)
 		if v1StringSafeHTML(s) {
@@ -1950,64 +2036,69 @@ func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML 
 			out[0] = '"'
 			copy(out[1:], s)
 			out[len(s)+1] = '"'
-			return out, true
+			return out, nil
 		}
 	case v1fkInt:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int)(ptr)), 10)), nil
 	case v1fkInt8:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int8)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int8)(ptr)), 10)), nil
 	case v1fkInt16:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int16)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int16)(ptr)), 10)), nil
 	case v1fkInt32:
 		var scratch [16]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int32)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int32)(ptr)), 10)), nil
 	case v1fkInt64:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], *(*int64)(ptr), 10)), true
+		return bytes.Clone(strconv.AppendInt(scratch[:0], *(*int64)(ptr), 10)), nil
 	case v1fkUint:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint)(ptr)), 10)), nil
 	case v1fkUint8:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint8)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint8)(ptr)), 10)), nil
 	case v1fkUint16:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint16)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint16)(ptr)), 10)), nil
 	case v1fkUint32:
 		var scratch [16]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint32)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint32)(ptr)), 10)), nil
 	case v1fkUint64:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], *(*uint64)(ptr), 10)), true
+		return bytes.Clone(strconv.AppendUint(scratch[:0], *(*uint64)(ptr), 10)), nil
 	case v1fkUintptr:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uintptr)(ptr)), 10)), true
+		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uintptr)(ptr)), 10)), nil
 	case v1fkFloat32:
 		fv := float64(*(*float32)(ptr))
 		if math.IsNaN(fv) || math.IsInf(fv, 0) {
-			return nil, false
+			return nil, v1UnsupportedFloatError(plan.rt, ptr, fv, 32)
 		}
 		var scratch [32]byte
-		return bytes.Clone(v1AppendFloat(scratch[:0], fv, 32)), true
+		return bytes.Clone(v1AppendFloat(scratch[:0], fv, 32)), nil
 	case v1fkFloat64:
 		fv := *(*float64)(ptr)
 		if math.IsNaN(fv) || math.IsInf(fv, 0) {
-			return nil, false
+			return nil, v1UnsupportedFloatError(plan.rt, ptr, fv, 64)
 		}
 		var scratch [32]byte
-		return bytes.Clone(v1AppendFloat(scratch[:0], fv, 64)), true
+		return bytes.Clone(v1AppendFloat(scratch[:0], fv, 64)), nil
 	}
 	fb := getV1FastBuf()
 	b, err := plan.marshal(fb.b, ptr, escapeHTML, 0)
 	if err != nil {
-		putV1FastBuf(fb)
-		return nil, false
+		if cap(b) > cap(fb.b) {
+			fb.b = b[:0]
+		} else {
+			fb.b = fb.b[:0]
+		}
+		v1FastBufPool.Put(fb)
+		return nil, err
 	}
 	fb.b = b
 	out := bytes.Clone(b)
 	putV1FastBuf(fb)
-	return out, true
+	return out, nil
 }

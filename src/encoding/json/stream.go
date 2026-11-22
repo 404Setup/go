@@ -74,12 +74,12 @@ func (dec *Decoder) Decode(v any) error {
 
 	e := (*v1Eface)(unsafe.Pointer(&v))
 	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
-		if tryV1FastUnmarshal(raw, e.typ.Elem(), e.data, true, dec.d.useNumber, dec.d.disallowUnknownFields) {
-			runtime.KeepAlive(&v)
-			dec.tokenValueEnd()
-			return nil
-		}
+		handled, err := tryV1FastUnmarshal(raw, e.typ.Elem(), e.data, true, dec.d.useNumber, dec.d.disallowUnknownFields)
 		runtime.KeepAlive(&v)
+		if handled {
+			dec.tokenValueEnd()
+			return err
+		}
 	}
 
 	dec.d.init(raw)
@@ -253,8 +253,9 @@ func (enc *Encoder) Encode(v any) error {
 	plan := lookupV1FastMarshalPlan(at)
 	if plan.canFast {
 		fb := getV1FastBuf()
-		if b, err := plan.marshal(fb.b, ptr, enc.escapeHTML, 0); err == nil {
-			runtime.KeepAlive(&v)
+		b, err := plan.marshal(fb.b, ptr, enc.escapeHTML, 0)
+		runtime.KeepAlive(&v)
+		if err == nil {
 			b = append(b, '\n')
 			fb.b = b
 			out := b
@@ -274,8 +275,10 @@ func (enc *Encoder) Encode(v any) error {
 			}
 			return werr
 		}
-		runtime.KeepAlive(&v)
 		putV1FastBuf(fb)
+		if err != errV1FastFallback {
+			return err
+		}
 	}
 
 	e := newEncodeState()

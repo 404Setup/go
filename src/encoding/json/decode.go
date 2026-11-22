@@ -111,11 +111,11 @@ import (
 func Unmarshal(data []byte, v any) error {
 	e := (*v1Eface)(unsafe.Pointer(&v))
 	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
-		if tryV1FastUnmarshal(data, e.typ.Elem(), e.data, false, false, false) {
-			runtime.KeepAlive(&v)
-			return nil
-		}
+		handled, err := tryV1FastUnmarshal(data, e.typ.Elem(), e.data, false, false, false)
 		runtime.KeepAlive(&v)
+		if handled {
+			return err
+		}
 	}
 
 	// Check for well-formedness.
@@ -239,6 +239,8 @@ type decodeState struct {
 	savedError            error
 	useNumber             bool
 	disallowUnknownFields bool
+	skipUnmarshaler       int
+	replayErr             error
 }
 
 // readIndex returns the position of the last byte read.
@@ -255,6 +257,8 @@ func (d *decodeState) init(data []byte) *decodeState {
 	d.data = data
 	d.off = 0
 	d.savedError = nil
+	d.skipUnmarshaler = 0
+	d.replayErr = nil
 	if d.errorContext != nil {
 		d.errorContext.Struct = nil
 		// Reuse the allocated space for the FieldStack slice.
@@ -528,6 +532,17 @@ func (d *decodeState) array(v reflect.Value) error {
 	// Check for unmarshaler.
 	u, ut, pv := indirect(v, false)
 	if u != nil {
+		if d.skipUnmarshaler > 0 {
+			d.skipUnmarshaler--
+			d.skip()
+			return nil
+		}
+		if d.replayErr != nil {
+			err := d.replayErr
+			d.replayErr = nil
+			d.skip()
+			return err
+		}
 		start := d.readIndex()
 		d.skip()
 		return u.UnmarshalJSON(d.data[start:d.off])
@@ -625,6 +640,17 @@ func (d *decodeState) object(v reflect.Value) error {
 	// Check for unmarshaler.
 	u, ut, pv := indirect(v, false)
 	if u != nil {
+		if d.skipUnmarshaler > 0 {
+			d.skipUnmarshaler--
+			d.skip()
+			return nil
+		}
+		if d.replayErr != nil {
+			err := d.replayErr
+			d.replayErr = nil
+			d.skip()
+			return err
+		}
 		start := d.readIndex()
 		d.skip()
 		return u.UnmarshalJSON(d.data[start:d.off])
@@ -883,6 +909,15 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 	isNull := item[0] == 'n' // null
 	u, ut, pv := indirect(v, isNull)
 	if u != nil {
+		if d.skipUnmarshaler > 0 {
+			d.skipUnmarshaler--
+			return nil
+		}
+		if d.replayErr != nil {
+			err := d.replayErr
+			d.replayErr = nil
+			return err
+		}
 		return u.UnmarshalJSON(item)
 	}
 	if ut != nil {

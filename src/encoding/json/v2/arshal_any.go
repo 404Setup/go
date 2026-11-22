@@ -31,7 +31,7 @@ import (
 // for any possible nested value.
 func marshalValueAny(enc *jsontext.Encoder, val any, mo *jsonopts.Struct) error {
 	xe := export.Encoder(enc)
-	fast := !mo.Flags.Get(jsonflags.AnyWhitespace) && !xe.Tokens.Last.NeedObjectName()
+	fast := !mo.Flags.Get(jsonflags.AnyWhitespace|jsonflags.StringifyNumbers|jsonflags.TagFlags) && !xe.Tokens.Last.NeedObjectName()
 	switch val := val.(type) {
 	case nil:
 		if fast {

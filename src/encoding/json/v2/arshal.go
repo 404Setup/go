@@ -167,17 +167,37 @@ func Marshal(in any, opts ...Options) (out []byte, err error) {
 	var moBuf jsonopts.Struct
 	mo := fastOpts(opts, &moBuf)
 	if canFastMarshalFlags(mo) {
-		at, ptr := efacePtr(&in)
+		e := (*eface)(noescape(unsafe.Pointer(&in)))
+		at := e.typ
 		if at == nil {
 			return []byte("null"), nil
 		}
 		plan := lookupFastMarshalPlan(at)
 		if plan.canFast {
-			if out, ok := marshalFastAlloc(plan, ptr, mo); ok {
-				runtime.KeepAlive(&in)
+			var ferr error
+			if !plan.hasCustom {
+				var ptr unsafe.Pointer
+				if at.IsDirectIface() {
+					ptr = noescape(unsafe.Pointer(&e.data))
+				} else {
+					ptr = noescape(e.data)
+				}
+				out, ferr = marshalFastAlloc(plan, ptr, mo)
+				runtime.KeepAlive(in)
+			} else if at.Kind() == abi.Pointer && plan.kind == fkPtr {
+				if e.data == nil {
+					return []byte("null"), nil
+				}
+				out, ferr = marshalFastAlloc(plan.elemPlan, e.data, mo)
+			} else {
+				out, ferr = marshalFastAllocEface(plan, in, mo)
+			}
+			if ferr == nil {
 				return out, nil
 			}
-			runtime.KeepAlive(&in)
+			if ferr != errFastFallback {
+				return out, materializeFastErr(ferr, in, at, 0, mo)
+			}
 		}
 	}
 
@@ -205,13 +225,33 @@ func MarshalWrite(out io.Writer, in any, opts ...Options) (err error) {
 	xe := export.Encoder(enc)
 	xe.Flags.Set(jsonflags.OmitTopLevelNewline | 1)
 	if canFastMarshalFlags(&xe.Struct) && isFastWritable(out) {
-		at, ptr := efacePtr(&in)
+		e := (*eface)(noescape(unsafe.Pointer(&in)))
+		at := e.typ
 		if at != nil {
 			plan := lookupFastMarshalPlan(at)
 			if plan.canFast {
 				origBuf := xe.Buf
-				if b, ferr := plan.marshal(origBuf, ptr, &xe.Struct, 0); ferr == nil {
-					runtime.KeepAlive(&in)
+				var b []byte
+				var ferr error
+				if !plan.hasCustom {
+					var ptr unsafe.Pointer
+					if at.IsDirectIface() {
+						ptr = noescape(unsafe.Pointer(&e.data))
+					} else {
+						ptr = noescape(e.data)
+					}
+					b, ferr = plan.marshal(origBuf, ptr, &xe.Struct, 0)
+					runtime.KeepAlive(in)
+				} else if at.Kind() == abi.Pointer && plan.kind == fkPtr {
+					if e.data == nil {
+						b = append(origBuf, "null"...)
+					} else {
+						b, ferr = plan.elemPlan.marshal(origBuf, e.data, &xe.Struct, 0)
+					}
+				} else {
+					b, ferr = marshalFastEface(plan, origBuf, in, &xe.Struct)
+				}
+				if ferr == nil {
 					xe.CommitBuffer(b)
 					xe.Tokens.Last.Increment()
 					err = xe.Flush()
@@ -220,7 +260,18 @@ func MarshalWrite(out io.Writer, in any, opts ...Options) (err error) {
 					}
 					return err
 				}
-				runtime.KeepAlive(&in)
+				if ferr != errFastFallback {
+					if !xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+						if p := fastPartialOutput(b, ferr); len(p) > len(origBuf) {
+							xe.CommitBuffer(p)
+							_ = xe.Flush()
+						}
+					}
+					if se, ok := ferr.(*fastSemanticError); !ok || se.partialBuf == nil {
+						xe.Buf = origBuf
+					}
+					return materializeFastErr(ferr, in, at, len(origBuf), &xe.Struct)
+				}
 				xe.Buf = origBuf
 			}
 		}
@@ -252,13 +303,33 @@ func MarshalEncode(out *jsontext.Encoder, in any, opts ...Options) (err error) {
 	}
 	xe := export.Encoder(out)
 	if len(opts) == 0 && xe.Tokens.Depth() == 1 && xe.Tokens.Last.Length() == 0 && !xe.NeedFlush() && canFastMarshalFlags(&xe.Struct) {
-		at, ptr := efacePtr(&in)
+		e := (*eface)(noescape(unsafe.Pointer(&in)))
+		at := e.typ
 		if at != nil {
 			plan := lookupFastMarshalPlan(at)
 			if plan.canFast {
 				origBuf := xe.Buf
-				if b, ferr := plan.marshal(origBuf, ptr, &xe.Struct, 0); ferr == nil {
-					runtime.KeepAlive(&in)
+				var b []byte
+				var ferr error
+				if !plan.hasCustom {
+					var ptr unsafe.Pointer
+					if at.IsDirectIface() {
+						ptr = noescape(unsafe.Pointer(&e.data))
+					} else {
+						ptr = noescape(e.data)
+					}
+					b, ferr = plan.marshal(origBuf, ptr, &xe.Struct, 0)
+					runtime.KeepAlive(in)
+				} else if at.Kind() == abi.Pointer && plan.kind == fkPtr {
+					if e.data == nil {
+						b = append(origBuf, "null"...)
+					} else {
+						b, ferr = plan.elemPlan.marshal(origBuf, e.data, &xe.Struct, 0)
+					}
+				} else {
+					b, ferr = marshalFastEface(plan, origBuf, in, &xe.Struct)
+				}
+				if ferr == nil {
 					xe.CommitBuffer(b)
 					xe.Tokens.Last.Increment()
 					if xe.NeedFlush() {
@@ -270,7 +341,18 @@ func MarshalEncode(out *jsontext.Encoder, in any, opts ...Options) (err error) {
 					}
 					return nil
 				}
-				runtime.KeepAlive(&in)
+				if ferr != errFastFallback {
+					if !xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+						if p := fastPartialOutput(b, ferr); len(p) > len(origBuf) {
+							xe.CommitBuffer(p)
+						} else {
+							xe.Buf = origBuf
+						}
+					} else {
+						xe.Buf = origBuf
+					}
+					return materializeFastErr(ferr, in, at, len(origBuf), &xe.Struct)
+				}
 				xe.Buf = origBuf
 			}
 		}
@@ -463,9 +545,9 @@ func Unmarshal(in []byte, out any, opts ...Options) (err error) {
 	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
 		var uoBuf jsonopts.Struct
 		uo := fastOpts(opts, &uoBuf)
-		if tryFastUnmarshal(in, e.typ.Elem(), e.data, uo) {
+		if handled, ferr := tryFastUnmarshal(in, e.typ.Elem(), e.data, uo); handled {
 			runtime.KeepAlive(&out)
-			return nil
+			return ferr
 		}
 		runtime.KeepAlive(&out)
 	}
@@ -495,10 +577,10 @@ func UnmarshalRead(in io.Reader, out any, opts ...Options) (err error) {
 			data := bb.Bytes()
 			var uoBuf jsonopts.Struct
 			uo := fastOpts(opts, &uoBuf)
-			if tryFastUnmarshal(data, e.typ.Elem(), e.data, uo) {
+			if handled, ferr := tryFastUnmarshal(data, e.typ.Elem(), e.data, uo); handled {
 				bb.Next(len(data))
 				runtime.KeepAlive(&out)
-				return nil
+				return ferr
 			}
 			runtime.KeepAlive(&out)
 		}
@@ -506,6 +588,14 @@ func UnmarshalRead(in io.Reader, out any, opts ...Options) (err error) {
 	dec := export.GetStreamingDecoder(in, opts...)
 	defer export.PutStreamingDecoder(dec)
 	xd := export.Decoder(dec)
+	e := (*eface)(unsafe.Pointer(&out))
+	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
+		if handled, ferr := tryFastUnmarshalDecode(dec, e.typ.Elem(), e.data, &xd.Struct, true); handled {
+			runtime.KeepAlive(&out)
+			return ferr
+		}
+		runtime.KeepAlive(&out)
+	}
 	err = unmarshalDecode(dec, out, &xd.Struct, true)
 	if err != nil && xd.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
 		return internal.TransformUnmarshalError(out, err)
@@ -540,6 +630,14 @@ func UnmarshalDecode(in *jsontext.Decoder, out any, opts ...Options) (err error)
 				return newUnmarshalErrorBefore(in, reflect.TypeOf(out), errChangingInvalidUTF8)
 			}
 		}
+	}
+	e := (*eface)(unsafe.Pointer(&out))
+	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
+		if handled, ferr := tryFastUnmarshalDecode(in, e.typ.Elem(), e.data, &xd.Struct, false); handled {
+			runtime.KeepAlive(&out)
+			return ferr
+		}
+		runtime.KeepAlive(&out)
 	}
 	err = unmarshalDecode(in, out, &xd.Struct, false)
 	if err != nil && xd.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {

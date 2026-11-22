@@ -123,6 +123,11 @@ func AppendQuoteString(dst []byte, src string, flags *jsonflags.Flags) ([]byte, 
 	return appendQuoteBytes(dst, unsafe.Slice(unsafe.StringData(src), len(src)), flags)
 }
 
+// AppendQuoteBytes appends src to dst as a JSON string without boxing or copying.
+func AppendQuoteBytes(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
+	return appendQuoteBytes(dst, src, flags)
+}
+
 func appendQuoteBytes(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
 	need := len(src) + 2
 	if cap(dst)-len(dst) < need {
@@ -137,6 +142,13 @@ func appendQuoteBytes(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
 			}
 			n += 8
 		}
+		if len(src)-n >= 4 {
+			w := uint64(byteorder.LEUint32(src[n:])) | 0x20202020_00000000
+			if m := escapeMaskNoHTML(w); m != 0 {
+				return appendQuoteBytesSlow(dst, src, n+(bits.TrailingZeros64(m)>>3), flags)
+			}
+			n += 4
+		}
 		for n < len(src) {
 			c := src[n]
 			if c >= utf8.RuneSelf || c < ' ' || c == '"' || c == '\\' {
@@ -150,6 +162,13 @@ func appendQuoteBytes(dst, src []byte, flags *jsonflags.Flags) ([]byte, error) {
 				return appendQuoteBytesSlow(dst, src, n+(bits.TrailingZeros64(m)>>3), flags)
 			}
 			n += 8
+		}
+		if len(src)-n >= 4 {
+			w := uint64(byteorder.LEUint32(src[n:])) | 0x20202020_00000000
+			if m := escapeMaskHTML(w); m != 0 {
+				return appendQuoteBytesSlow(dst, src, n+(bits.TrailingZeros64(m)>>3), flags)
+			}
+			n += 4
 		}
 		for n < len(src) {
 			c := src[n]
@@ -175,23 +194,41 @@ func appendQuoteBytesSlow(dst, src []byte, n int, flags *jsonflags.Flags) ([]byt
 	first := true
 	for uint(len(src)) > uint(n) {
 		if !first {
-			if !escapeHTML {
-				for len(src)-n >= 8 {
-					if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
-						n += bits.TrailingZeros64(m) >> 3
-						break
+			if len(src)-n >= 8 {
+				peelEnd := n + 4
+				if !escapeHTML {
+					for n < peelEnd {
+						c := src[n]
+						if c >= utf8.RuneSelf || c < ' ' || c == '"' || c == '\\' {
+							goto found
+						}
+						n++
 					}
-					n += 8
-				}
-			} else {
-				for len(src)-n >= 8 {
-					if m := escapeMaskHTML(byteorder.LEUint64(src[n:])); m != 0 {
-						n += bits.TrailingZeros64(m) >> 3
-						break
+					for len(src)-n >= 8 {
+						if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
+							n += bits.TrailingZeros64(m) >> 3
+							break
+						}
+						n += 8
 					}
-					n += 8
+				} else {
+					for n < peelEnd {
+						c := src[n]
+						if c >= utf8.RuneSelf || escapeASCII[c] > 0 {
+							goto found
+						}
+						n++
+					}
+					for len(src)-n >= 8 {
+						if m := escapeMaskHTML(byteorder.LEUint64(src[n:])); m != 0 {
+							n += bits.TrailingZeros64(m) >> 3
+							break
+						}
+						n += 8
+					}
 				}
 			}
+		found:
 			if uint(len(src)) <= uint(n) {
 				break
 			}

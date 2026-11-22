@@ -11,6 +11,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -683,6 +684,311 @@ func BenchmarkFastGenericMap(b *testing.B) {
 			if err := Unmarshal(data, &dst); err != nil {
 				b.Fatal(err)
 			}
+		}
+	})
+}
+
+type testV2CountCustom struct {
+	calls *int
+	out   []byte
+	err   error
+	val   string
+}
+
+func (c testV2CountCustom) MarshalJSON() ([]byte, error) {
+	*c.calls++
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.out, nil
+}
+
+func (c *testV2CountCustom) UnmarshalJSON(b []byte) error {
+	*c.calls++
+	if c.err != nil {
+		return c.err
+	}
+	c.val = string(b)
+	return nil
+}
+
+type testV2DirectCustom struct {
+	calls *int
+}
+
+func (c testV2DirectCustom) MarshalJSON() ([]byte, error) {
+	*c.calls++
+	return []byte(`{"x":"<a>\u0020\u2028"}`), nil
+}
+
+func testV2GrowStack(depth int, fn func()) {
+	var pad [256]byte
+	pad[depth&255] = byte(depth)
+	if depth > 0 {
+		testV2GrowStack(depth-1, fn)
+		runtime.KeepAlive(pad)
+		return
+	}
+	fn()
+}
+
+func TestFastCustomSingleInvocationAndPartialOutput(t *testing.T) {
+	t.Run("PartialOutputOnSiblingFailure", func(t *testing.T) {
+		type doc struct {
+			First  testV2DirectCustom `json:"first"`
+			Second float64            `json:"second"`
+		}
+		calls := 0
+		in := doc{First: testV2DirectCustom{calls: &calls}, Second: math.NaN()}
+
+		// v2 non-legacy preserves partial output emitted before failing member value.
+		out, err := Marshal(in)
+		if err == nil {
+			t.Fatal("Marshal succeeded, want error")
+		}
+		wantPrefix := "{\"first\":{\"x\":\"<a> \u2028\"},\"second\""
+		if string(out) != wantPrefix {
+			t.Fatalf("Marshal partial = %q, want %q", out, wantPrefix)
+		}
+		if calls != 1 {
+			t.Fatalf("Marshal calls = %d, want 1", calls)
+		}
+
+		// With EscapeForHTML and EscapeForJS enabled, custom output is re-escaped.
+		calls = 0
+		outEsc, err := Marshal(in, jsontext.EscapeForHTML(true), jsontext.EscapeForJS(true))
+		if err == nil {
+			t.Fatal("Marshal(EscapeHTML/JS) succeeded, want error")
+		}
+		wantEscPrefix := `{"first":{"x":"\u003ca\u003e \u2028"},"second"`
+		if string(outEsc) != wantEscPrefix {
+			t.Fatalf("Marshal(EscapeHTML/JS) partial = %q, want %q", outEsc, wantEscPrefix)
+		}
+
+		// MarshalOf preserves partial output; MarshalWriteOf does not flush small partial buffers on error (matching MarshalWrite).
+		calls = 0
+		outOf, err := MarshalOf(in)
+		if err == nil {
+			t.Fatal("MarshalOf succeeded, want error")
+		}
+		if string(outOf) != wantPrefix || calls != 1 {
+			t.Fatalf("MarshalOf partial=%q calls=%d, want %q / 1", outOf, calls, wantPrefix)
+		}
+
+		calls = 0
+		var wb bytes.Buffer
+		if err := MarshalWriteOf(&wb, in); err == nil {
+			t.Fatal("MarshalWriteOf succeeded, want error")
+		}
+		if wb.Len() != 0 {
+			t.Fatalf("MarshalWriteOf partial = %q, want empty unflushed buffer", wb.String())
+		}
+		if calls != 1 {
+			t.Fatalf("MarshalWriteOf calls = %d, want 1", calls)
+		}
+
+		// Legacy mode omits partial output.
+		calls = 0
+		outLeg, err := Marshal(in, flagOpt(jsonflags.ReportErrorsWithLegacySemantics))
+		if err == nil {
+			t.Fatal("legacy Marshal succeeded, want error")
+		}
+		if outLeg != nil || calls != 1 {
+			t.Fatalf("legacy Marshal out=%v calls=%d, want nil / 1", outLeg, calls)
+		}
+	})
+
+	t.Run("CustomJSONDepth10000AndOver8Keys", func(t *testing.T) {
+		manyKeys := `{"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9,"k10":10}`
+		calls := 0
+		type doc struct {
+			A testV2CountCustom `json:"a"`
+		}
+		out, err := MarshalOf(doc{A: testV2CountCustom{calls: &calls, out: []byte(manyKeys)}})
+		if err != nil {
+			t.Fatalf("MarshalOf >8 keys: %v", err)
+		}
+		if calls != 1 || string(out) != `{"a":`+manyKeys+`}` {
+			t.Fatalf("calls=%d out=%s", calls, out)
+		}
+
+		// Depth 10000 succeeds; depth 10001 fails, both calling MarshalJSON once.
+		d10000 := strings.Repeat("[", 9999) + "1" + strings.Repeat("]", 9999)
+		calls = 0
+		if _, err := Marshal(doc{A: testV2CountCustom{calls: &calls, out: []byte(d10000)}}); err != nil {
+			t.Fatalf("depth 10000 inside custom: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("depth 10000 calls = %d, want 1", calls)
+		}
+		d10001 := strings.Repeat("[", 10000) + "1" + strings.Repeat("]", 10000)
+		calls = 0
+		if _, err := Marshal(doc{A: testV2CountCustom{calls: &calls, out: []byte(d10001)}}); err == nil {
+			t.Fatal("depth 10001 inside custom succeeded, want error")
+		}
+		if calls != 1 {
+			t.Fatalf("depth 10001 calls = %d, want 1", calls)
+		}
+	})
+
+	t.Run("UnmarshalInvalidAndSiblingSingleCall", func(t *testing.T) {
+		calls := 0
+		type doc struct {
+			A testV2CountCustom `json:"a"`
+			B int               `json:"b"`
+		}
+		dst := doc{A: testV2CountCustom{calls: &calls}}
+		if err := Unmarshal([]byte(`{"a":1,"b":`), &dst, flagOpt(jsonflags.ReportErrorsWithLegacySemantics)); err == nil {
+			t.Fatal("expected syntax error")
+		}
+		if calls != 0 {
+			t.Fatalf("legacy invalid JSON calls = %d, want 0", calls)
+		}
+
+		calls = 0
+		if err := Unmarshal([]byte(`{"a":{"k":1},"b":"bad"}`), &dst); err == nil {
+			t.Fatal("expected semantic error")
+		}
+		if calls != 1 || dst.A.val != `{"k":1}` {
+			t.Fatalf("sibling error calls=%d val=%q", calls, dst.A.val)
+		}
+	})
+
+	t.Run("AnyCycleDepth1001", func(t *testing.T) {
+		calls := 0
+		root := make([]any, 2)
+		root[0] = testV2DirectCustom{calls: &calls}
+		root[1] = root
+		if _, err := Marshal(root); err == nil {
+			t.Fatal("expected cycle error on []any")
+		}
+
+		mroot := map[string]any{"a": testV2DirectCustom{calls: &calls}}
+		mroot["b"] = mroot
+		if _, err := Marshal(mroot); err == nil {
+			t.Fatal("expected cycle error on map[string]any")
+		}
+	})
+}
+
+func TestFastOptionsAndEdgeSemantics(t *testing.T) {
+	t.Run("StringifyNumbersAndQuotedString", func(t *testing.T) {
+		type S struct {
+			N int64   `json:"n"`
+			F float64 `json:"f"`
+			S string  `json:"s,string"`
+		}
+		in := S{N: 42, F: 3.5, S: "hi"}
+		// Without StringifyWithLegacySemantics and without ReportErrorsWithLegacySemantics, string tag on string fails.
+		if _, err := Marshal(in); err == nil {
+			t.Fatal("expected error for string tag on string in strict v2")
+		}
+		// With StringifyWithLegacySemantics + StringifyNumbers.
+		opts := JoinOptions(flagOpt(jsonflags.StringifyWithLegacySemantics), StringifyNumbers(true))
+		out, err := Marshal(in, opts)
+		if err != nil {
+			t.Fatalf("Marshal StringifyNumbers: %v", err)
+		}
+		want := `{"n":"42","f":"3.5","s":"\"hi\""}`
+		if string(out) != want {
+			t.Fatalf("got %s, want %s", out, want)
+		}
+	})
+
+	t.Run("AllowDuplicateNamesAndMapAnyMerge", func(t *testing.T) {
+		type inner struct {
+			A int `json:"a"`
+			B int `json:"b"`
+		}
+		m := map[string]any{
+			"obj": &inner{A: 1},
+		}
+		data := []byte(`{"obj":{"a":10},"obj":{"b":20}}`)
+		if err := Unmarshal(data, &m, jsontext.AllowDuplicateNames(true)); err != nil {
+			t.Fatalf("Unmarshal AllowDuplicateNames: %v", err)
+		}
+		got := m["obj"].(*inner)
+		if got.A != 10 || got.B != 20 {
+			t.Fatalf("map[string]any duplicate key merge = %+v, want {10 20}", got)
+		}
+
+		// Duplicate invalid UTF-8 keys in map with AllowInvalidUTF8 + !AllowDuplicateNames must fail.
+		badKeyMap := map[string]int{"\x80": 1, "\x81": 2}
+		if _, err := Marshal(badKeyMap, flagOpt(jsonflags.AllowInvalidUTF8)); err == nil {
+			t.Fatal("expected duplicate invalid UTF-8 key error (both coerce to U+FFFD)")
+		}
+	})
+
+	t.Run("UnmarshalArrayFromAnyLengthAndMerge", func(t *testing.T) {
+		dst := [4]int{1, 2, 3, 4}
+		opts := flagOpt(jsonflags.UnmarshalArrayFromAnyLength, jsonflags.MergeWithLegacySemantics)
+		if err := Unmarshal([]byte(`[9,8]`), &dst, opts); err != nil {
+			t.Fatalf("UnmarshalArrayFromAnyLength: %v", err)
+		}
+		if dst != [4]int{9, 8, 0, 0} {
+			t.Fatalf("underflow array = %v, want [9 8 0 0]", dst)
+		}
+	})
+
+	t.Run("NegZeroOmitZeroAndStrictRFC3339", func(t *testing.T) {
+		type S struct {
+			Z float64   `json:"z,omitzero"`
+			T time.Time `json:"t"`
+		}
+		b, err := Marshal(S{Z: math.Copysign(0, -1), T: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if strings.Contains(string(b), `"z"`) {
+			t.Fatalf("-0.0 should be omitted with omitzero: %s", b)
+		}
+		var dst S
+		if err := Unmarshal([]byte(`{"t":"2026-01-02T03:04:05,5Z"}`), &dst); err == nil {
+			t.Fatal("comma fractional separator in RFC3339 should fail strict v2 Unmarshal")
+		}
+		if err := Unmarshal([]byte(`{"t":"2026-01-02T03:04:05,5Z"}`), &dst, flagOpt(jsonflags.ParseTimeWithLooseRFC3339)); err != nil {
+			t.Fatalf("loose RFC3339 failed: %v", err)
+		}
+	})
+
+	t.Run("PreserveRawStringsAndDecodeOfContiguous", func(t *testing.T) {
+		type S struct {
+			A string `json:"a"`
+		}
+		out, err := Marshal(S{A: "<script>"}, flagOpt(jsonflags.PreserveRawStrings))
+		if err != nil {
+			t.Fatalf("PreserveRawStrings Marshal: %v", err)
+		}
+		_ = out
+
+		// UnmarshalDecodeOf multi-value stream.
+		stream := `{"a":"one"} {"a":"two"}`
+		dec := jsontext.NewDecoder(strings.NewReader(stream))
+		var s1, s2 S
+		if err := UnmarshalDecodeOf(dec, &s1); err != nil || s1.A != "one" {
+			t.Fatalf("UnmarshalDecodeOf 1 = %+v, %v", s1, err)
+		}
+		if err := UnmarshalDecodeOf(dec, &s2); err != nil || s2.A != "two" {
+			t.Fatalf("UnmarshalDecodeOf 2 = %+v, %v", s2, err)
+		}
+	})
+
+	t.Run("NoescapeStackGrowthGCStress", func(t *testing.T) {
+		calls := 0
+		for range 200 {
+			type S struct {
+				C testV2DirectCustom `json:"c"`
+			}
+			in := S{C: testV2DirectCustom{calls: &calls}}
+			testV2GrowStack(64, func() {
+				runtime.GC()
+				if _, err := MarshalOf(in); err != nil {
+					t.Fatalf("MarshalOf under GC stress: %v", err)
+				}
+			})
+		}
+		if calls != 200 {
+			t.Fatalf("calls = %d, want 200", calls)
 		}
 	})
 }

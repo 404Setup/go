@@ -207,13 +207,13 @@ func Marshal(v any) ([]byte, error) {
 // followed by one or more copies of indent according to the indentation nesting.
 func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
 	bp := getIndentScratch()
-	b, err := AppendMarshal(*bp, v)
+	b, err := AppendMarshal(bp.b, v)
 	if err != nil {
-		*bp = b[:0]
+		bp.b = b[:0]
 		putIndentScratch(bp)
 		return nil, err
 	}
-	*bp = b
+	bp.b = b
 	out, err := appendIndent(nil, b, prefix, indent)
 	putIndentScratch(bp)
 	if err != nil {

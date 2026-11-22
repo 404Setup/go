@@ -7,30 +7,39 @@
 package json
 
 import (
+	"encoding/json/internal"
+	"internal/abi"
 	"io"
 	"sync/v2"
+	"unsafe"
 
 	jsonv2 "encoding/json/v2"
 )
 
-var v2IndentBufPool = sync.Pool[*[]byte]{
-	New: func() *[]byte {
-		b := make([]byte, 0, 256)
-		return &b
+type v2IndentScratch struct {
+	b   []byte
+	arr [256]byte
+}
+
+var v2IndentBufPool = sync.Pool[*v2IndentScratch]{
+	New: func() *v2IndentScratch {
+		s := new(v2IndentScratch)
+		s.b = s.arr[:0]
+		return s
 	},
 }
 
-func getIndentScratch() *[]byte {
-	bp := v2IndentBufPool.Get()
-	*bp = (*bp)[:0]
-	return bp
+func getIndentScratch() *v2IndentScratch {
+	s := v2IndentBufPool.Get()
+	s.b = s.b[:0]
+	return s
 }
 
-func putIndentScratch(bp *[]byte) {
-	if cap(*bp) > 64<<10 {
-		*bp = nil
+func putIndentScratch(s *v2IndentScratch) {
+	if cap(s.b) > 64<<10 {
+		s.b = s.arr[:0]
 	}
-	v2IndentBufPool.Put(bp)
+	v2IndentBufPool.Put(s)
 }
 
 // MarshalOf is a generic version of [Marshal] that returns the JSON encoding of v
@@ -55,16 +64,16 @@ func AppendMarshalOf[T any](dst []byte, v T) ([]byte, error) {
 // MarshalIndentOf is a generic version of [MarshalIndent] without boxing v
 // into an interface value.
 func MarshalIndentOf[T any](v T, prefix, indent string) ([]byte, error) {
-	bp := getIndentScratch()
-	b, err := AppendMarshalOf(*bp, v)
+	sc := getIndentScratch()
+	b, err := AppendMarshalOf(sc.b, v)
 	if err != nil {
-		*bp = b[:0]
-		putIndentScratch(bp)
+		sc.b = b[:0]
+		putIndentScratch(sc)
 		return nil, err
 	}
-	*bp = b
+	sc.b = b
 	out, err := appendIndent(nil, b, prefix, indent)
-	putIndentScratch(bp)
+	putIndentScratch(sc)
 	if err != nil {
 		return nil, err
 	}
@@ -76,16 +85,16 @@ func MarshalIndentOf[T any](v T, prefix, indent string) ([]byte, error) {
 // length alongside the error.
 func AppendMarshalIndent(dst []byte, v any, prefix, indent string) ([]byte, error) {
 	origLen := len(dst)
-	bp := getIndentScratch()
-	b, err := AppendMarshal(*bp, v)
+	sc := getIndentScratch()
+	b, err := AppendMarshal(sc.b, v)
 	if err != nil {
-		*bp = b[:0]
-		putIndentScratch(bp)
+		sc.b = b[:0]
+		putIndentScratch(sc)
 		return dst[:origLen], err
 	}
-	*bp = b
+	sc.b = b
 	out, err := appendIndent(dst, b, prefix, indent)
-	putIndentScratch(bp)
+	putIndentScratch(sc)
 	if err != nil {
 		return dst[:origLen], err
 	}
@@ -97,16 +106,16 @@ func AppendMarshalIndent(dst []byte, v any, prefix, indent string) ([]byte, erro
 // original length alongside the error.
 func AppendMarshalIndentOf[T any](dst []byte, v T, prefix, indent string) ([]byte, error) {
 	origLen := len(dst)
-	bp := getIndentScratch()
-	b, err := AppendMarshalOf(*bp, v)
+	sc := getIndentScratch()
+	b, err := AppendMarshalOf(sc.b, v)
 	if err != nil {
-		*bp = b[:0]
-		putIndentScratch(bp)
+		sc.b = b[:0]
+		putIndentScratch(sc)
 		return dst[:origLen], err
 	}
-	*bp = b
+	sc.b = b
 	out, err := appendIndent(dst, b, prefix, indent)
-	putIndentScratch(bp)
+	putIndentScratch(sc)
 	if err != nil {
 		return dst[:origLen], err
 	}
@@ -163,6 +172,13 @@ func DecodeOf[T any](dec *Decoder, v *T) error {
 	}
 	if dec.err != nil {
 		return dec.err
+	}
+	if !dec.hadPeeked && !dec.hadEOF && v != nil {
+		if handled, err := internal.FastUnmarshalDecode(dec.dec, dec.opts, uintptr(unsafe.Pointer(abi.TypeFor[T]())), unsafe.Pointer(v)); handled {
+			dec.hadPeeked = false
+			dec.hadEOF = false
+			return err
+		}
 	}
 	b, err := dec.dec.ReadValue()
 	if err != nil {

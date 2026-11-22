@@ -6,7 +6,10 @@
 
 package internal
 
-import "errors"
+import (
+	"errors"
+	"unsafe"
+)
 
 // NotForPublicUse is a marker type that an API is for internal use only.
 // It does not perfectly prevent usage of that API, but helps to restrict usage.
@@ -43,11 +46,15 @@ var (
 	// It is called after a user-defined Marshal method/function fails.
 	NewMarshalerError func(any, error, string) error
 	// TransformUnmarshalError converts a v2 error into a v1 error.
-	// It is called only at the top-level of an Unmarshal function.
+	// It is called only at the top-level of a Unmarshal function.
 	TransformUnmarshalError func(any, error) error
 
 	// NewRawNumber returns new(jsonv1.Number).
 	NewRawNumber func() any
 	// RawNumberOf returns jsonv1.Number(b).
 	RawNumberOf func(b []byte) any
+
+	// FastUnmarshalDecode decodes the next top-level JSON value from a *jsontext.Decoder
+	// using the contiguous buffer fast path when possible.
+	FastUnmarshalDecode func(dec, opts any, at uintptr, ptr unsafe.Pointer) (bool, error)
 )

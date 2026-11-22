@@ -217,7 +217,15 @@ func (d *decoderState) fetch() error {
 
 	// Allocate initial buffer if empty.
 	if cap(d.buf) == 0 {
-		d.buf = make([]byte, 0, 64)
+		initCap := 512
+		if br, ok := d.rd.(*bytes.Reader); ok {
+			if rem := br.Len() + 1; rem < initCap {
+				initCap = max(rem, 64)
+			} else if rem <= 4096 {
+				initCap = rem
+			}
+		}
+		d.buf = make([]byte, 0, initCap)
 	}
 
 	// Check whether to grow the buffer.
@@ -269,6 +277,32 @@ func (d *decoderState) fetch() error {
 			continue // Read returned (0, nil)
 		}
 	}
+}
+
+// ContiguousValue returns unread contiguous buffer bytes at top-level depth 1
+// when no lookahead token is buffered, fetching once from rd if empty.
+func (d *decoderState) ContiguousValue() (buf []byte, atEOF bool, ok bool) {
+	if d.Tokens.Depth() != 1 || d.Tokens.Last.NeedObjectName() || d.peekPos != 0 || d.peekErr != nil {
+		return nil, false, false
+	}
+	d.invalidatePreviousRead()
+	if d.prevEnd == len(d.buf) {
+		if d.rd == nil || d.rdErr == io.EOF {
+			return nil, false, false
+		}
+		if err := d.fetch(); err != nil {
+			return nil, false, false
+		}
+	}
+	return d.buf[d.prevEnd:], d.rd == nil || d.rdErr == io.EOF, true
+}
+
+// ConsumeContiguous advances the decoder past [valStart:valEnd] relative to the
+// unread buffer returned by ContiguousValue.
+func (d *decoderState) ConsumeContiguous(valStart, valEnd int) {
+	d.prevStart = d.prevEnd + valStart
+	d.prevEnd += valEnd
+	d.Tokens.Last.Increment()
 }
 
 const invalidateBufferByte = '#' // invalid starting character for JSON grammar
