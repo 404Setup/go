@@ -17,6 +17,7 @@ import (
 	"go/printer"
 	"go/token"
 	"internal/buildcfg"
+	"internal/platform"
 	"io"
 	"maps"
 	"os"
@@ -38,6 +39,7 @@ import (
 type Package struct {
 	PackageName string // name of package
 	PackagePath string
+	fset        *token.FileSet
 	PtrSize     int64
 	IntSize     int64
 	GccOptions  []string
@@ -52,6 +54,7 @@ type Package struct {
 	Preamble    string          // collected preamble for _cgo_export.h
 	noCallbacks map[string]bool // C function names with #cgo nocallback directive
 	noEscapes   map[string]bool // C function names with #cgo noescape directive
+	genFiles    []*File         // input files for -gen-binding
 }
 
 // A typedefInfo is an element on Package.typedefList: a typedef name
@@ -79,6 +82,8 @@ type File struct {
 	Edit        *edit.Buffer
 
 	debugs []*debug // debug data from iterations of gccDebug. Initialized by File.loadDebug.
+
+	gen *genBindingFile // input for -gen-binding
 }
 
 func (f *File) offset(p token.Pos) int {
@@ -279,7 +284,12 @@ var objDir = flag.String("objdir", "", "object directory")
 var importPath = flag.String("importpath", "", "import path of package being built (for comments in generated files)")
 var exportHeader = flag.String("exportheader", "", "where to write export header if any exported functions")
 
+var binding = flag.Bool("binding", false, "generate code for //cgo: binding pragmas without a C compiler")
+
+var genBinding = flag.Bool("gen-binding", false, "generate a Go binding file from the //cgo: pragmas in a package's Go files and their C headers")
+
 var ldflags = flag.String("ldflags", "", "flags to pass to C linker")
+var ldflagsSet bool
 
 var gccgo = flag.Bool("gccgo", false, "generate files for use with gccgo")
 var gccgoprefix = flag.String("gccgoprefix", "", "-fgo-prefix option used with gccgo")
@@ -321,7 +331,7 @@ func main() {
 		return
 	}
 
-	if *godefs {
+	if *godefs || *genBinding {
 		// Generating definitions pulled from header files,
 		// to be checked into Go repositories.
 		// Line numbers are just noise.
@@ -364,15 +374,13 @@ func main() {
 		}
 	}
 
-	p := newPackage(args[:i])
+	p := newPackage(args[:i], fset)
 
-	// We need a C compiler to be available. Check this.
-	var err error
-	gccBaseCmd, err = checkGCCBaseCmd()
-	if err != nil {
-		fatalf("%v", err)
-		os.Exit(2)
-	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "ldflags" {
+			ldflagsSet = true
+		}
+	})
 
 	// Record linker flags for external linking.
 	if *ldflags != "" {
@@ -398,6 +406,38 @@ func main() {
 		p.addToFlag("LDFLAGS", args)
 	}
 
+	if *genBinding && (*binding || *godefs) {
+		fatalf("-gen-binding cannot be combined with -binding or -godefs")
+	}
+
+	if *binding {
+		if !buildcfg.Experiment.CgoBindings {
+			fatalf("-binding requires GOEXPERIMENT=cgobindings")
+		}
+		if !platform.CgoSupported(goos, goarch) {
+			fatalf("-binding is not supported on %s/%s", goos, goarch)
+		}
+		p.processBinding(goFiles)
+		return
+	}
+
+	if *genBinding {
+		if !buildcfg.Experiment.CgoBindings {
+			fatalf("-gen-binding requires GOEXPERIMENT=cgobindings")
+		}
+		if !platform.CgoSupported(goos, goarch) {
+			fatalf("-gen-binding is not supported on %s/%s", goos, goarch)
+		}
+	}
+
+	// We need a C compiler to be available. Check this.
+	var err error
+	gccBaseCmd, err = checkGCCBaseCmd()
+	if err != nil {
+		fatalf("%v", err)
+		os.Exit(2)
+	}
+
 	// Need a unique prefix for the global C symbols that
 	// we use to coordinate between gcc and ourselves.
 	// We already put _cgo_ at the beginning, so the main
@@ -419,6 +459,11 @@ func main() {
 		if aname, err := filepath.Abs(input); err == nil {
 			input = aname
 		}
+		if *genBinding {
+			// As when cmd/go runs cgo, let the preamble include headers
+			// from the directory of the Go file.
+			p.addToFlag("CFLAGS", []string{"-I", filepath.Dir(input)})
+		}
 
 		b, err := os.ReadFile(input)
 		if err != nil {
@@ -428,6 +473,7 @@ func main() {
 			fatalf("%s", err)
 		}
 
+		origDir := filepath.Dir(input)
 		q.Add(func() {
 			// Apply trimpath to the file path. The path won't be read from after this point.
 			input, _ = objabi.ApplyRewrites(input, *trimpath)
@@ -440,10 +486,20 @@ func main() {
 			goFiles[i] = input
 
 			f := new(File)
+			if *genBinding && !genBindingImportsC(input, b) {
+				// A Go file of the package that does not use cgo.
+				// It may declare Go names bound by the pragmas.
+				f.useGenBindingPragmas(input, origDir, b)
+				fs[i] = f
+				return
+			}
 			f.Edit = edit.NewBuffer(b)
 			f.LitMap = make(map[*ast.CompositeLit]*Lit)
 			f.ParseGo(input, b)
-			f.ProcessCgoDirectives()
+			if *genBinding {
+				f.useGenBindingPragmas(input, origDir, b)
+			}
+			f.ProcessCgoDirectives(p)
 			gccIsClang := f.loadDefines(p.GccOptions)
 			once.Do(func() {
 				p.GccIsClang = gccIsClang
@@ -461,6 +517,11 @@ func main() {
 
 	for i, input := range goFiles {
 		f := fs[i]
+		if f.AST == nil {
+			// A -gen-binding input file that does not import "C".
+			p.genFiles = append(p.genFiles, f)
+			continue
+		}
 		p.Translate(f)
 		for _, cref := range f.Ref {
 			switch cref.Context {
@@ -480,6 +541,8 @@ func main() {
 		p.Record(f)
 		if *godefs {
 			os.Stdout.WriteString(p.godefs(f, osArgs))
+		} else if *genBinding {
+			p.genFiles = append(p.genFiles, f)
 		} else {
 			p.writeOutput(f, input)
 		}
@@ -504,6 +567,17 @@ func main() {
 		}
 	}
 
+	if *genBinding {
+		if nerrors > 0 {
+			os.Exit(2)
+		}
+		p.writeBinding(os.Stdout)
+		if nerrors > 0 {
+			os.Exit(2)
+		}
+		return
+	}
+
 	if !*godefs {
 		p.writeDefs()
 	}
@@ -514,7 +588,7 @@ func main() {
 
 // newPackage returns a new Package that will invoke
 // gcc with the additional arguments specified in args.
-func newPackage(args []string) *Package {
+func newPackage(args []string, fset *token.FileSet) *Package {
 	goarch = runtime.GOARCH
 	if s := os.Getenv("GOARCH"); s != "" {
 		goarch = s
@@ -540,6 +614,7 @@ func newPackage(args []string) *Package {
 	os.Setenv("LC_ALL", "C")
 
 	p := &Package{
+		fset:        fset,
 		PtrSize:     ptrSize,
 		IntSize:     intSize,
 		Written:     make(map[string]bool),

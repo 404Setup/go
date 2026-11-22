@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.runtimecgopurego && !msan && !tsan && (darwin || (linux && !android && (amd64 || arm64)))
+//go:build goexperiment.runtimecgopurego && !msan && !tsan && (darwin || (linux && (amd64 || arm64)))
 
 package cgo
 
@@ -57,6 +57,22 @@ var libc_pthread_sigmask = unsafe.Pointer(&_libc_pthread_sigmask)
 var _libc_sigfillset byte
 var libc_sigfillset = unsafe.Pointer(&_libc_sigfillset)
 
+// libc_dlopen, libc_dlsym, and libc_dlerror are imported only when the
+// cgobindings experiment is enabled (see library_linux.go and
+// library_darwin.go), for Open.
+
+//go:linkname _libc_dlopen libc_dlopen
+var _libc_dlopen byte
+var libc_dlopen = unsafe.Pointer(&_libc_dlopen)
+
+//go:linkname _libc_dlsym libc_dlsym
+var _libc_dlsym byte
+var libc_dlsym = unsafe.Pointer(&_libc_dlsym)
+
+//go:linkname _libc_dlerror libc_dlerror
+var _libc_dlerror byte
+var libc_dlerror = unsafe.Pointer(&_libc_dlerror)
+
 //go:linknamestd runtime_setg runtime.setg
 func runtime_setg(gg uintptr)
 
@@ -109,11 +125,11 @@ type g struct {
 
 // pthreadAttr corresponds to pthread_attr_t.
 type pthreadAttr struct {
-	data [8]uintptr
+	data [9]uintptr
 }
 
 type sigset struct {
-	mask [16]uintptr
+	mask [128 / unsafe.Sizeof(uintptr(0))]uintptr
 }
 
 var (
@@ -130,12 +146,14 @@ func cgoYieldWaitRuntimeInit() {
 //go:norace
 //go:nocheckptr
 func cgoNotifyRuntimeInitDoneOS() {
+	var key pthreadKey
 	tsanAcquire()
 	r := asmcgocall(uintptr(libc_pthread_key_create),
-		uintptr(unsafe.Pointer(&pthread_g)),
+		uintptr(unsafe.Pointer(&key)),
 		abi.FuncPCABI0(pthreadKeyDestructor), 0, 0, 0, 0)
 	tsanRelease()
 	if int32(r) == 0 {
+		atomic.Storeuintptr(&pthread_g, uintptr(key))
 		atomic.Storeuintptr(&pthread_key_created, 1)
 	}
 }
@@ -152,13 +170,15 @@ func cgoBindM(g uintptr) {
 //go:nosplit
 //go:norace
 //go:nocheckptr
-func cgoInit(g *g, _ uintptr) {
+func cgoInit(g *g, _ uintptr, tlsg, tlsbase uintptr) {
+	if tlsg != 0 {
+		cgoInitTLS(tlsg, tlsbase)
+	}
 	asmcgocallNoG(uintptr(libc_sigfillset), uintptr(unsafe.Pointer(&fullSigset)), 0, 0, 0, 0, 0)
 	lo, _ := cgoGetStackBound()
 	g.stacklo = lo
 	if g.stacklo >= g.stackhi {
-		runtime_writeErrStr("runtime/cgo: bad stack bounds\n")
-		runtime_abort()
+		cgoFatal("runtime/cgo: bad stack bounds\n\x00")
 	}
 }
 

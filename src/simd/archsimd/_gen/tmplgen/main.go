@@ -1009,7 +1009,7 @@ func Load{{.VType}}Part(s []{{.Etype}}) ({{.VType}}, int) {
 	}
 	t := unsafe.Slice((*int{{.EWidth}})(unsafe.Pointer(&s[0])), len(s))
 	v, l := LoadInt{{.WxC}}Part(t)
-	return v.As{{.VType}}(), l
+	return v.ToBits(), l
 }
 
 // StorePart stores the {{.Count}} elements of x into the slice s.
@@ -1020,7 +1020,7 @@ func (x {{.VType}}) StorePart(s []{{.Etype}}) int {
 		return 0
 	}
 	t := unsafe.Slice((*int{{.EWidth}})(unsafe.Pointer(&s[0])), len(s))
-	return x.AsInt{{.WxC}}().StorePart(t)
+	return x.BitsToInt{{.EWidth}}().StorePart(t)
 }
 `)
 
@@ -1123,7 +1123,7 @@ var bitWiseUintTemplate = shapedTemplateOf(uintShapes, "bitwise uint complement"
 //
 // Emulated, CPU Feature: {{.CPUfeature}}
 func (x {{.VType}}) Not() {{.VType}} {
-	return x.Xor(x.Equal(x).ToInt{{.WxC}}().As{{.VType}}())
+	return x.Xor(x.Equal(x).ToInt{{.WxC}}().ToBits())
 }
 `)
 
@@ -1146,7 +1146,7 @@ func (x {{.VType}}) Greater(y {{.VType}}) Mask{{.WxC}} {
 {{- if ne .EWidth 64}}
 	return x.Min(y).Equal(x).Not()
 {{- else}}
-	a, b := x.AsInt{{.WxC}}(), y.AsInt{{.WxC}}()
+	a, b := x.BitsToInt{{.EWidth}}(), y.BitsToInt{{.EWidth}}()
 	ones := x.Equal(x).ToInt{{.WxC}}()
 	signs := ones.ShiftAllLeft({{.EWidth}}-1)
 	return a.Xor(signs).Greater(b.Xor(signs))
@@ -1160,7 +1160,7 @@ func (x {{.VType}}) Less(y {{.VType}}) Mask{{.WxC}} {
 {{- if ne .EWidth 64}}
 	return x.Max(y).Equal(x).Not()
 {{- else}}
-	a, b := x.AsInt{{.WxC}}(), y.AsInt{{.WxC}}()
+	a, b := x.BitsToInt{{.EWidth}}(), y.BitsToInt{{.EWidth}}()
 	ones := x.Equal(x).ToInt{{.WxC}}()
 	signs := ones.ShiftAllLeft({{.EWidth}}-1)
 	return b.Xor(signs).Greater(a.Xor(signs))
@@ -1174,7 +1174,7 @@ func (x {{.VType}}) GreaterEqual(y {{.VType}}) Mask{{.WxC}} {
 {{- if ne .EWidth 64}}
 	return x.Max(y).Equal(x)
 {{- else}}
-	a, b := x.AsInt{{.WxC}}(), y.AsInt{{.WxC}}()
+	a, b := x.BitsToInt{{.EWidth}}(), y.BitsToInt{{.EWidth}}()
 	ones := x.Equal(x).ToInt{{.WxC}}()
 	signs := ones.ShiftAllLeft({{.EWidth}}-1)
 	return b.Xor(signs).Greater(a.Xor(signs)).ToInt{{.WxC}}().Xor(ones).asMask()
@@ -1188,7 +1188,7 @@ func (x {{.VType}}) LessEqual(y {{.VType}}) Mask{{.WxC}} {
 {{- if ne .EWidth 64}}
 	return x.Min(y).Equal(x)
 {{- else}}
-	a, b := x.AsInt{{.WxC}}(), y.AsInt{{.WxC}}()
+	a, b := x.BitsToInt{{.EWidth}}(), y.BitsToInt{{.EWidth}}()
 	ones := x.Equal(x).ToInt{{.WxC}}()
 	signs := ones.ShiftAllLeft({{.EWidth}}-1)
 	return a.Xor(signs).Greater(b.Xor(signs)).ToInt{{.WxC}}().Xor(ones).asMask()
@@ -1199,7 +1199,7 @@ func (x {{.VType}}) LessEqual(y {{.VType}}) Mask{{.WxC}} {
 //
 // Emulated, CPU Feature: {{.CPUfeature}}
 func (x {{.VType}}) NotEqual(y {{.VType}}) Mask{{.WxC}} {
-	a, b := x.AsInt{{.WxC}}(), y.AsInt{{.WxC}}()
+	a, b := x.BitsToInt{{.EWidth}}(), y.BitsToInt{{.EWidth}}()
 	ones := x.Equal(x).ToInt{{.WxC}}()
 	return a.Equal(b).ToInt{{.WxC}}().Xor(ones).asMask()
 }
@@ -1232,17 +1232,6 @@ func pa{{.VType}}(s []{{.Etype}}) *[{{.Count}}]{{.Etype}} {
 var maskedTemplate = shapedTemplateOf(allShapes, ".Masked and .IfElse methods", `
 // CPU Feature: {{.CPUfeature}}
 func (x {{.VType}}) Masked(mask Mask{{.WxC}}) {{.VType}}
-
-// Merge returns x but with elements set to y where mask is false.
-//
-// Emulated, CPU Feature: {{.CPUfeature}}
-//
-// Deprecated: use x.IfElse(mask, y)
-//
-//go:fix inline
-func (x {{.VType}}) Merge(y {{.VType}}, mask Mask{{.WxC}}) {{.VType}} {
-	return x.IfElse(mask, y)
-}
 
 // CPU Feature: {{.CPUfeature}}
 func (x {{.VType}}) IfElse(mask Mask{{.WxC}}, y {{.VType}}) {{.VType}}
@@ -1352,7 +1341,7 @@ func (t templateData) FromUint64s() string {
 }
 
 // hiToLoTemplateAMD64 implements HiToLo for amd64 vectors of all widths. It
-// relies on amd64-only operations (ConcatPermute128Scalars, and Hi/SetLo),
+// relies on amd64-only operations (concatPermute128Scalars, and Hi/SetLo),
 // so it is only used for amd64.
 var hiToLoTemplateAMD64 = templateOf("amd64 HiToLo methods", `
 // Emulated, CPU Feature: {{.CPUfeature}}
@@ -1362,7 +1351,7 @@ func (x {{.VType}}) HiToLo() {{.VType}} {
 	return x{{.ToUint64s}}.InterleaveHi(zero){{.FromUint64s}}
 {{- else if eq .Vwidth 256}}
 	var zero {{.VType}}
-	return x.ConcatPermute128Scalars(1, 2, zero)
+	return x.concatPermute128Scalars(1, 2, zero)
 {{- else}}
 	var zero {{.VType}}
 	return zero.SetLo(x.Hi())
@@ -1831,9 +1820,9 @@ func classifyBooleanSIMD(v *ssa.Value) SIMDLogicalOP {
 		return sloAndNot
 `)
 
-	// "Not" is encoded as x.Xor(x.Equal(x).AsInt8x16())
-	// i.e. xor.Args[0] == x, xor.Args[1].Op == As...
-	// but AsInt8x16 is a pun/passthrough.
+	// "Not" is encoded as x.Xor(x.Equal(x).ToInt8x16().ToBits())
+	// i.e. xor.Args[0] == x, xor.Args[1].Op == Equal...
+	// because ToInt8x16 and ToBits are puns/passthroughs.
 
 	intShapes.forAllShapes(
 		func(seq int, t, upperT string, w, c int, out io.Writer) {
