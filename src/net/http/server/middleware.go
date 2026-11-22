@@ -213,6 +213,12 @@ func isValidRequestID(s string) bool {
 	return true
 }
 
+var (
+	headerValVaryOrigin = []string{"Origin"}[:1:1]
+	headerValWildcard   = []string{"*"}[:1:1]
+	headerValTrue       = []string{"true"}[:1:1]
+)
+
 // BodyLimit returns middleware that enforces a maximum request body size of
 // maxBytes, rejecting larger requests with 413 Request Entity Too Large.
 func BodyLimit(maxBytes int64) HandlerFunc {
@@ -222,9 +228,10 @@ func BodyLimit(maxBytes int64) HandlerFunc {
 	return func(c *Context) error {
 		c.SetMaxBodyBytes(maxBytes)
 		if c.req.ContentLength > maxBytes {
+			c.markRequestTooLarge()
 			return WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
 		}
-		if c.req.Body != nil {
+		if c.req.Body != nil && c.req.Body != http.NoBody {
 			c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, maxBytes)
 		}
 		return c.Next()
@@ -260,7 +267,8 @@ type SecurityHeadersConfig struct {
 	ContentSecurityPolicy string
 
 	// StrictTransportSecurity optionally sets Strict-Transport-Security.
-	// Only sent when the request arrived over TLS (r.TLS != nil).
+	// Only sent when the request arrived over HTTPS (r.TLS != nil or via a
+	// configured trusted proxy with X-Forwarded-Proto: https).
 	StrictTransportSecurity string
 
 	// PermissionsPolicy optionally sets Permissions-Policy.
@@ -287,22 +295,38 @@ func SecurityHeadersWithConfig(cfg SecurityHeadersConfig) HandlerFunc {
 	if cfg.ReferrerPolicy == "" {
 		cfg.ReferrerPolicy = "strict-origin-when-cross-origin"
 	}
+	ctoSlice := []string{cfg.ContentTypeOptions}[:1:1]
+	foSlice := []string{cfg.FrameOptions}[:1:1]
+	rpSlice := []string{cfg.ReferrerPolicy}[:1:1]
+	var cspSlice, ppSlice, coopSlice, hstsSlice []string
+	if cfg.ContentSecurityPolicy != "" {
+		cspSlice = []string{cfg.ContentSecurityPolicy}[:1:1]
+	}
+	if cfg.PermissionsPolicy != "" {
+		ppSlice = []string{cfg.PermissionsPolicy}[:1:1]
+	}
+	if cfg.CrossOriginOpenerPolicy != "" {
+		coopSlice = []string{cfg.CrossOriginOpenerPolicy}[:1:1]
+	}
+	if cfg.StrictTransportSecurity != "" {
+		hstsSlice = []string{cfg.StrictTransportSecurity}[:1:1]
+	}
 	return func(c *Context) error {
 		h := c.respHeader()
-		h.Set("X-Content-Type-Options", cfg.ContentTypeOptions)
-		h.Set("X-Frame-Options", cfg.FrameOptions)
-		h.Set("Referrer-Policy", cfg.ReferrerPolicy)
-		if cfg.ContentSecurityPolicy != "" {
-			h.Set("Content-Security-Policy", cfg.ContentSecurityPolicy)
+		h["X-Content-Type-Options"] = ctoSlice
+		h["X-Frame-Options"] = foSlice
+		h["Referrer-Policy"] = rpSlice
+		if cspSlice != nil {
+			h["Content-Security-Policy"] = cspSlice
 		}
-		if cfg.PermissionsPolicy != "" {
-			h.Set("Permissions-Policy", cfg.PermissionsPolicy)
+		if ppSlice != nil {
+			h["Permissions-Policy"] = ppSlice
 		}
-		if cfg.CrossOriginOpenerPolicy != "" {
-			h.Set("Cross-Origin-Opener-Policy", cfg.CrossOriginOpenerPolicy)
+		if coopSlice != nil {
+			h["Cross-Origin-Opener-Policy"] = coopSlice
 		}
-		if cfg.StrictTransportSecurity != "" && c.req.TLS != nil {
-			h.Set("Strict-Transport-Security", cfg.StrictTransportSecurity)
+		if hstsSlice != nil && c.Scheme() == "https" {
+			h["Strict-Transport-Security"] = hstsSlice
 		}
 		return c.Next()
 	}
@@ -350,11 +374,11 @@ func CORS(cfg CORSConfig) HandlerFunc {
 		panic("server: CORS AllowCredentials cannot be combined with wildcard '*' origin")
 	}
 
-	var allowedSet map[string]struct{}
+	var allowedSet map[string][]string
 	if cfg.AllowOriginFunc == nil && !allowAll && len(cfg.AllowOrigins) > 0 {
-		allowedSet = make(map[string]struct{}, len(cfg.AllowOrigins))
+		allowedSet = make(map[string][]string, len(cfg.AllowOrigins))
 		for _, o := range cfg.AllowOrigins {
-			allowedSet[o] = struct{}{}
+			allowedSet[o] = []string{o}[:1:1]
 		}
 	}
 
@@ -369,66 +393,81 @@ func CORS(cfg CORSConfig) HandlerFunc {
 			http.MethodDelete,
 		}
 	}
-	allowMethodsHeader := strings.Join(methods, ", ")
-	allowHeadersHeader := strings.Join(cfg.AllowHeaders, ", ")
-	exposeHeadersHeader := strings.Join(cfg.ExposeHeaders, ", ")
-	var maxAgeHeader string
-	if cfg.MaxAge > 0 {
-		maxAgeHeader = strconv.Itoa(int(cfg.MaxAge / time.Second))
+	allowMethodsSlice := []string{strings.Join(methods, ", ")}[:1:1]
+	allowWildcardHeaders := slices.Contains(cfg.AllowHeaders, "*")
+	var allowHeadersSlice []string
+	if len(cfg.AllowHeaders) > 0 {
+		allowHeadersSlice = []string{strings.Join(cfg.AllowHeaders, ", ")}[:1:1]
 	}
-
-	isAllowed := func(origin string) bool {
-		if cfg.AllowOriginFunc != nil {
-			return cfg.AllowOriginFunc(origin)
-		}
-		if allowAll {
-			return true
-		}
-		_, ok := allowedSet[origin]
-		return ok
+	var exposeHeadersSlice []string
+	if len(cfg.ExposeHeaders) > 0 {
+		exposeHeadersSlice = []string{strings.Join(cfg.ExposeHeaders, ", ")}[:1:1]
+	}
+	var maxAgeSlice []string
+	if cfg.MaxAge > 0 {
+		maxAgeSlice = []string{strconv.Itoa(int(cfg.MaxAge / time.Second))}[:1:1]
 	}
 
 	return func(c *Context) error {
 		h := c.respHeader()
-		h.Add("Vary", "Origin")
+		addVaryToken(h, "Origin")
 
-		origin := c.Header("Origin")
+		origin := c.canonicalReqHeader("Origin")
 		if origin == "" || hasASCIIControl(origin) {
 			return c.Next()
 		}
 
-		isPreflight := c.Method() == http.MethodOptions && c.Header("Access-Control-Request-Method") != ""
+		isPreflight := c.Method() == http.MethodOptions && c.canonicalReqHeader("Access-Control-Request-Method") != ""
 		if isPreflight {
-			h.Add("Vary", "Access-Control-Request-Method")
-			h.Add("Vary", "Access-Control-Request-Headers")
+			addVaryToken(h, "Access-Control-Request-Method")
+			addVaryToken(h, "Access-Control-Request-Headers")
 		}
 
-		if !isAllowed(origin) {
-			if isPreflight {
-				return c.WriteStatus(http.StatusForbidden)
+		var originSlice []string
+		if cfg.AllowOriginFunc != nil {
+			if !cfg.AllowOriginFunc(origin) {
+				if isPreflight {
+					return c.WriteStatus(http.StatusForbidden)
+				}
+				return c.Next()
 			}
-			return c.Next()
-		}
-
-		if allowAll && !cfg.AllowCredentials {
-			h.Set("Access-Control-Allow-Origin", "*")
+			originSlice = []string{origin}
+		} else if allowAll {
+			if cfg.AllowCredentials {
+				originSlice = []string{origin}
+			} else {
+				originSlice = headerValWildcard
+			}
 		} else {
-			h.Set("Access-Control-Allow-Origin", origin)
+			var ok bool
+			originSlice, ok = allowedSet[origin]
+			if !ok {
+				if isPreflight {
+					return c.WriteStatus(http.StatusForbidden)
+				}
+				return c.Next()
+			}
 		}
+
+		h["Access-Control-Allow-Origin"] = originSlice
 		if cfg.AllowCredentials {
-			h.Set("Access-Control-Allow-Credentials", "true")
+			h["Access-Control-Allow-Credentials"] = headerValTrue
 		}
-		if exposeHeadersHeader != "" && !isPreflight {
-			h.Set("Access-Control-Expose-Headers", exposeHeadersHeader)
+		if exposeHeadersSlice != nil && !isPreflight {
+			h["Access-Control-Expose-Headers"] = exposeHeadersSlice
 		}
 
 		if isPreflight {
-			h.Set("Access-Control-Allow-Methods", allowMethodsHeader)
-			if allowHeadersHeader != "" {
-				h.Set("Access-Control-Allow-Headers", allowHeadersHeader)
+			h["Access-Control-Allow-Methods"] = allowMethodsSlice
+			if allowWildcardHeaders && cfg.AllowCredentials {
+				if reqHdrs := c.canonicalReqHeader("Access-Control-Request-Headers"); reqHdrs != "" && !hasASCIIControl(reqHdrs) {
+					h["Access-Control-Allow-Headers"] = []string{reqHdrs}
+				}
+			} else if allowHeadersSlice != nil {
+				h["Access-Control-Allow-Headers"] = allowHeadersSlice
 			}
-			if maxAgeHeader != "" {
-				h.Set("Access-Control-Max-Age", maxAgeHeader)
+			if maxAgeSlice != nil {
+				h["Access-Control-Max-Age"] = maxAgeSlice
 			}
 			return c.NoContent()
 		}
@@ -467,12 +506,12 @@ func BasicAuth(realm string, validator func(username, password string) bool) Han
 		}
 		return r
 	}, realm)
-	wwwAuth := `Basic realm="` + safeRealm + `", charset="UTF-8"`
+	wwwAuthSlice := []string{`Basic realm="` + safeRealm + `", charset="UTF-8"`}[:1:1]
 
 	return func(c *Context) error {
 		user, pass, ok := c.req.BasicAuth()
 		if !ok || !validator(user, pass) {
-			c.SetHeader("WWW-Authenticate", wwwAuth)
+			c.respHeader()["Www-Authenticate"] = wwwAuthSlice
 			return NewError(http.StatusUnauthorized, "unauthorized")
 		}
 		return c.Next()
@@ -505,6 +544,9 @@ func Adapt(mw func(http.Handler) http.Handler) HandlerFunc {
 				c.writer = prevWriter
 			}()
 			nextErr = c.Next()
+			if nextErr != nil && !c.errHandled {
+				c.HandleError(nextErr)
+			}
 		})
 		mw(next).ServeHTTP(c.ResponseWriter(), c.req)
 		if !called {

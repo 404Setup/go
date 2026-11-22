@@ -5,9 +5,13 @@
 package server_test
 
 import (
+	"bytes"
 	"compress/gzip"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
@@ -333,4 +337,65 @@ func TestMiddlewareCompressConcurrent(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
+}
+
+func TestMiddlewareCompressLoggerInnerAndPartialWriteErrorIsolation(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	s := server.New()
+	// Place Compress OUTSIDE Logger to verify StatusCode(), BytesWritten(),
+	// and Written() are accurate even while responses are buffered in Compress.
+	s.Use(server.Compress(), server.Logger(logger))
+
+	s.POST("/small-created", func(c *server.Context) error {
+		return c.Text(http.StatusCreated, "created-small")
+	})
+	s.GET("/partial-then-err", func(c *server.Context) error {
+		_, _ = c.ResponseWriter().Write([]byte("partial-body"))
+		return errors.New("late failure after write")
+	})
+	bigText := strings.Repeat("chunked-write-string-payload-0123456789;", 300) // ~12 KiB (> 4096 maxPooledCompressBuf)
+	s.GET("/big-string", func(c *server.Context) error {
+		return c.Text(http.StatusOK, bigText)
+	})
+
+	// 1. Small 201 response (< MinLength) logged inside Compress must record status=201 and bytes=13.
+	req := httptest.NewRequest(http.MethodPost, "/small-created", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated || rec.Body.String() != "created-small" {
+		t.Fatalf("small-created: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(logBuf.Bytes(), &entry); err != nil {
+		t.Fatalf("unmarshal log: %v (raw=%q)", err, logBuf.String())
+	}
+	if entry["status"] != float64(http.StatusCreated) || entry["bytes"] != float64(len("created-small")) {
+		t.Fatalf("inner Logger recorded wrong status/bytes: %#v", entry)
+	}
+
+	// 2. Partial write (< MinLength) followed by an error must NOT append error message to the buffered body.
+	logBuf.Reset()
+	req = httptest.NewRequest(http.MethodGet, "/partial-then-err", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "partial-body" {
+		t.Fatalf("partial-then-err corrupted body: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// 3. Multi-chunk WriteString (> 4 KiB) compresses and decompresses cleanly.
+	logBuf.Reset()
+	req = httptest.NewRequest(http.MethodGet, "/big-string", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("big-string: code=%d ce=%q", rec.Code, rec.Header().Get("Content-Encoding"))
+	}
+	if got := gunzipBody(t, rec.Body); got != bigText {
+		t.Fatalf("big-string decompressed len=%d, want %d", len(got), len(bigText))
+	}
 }

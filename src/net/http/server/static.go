@@ -84,10 +84,15 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 	}
 	fileServer := http.FileServerFS(effectiveFS)
 
+	var ccSlice []string
+	if c.CacheControl != "" {
+		ccSlice = []string{c.CacheControl}[:1:1]
+	}
+
 	handler := func(ctx *Context) error {
 		rel := ctx.Param("filepath")
-		// Reject backslashes and NUL bytes defensively.
-		if strings.ContainsAny(rel, "\\\x00") {
+		// Reject backslashes, NUL bytes, and dot-dot traversal segments defensively.
+		if strings.ContainsAny(rel, "\\\x00") || containsDotDot(rel) {
 			return NewError(http.StatusNotFound, "not found")
 		}
 
@@ -105,8 +110,8 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 		r2.URL = u2
 
 		rw := ctx.ResponseWriter()
-		if c.CacheControl != "" {
-			rw = &cacheControlWriter{ResponseWriter: rw, value: c.CacheControl}
+		if ccSlice != nil {
+			rw = &cacheControlWriter{ResponseWriter: rw, value: ccSlice}
 		}
 
 		// When serving a custom index name (other than "index.html"), serve
@@ -117,6 +122,9 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 				name = "."
 			}
 			if info, err := fs.Stat(effectiveFS, name); err == nil && info.IsDir() {
+				if !strings.HasSuffix(u2.Path, "/") {
+					return ctx.Redirect(http.StatusMovedPermanently, ctx.req.URL.Path+"/")
+				}
 				idxPath := c.Index
 				if name != "." {
 					idxPath = name + "/" + c.Index
@@ -145,8 +153,8 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 		// is enabled, or return 404.
 		if idxInfo, err := fs.Stat(effectiveFS, c.Index); err == nil && !idxInfo.IsDir() {
 			rw := ctx.ResponseWriter()
-			if c.CacheControl != "" {
-				rw = &cacheControlWriter{ResponseWriter: rw, value: c.CacheControl}
+			if ccSlice != nil {
+				rw = &cacheControlWriter{ResponseWriter: rw, value: ccSlice}
 			}
 			http.ServeFileFS(rw, ctx.req, effectiveFS, c.Index)
 			return nil
@@ -159,17 +167,31 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 	g.GET(relBase+"/{filepath...}", handler)
 }
 
+func containsDotDot(v string) bool {
+	for v != "" {
+		var seg string
+		seg, v, _ = strings.Cut(v, "/")
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 type cacheControlWriter struct {
 	http.ResponseWriter
-	value   string
+	value   []string
 	written bool
 }
 
 func (w *cacheControlWriter) WriteHeader(code int) {
 	if !w.written {
 		w.written = true
-		if ((code >= 200 && code < 300) || code == http.StatusNotModified) && w.Header().Get("Cache-Control") == "" {
-			w.Header().Set("Cache-Control", w.value)
+		if (code >= 200 && code < 300) || code == http.StatusNotModified {
+			h := w.Header()
+			if len(h["Cache-Control"]) == 0 {
+				h["Cache-Control"] = w.value
+			}
 		}
 	}
 	w.ResponseWriter.WriteHeader(code)
@@ -177,7 +199,11 @@ func (w *cacheControlWriter) WriteHeader(code int) {
 
 func (w *cacheControlWriter) Write(p []byte) (int, error) {
 	if !w.written {
-		w.WriteHeader(http.StatusOK)
+		w.written = true
+		h := w.Header()
+		if len(h["Cache-Control"]) == 0 {
+			h["Cache-Control"] = w.value
+		}
 	}
 	return w.ResponseWriter.Write(p)
 }

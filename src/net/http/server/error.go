@@ -102,6 +102,13 @@ func classifyError(err error) (code int, msg string, internal bool) {
 	return http.StatusInternalServerError, "internal server error", true
 }
 
+var (
+	headerValNosniff   = []string{"nosniff"}[:1:1]
+	contentTypeText    = []string{"text/plain; charset=utf-8"}[:1:1]
+	contentTypeHTML    = []string{"text/html; charset=utf-8"}[:1:1]
+	contentTypeJSON    = []string{"application/json; charset=utf-8"}[:1:1]
+)
+
 // DefaultErrorHandler writes a plain-text error response with
 // X-Content-Type-Options: nosniff. If a response has already been written, it
 // does nothing. Internal errors are logged when a server logger is configured
@@ -122,11 +129,11 @@ func DefaultErrorHandler(c *Context, err error) {
 	if c.Written() {
 		return
 	}
-	h := c.ResponseWriter().Header()
-	h.Del("Content-Length")
-	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("Content-Type", "text/plain; charset=utf-8")
-	c.ResponseWriter().WriteHeader(code)
+	h := c.respHeader()
+	delete(h, "Content-Length")
+	h["X-Content-Type-Options"] = headerValNosniff
+	h["Content-Type"] = contentTypeText
+	c.writeHeader(code)
 	_, _ = c.writeString(msg)
 }
 
@@ -154,8 +161,8 @@ func JSONErrorHandler(c *Context, err error) {
 	if c.Written() {
 		return
 	}
-	h := c.ResponseWriter().Header()
-	h.Del("Content-Length")
-	h.Set("X-Content-Type-Options", "nosniff")
+	h := c.respHeader()
+	delete(h, "Content-Length")
+	h["X-Content-Type-Options"] = headerValNosniff
 	_ = c.JSON(code, jsonErrorBody{Error: msg})
 }

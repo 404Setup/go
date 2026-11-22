@@ -211,6 +211,9 @@ func parsePattern(raw string) (parsedPattern, error) {
 			if err != nil {
 				return parsedPattern{}, fmt.Errorf("route pattern %q has invalid percent-encoding in segment %q: %w", raw, part, err)
 			}
+			if u == "" || u == "." || u == ".." || hasASCIIControl(u) {
+				return parsedPattern{}, fmt.Errorf("route pattern %q has unsafe unescaped segment %q", raw, part)
+			}
 			literal = u
 			p.isStatic = false
 		}
@@ -354,18 +357,27 @@ func (n *treeNode) compressChains() {
 	n.chainPrefix = ""
 	n.chainTarget = nil
 
-	if n.leaf == nil && n.slashChild == nil && n.paramChild == nil && n.wildcardChild == nil &&
+	if n.paramChild == nil && n.wildcardChild == nil &&
 		n.staticMap == nil && len(n.staticSlice) == 1 && strings.IndexByte(n.staticSlice[0].seg, '/') < 0 {
-		var sb strings.Builder
-		cur := n
-		for cur.leaf == nil && cur.slashChild == nil && cur.paramChild == nil && cur.wildcardChild == nil &&
+		first := n.staticSlice[0]
+		cur := first.node
+		if cur.leaf == nil && cur.slashChild == nil && cur.paramChild == nil && cur.wildcardChild == nil &&
 			cur.staticMap == nil && len(cur.staticSlice) == 1 && strings.IndexByte(cur.staticSlice[0].seg, '/') < 0 {
+			var sb strings.Builder
 			sb.WriteByte('/')
-			sb.WriteString(cur.staticSlice[0].seg)
-			cur = cur.staticSlice[0].node
+			sb.WriteString(first.seg)
+			for cur.leaf == nil && cur.slashChild == nil && cur.paramChild == nil && cur.wildcardChild == nil &&
+				cur.staticMap == nil && len(cur.staticSlice) == 1 && strings.IndexByte(cur.staticSlice[0].seg, '/') < 0 {
+				sb.WriteByte('/')
+				sb.WriteString(cur.staticSlice[0].seg)
+				cur = cur.staticSlice[0].node
+			}
+			n.chainPrefix = sb.String()
+		} else {
+			n.chainPrefix = "/" + first.seg
 		}
-		n.chainPrefix = sb.String()
 		n.chainTarget = cur
+		n.slashChild.compressChains()
 		cur.compressChains()
 		return
 	}
@@ -571,7 +583,9 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 					}
 				}
 			}
-			if n.paramChild != nil && seg != "" {
+			if n.paramChild != nil && seg != "" &&
+				(seg[0] != '.' || (len(seg) > 2 || (len(seg) == 2 && seg[1] != '.'))) &&
+				strings.IndexByte(seg, 0) < 0 {
 				if n.wildcardChild == nil {
 					if pc != nil {
 						pc.push(seg)
@@ -594,6 +608,9 @@ func (n *treeNode) matchUnescaped(path string, pc *paramCapture) *routeEntry {
 		}
 
 		if n.wildcardChild != nil && n.wildcardChild.leaf != nil {
+			if clean, hasNul := checkPath(path); !clean || hasNul {
+				return nil
+			}
 			if pc != nil {
 				pc.push(s)
 			}
@@ -642,7 +659,9 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 				}
 			}
 		}
-		if n.paramChild != nil && seg != "" {
+		if n.paramChild != nil && seg != "" &&
+			(seg[0] != '.' || (len(seg) > 2 || (len(seg) == 2 && seg[1] != '.'))) &&
+			strings.IndexByte(seg, 0) < 0 {
 			var mark int
 			if pc != nil {
 				mark = pc.push(seg)
@@ -664,6 +683,9 @@ func (n *treeNode) match(path string, escaped bool, pc *paramCapture) *routeEntr
 				return nil
 			}
 			rem = u
+		}
+		if strings.IndexByte(rem, 0) >= 0 {
+			return nil
 		}
 		if pc != nil {
 			pc.push(rem)

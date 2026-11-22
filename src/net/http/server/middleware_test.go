@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -380,5 +381,56 @@ func TestMiddlewareLoggerWithConfigSkipAndErrorPropagation(t *testing.T) {
 	}
 	if buf.Len() == 0 {
 		t.Fatal("expected log entry for /fail")
+	}
+}
+
+func TestMiddlewareAdaptErrorAndTrustedProxyHSTSAndCORSWildcardHeaders(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	s := server.NewWithConfig(cfg)
+
+	s.Use(server.SecurityHeadersWithConfig(server.SecurityHeadersConfig{
+		StrictTransportSecurity: "max-age=31536000",
+	}))
+	s.Use(server.CORS(server.CORSConfig{
+		AllowOrigins:     []string{"https://app.example.com"},
+		AllowHeaders:     []string{"*"},
+		AllowCredentials: true,
+	}))
+
+	wrapMW := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(&headerPrefixWriter{ResponseWriter: w}, r)
+		})
+	}
+	s.GET("/adapted-err", server.Adapt(wrapMW), func(c *server.Context) error {
+		return server.NewError(http.StatusTeapot, "teapot")
+	})
+
+	// 1. Adapted net/http middleware wraps error responses returned by downstream HandlerFunc.
+	req := httptest.NewRequest(http.MethodGet, "/adapted-err", nil)
+	req.RemoteAddr = "10.0.0.1:443"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTeapot || rec.Body.String() != "[wrapped]teapot" {
+		t.Fatalf("adapted-err: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Strict-Transport-Security") != "max-age=31536000" {
+		t.Fatalf("expected HSTS behind trusted proxy with X-Forwarded-Proto: https, got %v", rec.Header())
+	}
+
+	// 2. CORS preflight with AllowCredentials=true and AllowHeaders=["*"] echoes Access-Control-Request-Headers.
+	req = httptest.NewRequest(http.MethodOptions, "/adapted-err", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "X-Custom-Auth, Content-Type")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("CORS preflight code=%d", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "X-Custom-Auth, Content-Type" {
+		t.Fatalf("Access-Control-Allow-Headers = %q", got)
 	}
 }

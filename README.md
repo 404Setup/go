@@ -16,6 +16,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
 - **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
 - **`net/http`, `net/textproto`, `net/url`**: Performance and Memory Allocation Optimization (h1/h2/h3)
+- **`net/http/server`**: HTTP server wrapper with parameterized routing, route groups, pooled contexts, and middleware.
 - **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
 - **`runtime`**: Faster span reclamation, GC bit-scanning and fused inline-mark sweep, batched `mcache.releaseAll` and lock-free empty `stackcache_clear`, O(1) `pageCache.flush` and `spanClassToNelems` lookup, write-barrier pointer deduplication, and zero-size slice fast paths.
 - **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
@@ -154,21 +155,21 @@ xychart-beta
 xychart-beta
     title "net/http.ServeMux (left bar) vs net/http/server (right bar) — Latency (ns/op, lower is better)"
     x-axis ["StaticRoute", "ParallelParam1", "Param1Route", "Param3Route", "JSONResponse", "QueryParam"]
-    y-axis "Latency (ns/op)" 0 --> 950
-    bar [83.14, 115.1, 213.7, 373.2, 564.0, 913.0]
-    bar [71.29, 72.73, 141.2, 219.5, 545.1, 290.0]
+    y-axis "Latency (ns/op)" 0 --> 1250
+    bar [101.0, 142.3, 238.3, 434.4, 706.0, 1195]
+    bar [81.39, 68.93, 134.9, 218.8, 552.7, 185.4]
 ```
 
 | Benchmark | `net/http.ServeMux` | `net/http/server` | Latency Delta | Allocs (`ServeMux` → `server`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `StaticRoute` (50+ routes) | 83.14 ns/op | **71.29 ns/op** | **-14.3%** (1.17×) | 0 → 0 |
-| `Param1Route` (`/api/v1/users/{id}`) | 213.7 ns/op | **141.2 ns/op** | **-33.9%** (1.51×) | 1 (16 B) → **0 (0 B)** |
-| `Param3Route` (3 params) | 373.2 ns/op | **219.5 ns/op** | **-41.2%** (1.70×) | 1 (48 B) → **0 (0 B)** |
-| `ParallelParamRoute` (`-cpu=2`) | 115.1 ns/op | **72.73 ns/op** | **-36.8%** (1.58×) | 1 (16 B) → **0 (0 B)** |
-| `QueryParam` (2 keys) | 913.0 ns/op | **290.0 ns/op** | **-68.2%** (3.15×) | 6 (464 B) → **0 (0 B)** |
-| `JSONResponse` (`c.JSON` vs `json.Marshal`) | 564.0 ns/op | **545.1 ns/op** | **-3.4%** (1.03×) | 2 (64 B) → **1 (16 B)** |
+| `StaticRoute` (50+ routes) | 101.0 ns/op | **81.39 ns/op** | **-19.4%** (1.24×) | 0 → 0 |
+| `Param1Route` (`/api/v1/users/{id}`) | 238.3 ns/op | **134.9 ns/op** | **-43.4%** (1.77×) | 1 (16 B) → **0 (0 B)** |
+| `Param3Route` (3 params) | 434.4 ns/op | **218.8 ns/op** | **-49.6%** (1.99×) | 1 (48 B) → **0 (0 B)** |
+| `ParallelParamRoute` (`-cpu=2`) | 142.3 ns/op | **68.93 ns/op** | **-51.6%** (2.06×) | 1 (16 B) → **0 (0 B)** |
+| `QueryParam` (2 keys) | 1,195 ns/op | **185.4 ns/op** | **-84.5%** (6.45×) | 6 (464 B) → **0 (0 B)** |
+| `JSONResponse` (`c.JSON` vs `json.Marshal`) | 706.0 ns/op | **552.7 ns/op** | **-21.7%** (1.28×) | 2 (64 B) → **0 (0 B)** |
 
-> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz). Additional `net/http/server` medians: `WildcardRoute` **119.3 ns/op** (0 allocs), `MiddlewareChain5` **142.8 ns/op** (0 allocs), `BindJSON` **919.1 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **14.23 µs/op** (4 allocs, 3,049 B).*
+> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz). Additional `net/http/server` medians: `WildcardRoute` **137.9 ns/op** (0 allocs), `MiddlewareChain5` **139.2 ns/op** (0 allocs), `BindJSON` **950.8 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **12.52 µs/op** (0 allocs, 56 B).*
 
 ---
 

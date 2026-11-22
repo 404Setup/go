@@ -19,6 +19,11 @@ const (
 	maxPooledCompressBuf     = 4096
 )
 
+var (
+	headerValGzip               = []string{"gzip"}[:1:1]
+	headerValVaryAcceptEncoding = []string{"Accept-Encoding"}[:1:1]
+)
+
 // CompressConfig configures [CompressWithConfig].
 type CompressConfig struct {
 	// Level is the gzip compression level (from [gzip.HuffmanOnly] to
@@ -78,25 +83,29 @@ func CompressWithConfig(cfg CompressConfig) HandlerFunc {
 		// Always advertise Vary: Accept-Encoding so caches key on encoding.
 		addVaryToken(c.respHeader(), "Accept-Encoding")
 
-		if !acceptsGzip(c.Header("Accept-Encoding")) {
+		if !acceptsGzip(c.canonicalReqHeader("Accept-Encoding")) {
 			return c.Next()
 		}
 
 		prevWriter := c.writer
+		prevCW := c.cw
 		cw := cwPool.Get()
 		cw.rw = c.ResponseWriter()
 		cw.pool = gzPool
 		cw.minLength = minLen
 		cw.status = 0
+		cw.writtenBytes = 0
 		cw.wroteHeader = false
 		cw.mode = compressUndecided
 		cw.gz = nil
 		cw.buf = cw.buf[:0]
 
 		c.writer = cw
+		c.cw = cw
 		var panicked = true
 		defer func() {
 			c.writer = prevWriter
+			c.cw = prevCW
 			if panicked {
 				// On panic, discard the gzip writer rather than returning
 				// potentially half-written state to the pool.
@@ -129,14 +138,15 @@ const (
 )
 
 type compressResponseWriter struct {
-	rw          http.ResponseWriter
-	pool        *syncv2.Pool[*gzip.Writer]
-	gz          *gzip.Writer
-	buf         []byte
-	minLength   int
-	status      int
-	wroteHeader bool
-	mode        compressMode
+	rw           http.ResponseWriter
+	pool         *syncv2.Pool[*gzip.Writer]
+	gz           *gzip.Writer
+	buf          []byte
+	minLength    int
+	status       int
+	writtenBytes int64
+	wroteHeader  bool
+	mode         compressMode
 }
 
 func (w *compressResponseWriter) Header() http.Header {
@@ -149,13 +159,13 @@ func (w *compressResponseWriter) Unwrap() http.ResponseWriter {
 
 func (w *compressResponseWriter) shouldBypassHeaders() bool {
 	h := w.rw.Header()
-	if h.Get("Content-Encoding") != "" {
+	if len(h["Content-Encoding"]) > 0 && h["Content-Encoding"][0] != "" {
 		return true
 	}
-	if h.Get("Upgrade") != "" {
+	if len(h["Upgrade"]) > 0 && h["Upgrade"][0] != "" {
 		return true
 	}
-	if ct := h.Get("Content-Type"); ct != "" && isIncompressibleContentType(ct) {
+	if ct := h["Content-Type"]; len(ct) > 0 && ct[0] != "" && isIncompressibleContentType(ct[0]) {
 		return true
 	}
 	return false
@@ -188,7 +198,9 @@ func (w *compressResponseWriter) bypassAndFlush(extra []byte) (int, error) {
 	if code == 0 {
 		code = http.StatusOK
 	}
-	w.rw.WriteHeader(code)
+	if code != http.StatusOK || (len(w.buf) == 0 && len(extra) == 0) {
+		w.rw.WriteHeader(code)
+	}
 	if len(w.buf) > 0 {
 		_, err := w.rw.Write(w.buf)
 		w.buf = w.buf[:0]
@@ -202,11 +214,33 @@ func (w *compressResponseWriter) bypassAndFlush(extra []byte) (int, error) {
 	return 0, nil
 }
 
+func (w *compressResponseWriter) bypassAndFlushString(extra string) (int, error) {
+	w.mode = compressBypassed
+	code := w.status
+	if code == 0 {
+		code = http.StatusOK
+	}
+	if code != http.StatusOK || (len(w.buf) == 0 && len(extra) == 0) {
+		w.rw.WriteHeader(code)
+	}
+	if len(w.buf) > 0 {
+		_, err := w.rw.Write(w.buf)
+		w.buf = w.buf[:0]
+		if err != nil {
+			return 0, err
+		}
+	}
+	if len(extra) > 0 {
+		return io.WriteString(w.rw, extra)
+	}
+	return 0, nil
+}
+
 func (w *compressResponseWriter) startGzip() error {
 	h := w.rw.Header()
-	h.Del("Content-Length")
-	h.Del("Accept-Ranges")
-	h.Set("Content-Encoding", "gzip")
+	delete(h, "Content-Length")
+	delete(h, "Accept-Ranges")
+	h["Content-Encoding"] = headerValGzip
 
 	code := w.status
 	if code == 0 {
@@ -233,6 +267,7 @@ func (w *compressResponseWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
+	w.writtenBytes += int64(len(p))
 	switch w.mode {
 	case compressBypassed:
 		return w.rw.Write(p)
@@ -270,6 +305,60 @@ func (w *compressResponseWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return w.gz.Write(p)
+}
+
+func (w *compressResponseWriter) writeGzipString(s string) (int, error) {
+	total := 0
+	for len(s) > 0 {
+		chunk := s
+		if len(chunk) > maxPooledCompressBuf {
+			chunk = chunk[:maxPooledCompressBuf]
+		}
+		w.buf = append(w.buf[:0], chunk...)
+		n, err := w.gz.Write(w.buf)
+		w.buf = w.buf[:0]
+		total += n
+		if err != nil {
+			return total, err
+		}
+		s = s[len(chunk):]
+	}
+	return total, nil
+}
+
+func (w *compressResponseWriter) WriteString(s string) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	w.writtenBytes += int64(len(s))
+	switch w.mode {
+	case compressBypassed:
+		return io.WriteString(w.rw, s)
+	case compressEnabled:
+		return w.writeGzipString(s)
+	}
+
+	if len(w.buf)+len(s) < w.minLength {
+		w.buf = append(w.buf, s...)
+		return len(s), nil
+	}
+
+	h := w.rw.Header()
+	if len(h["Content-Type"]) == 0 {
+		var sniffBuf [512]byte
+		n := copy(sniffBuf[:], w.buf)
+		if n < len(sniffBuf) {
+			n += copy(sniffBuf[n:], s)
+		}
+		h["Content-Type"] = []string{http.DetectContentType(sniffBuf[:n])}
+	}
+	if w.shouldBypassHeaders() {
+		return w.bypassAndFlushString(s)
+	}
+	if err := w.startGzip(); err != nil {
+		return 0, err
+	}
+	return w.writeGzipString(s)
 }
 
 // FlushError implements the interface recognized by [http.ResponseController.Flush].
@@ -317,7 +406,20 @@ func (w *compressResponseWriter) finish() {
 
 // addVaryToken adds token to the Vary response header if not already present.
 func addVaryToken(h http.Header, token string) {
-	for _, v := range h.Values("Vary") {
+	existing := h["Vary"]
+	if len(existing) == 0 {
+		if token == "Accept-Encoding" {
+			h["Vary"] = headerValVaryAcceptEncoding
+			return
+		}
+		if token == "Origin" {
+			h["Vary"] = headerValVaryOrigin
+			return
+		}
+		h["Vary"] = []string{token}
+		return
+	}
+	for _, v := range existing {
 		for part := v; part != ""; {
 			var tok string
 			tok, part, _ = strings.Cut(part, ",")
@@ -326,7 +428,7 @@ func addVaryToken(h http.Header, token string) {
 			}
 		}
 	}
-	h.Add("Vary", token)
+	h["Vary"] = append(existing, token)
 }
 
 // acceptsGzip reports whether an Accept-Encoding header permits gzip encoding

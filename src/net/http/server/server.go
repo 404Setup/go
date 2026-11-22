@@ -625,9 +625,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rawPath := r.URL.RawPath
 	snap := s.snap.Load()
 
-	// Fast path for exact static routes: every key in staticTable was validated
-	// by parsePattern to be clean and NUL-free, so an exact match with empty
-	// RawPath guarantees reqPath needs neither NUL scanning nor cleaning.
+	// Fast path for unescaped requests: every static literal in staticTable and
+	// dynTree was validated by parsePattern to be clean and NUL-free, and
+	// matchUnescaped validates captured parameters and wildcards inline.
 	if rawPath == "" {
 		if entry := snap.matchStatic(r.Method, reqPath); entry != nil {
 			c := acquireContext(s, w, r)
@@ -644,6 +644,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			releaseContext(c)
 			return
+		}
+		if len(reqPath) > 0 && reqPath[0] == '/' {
+			c := acquireContext(s, w, r)
+			pc := paramCapture{
+				buf:   &c.paramBuf,
+				extra: &c.paramExtra,
+			}
+			mIdx := methodIndex(r.Method)
+			if entry := snap.matchAfterStaticIdx(mIdx, r.Method, reqPath, &pc); entry != nil {
+				c.nParams = pc.n
+				c.paramNames = entry.paramNames
+				c.routePattern = entry.pattern
+				var err error
+				if len(entry.chain) == 1 {
+					err = entry.chain[0](c)
+				} else {
+					c.handlers = entry.chain
+					err = c.Next()
+				}
+				if err != nil {
+					c.HandleError(err)
+				}
+				releaseContext(c)
+				return
+			}
+			releaseContext(c)
 		}
 	}
 

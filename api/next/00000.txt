@@ -26,12 +26,14 @@ pkg net/http/server, func SecurityHeadersWithConfig(SecurityHeadersConfig) Handl
 pkg net/http/server, func Timeout(time.Duration) HandlerFunc #80000
 pkg net/http/server, func WrapError(int, string, error) *HTTPError #80000
 pkg net/http/server, method (*Context) AddHeader(string, string) #80000
+pkg net/http/server, method (*Context) BearerToken() (string, bool) #80000
 pkg net/http/server, method (*Context) BindJSON(interface{}) error #80000
 pkg net/http/server, method (*Context) BindJSONStrict(interface{}) error #80000
 pkg net/http/server, method (*Context) BodyBytes() ([]uint8, error) #80000
 pkg net/http/server, method (*Context) Bytes(int, string, []uint8) error #80000
 pkg net/http/server, method (*Context) BytesWritten() int64 #80000
 pkg net/http/server, method (*Context) ClientIP() string #80000
+pkg net/http/server, method (*Context) ContentType() string #80000
 pkg net/http/server, method (*Context) Context() context.Context #80000
 pkg net/http/server, method (*Context) Cookie(string) (*http.Cookie, error) #80000
 pkg net/http/server, method (*Context) Delete(string) #80000
@@ -39,6 +41,7 @@ pkg net/http/server, method (*Context) File(string) error #80000
 pkg net/http/server, method (*Context) FileFS(fs.FS, string) error #80000
 pkg net/http/server, method (*Context) Flush() error #80000
 pkg net/http/server, method (*Context) FormFile(string) (multipart.File, *multipart.FileHeader, error) #80000
+pkg net/http/server, method (*Context) FormValue(string) string #80000
 pkg net/http/server, method (*Context) Get(string) (interface{}, bool) #80000
 pkg net/http/server, method (*Context) HTML(int, string) error #80000
 pkg net/http/server, method (*Context) HandleError(error) #80000
@@ -64,6 +67,7 @@ pkg net/http/server, method (*Context) Redirect(int, string) error #80000
 pkg net/http/server, method (*Context) Request() *http.Request #80000
 pkg net/http/server, method (*Context) ResponseWriter() http.ResponseWriter #80000
 pkg net/http/server, method (*Context) RoutePattern() string #80000
+pkg net/http/server, method (*Context) Scheme() string #80000
 pkg net/http/server, method (*Context) Set(string, interface{}) #80000
 pkg net/http/server, method (*Context) SetAttachment(string) #80000
 pkg net/http/server, method (*Context) SetContext(context.Context) #80000

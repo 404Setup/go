@@ -72,7 +72,8 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 func (rw *responseWriter) Write(p []byte) (int, error) {
 	if !rw.written {
-		rw.WriteHeader(http.StatusOK)
+		rw.status = http.StatusOK
+		rw.written = true
 	}
 	n, err := rw.w.Write(p)
 	rw.size += int64(n)
@@ -81,7 +82,8 @@ func (rw *responseWriter) Write(p []byte) (int, error) {
 
 func (rw *responseWriter) WriteString(s string) (int, error) {
 	if !rw.written {
-		rw.WriteHeader(http.StatusOK)
+		rw.status = http.StatusOK
+		rw.written = true
 	}
 	n, err := io.WriteString(rw.w, s)
 	rw.size += int64(n)
@@ -90,7 +92,8 @@ func (rw *responseWriter) WriteString(s string) (int, error) {
 
 func (rw *responseWriter) ReadFrom(r io.Reader) (int64, error) {
 	if !rw.written {
-		rw.WriteHeader(http.StatusOK)
+		rw.status = http.StatusOK
+		rw.written = true
 	}
 	if rf, ok := rw.w.(io.ReaderFrom); ok {
 		n, err := rf.ReadFrom(r)
@@ -121,6 +124,7 @@ type Context struct {
 	req    *http.Request
 	rw     responseWriter
 	writer http.ResponseWriter
+	cw     *compressResponseWriter
 
 	handlers     []HandlerFunc
 	index        int
@@ -191,16 +195,19 @@ func releaseContext(c *Context) {
 		}
 		c.nValues = 0
 	}
-	if len(c.valuesMap) > 32 {
-		c.valuesMap = nil
-	} else if len(c.valuesMap) > 0 {
-		clear(c.valuesMap)
+	if c.valuesMap != nil {
+		if len(c.valuesMap) > 32 {
+			c.valuesMap = nil
+		} else if len(c.valuesMap) > 0 {
+			clear(c.valuesMap)
+		}
 	}
 	c.server = nil
 	c.req = nil
 	c.rw = responseWriter{}
 	if c.writer != nil {
 		c.writer = nil
+		c.cw = nil
 	}
 	c.handlers = nil
 	c.routePattern = ""
@@ -263,17 +270,26 @@ func (c *Context) RoutePattern() string {
 // StatusCode returns the HTTP status code written to the response, or 0 if no
 // response header has been written yet.
 func (c *Context) StatusCode() int {
-	return c.rw.status
+	if c.rw.status != 0 {
+		return c.rw.status
+	}
+	if c.cw != nil && c.cw.wroteHeader {
+		return c.cw.status
+	}
+	return 0
 }
 
 // BytesWritten returns the number of response body bytes written so far.
 func (c *Context) BytesWritten() int64 {
-	return c.rw.size
+	if c.rw.size > 0 || c.cw == nil {
+		return c.rw.size
+	}
+	return c.cw.writtenBytes
 }
 
 // Written reports whether the response header has been written.
 func (c *Context) Written() bool {
-	return c.rw.written
+	return c.rw.written || (c.cw != nil && c.cw.wroteHeader)
 }
 
 // Next executes the next handler in the middleware chain and returns its error.
@@ -361,17 +377,48 @@ func (c *Context) Query(key string) string {
 	return lookupRawQuery(raw, key)
 }
 
-// lookupRawQuery scans raw for the first valid occurrence of target without
-// allocating a url.Values map, matching net/url.ParseQuery semantics.
+// lookupRawQuery scans raw in a single pass for the first valid occurrence of
+// target without allocating a url.Values map, matching net/url.ParseQuery
+// semantics.
 func lookupRawQuery(raw, target string) string {
-	for raw != "" {
-		var part string
-		part, raw, _ = strings.Cut(raw, "&")
-		if part == "" || strings.IndexByte(part, ';') >= 0 {
+	n := len(raw)
+	for i := 0; i < n; {
+		start := i
+		eq := -1
+		hasSemi := false
+		keyEsc := false
+		valEsc := false
+		for i < n {
+			b := raw[i]
+			if b == '&' {
+				break
+			}
+			if b == '=' && eq < 0 {
+				eq = i
+			} else if b == ';' {
+				hasSemi = true
+			} else if b == '%' || b == '+' {
+				if eq < 0 {
+					keyEsc = true
+				} else {
+					valEsc = true
+				}
+			}
+			i++
+		}
+		end := i
+		i++
+		if start == end || hasSemi {
 			continue
 		}
-		k, v, _ := strings.Cut(part, "=")
-		if strings.IndexByte(k, '%') >= 0 || strings.IndexByte(k, '+') >= 0 {
+		var k, v string
+		if eq >= 0 {
+			k = raw[start:eq]
+			v = raw[eq+1 : end]
+		} else {
+			k = raw[start:end]
+		}
+		if keyEsc {
 			u, err := url.QueryUnescape(k)
 			if err != nil {
 				continue
@@ -381,7 +428,7 @@ func lookupRawQuery(raw, target string) string {
 		if k != target {
 			continue
 		}
-		if strings.IndexByte(v, '%') >= 0 || strings.IndexByte(v, '+') >= 0 {
+		if valEsc {
 			u, err := url.QueryUnescape(v)
 			if err != nil {
 				continue
@@ -435,6 +482,138 @@ func (c *Context) QueryBool(key string, def bool) (bool, error) {
 // Header returns the first value of the named request header.
 func (c *Context) Header(key string) string {
 	return c.req.Header.Get(key)
+}
+
+func (c *Context) canonicalReqHeader(canonicalKey string) string {
+	if v := c.req.Header[canonicalKey]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
+}
+
+// ContentType returns the media type portion of the request's Content-Type
+// header (for example, "application/json"), stripped of parameters and
+// converted to lower case, or "" if the header is absent or malformed.
+func (c *Context) ContentType() string {
+	ct := c.canonicalReqHeader("Content-Type")
+	if ct == "" {
+		return ""
+	}
+	if semi := strings.IndexByte(ct, ';'); semi >= 0 {
+		ct = ct[:semi]
+	}
+	ct = trimOWS(ct)
+	if ct == "" {
+		return ""
+	}
+	hasUpper := false
+	slash := -1
+	for i := 0; i < len(ct); i++ {
+		b := ct[i]
+		if b == '/' {
+			if slash >= 0 || i == 0 || i == len(ct)-1 {
+				return ""
+			}
+			slash = i
+			continue
+		}
+		if b >= 'A' && b <= 'Z' {
+			hasUpper = true
+			continue
+		}
+		if (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') {
+			continue
+		}
+		switch b {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return ""
+		}
+	}
+	if slash < 0 {
+		return ""
+	}
+	if !hasUpper {
+		return ct
+	}
+	var buf [64]byte
+	if len(ct) <= len(buf) {
+		for i := 0; i < len(ct); i++ {
+			b := ct[i]
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			buf[i] = b
+		}
+		switch string(buf[:len(ct)]) {
+		case "application/json":
+			return "application/json"
+		case "application/x-www-form-urlencoded":
+			return "application/x-www-form-urlencoded"
+		case "multipart/form-data":
+			return "multipart/form-data"
+		case "text/plain":
+			return "text/plain"
+		case "text/html":
+			return "text/html"
+		case "application/octet-stream":
+			return "application/octet-stream"
+		}
+		return string(buf[:len(ct)])
+	}
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return ""
+	}
+	return mediaType
+}
+
+// BearerToken extracts a bearer token from the Authorization request header
+// per RFC 6750. It returns ("", false) if the header is absent, does not use
+// the Bearer scheme, or contains an empty or malformed token.
+func (c *Context) BearerToken() (string, bool) {
+	auth := c.canonicalReqHeader("Authorization")
+	if len(auth) <= 7 {
+		return "", false
+	}
+	if !asciiEqualFold(auth[:6], "bearer") || (auth[6] != ' ' && auth[6] != '\t') {
+		return "", false
+	}
+	tok := trimOWS(auth[7:])
+	if tok == "" {
+		return "", false
+	}
+	for i := 0; i < len(tok); i++ {
+		b := tok[i]
+		if b <= 0x20 || b >= 0x7f {
+			return "", false
+		}
+	}
+	return tok, true
+}
+
+// Scheme returns "https" if the request arrived over TLS or via a configured
+// trusted proxy with X-Forwarded-Proto set to "https", and "http" otherwise.
+func (c *Context) Scheme() string {
+	if c.req.TLS != nil {
+		return "https"
+	}
+	if c.server != nil && len(c.server.trustedProxies) > 0 {
+		if peer, _, ok := parseRemoteAddr(c.req.RemoteAddr); ok && c.server.isTrustedProxy(peer) {
+			if xfp := c.canonicalReqHeader("X-Forwarded-Proto"); xfp != "" {
+				proto, _, _ := strings.Cut(xfp, ",")
+				proto = trimOWS(proto)
+				if asciiEqualFold(proto, "https") {
+					return "https"
+				}
+				if asciiEqualFold(proto, "http") {
+					return "http"
+				}
+			}
+		}
+	}
+	return "http"
 }
 
 // SetHeader sets a response header.
@@ -550,12 +729,14 @@ func (c *Context) readBodyInto(jrb *jsonReadBuf, limit int64) error {
 		c.markRequestTooLarge()
 		return WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
 	}
-	if c.req.ContentLength > 0 {
+	if c.req.ContentLength > bytes.MinRead {
 		grow := c.req.ContentLength
 		if grow > maxPooledJSONSize {
 			grow = maxPooledJSONSize
 		}
-		jrb.buf.Grow(int(grow))
+		if need := int(grow) + bytes.MinRead; jrb.buf.Cap() < need {
+			jrb.buf.Grow(need)
+		}
 	}
 
 	var err error
@@ -611,7 +792,7 @@ func (c *Context) BodyBytes() ([]byte, error) {
 // enforcing the configured maximum body size.
 func (c *Context) ParseForm() (url.Values, error) {
 	limit := c.effectiveMaxBodyBytes()
-	if limit > 0 && c.req.Body != nil {
+	if limit > 0 && c.req.Body != nil && c.req.Body != http.NoBody {
 		if c.req.ContentLength > limit {
 			c.markRequestTooLarge()
 			return nil, WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
@@ -626,6 +807,23 @@ func (c *Context) ParseForm() (url.Values, error) {
 		return nil, WrapError(http.StatusBadRequest, "invalid form data", err)
 	}
 	return c.req.Form, nil
+}
+
+// FormValue returns the first value for the named component of the query or
+// POST/PUT/PATCH form body, enforcing Config.MaxBodyBytes when parsing the
+// request body. If body parsing fails, FormValue returns "".
+func (c *Context) FormValue(key string) string {
+	if c.req.Form == nil && c.req.MultipartForm == nil {
+		limit := c.effectiveMaxBodyBytes()
+		if limit > 0 && c.req.Body != nil && c.req.Body != http.NoBody {
+			if c.req.ContentLength > limit {
+				c.markRequestTooLarge()
+				return ""
+			}
+			c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, limit)
+		}
+	}
+	return c.req.FormValue(key)
 }
 
 const defaultMultipartMemory = 32 << 20 // 32 MiB
@@ -643,7 +841,7 @@ func (c *Context) ParseMultipartForm(maxMemory int64) (*multipart.Form, error) {
 		if maxMemory > limit {
 			maxMemory = limit
 		}
-		if c.req.Body != nil {
+		if c.req.Body != nil && c.req.Body != http.NoBody {
 			if c.req.ContentLength > limit {
 				c.markRequestTooLarge()
 				return nil, WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
@@ -688,17 +886,13 @@ func (c *Context) BindJSONStrict(dst any) error {
 }
 
 func (c *Context) bindJSON(dst any, strict bool) error {
-	if ct := c.req.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
+	if ct := c.canonicalReqHeader("Content-Type"); ct != "" && !isJSONContentType(ct) {
 		return WrapError(http.StatusUnsupportedMediaType, "content-type must be application/json", ErrUnsupportedMediaType)
 	}
 	if c.req.Body == nil || c.req.Body == http.NoBody {
 		return WrapError(http.StatusBadRequest, "request body is empty", ErrInvalidJSON)
 	}
 	limit := c.effectiveMaxBodyBytes()
-	if limit > 0 && c.req.ContentLength > limit {
-		c.markRequestTooLarge()
-		return WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge)
-	}
 
 	jrb := jsonReadBufPool.Get()
 	jrb.buf.Reset()
@@ -732,11 +926,8 @@ func (c *Context) bindJSON(dst any, strict bool) error {
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(dst); err != nil {
 			decodeErr = err
-		} else {
-			var trailing struct{}
-			if err := dec.Decode(&trailing); err != io.EOF {
-				decodeErr = errors.New("trailing data after JSON value")
-			}
+		} else if dec.InputOffset() != int64(len(raw)) {
+			decodeErr = errors.New("trailing data after JSON value")
 		}
 	}
 
@@ -819,7 +1010,7 @@ func (c *Context) ClientIP() string {
 	}
 
 	// Walk X-Forwarded-For headers from right to left.
-	if xffHeaders := c.req.Header.Values("X-Forwarded-For"); len(xffHeaders) > 0 {
+	if xffHeaders := c.req.Header["X-Forwarded-For"]; len(xffHeaders) > 0 {
 		var leftmost netip.Addr
 		sawValid := false
 		for i := len(xffHeaders) - 1; i >= 0; i-- {
@@ -857,7 +1048,7 @@ func (c *Context) ClientIP() string {
 		}
 	}
 
-	if xri := trimOWS(c.req.Header.Get("X-Real-IP")); xri != "" {
+	if xri := trimOWS(c.canonicalReqHeader("X-Real-Ip")); xri != "" {
 		if ip, err := netip.ParseAddr(xri); err == nil && ip.Zone() == "" {
 			return ip.Unmap().String()
 		}
@@ -928,6 +1119,13 @@ func (c *Context) setDefaultContentType(ct string) {
 	}
 }
 
+func (c *Context) setDefaultContentTypeSlice(ct []string) {
+	h := c.respHeader()
+	if len(h["Content-Type"]) == 0 {
+		h["Content-Type"] = ct
+	}
+}
+
 // WriteStatus writes an HTTP status code with no response body.
 func (c *Context) WriteStatus(code int) error {
 	if c.writer == nil {
@@ -950,7 +1148,7 @@ func (c *Context) NoContent() error {
 
 // Text writes a UTF-8 plain-text response with status code.
 func (c *Context) Text(code int, s string) error {
-	c.setDefaultContentType("text/plain; charset=utf-8")
+	c.setDefaultContentTypeSlice(contentTypeText)
 	c.writeHeader(code)
 	_, err := c.writeString(s)
 	return err
@@ -958,7 +1156,7 @@ func (c *Context) Text(code int, s string) error {
 
 // HTML writes a UTF-8 HTML response with status code.
 func (c *Context) HTML(code int, html string) error {
-	c.setDefaultContentType("text/html; charset=utf-8")
+	c.setDefaultContentTypeSlice(contentTypeHTML)
 	c.writeHeader(code)
 	_, err := c.writeString(html)
 	return err
@@ -995,7 +1193,7 @@ func (c *Context) JSON(code int, v any) error {
 	if len(b) > 0 && b[len(b)-1] == '\n' {
 		b = b[:len(b)-1]
 	}
-	c.setDefaultContentType("application/json; charset=utf-8")
+	c.setDefaultContentTypeSlice(contentTypeJSON)
 	c.writeHeader(code)
 	_, werr := c.writeBytes(b)
 	if jeb.buf.Cap() <= maxPooledJSONSize {
@@ -1011,7 +1209,7 @@ func (c *Context) JSONIndented(code int, v any, prefix, indent string) error {
 	if err != nil {
 		return err
 	}
-	c.setDefaultContentType("application/json; charset=utf-8")
+	c.setDefaultContentTypeSlice(contentTypeJSON)
 	c.writeHeader(code)
 	_, err = c.writeBytes(data)
 	return err
@@ -1096,7 +1294,7 @@ func (c *Context) FileFS(fsys fs.FS, name string) error {
 
 // Flush flushes buffered response data to the client using [http.ResponseController].
 func (c *Context) Flush() error {
-	if !c.rw.written {
+	if !c.Written() {
 		c.writeHeader(http.StatusOK)
 	}
 	return http.NewResponseController(c.ResponseWriter()).Flush()

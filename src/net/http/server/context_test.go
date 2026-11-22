@@ -7,12 +7,14 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -439,5 +441,96 @@ func TestContextDeleteQueryHelpersAndMultipart(t *testing.T) {
 	s.ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized multipart status = %d, want 413", rec.Code)
+	}
+}
+
+func TestContextContentTypeBearerTokenSchemeAndFormValue(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.MaxBodyBytes = 32
+	cfg.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	s := server.NewWithConfig(cfg)
+
+	s.POST("/inspect", func(c *server.Context) error {
+		tok, ok := c.BearerToken()
+		return c.JSON(http.StatusOK, map[string]any{
+			"ct":     c.ContentType(),
+			"tok":    tok,
+			"tok_ok": ok,
+			"scheme": c.Scheme(),
+			"fv":     c.FormValue("field"),
+		})
+	})
+	s.GET("/sniff", func(c *server.Context) error {
+		_, err := c.ResponseWriter().Write([]byte("<!DOCTYPE html><html><body>sniffed</body></html>"))
+		return err
+	})
+
+	// 1. Valid Bearer token, uppercase Content-Type with params, trusted X-Forwarded-Proto, and bounded FormValue.
+	req := httptest.NewRequest(http.MethodPost, "/inspect?q=1", strings.NewReader("field=hello"))
+	req.RemoteAddr = "10.1.2.3:1234"
+	req.Header.Set("Content-Type", "Application/X-Www-Form-Urlencoded; charset=UTF-8")
+	req.Header.Set("Authorization", "bearer   secret-jwt.token_123  ")
+	req.Header.Set("X-Forwarded-Proto", "https, http")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["ct"] != "application/x-www-form-urlencoded" ||
+		got["tok"] != "secret-jwt.token_123" ||
+		got["tok_ok"] != true ||
+		got["scheme"] != "https" ||
+		got["fv"] != "hello" {
+		t.Fatalf("unexpected inspect output: %#v", got)
+	}
+
+	// 2. Untrusted peer cannot spoof X-Forwarded-Proto; malformed Bearer tokens are rejected; oversized FormValue is blocked.
+	for _, badAuth := range []string{"", "Basic dXNlcjpwYXNz", "Bearer", "Bearer   ", "Bearer a b", "Bearer a\x00b"} {
+		req := httptest.NewRequest(http.MethodPost, "/inspect", strings.NewReader("field="+strings.Repeat("x", 64)))
+		req.RemoteAddr = "198.51.100.10:4321"
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-Forwarded-Proto", "https")
+		if badAuth != "" {
+			req.Header.Set("Authorization", badAuth)
+		}
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		var res map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatal(err)
+		}
+		if res["tok_ok"] != false || res["tok"] != "" {
+			t.Fatalf("auth %q should be rejected, got %#v", badAuth, res)
+		}
+		if res["scheme"] != "http" {
+			t.Fatalf("untrusted X-Forwarded-Proto spoofed scheme: %#v", res)
+		}
+		if res["fv"] != "" {
+			t.Fatalf("oversized FormValue should return empty, got %#v", res)
+		}
+	}
+
+	// 3. Direct TLS sets scheme to https.
+	req = httptest.NewRequest(http.MethodPost, "/inspect", nil)
+	req.TLS = &tls.ConnectionState{}
+	req.Header.Set("Content-Type", "invalid-media-type")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["scheme"] != "https" || got["ct"] != "" {
+		t.Fatalf("TLS / invalid Content-Type: %#v", got)
+	}
+
+	// 4. Direct Write without WriteHeader preserves Content-Type sniffing on ResponseRecorder.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sniff", nil))
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("sniff: code=%d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
 	}
 }
