@@ -43,12 +43,12 @@ func v1Noescape(p unsafe.Pointer) unsafe.Pointer {
 }
 
 func v1EfacePtr(a *any) (*abi.Type, unsafe.Pointer) {
-	e := (*v1Eface)(unsafe.Pointer(a))
+	e := (*v1Eface)(v1Noescape(unsafe.Pointer(a)))
 	if e.typ == nil {
 		return nil, nil
 	}
 	if e.typ.IsDirectIface() {
-		return e.typ, unsafe.Pointer(&e.data)
+		return e.typ, v1Noescape(unsafe.Pointer(&e.data))
 	}
 	return e.typ, e.data
 }
@@ -389,6 +389,7 @@ const (
 	v1fkSliceUint64
 	v1fkSliceFloat64
 	v1fkSliceFloat32
+	v1fkSlicePoint2F64
 	v1fkSlice
 	v1fkArray
 	v1fkPtr
@@ -409,7 +410,10 @@ func v1IsFastNumericKind(k v1FastKind) bool {
 	return k >= v1fkInt && k <= v1fkFloat64
 }
 
-var v1TimeType = reflect.TypeFor[time.Time]()
+var (
+	v1TimeType           = reflect.TypeFor[time.Time]()
+	v1SlicePoint2F64Type = reflect.TypeFor[[][2]float64]()
+)
 
 type v1FastMarshalField struct {
 	offset           uintptr
@@ -434,13 +438,15 @@ type v1FastMarshalPlan struct {
 	canFast   bool
 	hasCustom bool
 	hasCycle  bool
-	hasOmit   bool
-	hasQuoted bool
-	minSize   int
-	elemSize  uintptr
-	arrayLen  int
-	elemPlan  *v1FastMarshalPlan
-	fields    []v1FastMarshalField
+	building  bool
+	hasOmit     bool
+	hasQuoted   bool
+	isFlatSmall bool
+	minSize     int
+	elemSize    uintptr
+	arrayLen    int
+	elemPlan    *v1FastMarshalPlan
+	fields      []v1FastMarshalField
 }
 
 var v1FastMarshalCache sync.Map[*abi.Type, *v1FastMarshalPlan]
@@ -509,10 +515,19 @@ func finalizeV1FastMarshalPlans(visiting map[*abi.Type]*v1FastMarshalPlan) {
 					}
 				}
 			}
-			if p.canFast && p.hasCustom && p.hasCycle {
-				p.canFast = false
-				changed = true
+		}
+	}
+	for _, p := range visiting {
+		if p.kind == v1fkStruct && p.canFast && !p.hasCustom && !p.hasOmit && !p.hasCycle && p.minSize > 0 && p.minSize <= 256 {
+			flat := true
+			for i := range p.fields {
+				k := p.fields[i].kind
+				if k < v1fkBool || k > v1fkSliceFloat32 {
+					flat = false
+					break
+				}
 			}
+			p.isFlatSmall = flat
 		}
 	}
 }
@@ -549,11 +564,14 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 		return p
 	}
 	if p, ok := visiting[at]; ok {
-		p.hasCycle = true
+		if p.building {
+			p.hasCycle = true
+		}
 		return p
 	}
-	p := &v1FastMarshalPlan{typ: at, rt: rt}
+	p := &v1FastMarshalPlan{typ: at, rt: rt, building: true}
 	visiting[at] = p
+	defer func() { p.building = false }()
 
 	if rt == v1TimeType {
 		p.kind = v1fkTime
@@ -649,6 +667,12 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 			p.kind = v1fkSliceFloat64
 		case v1fkFloat32:
 			p.kind = v1fkSliceFloat32
+		case v1fkArray:
+			if rt == v1SlicePoint2F64Type && ep.arrayLen == 2 && ep.elemPlan != nil && ep.elemPlan.kind == v1fkFloat64 {
+				p.kind = v1fkSlicePoint2F64
+			} else {
+				p.kind = v1fkSlice
+			}
 		default:
 			p.kind = v1fkSlice
 		}
@@ -767,7 +791,7 @@ func buildV1FastMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Typ
 }
 
 func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML bool, depth int) ([]byte, error) {
-	if depth > 64 {
+	if depth > startDetectingCyclesAfter {
 		return nil, errV1FastFallback
 	}
 	switch p.kind {
@@ -957,6 +981,34 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 				return nil, v1UnsupportedFloatError(p.elemPlan.rt, unsafe.Pointer(&s[i]), fv, 32)
 			}
 			b = v1AppendFloat(b, fv, 32)
+		}
+		return append(b, ']'), nil
+	case v1fkSlicePoint2F64:
+		s := *(*[][2]float64)(ptr)
+		if s == nil {
+			return append(b, "null"...), nil
+		}
+		if len(s) == 0 {
+			return append(b, "[]"...), nil
+		}
+		b = slices.Grow(b, len(s)*24+2)
+		b = append(b, '[')
+		for i, pt := range s {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			v0, v1 := pt[0], pt[1]
+			if math.IsNaN(v0) || math.IsInf(v0, 0) {
+				return nil, v1UnsupportedFloatError(p.elemPlan.elemPlan.rt, unsafe.Pointer(&s[i][0]), v0, 64)
+			}
+			if math.IsNaN(v1) || math.IsInf(v1, 0) {
+				return nil, v1UnsupportedFloatError(p.elemPlan.elemPlan.rt, unsafe.Pointer(&s[i][1]), v1, 64)
+			}
+			b = append(b, '[')
+			b = v1AppendFloat(b, v0, 64)
+			b = append(b, ',')
+			b = v1AppendFloat(b, v1, 64)
+			b = append(b, ']')
 		}
 		return append(b, ']'), nil
 	case v1fkSlice:
@@ -1413,7 +1465,7 @@ func v1IsFastEmpty(k v1FastKind, plan *v1FastMarshalPlan, ptr unsafe.Pointer) bo
 		return *(*float64)(ptr) == 0
 	case v1fkBytes:
 		return len(*(*[]byte)(ptr)) == 0
-	case v1fkSliceBool, v1fkSliceString, v1fkSliceInt, v1fkSliceInt64, v1fkSliceUint64, v1fkSliceFloat64, v1fkSliceFloat32, v1fkSlice:
+	case v1fkSliceBool, v1fkSliceString, v1fkSliceInt, v1fkSliceInt64, v1fkSliceUint64, v1fkSliceFloat64, v1fkSliceFloat32, v1fkSlicePoint2F64, v1fkSlice:
 		return (*unsafeheader.Slice)(ptr).Len == 0
 	case v1fkArray:
 		return plan.arrayLen == 0
@@ -1486,7 +1538,7 @@ func v1IsFastZero(k v1FastKind, plan *v1FastMarshalPlan, ptr unsafe.Pointer) boo
 		return (*time.Time)(ptr).IsZero()
 	case v1fkBytes:
 		return *(*[]byte)(ptr) == nil
-	case v1fkSliceBool, v1fkSliceString, v1fkSliceInt, v1fkSliceInt64, v1fkSliceUint64, v1fkSliceFloat64, v1fkSliceFloat32, v1fkSlice:
+	case v1fkSliceBool, v1fkSliceString, v1fkSliceInt, v1fkSliceInt64, v1fkSliceUint64, v1fkSliceFloat64, v1fkSliceFloat32, v1fkSlicePoint2F64, v1fkSlice:
 		return (*unsafeheader.Slice)(ptr).Data == nil
 	case v1fkPtr:
 		return *(*unsafe.Pointer)(ptr) == nil
@@ -1842,7 +1894,7 @@ func v1MarshalFastMapStringInt(b []byte, m map[string]int, escapeHTML bool) ([]b
 
 func v1MarshalFastMapStringAny(b []byte, m map[string]any, escapeHTML bool, depth int) ([]byte, error) {
 	if depth > startDetectingCyclesAfter {
-		return v1MarshalReflect(b, m, escapeHTML, depth)
+		return nil, errV1FastFallback
 	}
 	if m == nil {
 		return append(b, "null"...), nil
@@ -1887,7 +1939,7 @@ func v1MarshalFastMapStringAny(b []byte, m map[string]any, escapeHTML bool, dept
 
 func v1MarshalFastAny(b []byte, val any, escapeHTML bool, depth int) ([]byte, error) {
 	if depth > startDetectingCyclesAfter {
-		return v1MarshalReflect(b, val, escapeHTML, depth)
+		return nil, errV1FastFallback
 	}
 	switch v := val.(type) {
 	case nil:
@@ -1997,9 +2049,7 @@ func v1MarshalFastAnyEface(b []byte, val any, escapeHTML bool, depth int) ([]byt
 	if plan.canFast {
 		out, err := plan.marshal(b, ptr, escapeHTML, depth+1)
 		runtime.KeepAlive(&val)
-		if err != errV1FastFallback {
-			return out, err
-		}
+		return out, err
 	}
 	return v1MarshalReflect(b, val, escapeHTML, depth+1)
 }
@@ -2085,6 +2135,14 @@ func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML 
 		}
 		var scratch [32]byte
 		return bytes.Clone(v1AppendFloat(scratch[:0], fv, 64)), nil
+	}
+	if plan.isFlatSmall {
+		est := min(max(plan.minSize+80, 128), 384)
+		b, err := plan.marshal(make([]byte, 0, est), ptr, escapeHTML, 0)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
 	}
 	fb := getV1FastBuf()
 	b, err := plan.marshal(fb.b, ptr, escapeHTML, 0)

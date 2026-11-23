@@ -1410,3 +1410,82 @@ func TestDecoderReset(t *testing.T) {
 		// TODO: Calling methods on zero Decoder should also panic.
 	})
 }
+
+type failOnceReader struct {
+	chunks [][]byte
+	errs   []error
+	idx    int
+	reads  int
+}
+
+func (r *failOnceReader) Read(p []byte) (int, error) {
+	r.reads++
+	if r.idx >= len(r.errs) && r.idx >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	var n int
+	if r.idx < len(r.chunks) {
+		n = copy(p, r.chunks[r.idx])
+	}
+	var err error
+	if r.idx < len(r.errs) {
+		err = r.errs[r.idx]
+	}
+	r.idx++
+	return n, err
+}
+
+func TestDecoderContiguousValueIOError(t *testing.T) {
+	errBoom := errors.New("boom read error")
+
+	t.Run("DeferredIOErrorNotSwallowed", func(t *testing.T) {
+		r := &failOnceReader{
+			chunks: [][]byte{[]byte(`{"a":1}`)},
+			errs:   []error{errBoom},
+		}
+		dec := NewDecoder(r)
+
+		// First value returns valid JSON, while deferring errBoom in rdErr.
+		val, err := dec.ReadValue()
+		if err != nil || string(val) != `{"a":1}` {
+			t.Fatalf("first ReadValue = %q, %v; want %q, nil", val, err, `{"a":1}`)
+		}
+		readsBefore := r.reads
+
+		// ContiguousValue when prevEnd == len(buf) must NOT drop rdErr or call r.Read again.
+		if buf, _, ok := dec.s.ContiguousValue(); ok || buf != nil {
+			t.Fatalf("ContiguousValue succeeded unexpectedly with pending rdErr")
+		}
+		if r.reads != readsBefore {
+			t.Fatalf("ContiguousValue triggered extra Read (%d -> %d)", readsBefore, r.reads)
+		}
+
+		// Subsequent ReadValue must surface errBoom without re-reading.
+		if _, err := dec.ReadValue(); !errors.Is(err, errBoom) {
+			t.Fatalf("second ReadValue err = %v, want %v", err, errBoom)
+		}
+		if r.reads != readsBefore {
+			t.Fatalf("ReadValue after deferred error triggered extra Read (%d -> %d)", readsBefore, r.reads)
+		}
+	})
+
+	t.Run("ImmediateFetchIOErrorNotSwallowed", func(t *testing.T) {
+		r := &failOnceReader{
+			chunks: [][]byte{nil},
+			errs:   []error{errBoom},
+		}
+		dec := NewDecoder(r)
+
+		if _, _, ok := dec.s.ContiguousValue(); ok {
+			t.Fatalf("ContiguousValue succeeded on failing reader")
+		}
+		readsAfter := r.reads
+		if _, err := dec.ReadValue(); !errors.Is(err, errBoom) {
+			t.Fatalf("ReadValue err = %v, want %v", err, errBoom)
+		}
+		if r.reads != readsAfter {
+			t.Fatalf("ReadValue re-invoked Read after error (%d -> %d)", readsAfter, r.reads)
+		}
+	})
+}
+

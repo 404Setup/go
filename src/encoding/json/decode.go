@@ -109,10 +109,10 @@ import (
 // Instead, they are replaced by the Unicode replacement
 // character U+FFFD.
 func Unmarshal(data []byte, v any) error {
-	e := (*v1Eface)(unsafe.Pointer(&v))
+	e := (*v1Eface)(v1Noescape(unsafe.Pointer(&v)))
 	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
 		handled, err := tryV1FastUnmarshal(data, e.typ.Elem(), e.data, false, false, false)
-		runtime.KeepAlive(&v)
+		runtime.KeepAlive(v)
 		if handled {
 			return err
 		}

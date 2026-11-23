@@ -629,3 +629,167 @@ func TestFastV1EdgeCasesAndGCStress(t *testing.T) {
 		}
 	})
 }
+
+func TestFastV1RegressionAndSecurity(t *testing.T) {
+	t.Run("DAGAndCyclicCustom", func(t *testing.T) {
+		type leaf struct {
+			Name string `json:"name"`
+		}
+		type node struct {
+			L1   leaf                  `json:"l1"`
+			L2   *leaf                 `json:"l2"`
+			C    fastV1DirectMarshaler `json:"c"`
+			Any  any                   `json:"any,omitempty"`
+			Next *node                 `json:"next,omitempty"`
+		}
+		calls := 0
+		in := &node{
+			L1:  leaf{Name: "a"},
+			L2:  &leaf{Name: "b"},
+			C:   fastV1DirectMarshaler{calls: &calls},
+			Any: []any{"x", float64(2)},
+			Next: &node{
+				L1: leaf{Name: "c"},
+				C:  fastV1DirectMarshaler{calls: &calls},
+			},
+		}
+		b, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("Marshal custom calls = %d, want 2", calls)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+	})
+
+	t.Run("CustomPlusTimeErrorReplay", func(t *testing.T) {
+		type payload struct {
+			T1   time.Time              `json:"t1"`
+			U    fastV1CountUnmarshaler `json:"u"`
+			T2   time.Time              `json:"t2"`
+			Bad  int                    `json:"bad"`
+			Tail int                    `json:"tail"`
+		}
+		var uCalls int
+		p := payload{U: fastV1CountUnmarshaler{calls: &uCalls}}
+		err := json.Unmarshal([]byte(`{"t1":"2026-01-02T03:04:05Z","u":1,"t2":"bad-time","tail":5}`), &p)
+		if err == nil {
+			t.Fatal("expected error for invalid t2")
+		}
+		if uCalls != 1 {
+			t.Fatalf("uCalls = %d, want 1", uCalls)
+		}
+
+		// When Bad fails with type mismatch after T1 and U, replay continues to populate Tail.
+		uCalls = 0
+		p2 := payload{U: fastV1CountUnmarshaler{calls: &uCalls}}
+		err = json.Unmarshal([]byte(`{"t1":"2026-01-02T03:04:05Z","u":1,"bad":"oops","tail":5}`), &p2)
+		if err == nil {
+			t.Fatal("expected UnmarshalTypeError for bad int")
+		}
+		if uCalls != 1 {
+			t.Fatalf("replay uCalls = %d, want 1", uCalls)
+		}
+		if p2.Tail != 5 {
+			t.Fatalf("expected Tail=5 after replay continuation, got %d", p2.Tail)
+		}
+	})
+
+	t.Run("ValidParityEdgeCases", func(t *testing.T) {
+		cases := []struct {
+			in   string
+			want bool
+		}{
+			{"", false},
+			{"   \t\r\n ", false},
+			{"null", true},
+			{"true", true},
+			{"false", true},
+			{"123", true},
+			{"-0.5e+2", true},
+			{"01", false},
+			{"-01", false},
+			{"1.", false},
+			{"1e+", false},
+			{`{"a":[1,2,3],"b":"x\u0020y"}`, true},
+			{"\"bad\nstr\"", false},
+			{"\"bad\x00\"", false},
+			{"\"raw\xffutf8\"", true},
+			{`"\u123"`, false},
+			{`"\uZZZZ"`, false},
+			{`{"a":1,} `, false},
+			{`[1,2,]`, false},
+			{`{"a":1}{"b":2}`, false},
+			{strings.Repeat("[", 10000) + "0" + strings.Repeat("]", 10000), true},
+			{strings.Repeat("[", 10001) + "0" + strings.Repeat("]", 10001), false},
+		}
+		for _, tc := range cases {
+			got := json.Valid([]byte(tc.in))
+			if got != tc.want {
+				t.Errorf("Valid(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+			var v any
+			err := json.Unmarshal([]byte(tc.in), &v)
+			if (err == nil) != tc.want {
+				t.Errorf("Unmarshal(%q) err=%v vs wantValid=%v", tc.in, err, tc.want)
+			}
+		}
+	})
+
+	t.Run("SlicePoint2F64MergeAndNaN", func(t *testing.T) {
+		type geo struct {
+			Coords [][2]float64 `json:"coords"`
+		}
+		g := geo{Coords: [][2]float64{{10, 20}, {30, 40}}}
+		if err := json.Unmarshal([]byte(`{"coords":[[1,2],null]}`), &g); err != nil {
+			t.Fatalf("Unmarshal non-empty merge: %v", err)
+		}
+		if g.Coords[0] != [2]float64{1, 2} || g.Coords[1] != [2]float64{30, 40} {
+			t.Fatalf("Coords = %+v, want [[1 2] [30 40]]", g.Coords)
+		}
+		if _, err := json.Marshal(geo{Coords: [][2]float64{{1, math.Inf(1)}}}); err == nil {
+			t.Fatal("expected error for +Inf in [][2]float64")
+		}
+	})
+
+	t.Run("GenericOfZeroAlloc", func(t *testing.T) {
+		type flat struct {
+			A int64   `json:"a"`
+			B string  `json:"b"`
+			C float64 `json:"c"`
+			D bool    `json:"d"`
+		}
+		v := flat{A: 99, B: "ok", C: 1.25, D: false}
+		buf := make([]byte, 0, 256)
+		if n := testing.AllocsPerRun(50, func() {
+			var err error
+			buf, err = json.AppendMarshalOf(buf[:0], v)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}); n != 0 {
+			t.Fatalf("AppendMarshalOf allocs = %v, want 0", n)
+		}
+		if n := testing.AllocsPerRun(50, func() {
+			out, err := json.MarshalOf(v)
+			if err != nil || len(out) == 0 {
+				t.Fatalf("MarshalOf: %v", err)
+			}
+		}); n != 1 {
+			t.Fatalf("MarshalOf allocs = %v, want 1", n)
+		}
+		enc := json.NewEncoder(io.Discard)
+		if n := testing.AllocsPerRun(50, func() {
+			if err := json.EncodeOf(enc, v); err != nil {
+				t.Fatal(err)
+			}
+		}); n != 0 {
+			t.Fatalf("EncodeOf allocs = %v, want 0", n)
+		}
+	})
+}
+

@@ -72,10 +72,10 @@ func (dec *Decoder) Decode(v any) error {
 	raw := dec.buf[dec.scanp : dec.scanp+n]
 	dec.scanp += n
 
-	e := (*v1Eface)(unsafe.Pointer(&v))
+	e := (*v1Eface)(v1Noescape(unsafe.Pointer(&v)))
 	if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
 		handled, err := tryV1FastUnmarshal(raw, e.typ.Elem(), e.data, true, dec.d.useNumber, dec.d.disallowUnknownFields)
-		runtime.KeepAlive(&v)
+		runtime.KeepAlive(v)
 		if handled {
 			dec.tokenValueEnd()
 			return err
@@ -254,7 +254,7 @@ func (enc *Encoder) Encode(v any) error {
 	if plan.canFast {
 		fb := getV1FastBuf()
 		b, err := plan.marshal(fb.b, ptr, enc.escapeHTML, 0)
-		runtime.KeepAlive(&v)
+		runtime.KeepAlive(v)
 		if err == nil {
 			b = append(b, '\n')
 			fb.b = b

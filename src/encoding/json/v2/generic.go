@@ -28,24 +28,29 @@ func MarshalOf[T any](in T, opts ...Options) (out []byte, err error) {
 		at := abi.TypeFor[T]()
 		if at.Kind() != abi.Interface {
 			plan := lookupFastMarshalPlan(at)
-			if plan.canFast {
-				var ptr unsafe.Pointer
-				if plan.hasCustom {
-					ptr = unsafe.Pointer(&in)
-				} else {
-					ptr = noescape(unsafe.Pointer(&in))
-				}
-				out, ferr := marshalFastAlloc(plan, ptr, mo)
-				runtime.KeepAlive(&in)
+			if plan.canFast && !plan.hasCustom {
+				out, ferr := marshalFastAlloc(plan, noescape(unsafe.Pointer(&in)), mo)
+				runtime.KeepAlive(in)
 				if ferr == nil {
 					return out, nil
 				}
-				if ferr != errFastFallback {
-					return out, materializeFastErr(ferr, in, at, 0, mo)
-				}
+				return marshalOfSlowErr(in, out, at, ferr, mo, opts)
 			}
 		}
 	}
+	return marshalOfSlow(in, opts)
+}
+
+//go:noinline
+func marshalOfSlowErr[T any](in T, out []byte, at *abi.Type, ferr error, mo *jsonopts.Struct, opts []Options) ([]byte, error) {
+	if ferr != errFastFallback {
+		return out, materializeFastErr(ferr, in, at, 0, mo)
+	}
+	return Marshal(in, opts...)
+}
+
+//go:noinline
+func marshalOfSlow[T any](in T, opts []Options) ([]byte, error) {
 	return Marshal(in, opts...)
 }
 
@@ -118,25 +123,29 @@ func AppendMarshalOf[T any](dst []byte, in T, opts ...Options) ([]byte, error) {
 		at := abi.TypeFor[T]()
 		if at.Kind() != abi.Interface {
 			plan := lookupFastMarshalPlan(at)
-			if plan.canFast {
-				var ptr unsafe.Pointer
-				if plan.hasCustom {
-					ptr = unsafe.Pointer(&in)
-				} else {
-					ptr = noescape(unsafe.Pointer(&in))
-				}
-				b, ferr := plan.marshal(dst, ptr, mo, 0)
-				runtime.KeepAlive(&in)
+			if plan.canFast && !plan.hasCustom {
+				b, ferr := plan.marshal(dst, noescape(unsafe.Pointer(&in)), mo, 0)
+				runtime.KeepAlive(in)
 				if ferr == nil {
 					return b, nil
 				}
-				dst = dst[:origLen]
-				if ferr != errFastFallback {
-					return dst, materializeFastErr(ferr, in, at, origLen, mo)
-				}
+				return appendMarshalOfSlowErr(dst[:origLen], in, at, origLen, ferr, mo, opts)
 			}
 		}
 	}
+	return appendMarshalOfSlow(dst[:origLen], in, opts)
+}
+
+//go:noinline
+func appendMarshalOfSlowErr[T any](dst []byte, in T, at *abi.Type, origLen int, ferr error, mo *jsonopts.Struct, opts []Options) ([]byte, error) {
+	if ferr != errFastFallback {
+		return dst, materializeFastErr(ferr, in, at, origLen, mo)
+	}
+	return AppendMarshal(dst, in, opts...)
+}
+
+//go:noinline
+func appendMarshalOfSlow[T any](dst []byte, in T, opts []Options) ([]byte, error) {
 	return AppendMarshal(dst, in, opts...)
 }
 
@@ -208,16 +217,10 @@ func MarshalEncodeOf[T any](out *jsontext.Encoder, in T, opts ...Options) error 
 			at := abi.TypeFor[T]()
 			if at.Kind() != abi.Interface {
 				plan := lookupFastMarshalPlan(at)
-				if plan.canFast {
+				if plan.canFast && !plan.hasCustom {
 					origBuf := xe.Buf
-					var ptr unsafe.Pointer
-					if plan.hasCustom {
-						ptr = unsafe.Pointer(&in)
-					} else {
-						ptr = noescape(unsafe.Pointer(&in))
-					}
-					b2, ferr := plan.marshal(origBuf, ptr, &xe.Struct, 0)
-					runtime.KeepAlive(&in)
+					b2, ferr := plan.marshal(origBuf, noescape(unsafe.Pointer(&in)), &xe.Struct, 0)
+					runtime.KeepAlive(in)
 					if ferr == nil {
 						xe.CommitBuffer(b2)
 						xe.Tokens.Last.Increment()
@@ -226,23 +229,35 @@ func MarshalEncodeOf[T any](out *jsontext.Encoder, in T, opts ...Options) error 
 						}
 						return nil
 					}
-					if ferr != errFastFallback {
-						if !xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
-							if p := fastPartialOutput(b2, ferr); len(p) > len(origBuf) {
-								xe.CommitBuffer(p)
-							} else {
-								xe.Buf = origBuf
-							}
-						} else {
-							xe.Buf = origBuf
-						}
-						return materializeFastErr(ferr, in, at, len(origBuf), &xe.Struct)
-					}
-					xe.Buf = origBuf
+					return marshalEncodeOfSlowErr(out, origBuf, b2, in, at, ferr, opts)
 				}
 			}
 		}
 	}
+	return marshalEncodeOfSlow(out, in, opts)
+}
+
+//go:noinline
+func marshalEncodeOfSlowErr[T any](out *jsontext.Encoder, origBuf, b2 []byte, in T, at *abi.Type, ferr error, opts []Options) error {
+	xe := export.Encoder(out)
+	if ferr != errFastFallback {
+		if !xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+			if p := fastPartialOutput(b2, ferr); len(p) > len(origBuf) {
+				xe.CommitBuffer(p)
+			} else {
+				xe.Buf = origBuf
+			}
+		} else {
+			xe.Buf = origBuf
+		}
+		return materializeFastErr(ferr, in, at, len(origBuf), &xe.Struct)
+	}
+	xe.Buf = origBuf
+	return MarshalEncode(out, in, opts...)
+}
+
+//go:noinline
+func marshalEncodeOfSlow[T any](out *jsontext.Encoder, in T, opts []Options) error {
 	return MarshalEncode(out, in, opts...)
 }
 

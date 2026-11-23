@@ -19,13 +19,9 @@ func MarshalOf[T any](v T) ([]byte, error) {
 	at := abi.TypeFor[T]()
 	if at.Kind() != abi.Interface {
 		plan := lookupV1FastMarshalPlan(at)
-		if plan.canFast {
-			ptr := unsafe.Pointer(&v)
-			if !plan.hasCustom {
-				ptr = v1Noescape(ptr)
-			}
-			out, err := v1MarshalFastAlloc(plan, ptr, true)
-			runtime.KeepAlive(&v)
+		if plan.canFast && !plan.hasCustom {
+			out, err := v1MarshalFastAlloc(plan, v1Noescape(unsafe.Pointer(&v)), true)
+			runtime.KeepAlive(v)
 			if err == nil {
 				return out, nil
 			}
@@ -34,6 +30,11 @@ func MarshalOf[T any](v T) ([]byte, error) {
 			}
 		}
 	}
+	return marshalOfSlow(v)
+}
+
+//go:noinline
+func marshalOfSlow[T any](v T) ([]byte, error) {
 	return Marshal(v)
 }
 
@@ -48,7 +49,7 @@ func AppendMarshal(dst []byte, v any) ([]byte, error) {
 	plan := lookupV1FastMarshalPlan(at)
 	if plan.canFast {
 		out, err := plan.marshal(dst, ptr, true, 0)
-		runtime.KeepAlive(&v)
+		runtime.KeepAlive(v)
 		if err == nil {
 			return out, nil
 		}
@@ -74,13 +75,9 @@ func AppendMarshalOf[T any](dst []byte, v T) ([]byte, error) {
 	at := abi.TypeFor[T]()
 	if at.Kind() != abi.Interface {
 		plan := lookupV1FastMarshalPlan(at)
-		if plan.canFast {
-			ptr := unsafe.Pointer(&v)
-			if !plan.hasCustom {
-				ptr = v1Noescape(ptr)
-			}
-			out, err := plan.marshal(dst, ptr, true, 0)
-			runtime.KeepAlive(&v)
+		if plan.canFast && !plan.hasCustom {
+			out, err := plan.marshal(dst, v1Noescape(unsafe.Pointer(&v)), true, 0)
+			runtime.KeepAlive(v)
 			if err == nil {
 				return out, nil
 			}
@@ -90,6 +87,11 @@ func AppendMarshalOf[T any](dst []byte, v T) ([]byte, error) {
 			}
 		}
 	}
+	return appendMarshalOfSlow(dst, v)
+}
+
+//go:noinline
+func appendMarshalOfSlow[T any](dst []byte, v T) ([]byte, error) {
 	return AppendMarshal(dst, v)
 }
 
@@ -185,14 +187,10 @@ func EncodeOf[T any](enc *Encoder, v T) error {
 	at := abi.TypeFor[T]()
 	if at.Kind() != abi.Interface {
 		plan := lookupV1FastMarshalPlan(at)
-		if plan.canFast {
+		if plan.canFast && !plan.hasCustom {
 			fb := getV1FastBuf()
-			ptr := unsafe.Pointer(&v)
-			if !plan.hasCustom {
-				ptr = v1Noescape(ptr)
-			}
-			b, err := plan.marshal(fb.b, ptr, enc.escapeHTML, 0)
-			runtime.KeepAlive(&v)
+			b, err := plan.marshal(fb.b, v1Noescape(unsafe.Pointer(&v)), enc.escapeHTML, 0)
+			runtime.KeepAlive(v)
 			if err == nil {
 				b = append(b, '\n')
 				fb.b = b
@@ -219,6 +217,11 @@ func EncodeOf[T any](enc *Encoder, v T) error {
 			}
 		}
 	}
+	return encodeOfSlow(enc, v)
+}
+
+//go:noinline
+func encodeOfSlow[T any](enc *Encoder, v T) error {
 	return enc.Encode(v)
 }
 

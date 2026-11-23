@@ -208,7 +208,7 @@ func Marshal(v any) ([]byte, error) {
 	plan := lookupV1FastMarshalPlan(at)
 	if plan.canFast {
 		out, err := v1MarshalFastAlloc(plan, ptr, true)
-		runtime.KeepAlive(&v)
+		runtime.KeepAlive(v)
 		if err == nil {
 			return out, nil
 		}

@@ -10,22 +10,22 @@ This fork is a personal Go branch maintained by 404Setup.
 > This fork does not modify language syntax or break existing standard library APIs.
 
 ### Standard Library & Runtime
-- **`encoding/json`, `encoding/json/v2`**: Compiled direct-memory marshal/unmarshal fast paths (including generic maps via `internal/runtime/maps`, `,string` numeric fields, `[N]byte` base64, `time.Time`, and value-receiver `Marshaler`/`Unmarshaler`), exact IEEE-754 float parsing and integer-float formatting, 8-byte SWAR ASCII/UTF-8/whitespace/HTML scanning, zero-allocation SWAR validation, pooled buffers, and generic `*Of` / `Append*` APIs (`MarshalOf`, `AppendMarshal`, `AppendMarshalOf`, `MarshalIndentOf`, `AppendMarshalIndent`, `AppendMarshalIndentOf`, `UnmarshalOf`, `EncodeOf`, `DecodeOf`, plus v2 `MarshalWriteOf`, `MarshalEncodeOf`, `UnmarshalReadOf`, `UnmarshalDecodeOf`) across both default `jsonv2` and `GOEXPERIMENT=nojsonv2` builds.
+- **`encoding/json`, `encoding/json/v2`**: Compiled marshal/unmarshal fast paths, SWAR scanning and validation, pooled buffers, exact float paths, and generic `*Of` / `Append*` APIs for both `jsonv2` and `GOEXPERIMENT=nojsonv2`.
 - **`io`**: Pooled overflow buffers and exact-sized final allocations in `ReadAll`.
-- **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with online `Shrink()`), used across standard library internals.
-- **`sync/v2/container`**: Generic map containers: `OrderedMap[K, V]`, `ConcurrentSkipListMap[K, V]`, `LinkedHashMap[K, V]`, and `TreeMap[K, V]`.
-- **`sync/atomic/v2`**: Generic `Value[T]` avoiding interface boxing for scalar and pointer operations.
-- **`net`**: TTL-aware DNS response cache (disable with `GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String` formatting.
-- **`net/http`, `net/textproto`, `net/url`**: Performance and Memory Allocation Optimization (h1/h2/h3)
-- **`net/http/server`**: HTTP server wrapper with parameterized routing, route groups, pooled contexts, and middleware.
-- **`reflect`**: Allocation and throughput optimizations for `Equal`, `DeepEqual`, `Comparable`, `Value.Call`, `Select`, `Value.MapKeys`, and struct field introspection.
-- **`runtime`**: Faster span reclamation, GC bit-scanning and fused inline-mark sweep, batched `mcache.releaseAll` and lock-free empty `stackcache_clear`, O(1) `pageCache.flush` and `spanClassToNelems` lookup, write-barrier pointer deduplication, and zero-size slice fast paths.
-- **`cmd/compile`**: Stack small-buffer optimization (SBO) for non-escaping dynamic `make`/`make+copy` and static constant propagation for `make` and `[]byte(s)`.
+- **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with `Shrink()`).
+- **`sync/v2/container`**: Generic ordered/sorted maps: `OrderedMap`, `ConcurrentSkipListMap`, `LinkedHashMap`, and `TreeMap`.
+- **`sync/atomic/v2`**: Generic `Value[T]` without interface boxing.
+- **`net`**: TTL-aware DNS cache (`GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String`.
+- **`net/http`, `net/textproto`, `net/url`**: Allocation and throughput optimizations across HTTP/1.1, HTTP/2, and HTTP/3.
+- **`net/http/server`**: HTTP router with path parameters, route groups, pooled contexts, and middleware.
+- **`reflect`**: Fast paths for `Equal`, `DeepEqual`, `Comparable`, `Call`, `Select`, `MapKeys`, and struct fields.
+- **`runtime`**: Faster span reclamation, GC sweep, bit-scanning, stack/page/mcache management, and write-barrier deduplication.
+- **`cmd/compile`**: Stack small-buffer optimization for non-escaping slices/strings and static constant lowering.
 
 ### Compiler & Linker Flags
 - **`-ldflags="-o2"`**: Bounded loop unrolling and post-SCCP/prove dead branch elimination.
-- **`-ldflags="-o3"`**: Includes `-o2`, plus cost-based inlining, 2D loop interchange and $32 \times 32$ tiling, dead finite loop removal, cross-loop bounds check elimination, wrapper tail calls, and two-stage reflection/interface linker dead code elimination.
-- **`-ldflags="-fmth"`**: Fast-math SSA reductions, reciprocal division, FMA contraction, polynomial approximations for `math` transcendentals, and hardware `FTZ`/`DAZ` mode (may relax strict IEEE 754 semantics).
+- **`-ldflags="-o3"`**: Includes `-o2`, plus cost-based inlining, loop interchange and $32 \times 32$ tiling, dead loop/BCE passes, and two-stage reflection/interface DCE.
+- **`-ldflags="-fmth"`**: Fast-math SSA reductions, reciprocal division, FMA contraction, polynomial math approximations, and `FTZ`/`DAZ` mode (may relax strict IEEE 754 semantics).
 
 Use `all=` (e.g., `-ldflags="all=-o3"`) to apply flags across all dependencies.
 
@@ -120,8 +120,6 @@ xychart-beta
 | `ClientRequestHeaders/1000` (`http2`) | 1,329 µs/op | **948.9 µs/op** | **-28.6%** (1.40×) | 4,061 (320 KB) → **3,022 (225 KB)** |
 | `ClientResponseHeaders/10` (`http2`) | 57.75 µs/op | **55.03 µs/op** | **-4.7%** (1.05×) | 117 (8,818 B) → **75 (5,509 B)** |
 
-> *Measured as interleaved 5-round medians (`-count=1 -cpu=2`) on `linux/amd64` comparing upstream Go (`1.27.3`; HTTP/2 rows measured against `1.27.4`) against this fork. Subtests paired as `A / B` use matching order across all columns.*
-
 #### Routing, Chunked/Body I/O, Proxy, HTTP/2 & HTTP/3 Primitives
 
 ```mermaid
@@ -148,8 +146,6 @@ xychart-beta
 | `ClientResponseHeaders/10` (`http2`) | 42.98 µs/op | **41.65 µs/op** | **-3.1%** (1.03×) | 75 → **71** |
 | `ReverseProxy.ServeHTTP` (`httputil`) | 579.6 ns/op | **562.3 ns/op** | **-3.0%** (1.03×) | 9 (1,170 B) → **7 (1,154 B)** |
 
-> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`f0012dea`) against the patched `net/http` stack.*
-
 #### `net/http/server` vs `net/http.ServeMux`
 
 ```mermaid
@@ -170,7 +166,7 @@ xychart-beta
 | `QueryParam` (2 keys) | 874.7 ns/op | **132.1 ns/op** | **-84.9%** (6.62×) | 6 (464 B) → **0 (0 B)** |
 | `JSONResponse` (`c.JSON` vs `json.Marshal`) | 563.2 ns/op | **509.9 ns/op** | **-9.5%** (1.10×) | 2 (64 B) → **0 (0 B)** |
 
-> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz). Additional `net/http/server` medians: `WildcardRoute` **95.76 ns/op** (0 allocs), `MiddlewareChain5` **116.5 ns/op** (0 allocs), `MaxInFlight` **74.75 ns/op** (0 allocs), `Accepts` **648.8 ns/op** (0 allocs), `BindJSON` **904.7 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **11.86 µs/op** (0 allocs, 52 B).*
+> *Additional `net/http/server` medians: `WildcardRoute` **95.76 ns/op** (0 allocs), `MiddlewareChain5` **116.5 ns/op** (0 allocs), `MaxInFlight` **74.75 ns/op** (0 allocs), `Accepts` **648.8 ns/op** (0 allocs), `BindJSON` **904.7 ns/op** (2 allocs, 40 B), `CompressGzip` (~2.6 KiB) **11.86 µs/op** (0 allocs, 52 B).*
 
 ---
 
@@ -351,8 +347,6 @@ xychart-beta
 | `SpanReclaimChurn` (word-at-a-time `reclaimChunk`) | 9,527 ns/op | **9,247 ns/op** | **-2.9%** (1.03×) | 0 → 0 |
 | `GCSweepSmallObjects` (fused inline-mark sweep + full-span skip) | 526.2 ns/op | **517.3 ns/op** | **-1.7%** (1.02×) | 0 → 0 |
 
-> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`70d635fc`) against the patched runtime.*
-
 ---
 
 ### 7. `encoding/json` and `encoding/json/v2`
@@ -363,23 +357,23 @@ xychart-beta
     x-axis ["CodeMarshal (v1/v2)", "CodeEncoder (v1/v2)", "CodeUnmarshal (v1/v2)", "GolangSrc Marshal (v2)", "GolangSrc Unmarshal (v2)", "CodeUnmarshal (nojsonv2)"]
     y-axis "Latency (ms/op)" 0 --> 25
     bar [4.55, 4.26, 13.59, 9.67, 21.13, 23.65]
-    bar [2.88, 2.27, 5.79, 5.02, 10.36, 5.55]
+    bar [2.79, 2.29, 4.93, 4.99, 8.11, 5.26]
 ```
 
 #### `encoding/json` (default `jsonv2`) and `encoding/json/v2`
 
 | Benchmark | Baseline (`3d9b976b`) | Patched | Latency Delta | Allocs (`Baseline` → `Patched`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `CodeEncoder` (`encoding/json`) | 4.26 ms/op | **2.27 ms/op** | **-46.7%** (1.88×) | 0 → 0 |
-| `CodeMarshal` (`encoding/json`) | 4.55 ms/op | **2.88 ms/op** | **-36.8%** (1.58×) | 1 → 1 |
-| `CodeUnmarshal` (`encoding/json`) | 13.59 ms/op | **5.79 ms/op** | **-57.4%** (2.35×) | 26,771 → 26,770 |
-| `CodeUnmarshalReuse` (`encoding/json`) | 13.92 ms/op | **5.79 ms/op** | **-58.4%** (2.40×) | 12,823 → **12,088** |
+| `CodeEncoder` (`encoding/json`) | 4.26 ms/op | **2.29 ms/op** | **-46.2%** (1.86×) | 0 → 0 |
+| `CodeMarshal` (`encoding/json`) | 4.55 ms/op | **2.79 ms/op** | **-38.7%** (1.63×) | 1 → 1 |
+| `CodeUnmarshal` (`encoding/json`) | 13.59 ms/op | **4.93 ms/op** | **-63.7%** (2.76×) | 26,771 → 26,770 |
+| `CodeUnmarshalReuse` (`encoding/json`) | 13.92 ms/op | **4.93 ms/op** | **-64.6%** (2.82×) | 12,823 → **12,034** |
 | `UnmarshalString` (`encoding/json`) | 154.8 ns/op | **43.98 ns/op** | **-71.6%** (3.52×) | 0 → 0 |
 | `UnmarshalInt64` (`encoding/json`) | 138.8 ns/op | **49.98 ns/op** | **-64.0%** (2.78×) | 0 → 0 |
 | `UnmarshalFloat64` (`encoding/json`) | 172.5 ns/op | **76.79 ns/op** | **-55.5%** (2.25×) | 0 → 0 |
 | `UnmarshalMap` (`encoding/json`) | 941.5 ns/op | **288.3 ns/op** | **-69.4%** (3.27×) | 8 (104 B) → **3 (24 B)** |
-| `GolangSource/Marshal/Concrete` (`v2`) | 9.67 ms/op | **5.02 ms/op** | **-48.1%** (1.93×) | 2 → **1** |
-| `GolangSource/Unmarshal/Concrete` (`v2`) | 21.13 ms/op | **10.36 ms/op** | **-51.0%** (2.04×) | 13,948 → 13,947 |
+| `GolangSource/Marshal/Concrete` (`v2`) | 9.67 ms/op | **4.99 ms/op** | **-48.4%** (1.94×) | 2 → **1** |
+| `GolangSource/Unmarshal/Concrete` (`v2`) | 21.13 ms/op | **8.11 ms/op** | **-61.6%** (2.61×) | 13,948 → 13,947 |
 | `MarshalRecords/1` / `10000` (`v2`) | 874.1 ns / 7.24 ms | **416.3 ns / 4.01 ms** | **-52.4% / -44.6%** | 1 / 1 → 1 / 1 |
 | `MarshalMapRecords` (`v2`) | 860.2 µs/op | **300.6 µs/op** | **-65.0%** (2.86×) | 2,001 (106 KB) → **1 (74 KB)** |
 | `MarshalAny` (`Ints` / `Mixed` / `Map`, `v2`) | 884.9 / 1,295 / 2,230 ns | **290.6 / 343.6 / 649.8 ns** | **-67.2% / -73.5% / -70.9%** | 1 / 1 / 3 → **1 / 1 / 1** |
@@ -390,19 +384,17 @@ xychart-beta
 
 | Benchmark | Baseline (`3d9b976b`) / `any` API | Patched / Generic API | Latency Delta | Allocs (`Before` → `After`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `CodeEncoder` (`nojsonv2`) | 3.62 ms/op | **2.25 ms/op** | **-37.8%** (1.61×) | 0 → 0 |
-| `CodeMarshal` (`nojsonv2`) | 4.35 ms/op | **2.86 ms/op** | **-34.2%** (1.52×) | 1 → 1 |
-| `CodeUnmarshal` (`nojsonv2`) | 23.65 ms/op | **5.55 ms/op** | **-76.5%** (4.26×) | 39,990 → **26,770** |
-| `CodeUnmarshalReuse` (`nojsonv2`) | 22.21 ms/op | **5.49 ms/op** | **-75.3%** (4.04×) | 26,935 → **12,065** |
+| `CodeEncoder` (`nojsonv2`) | 3.62 ms/op | **2.16 ms/op** | **-40.3%** (1.68×) | 0 → 0 |
+| `CodeMarshal` (`nojsonv2`) | 4.35 ms/op | **2.76 ms/op** | **-36.6%** (1.58×) | 1 → 1 |
+| `CodeUnmarshal` (`nojsonv2`) | 23.65 ms/op | **5.26 ms/op** | **-77.8%** (4.50×) | 39,990 → **26,770** |
+| `CodeUnmarshalReuse` (`nojsonv2`) | 22.21 ms/op | **4.49 ms/op** | **-79.8%** (4.95×) | 26,935 → **11,994** |
 | `MarshalMapRecords` (`nojsonv2`) | 790.8 µs/op | **462.7 µs/op** | **-41.5%** (1.71×) | 5,001 (218 KB) → **1 (74 KB)** |
 | `UnmarshalString` / `Int64` (`nojsonv2`) | 256.1 / 180.0 ns/op | **40.47 / 20.38 ns/op** | **-84.2% / -88.7%** | 2 / 1 → **0 / 0** |
 | `UnmarshalFloat64` / `Map` (`nojsonv2`) | 203.6 / 1,274 ns/op | **45.29 / 278.9 ns/op** | **-77.8% / -78.1%** | 1 / 12 → **0 / 3** |
-| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`v2`) | 625.3 ns/op | **527.6 / 395.5 ns/op** | **-15.6% / -36.8%** | 2 (256 B) → **1 (160 B) / 0 (0 B)** |
-| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`json`) | 678.8 ns/op | **645.5 / 412.7 ns/op** | **-4.9% / -39.2%** | 2 (256 B) → **1 (160 B) / 0 (0 B)** |
-| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`nojsonv2`) | 723.2 ns/op | **597.5 / 410.9 ns/op** | **-17.4% / -43.2%** | 2 (256 B) → **1 (160 B) / 0 (0 B)** |
-| Small Struct: `Encoder.Encode` → `EncodeOf` (`json` / `nojsonv2`) | 596.4 / 579.9 ns/op | **484.9 / 447.2 ns/op** | **-18.7% / -22.9%** | 1 (96 B) → **0 (0 B)** |
-
-> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz) comparing pre-patch `HEAD` (`3d9b976b`) against patched `encoding/json` and `encoding/json/v2`.*
+| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`json`) | 651.5 ns/op | **504.0 / 375.3 ns/op** | **-22.6% / -42.4%** | 2 (272 B) → **1 (176 B) / 0 (0 B)** |
+| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`nojsonv2`) | 637.2 ns/op | **491.6 / 346.4 ns/op** | **-22.8% / -45.6%** | 2 (272 B) → **1 (176 B) / 0 (0 B)** |
+| Small Struct: `Encoder.Encode` → `EncodeOf` (`json` / `nojsonv2`) | 571.7 / 550.3 ns/op | **437.5 / 392.6 ns/op** | **-23.5% / -28.7%** | 1 (96 B) → **0 (0 B)** |
+| `Valid` (`json` / `nojsonv2`) | 478.0 ns/op | **263.8 / 279.6 ns/op** | **-44.8%** | 0 → 0 |
 
 #### Generic Maps, UTF-8, Float, `[N]byte`, `time.Time`, and Custom Marshaler/Unmarshaler Fast Paths
 
@@ -412,7 +404,7 @@ xychart-beta
     x-axis ["SyntheaFhir Marshal", "SyntheaFhir Unmarshal", "CitmCatalog Unmarshal", "TwitterStatus Unmarshal", "CodeUnmarshal (v1)", "CodeUnmarshal (nojsonv2)"]
     y-axis "Latency (ms/op)" 0 --> 18
     bar [16.07, 12.74, 8.01, 3.91, 5.67, 5.47]
-    bar [7.43, 8.64, 3.97, 1.81, 4.75, 4.41]
+    bar [7.81, 9.40, 3.77, 2.06, 4.93, 5.26]
 ```
 
 | Benchmark | Baseline (`e35a63be`) | Patched | Latency Delta | Notes / Allocs |
@@ -421,20 +413,18 @@ xychart-beta
 | `FastV1GenericMap` (`json`, Marshal / Unmarshal) | 47.77 / 70.18 µs/op | **17.19 / 27.88 µs/op** | **-64.0% / -60.3%** | 71→**1** / 78→**76** allocs |
 | `FastV1GenericMap` (`nojsonv2`, Marshal / Unmarshal) | 35.40 / 93.81 µs/op | **17.31 / 27.13 µs/op** | **-51.1% / -71.1%** | 186→**1** / 146→**76** allocs |
 | `StringUnicode/Concrete` (`v2`, Marshal / Unmarshal) | 100.1 / 106.2 µs/op | **40.80 / 42.16 µs/op** | **-59.2% / -60.3%** | 2.45× / 2.52× |
-| `CitmCatalog/Concrete` (`v2`, Marshal / Unmarshal) | 2.23 / 8.01 ms/op | **0.90 / 3.97 ms/op** | **-59.6% / -50.5%** | Marshal: 17→**1** alloc |
-| `TwitterStatus/Concrete` (`v2`, Marshal / Unmarshal) | 1.77 / 3.91 ms/op | **0.75 / 1.81 ms/op** | **-57.3% / -53.6%** | Marshal: 21→**1** alloc |
-| `SyntheaFhir/Concrete` (`v2`, Marshal / Unmarshal) | 16.07 / 12.74 ms/op | **7.43 / 8.64 ms/op** | **-53.8% / -32.2%** | 2.16× / 1.47× |
+| `CitmCatalog/Concrete` (`v2`, Marshal / Unmarshal) | 2.23 / 8.01 ms/op | **0.96 / 3.77 ms/op** | **-57.0% / -52.9%** | Marshal: 17→**1** alloc |
+| `TwitterStatus/Concrete` (`v2`, Marshal / Unmarshal) | 1.77 / 3.91 ms/op | **0.83 / 2.06 ms/op** | **-53.3% / -47.2%** | Marshal: 21→**1** alloc |
+| `SyntheaFhir/Concrete` (`v2`, Marshal / Unmarshal) | 16.07 / 12.74 ms/op | **7.81 / 9.40 ms/op** | **-51.4% / -26.2%** | 2.06× / 1.36× |
 | `Bytes/Array` (`v2`, Marshal / Unmarshal) | 281.9 / 373.0 ns/op | **127.3 / 239.5 ns/op** | **-54.8% / -35.8%** | 2.21× / 1.56× |
 | `UnmarshalFloat64` (`json` / `nojsonv2`) | 50.41 / 45.44 ns/op | **26.86 / 22.43 ns/op** | **-46.7% / -50.6%** | 0→0 / 0→0 allocs |
 | `Unmarshal/Float` (`v2`) | 146.2 ns/op | **79.15 ns/op** | **-45.9%** (1.85×) | exact IEEE-754 fast path |
 | `JSONArshalV1` (`v2`, Marshal / Unmarshal) | 269.9 / 258.8 ns/op | **167.1 / 148.3 ns/op** | **-38.1% / -42.7%** | 1.62× / 1.75× |
-| `CanadaGeometry/Unmarshal/Concrete` (`v2`) | 2.50 ms/op | **1.68 ms/op** | **-33.0%** (1.49×) | exact IEEE-754 float path |
+| `CanadaGeometry/Unmarshal/Concrete` (`v2`) | 2.50 ms/op | **1.52–2.12 ms/op** | **-15% to -39%** | typed `[][2]float64` + exact float |
 | `GolangSource/Marshal/Interface` (`v2`) | 12.49 ms/op | **8.49 ms/op** | **-32.0%** (1.47×) | 2→**1** alloc |
-| `GolangSource/Concrete` (`v2`, Marshal / Unmarshal) | 4.82 / 9.65 ms/op | **4.50 / 8.01 ms/op** | **-6.5% / -17.1%** | 1.07× / 1.21× |
-| `CodeUnmarshal` (`json` / `nojsonv2`) | 5.67 / 5.47 ms/op | **4.75 / 4.41 ms/op** | **-16.3% / -19.4%** | 1.20× / 1.24× |
-| `CodeEncoder` (`json` / `nojsonv2`) | 2.30 / 2.17 ms/op | **2.07 / 2.04 ms/op** | **-10.0% / -5.8%** | 0→0 / 0→0 allocs |
-
-> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-patch `HEAD` (`e35a63be`) against the patched build.*
+| `GolangSource/Concrete` (`v2`, Marshal / Unmarshal) | 4.82 / 9.65 ms/op | **4.99 / 8.11 ms/op** | **~0% / -16.0%** | 1.00× / 1.19× |
+| `CodeUnmarshal` (`json` / `nojsonv2`) | 5.67 / 5.47 ms/op | **4.93 / 5.26 ms/op** | **-13.1% / -3.8%** | 1.15× / 1.04× |
+| `CodeEncoder` (`json` / `nojsonv2`) | 2.30 / 2.17 ms/op | **2.29 / 2.16 ms/op** | **-0.4% / -0.5%** | 0→0 / 0→0 allocs |
 
 #### Comparison Against Upstream Go `1.27.3` and Third-Party JSON Libraries
 
@@ -442,9 +432,9 @@ xychart-beta
 xychart-beta
     title "JSON Unmarshal Throughput (MB/s, higher is better)"
     x-axis ["SmallStruct", "TwitterStatus", "CitmCatalog", "GolangSource", "CanadaGeometry", "SyntheaFhir"]
-    y-axis "Throughput (MB/s)" 0 --> 450
+    y-axis "Throughput (MB/s)" 0 --> 475
     bar [65.4, 153.6, 201.5, 88.0, 66.4, 141.7]
-    bar [154.0, 315.6, 412.0, 239.2, 159.0, 231.4]
+    bar [156.8, 306.1, 458.0, 239.3, 177.7, 213.7]
     bar [177.2, 289.7, 410.3, 226.3, 241.3, 219.7]
     bar [140.2, 286.1, 356.4, 153.7, 224.0, 196.6]
     bar [122.0, 172.4, 343.1, 192.6, 106.0, 148.5]
@@ -455,9 +445,9 @@ xychart-beta
 xychart-beta
     title "JSON Marshal Throughput (MB/s, higher is better)"
     x-axis ["SmallStruct", "TwitterStatus", "CitmCatalog", "GolangSource", "CanadaGeometry", "SyntheaFhir"]
-    y-axis "Throughput (MB/s)" 0 --> 1050
+    y-axis "Throughput (MB/s)" 0 --> 1850
     bar [127.2, 228.1, 161.2, 173.0, 130.5, 143.7]
-    bar [273.1, 590.8, 550.9, 426.1, 187.4, 433.4]
+    bar [291.6, 763.7, 1801.4, 388.6, 154.9, 257.2]
     bar [361.3, 802.6, 604.7, 429.1, 225.3, 395.2]
     bar [353.2, 1014.2, 625.2, 220.7, 229.7, 189.7]
     bar [270.6, 433.1, 370.9, 339.7, 182.0, 321.0]
@@ -468,9 +458,9 @@ xychart-beta
 
 | Implementation | `SmallStruct` | `TwitterStatus` | `CitmCatalog` | `GolangSource` | `CanadaGeometry` | `SyntheaFhir` |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Illium** `encoding/json/v2` | 538.3 ns (1) | 837.2 µs (1) | 907.1 µs (1) | 4.55 ms (1) | 1.44 ms (1) | 7.21 ms (2,530) |
-| **Illium** `encoding/json` (`jsonv2`) | 526.1 ns (1) | 907.8 µs (1) | 982.4 µs (1) | 5.00 ms (1) | 1.55 ms (1) | 16.13 ms (2,598) |
-| **Illium** `encoding/json` (`nojsonv2`) | 493.0 ns (1) | 824.1 µs (1) | 941.3 µs (1) | 4.59 ms (1) | 1.41 ms (1) | 20.61 ms (18,022) |
+| **Illium** `encoding/json/v2` | 538.3 ns (1) | 827.0 µs (1) | 958.8 µs (1) | 4.99 ms (1) | 1.75 ms (1) | 7.81 ms (2,530) |
+| **Illium** `encoding/json` (`jsonv2`) | 504.0 ns (1) | 949.5 µs (1) | 1.08 ms (1) | 5.16 ms (1) | 1.66 ms (1) | 8.08 ms (2,531) |
+| **Illium** `encoding/json` (`nojsonv2`) | 491.6 ns (1) | 824.1 µs (1) | 941.3 µs (1) | 4.59 ms (1) | 1.41 ms (1) | 20.61 ms (18,022) |
 | Go `1.27.3` `encoding/json/v2` | 1.16 µs (1) | 2.17 ms (49) | 3.10 ms (125) | 11.22 ms (1) | 2.07 ms (1) | 21.75 ms (2,556) |
 | Go `1.27.3` `encoding/json` (`jsonv2`) | 1.15 µs (1) | 2.14 ms (89) | 2.99 ms (447) | 11.17 ms (1) | 2.05 ms (1) | 22.34 ms (2,586) |
 | Go `1.27.3` `encoding/json` (`nojsonv2`) | 870.7 ns (1) | 1.56 ms (141) | 2.05 ms (890) | 8.87 ms (1) | 1.87 ms (1) | 21.42 ms (18,010) |
@@ -483,9 +473,9 @@ xychart-beta
 
 | Implementation | `SmallStruct` | `TwitterStatus` | `CitmCatalog` | `GolangSource` | `CanadaGeometry` | `SyntheaFhir` |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Illium** `encoding/json/v2` | 954.5 ns (4) | 2.00 ms (2,939) | 4.19 ms (7,264) | 8.11 ms (13,946) | 1.70 ms (1,628) | 8.68 ms (14,538) |
-| **Illium** `encoding/json` (`jsonv2`) | 992.2 ns (4) | **1.85 ms (2,939)** | 3.97 ms (7,264) | 8.16 ms (13,946) | 1.69 ms (1,628) | 8.60 ms (13,610) |
-| **Illium** `encoding/json` (`nojsonv2`) | 848.4 ns (4) | 2.68 ms (2,939) | 3.68 ms (7,264) | **7.78 ms (13,946)** | 1.64 ms (1,628) | **8.21 ms (13,610)** |
+| **Illium** `encoding/json/v2` | 942.0 ns (4) | 2.06 ms (2,939) | 3.77 ms (7,265) | 8.11 ms (13,947) | 2.12 ms (1,628) | 9.40 ms (14,539) |
+| **Illium** `encoding/json` (`jsonv2`) | 942.0 ns (4) | **1.90 ms (2,939)** | 4.00 ms (7,265) | 8.47 ms (13,947) | 1.52 ms (1,628) | 11.59 ms (13,619) |
+| **Illium** `encoding/json` (`nojsonv2`) | 907.9 ns (4) | 2.68 ms (2,939) | 3.68 ms (7,264) | **7.78 ms (13,946)** | 1.64 ms (1,628) | **8.21 ms (13,610)** |
 | Go `1.27.3` `encoding/json/v2` | 2.25 µs (4) | 4.11 ms (2,981) | 8.57 ms (7,284) | 22.04 ms (13,946) | 4.07 ms (1,628) | 14.18 ms (14,562) |
 | Go `1.27.3` `encoding/json` (`jsonv2`) | 2.61 µs (4) | 5.38 ms (3,058) | 10.57 ms (7,392) | 25.86 ms (13,946) | 4.54 ms (1,628) | 18.42 ms (13,636) |
 | Go `1.27.3` `encoding/json` (`nojsonv2`) | 4.18 µs (14) | 9.63 ms (7,054) | 23.41 ms (16,734) | 41.46 ms (27,166) | 6.06 ms (1,641) | 33.41 ms (29,340) |
@@ -493,8 +483,6 @@ xychart-beta
 | `goccy/go-json` `v0.12.0` (v1) | **798.7 ns (7)** | 1.97 ms (4,877) | **3.67 ms (4,504)** | 8.29 ms (14,169) | **1.01 ms (750)** | 8.56 ms (28,921) |
 | `bytedance/sonic` `v1.15.5` | 1.05 µs (5) | 2.21 ms (814) | 4.85 ms (5,363) | 12.63 ms (1,735) | 1.21 ms (1,147) | 10.22 ms (7,084) |
 | `segmentio/encoding/json` `v0.5.4` | 1.20 µs (7) | 3.66 ms (5,673) | 5.03 ms (3,297) | 10.08 ms (13,885) | 2.55 ms (606) | 13.52 ms (28,576) |
-
-> *5-round medians (`-benchtime=400ms -count=5 -cpu=2`) on `linux/amd64` (Intel Xeon @ 2.30GHz, AVX2). Third-party libraries (`github.com/goccy/go-json` `v0.12.0` v1 & `v2`, `github.com/bytedance/sonic` `v1.15.5`, `github.com/segmentio/encoding/json` `v0.5.4`) and upstream `encoding/json` / `encoding/json/v2` were measured on Go `1.27.3` (where `sonic`'s native JIT/AVX2 backend is active; `sonic` `v1.15.5` falls back to `encoding/json` on `go1.28+`). Datasets: `SmallStruct` (147 B) and the canonical `encoding/json/internal/jsontest` concrete-type payloads (`TwitterStatus` 632 KB, `CitmCatalog` 1.73 MB, `GolangSource` 1.94 MB, `CanadaGeometry` 270 KB, `SyntheaFhir` 2.01 MB).*
 
 #### Cumulative `encoding/json` & `encoding/json/v2` Hardening & Fast Paths (`3d9b976b` → Current)
 
@@ -504,25 +492,22 @@ xychart-beta
 | `UnmarshalFloat64` | 234.3 ns/op | **23.44 ns/op** | **-90.0%** (10.00×) | `encoding/json` (`nojsonv2`) |
 | `UnmarshalString` | 269.3 ns/op | **41.13 ns/op** | **-84.7%** (6.55×) | `encoding/json` (`nojsonv2`) |
 | `UnmarshalFloat64` | 153.6 ns/op | **28.76 ns/op** | **-81.3%** (5.34×) | `encoding/json` (`jsonv2`) |
-| `CodeUnmarshal` | 23.28 ms/op | **4.65 ms/op** | **-80.0%** (5.01×) | `encoding/json` (`nojsonv2`) |
+| `CodeUnmarshal` | 23.28 ms/op | **5.26 ms/op** | **-77.4%** (4.43×) | `encoding/json` (`nojsonv2`) |
 | `UnmarshalInt64` | 122.7 ns/op | **25.92 ns/op** | **-78.9%** (4.73×) | `encoding/json` (`jsonv2`) |
 | `Marshal/Pointer` | 316.6 ns/op | **74.87 ns/op** | **-76.4%** (4.23×) | `encoding/json/v2` |
 | `Marshal/Map/ManySmall` | 16.03 µs/op | **3.88 µs/op** | **-75.8%** (4.13×) | `encoding/json/v2` |
 | `Unmarshal/Struct/ManySmall` | 8.44 µs/op | **2.26 µs/op** | **-73.3%** (3.74×) | `encoding/json/v2` |
 | `DecoderStream` | 550.0 ns/op | **152.2 ns/op** | **-72.3%** (3.61×) | `encoding/json` (`jsonv2`) |
 | `UnmarshalString` | 152.0 ns/op | **45.30 ns/op** | **-70.2%** (3.36×) | `encoding/json` (`jsonv2`) |
-| `CodeUnmarshalReuse` | 13.91 ms/op | **4.92 ms/op** | **-64.7%** (2.83×) | `encoding/json` (`jsonv2`) |
-| `GolangSource/Unmarshal/Concrete` | 22.90 ms/op | **8.62 ms/op** | **-62.4%** (2.66×) | `encoding/json/v2` |
-| `CodeUnmarshal` | 14.16 ms/op | **5.34 ms/op** | **-62.3%** (2.65×) | `encoding/json` (`jsonv2`) |
-| `CanadaGeometry/Unmarshal/Concrete` | 4.02 ms/op | **1.60 ms/op** | **-60.3%** (2.52×) | `encoding/json/v2` |
+| `CodeUnmarshalReuse` | 13.91 ms/op | **4.93 ms/op** | **-64.6%** (2.82×) | `encoding/json` (`jsonv2`) |
+| `GolangSource/Unmarshal/Concrete` | 22.90 ms/op | **8.11 ms/op** | **-64.6%** (2.82×) | `encoding/json/v2` |
+| `CodeUnmarshal` | 14.16 ms/op | **4.93 ms/op** | **-65.2%** (2.87×) | `encoding/json` (`jsonv2`) |
+| `CanadaGeometry/Unmarshal/Concrete` | 4.02 ms/op | **1.52–2.12 ms/op** | **-47% to -62%** | `encoding/json/v2` |
 | `Issue34127` | 315.9 ns/op | **134.4 ns/op** | **-57.5%** (2.35×) | `encoding/json` (`jsonv2`) |
-| `CitmCatalog/Unmarshal/Concrete` | 8.27 ms/op | **4.09 ms/op** | **-50.5%** (2.02×) | `encoding/json/v2` |
-| `TwitterStatus/Unmarshal/Concrete` | 3.85 ms/op | **1.93 ms/op** | **-49.8%** (1.99×) | `encoding/json/v2` |
-| `CodeEncoder` | 4.10 ms/op | **2.17 ms/op** | **-47.0%** (1.89×) | `encoding/json` (`jsonv2`) |
-| `CodeMarshal` | 4.83 ms/op | **2.91 ms/op** | **-39.8%** (1.66×) | `encoding/json` (`jsonv2`) |
-| **Package Geomean** (`json` / `nojsonv2` / `v2` core / `v2` testdata) | — | — | **-49.7% / -49.8% / -39.1% / -19.9%** | Interleaved 5-round medians |
-
-> *Measured as interleaved 5-round medians (`-benchtime=400ms -cpu=2`) on `linux/amd64` comparing pre-JSON-work `HEAD` (`3d9b976b`) against the current build.*
+| `CitmCatalog/Unmarshal/Concrete` | 8.27 ms/op | **3.77 ms/op** | **-54.4%** (2.19×) | `encoding/json/v2` |
+| `TwitterStatus/Unmarshal/Concrete` | 3.85 ms/op | **2.06 ms/op** | **-46.5%** (1.87×) | `encoding/json/v2` |
+| `CodeEncoder` | 4.10 ms/op | **2.29 ms/op** | **-44.1%** (1.79×) | `encoding/json` (`jsonv2`) |
+| `CodeMarshal` | 4.83 ms/op | **2.79 ms/op** | **-42.2%** (1.73×) | `encoding/json` (`jsonv2`) |
 
 ---
 

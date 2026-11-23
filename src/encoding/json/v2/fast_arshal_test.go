@@ -992,3 +992,232 @@ func TestFastOptionsAndEdgeSemantics(t *testing.T) {
 		}
 	})
 }
+
+type testV2RecCustom struct {
+	calls *int
+	val   string
+}
+
+func (c testV2RecCustom) MarshalJSON() ([]byte, error) {
+	if c.calls != nil {
+		*c.calls++
+	}
+	return Marshal(c.val)
+}
+
+func (c *testV2RecCustom) UnmarshalJSON(b []byte) error {
+	if c.calls != nil {
+		*c.calls++
+	}
+	return Unmarshal(b, &c.val)
+}
+
+func TestFastRegressionDAGCycleAndReplay(t *testing.T) {
+	t.Run("DAGSharedTypeNotMarkedCyclic", func(t *testing.T) {
+		type sharedLeaf struct {
+			K string `json:"k"`
+			V int    `json:"v"`
+		}
+		type dagRoot struct {
+			A sharedLeaf   `json:"a"`
+			B *sharedLeaf  `json:"b"`
+			C []sharedLeaf `json:"c"`
+			D any          `json:"d"`
+		}
+		mp := lookupFastMarshalPlan(abiTypeOfReflect(reflect.TypeFor[dagRoot]()))
+		up := lookupFastUnmarshalPlan(abiTypeOfReflect(reflect.TypeFor[dagRoot]()))
+		if mp.hasCycle || up.hasCycle {
+			t.Fatalf("DAG marked cyclic: mp.hasCycle=%v up.hasCycle=%v", mp.hasCycle, up.hasCycle)
+		}
+		if !mp.canFast || !up.canFast {
+			t.Fatalf("DAG fast path disabled: mp.canFast=%v up.canFast=%v", mp.canFast, up.canFast)
+		}
+		in := dagRoot{
+			A: sharedLeaf{K: "one", V: 1},
+			B: &sharedLeaf{K: "two", V: 2},
+			C: []sharedLeaf{{K: "three", V: 3}},
+			D: map[string]any{"x": float64(4)},
+		}
+		got, err := Marshal(in)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		var out dagRoot
+		if err := Unmarshal(got, &out); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if !reflect.DeepEqual(out, in) {
+			t.Fatalf("roundtrip mismatch: got %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("TrueCycleWithCustomAndAnyStaysFast", func(t *testing.T) {
+		type node struct {
+			Name string          `json:"name"`
+			Raw  any             `json:"raw,omitempty"`
+			C    testV2RecCustom `json:"c"`
+			Next *node           `json:"next,omitempty"`
+		}
+		mp := lookupFastMarshalPlan(abiTypeOfReflect(reflect.TypeFor[node]()))
+		up := lookupFastUnmarshalPlan(abiTypeOfReflect(reflect.TypeFor[node]()))
+		if !mp.hasCycle || !up.hasCycle {
+			t.Fatalf("expected true cycle detection: mp=%v up=%v", mp.hasCycle, up.hasCycle)
+		}
+		if !mp.canFast || !up.canFast {
+			t.Fatalf("expected hasCustom&&hasCycle fast path enabled: mp=%v up=%v", mp.canFast, up.canFast)
+		}
+		calls := 0
+		in := &node{
+			Name: "root",
+			Raw:  "val",
+			C:    testV2RecCustom{calls: &calls, val: "custom1"},
+			Next: &node{
+				Name: "child",
+				C:    testV2RecCustom{calls: &calls, val: "custom2"},
+			},
+		}
+		b, err := Marshal(in)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("marshal custom calls = %d, want 2", calls)
+		}
+		var out node
+		if err := Unmarshal(b, &out); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if out.Name != "root" || out.C.val != "custom1" || out.Next == nil || out.Next.Name != "child" || out.Next.C.val != "custom2" {
+			t.Fatalf("unexpected decoded tree: %+v", out)
+		}
+	})
+
+	t.Run("MapWithCyclicCustomUnmarshalerDisabledSafely", func(t *testing.T) {
+		type cyclicCustom struct {
+			C    testV2RecCustom `json:"c"`
+			Next *cyclicCustom   `json:"next,omitempty"`
+		}
+		mp := lookupFastUnmarshalPlan(abiTypeOfReflect(reflect.TypeFor[map[string]cyclicCustom]()))
+		if mp.canFast {
+			t.Fatalf("map with cyclic custom unmarshaler element must not use fast unmarshal")
+		}
+		var m map[string]cyclicCustom
+		if err := Unmarshal([]byte(`{"k":{"c":"v","next":{"c":"v2"}}}`), &m); err != nil {
+			t.Fatalf("Unmarshal map[string]cyclicCustom: %v", err)
+		}
+		if m["k"].C.val != "v" || m["k"].Next == nil || m["k"].Next.C.val != "v2" {
+			t.Fatalf("decoded map mismatch: %+v", m)
+		}
+	})
+
+	t.Run("CustomUnmarshalerAndTimeErrorReplay", func(t *testing.T) {
+		type S struct {
+			T1   time.Time       `json:"t1"`
+			C1   testV2RecCustom `json:"c1"`
+			T2   time.Time       `json:"t2"`
+			C2   testV2RecCustom `json:"c2"`
+			Tail int             `json:"tail"`
+		}
+
+		// Case 1: T1 precedes C1; T2 has an invalid timestamp.
+		// C1 must run once and T2 must not be skipped by custom-unmarshaler replay.
+		var c1Calls, c2Calls int
+		s := S{C1: testV2RecCustom{calls: &c1Calls}, C2: testV2RecCustom{calls: &c2Calls}}
+		inBadTimeAfter := []byte(`{"t1":"2026-01-02T03:04:05Z","c1":"ok1","t2":"not-a-time","c2":"ok2","tail":7}`)
+		err := Unmarshal(inBadTimeAfter, &s)
+		if err == nil {
+			t.Fatal("expected error for invalid t2")
+		}
+		if c1Calls != 1 {
+			t.Fatalf("c1 calls = %d, want 1", c1Calls)
+		}
+
+		// Case 2: Legacy semantics with custom unmarshaler before invalid T2 and trailing valid field.
+		c1Calls, c2Calls = 0, 0
+		s2 := S{C1: testV2RecCustom{calls: &c1Calls}, C2: testV2RecCustom{calls: &c2Calls}}
+		legacyOpts := flagOpt(jsonflags.ReportErrorsWithLegacySemantics, jsonflags.MergeWithLegacySemantics)
+		err = Unmarshal(inBadTimeAfter, &s2, legacyOpts)
+		if err == nil {
+			t.Fatal("expected legacy error for invalid t2")
+		}
+		if c1Calls != 1 {
+			t.Fatalf("legacy c1 calls = %d, want 1", c1Calls)
+		}
+
+		// Case 3: Legacy semantics where C1 runs before Tail type error ("tail":"bad") causing replay.
+		c1Calls, c2Calls = 0, 0
+		s3 := S{C1: testV2RecCustom{calls: &c1Calls}, C2: testV2RecCustom{calls: &c2Calls}}
+		err = Unmarshal([]byte(`{"c1":"ok1","t1":"2026-01-02T03:04:05Z","tail":"bad"}`), &s3, legacyOpts)
+		if err == nil {
+			t.Fatal("expected error for non-int tail")
+		}
+		if c1Calls != 1 {
+			t.Fatalf("legacy replay c1 calls = %d, want 1", c1Calls)
+		}
+		if s3.C1.val != "ok1" {
+			t.Fatalf("legacy partial c1 val = %q, want ok1", s3.C1.val)
+		}
+	})
+
+	t.Run("SlicePoint2F64Parity", func(t *testing.T) {
+		type ring struct {
+			Pts [][2]float64 `json:"pts"`
+		}
+		in := ring{Pts: [][2]float64{{-122.4194, 37.7749}, {0, -0.0}, {139.6917, 35.6895}}}
+		b, err := Marshal(in)
+		if err != nil {
+			t.Fatalf("Marshal ring: %v", err)
+		}
+		var gotV2 ring
+		if err := Unmarshal(b, &gotV2); err != nil {
+			t.Fatalf("Unmarshal v2 ring: %v", err)
+		}
+		if !reflect.DeepEqual(gotV2, in) {
+			t.Fatalf("v2 ring mismatch: got %+v, want %+v", gotV2, in)
+		}
+
+		// Legacy merge into non-empty slice with null element must fall back cleanly and preserve existing element.
+		pre := ring{Pts: [][2]float64{{10, 20}, {30, 40}}}
+		if err := Unmarshal([]byte(`{"pts":[[1,2],null]}`), &pre, flagOpt(jsonflags.MergeWithLegacySemantics)); err != nil {
+			t.Fatalf("Unmarshal legacy merge ring: %v", err)
+		}
+		if pre.Pts[0] != [2]float64{1, 2} || pre.Pts[1] != [2]float64{30, 40} {
+			t.Fatalf("legacy merge ring = %+v, want [[1 2] [30 40]]", pre.Pts)
+		}
+
+		// NaN error path parity.
+		badRing := ring{Pts: [][2]float64{{1, 2}, {3, math.NaN()}}}
+		if _, err := Marshal(badRing); err == nil {
+			t.Fatal("expected error marshaling NaN in [][2]float64")
+		}
+	})
+}
+
+func TestFastGenericOfZeroAlloc(t *testing.T) {
+	type flat struct {
+		A int64   `json:"a"`
+		B string  `json:"b"`
+		C float64 `json:"c"`
+		D bool    `json:"d"`
+	}
+	v := flat{A: 42, B: "hello", C: 3.5, D: true}
+	buf := make([]byte, 0, 256)
+	if n := testing.AllocsPerRun(50, func() {
+		var err error
+		buf, err = AppendMarshalOf(buf[:0], v)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}); n != 0 {
+		t.Fatalf("AppendMarshalOf allocs = %v, want 0", n)
+	}
+	if n := testing.AllocsPerRun(50, func() {
+		out, err := MarshalOf(v)
+		if err != nil || len(out) == 0 {
+			t.Fatalf("MarshalOf: %v", err)
+		}
+	}); n != 1 {
+		t.Fatalf("MarshalOf allocs = %v, want 1", n)
+	}
+}
+

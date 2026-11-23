@@ -88,7 +88,7 @@ func (dec *Decoder) Decode(v any) error {
 		e := (*v2StreamEface)(unsafe.Pointer(&v))
 		if e.typ != nil && e.typ.Kind() == abi.Pointer && e.data != nil {
 			handled, err := internal.FastUnmarshalDecode(dec.dec, dec.opts, uintptr(unsafe.Pointer(e.typ.Elem())), e.data)
-			runtime.KeepAlive(&v)
+			runtime.KeepAlive(v)
 			if handled {
 				dec.hadPeeked = false
 				dec.hadEOF = false

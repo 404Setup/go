@@ -287,10 +287,13 @@ func (d *decoderState) ContiguousValue() (buf []byte, atEOF bool, ok bool) {
 	}
 	d.invalidatePreviousRead()
 	if d.prevEnd == len(d.buf) {
-		if d.rd == nil || d.rdErr == io.EOF {
+		if d.rd == nil || d.rdErr != nil {
 			return nil, false, false
 		}
 		if err := d.fetch(); err != nil {
+			if ioErr, ok := err.(*ioError); ok {
+				d.rdErr = ioErr.err
+			}
 			return nil, false, false
 		}
 	}

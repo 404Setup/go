@@ -384,6 +384,7 @@ type v1FastUnmarshalPlan struct {
 	canFast        bool
 	hasCustom      bool
 	hasCycle       bool
+	building       bool
 	hasQuoted      bool
 	elemSize       uintptr
 	arrayLen       int
@@ -482,11 +483,14 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 		return p
 	}
 	if p, ok := visiting[at]; ok {
-		p.hasCycle = true
+		if p.building {
+			p.hasCycle = true
+		}
 		return p
 	}
-	p := &v1FastUnmarshalPlan{typ: at, rt: rt}
+	p := &v1FastUnmarshalPlan{typ: at, rt: rt, building: true}
 	visiting[at] = p
+	defer func() { p.building = false }()
 
 	if rt == v1TimeType {
 		p.kind = v1fkTime
@@ -584,6 +588,12 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 			p.kind = v1fkSliceFloat64
 		case v1fkFloat32:
 			p.kind = v1fkSliceFloat32
+		case v1fkArray:
+			if rt == v1SlicePoint2F64Type && ep.arrayLen == 2 && ep.elemPlan != nil && ep.elemPlan.kind == v1fkFloat64 {
+				p.kind = v1fkSlicePoint2F64
+			} else {
+				p.kind = v1fkSlice
+			}
 		default:
 			p.kind = v1fkSlice
 		}
@@ -1398,6 +1408,9 @@ func (d *v1FastDecoder) unmarshal(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, de
 
 	case v1fkSliceFloat32:
 		return d.unmarshalSliceFloat32(ptr)
+
+	case v1fkSlicePoint2F64:
+		return d.unmarshalSlicePoint2F64(ptr)
 
 	case v1fkSliceBool:
 		return d.unmarshalSliceBool(ptr)
@@ -2468,6 +2481,86 @@ func (d *v1FastDecoder) unmarshalSliceBool(ptr unsafe.Pointer) error {
 	}
 }
 
+func (d *v1FastDecoder) unmarshalSlicePoint2F64(ptr unsafe.Pointer) error {
+	c := d.data[d.pos]
+	if c == 'n' {
+		if d.consumeNull() {
+			*(*[][2]float64)(ptr) = nil
+			return nil
+		}
+		return errV1FastFallback
+	}
+	if c != '[' {
+		return errV1FastFallback
+	}
+	d.pos++
+	d.skipWS()
+	if d.pos < len(d.data) && d.data[d.pos] == ']' {
+		d.pos++
+		*(*[][2]float64)(ptr) = [][2]float64{}
+		return nil
+	}
+	sp := (*[][2]float64)(ptr)
+	s := *sp
+	s = s[:cap(s)]
+	i := 0
+	for {
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != '[' {
+			return errV1FastFallback
+		}
+		d.pos++
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errV1FastFallback
+		}
+		v0, err := d.readFloat(64)
+		if err != nil {
+			return err
+		}
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ',' {
+			return errV1FastFallback
+		}
+		d.pos++
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errV1FastFallback
+		}
+		v1, err := d.readFloat(64)
+		if err != nil {
+			return err
+		}
+		d.skipWS()
+		if d.pos >= len(d.data) || d.data[d.pos] != ']' {
+			return errV1FastFallback
+		}
+		d.pos++
+		pt := [2]float64{v0, v1}
+		if i < len(s) {
+			s[i] = pt
+		} else {
+			s = append(s, pt)
+			s = s[:cap(s)]
+		}
+		i++
+		d.skipWS()
+		if d.pos >= len(d.data) {
+			return errV1FastFallback
+		}
+		if d.data[d.pos] == ',' {
+			d.pos++
+			continue
+		}
+		if d.data[d.pos] == ']' {
+			d.pos++
+			*sp = s[:i]
+			return nil
+		}
+		return errV1FastFallback
+	}
+}
+
 func (d *v1FastDecoder) unmarshalSlice(p *v1FastUnmarshalPlan, ptr unsafe.Pointer, depth int) error {
 	c := d.data[d.pos]
 	if c == 'n' {
@@ -3177,7 +3270,7 @@ func v1IsTargetZero(p *v1FastUnmarshalPlan, ptr unsafe.Pointer) bool {
 		return *(*unsafe.Pointer)(ptr) == nil
 	case v1fkTime:
 		return (*time.Time)(ptr).IsZero()
-	case v1fkBytes, v1fkSliceBool, v1fkSliceString, v1fkSliceInt, v1fkSliceInt64, v1fkSliceUint64, v1fkSliceFloat64, v1fkSliceFloat32, v1fkSlice:
+	case v1fkBytes, v1fkSliceBool, v1fkSliceString, v1fkSliceInt, v1fkSliceInt64, v1fkSliceUint64, v1fkSliceFloat64, v1fkSliceFloat32, v1fkSlicePoint2F64, v1fkSlice:
 		return (*unsafeheader.Slice)(ptr).Data == nil
 	case v1fkMapStringString:
 		return *(*map[string]string)(ptr) == nil
