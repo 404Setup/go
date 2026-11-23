@@ -2341,3 +2341,4 @@ func (p *PageAlloc) ChunkHugePagesEnabled() bool {
 	return (*pageAlloc)(p).chunkHugePages
 }
 
+func SysRSS() (uint64, bool) { return sysRSS() }
