@@ -8,6 +8,7 @@ package cgo
 
 import (
 	"internal/cpu"
+	"internal/goos"
 	"internal/runtime/atomic"
 	"unsafe"
 )
@@ -171,7 +172,7 @@ var (
 //go:nosplit
 //go:norace
 //go:nocheckptr
-func cgoWaitRuntimeInitDone() uintptr {
+func cgoWaitRuntimeInit() uintptr {
 	if atomic.Load(&runtime_init_done) != 2 {
 		for atomic.Load(&runtime_init_done) == 0 {
 			cgoYieldWaitRuntimeInit()
@@ -187,10 +188,23 @@ func cgoWaitRuntimeInitDone() uintptr {
 	// initialization to be complete anyhow, later, by waiting for
 	// main_init_done to be closed in cgocallbackg1. We should wait here
 	// instead. See also issue #15943.
-	if pfn := atomic.Loaduintptr(&cgo_context_function); pfn != 0 {
+	return atomic.Loaduintptr(&cgo_context_function)
+}
+
+//go:nosplit
+//go:norace
+//go:nocheckptr
+func cgoWaitRuntimeInitDone() uintptr {
+	if pfn := cgoWaitRuntimeInit(); pfn != 0 {
 		var arg cgoContextArg
 		msanUnpoisonNoG(unsafe.Pointer(&arg), unsafe.Sizeof(arg))
-		asmcgocallNoG(pfn, uintptr(unsafe.Pointer(&arg)), 0, 0, 0, 0, 0)
+		fn := pfn
+		if goos.IsAix != 0 {
+			// On AIX, cgoCallTrampoline expects the address of a
+			// function descriptor pointer (see asm_unix_ppc64x.s).
+			fn = uintptr(unsafe.Pointer(&pfn))
+		}
+		asmcgocallNoG(fn, uintptr(unsafe.Pointer(&arg)), 0, 0, 0, 0, 0)
 		return arg.context
 	}
 	return 0
@@ -216,7 +230,12 @@ func cgoReleaseContext(ctxt uintptr) {
 	if pfn := atomic.Loaduintptr(&cgo_context_function); pfn != 0 {
 		arg := cgoContextArg{context: ctxt}
 		msanUnpoisonNoG(unsafe.Pointer(&arg), unsafe.Sizeof(arg))
-		asmcgocallNoG(pfn, uintptr(unsafe.Pointer(&arg)), 0, 0, 0, 0, 0)
+		fn := pfn
+		if goos.IsAix != 0 {
+			// See cgoWaitRuntimeInitDone.
+			fn = uintptr(unsafe.Pointer(&pfn))
+		}
+		asmcgocallNoG(fn, uintptr(unsafe.Pointer(&arg)), 0, 0, 0, 0, 0)
 	}
 }
 

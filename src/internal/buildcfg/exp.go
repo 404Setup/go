@@ -80,24 +80,28 @@ func ParseGOEXPERIMENT(goos, goarch, goexp string) (*ExperimentFlags, error) {
 
 	var runtimeCgoPuregoSupported bool
 	switch goos {
+	case "aix":
+		runtimeCgoPuregoSupported = goarch == "ppc64"
 	case "linux":
-		runtimeCgoPuregoSupported = goarch == "386" || goarch == "amd64" || goarch == "arm" || goarch == "arm64" || goarch == "loong64" || goarch == "riscv64"
+		switch goarch {
+		case "386", "amd64", "arm", "arm64", "loong64", "mips", "mipsle", "mips64", "mips64le", "ppc64", "ppc64le", "riscv64", "s390x":
+			runtimeCgoPuregoSupported = true
+		}
 	case "android", "netbsd":
 		runtimeCgoPuregoSupported = goarch == "386" || goarch == "amd64" || goarch == "arm" || goarch == "arm64"
-	case "darwin":
+	case "darwin", "ios":
 		runtimeCgoPuregoSupported = goarch == "amd64" || goarch == "arm64"
-	case "openbsd":
+	case "freebsd", "openbsd":
 		switch goarch {
 		case "386", "amd64", "arm", "arm64", "riscv64":
 			runtimeCgoPuregoSupported = true
 		}
-	case "windows":
+	case "dragonfly", "solaris", "illumos":
 		runtimeCgoPuregoSupported = goarch == "amd64"
+	case "windows":
+		runtimeCgoPuregoSupported = goarch == "386" || goarch == "amd64" || goarch == "arm64"
 	}
-	// So far, cmd/cgo only knows the C ABI of amd64, and of arm64
-	// outside Windows.
-	cgoBindingsSupported := runtimeCgoPuregoSupported &&
-		(goarch == "amd64" || (goarch == "arm64" && goos != "windows"))
+	cgoBindingsSupported := runtimeCgoPuregoSupported
 
 	baseline := goexperiment.Flags{
 		RegabiWrappers:        regabiSupported,

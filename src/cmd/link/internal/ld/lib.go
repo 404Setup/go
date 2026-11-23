@@ -1914,6 +1914,9 @@ func (ctxt *Link) hostlink() {
 			args := append(args, "-maix64", "--print-file-name="+file)
 			out, err := exec.Command(name, args...).CombinedOutput()
 			if err != nil {
+				if buildcfg.Experiment.RuntimeCgoPurego && iscgo && len(hostobj) == 0 {
+					Exitf("cgo on %s/%s requires an external linker (C toolchain); set CC or use CGO_ENABLED=0: running %s failed: %v\n%s", buildcfg.GOOS, buildcfg.GOARCH, name, err, out)
+				}
 				log.Fatalf("running %s failed: %v\n%s", extld, err, out)
 			}
 			return strings.Trim(string(out), "\n")
@@ -2047,6 +2050,9 @@ func (ctxt *Link) hostlink() {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if buildcfg.Experiment.RuntimeCgoPurego && iscgo && len(hostobj) == 0 && (platform.MustLinkExternalWithoutHostObj(buildcfg.GOOS, buildcfg.GOARCH) || buildcfg.GOOS == "ios") {
+			Exitf("cgo on %s/%s requires an external linker (C toolchain); set CC or use CGO_ENABLED=0: running %s failed: %v\n%s\n%s", buildcfg.GOOS, buildcfg.GOARCH, argv[0], err, cmd, out)
+		}
 		Exitf("running %s failed: %v\n%s\n%s", argv[0], err, cmd, out)
 	}
 

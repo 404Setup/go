@@ -150,11 +150,15 @@ type ELFArch struct {
 	Androiddynld   string
 	Linuxdynld     string
 	LinuxdynldMusl string
-	Freebsddynld   string
-	Netbsddynld    string
-	Openbsddynld   string
-	Dragonflydynld string
-	Solarisdynld   string
+	// LinuxdynldFallbacks lists additional fallback Linux dynamic linkers
+	// tried on native builds when neither Linuxdynld nor LinuxdynldMusl
+	// exists on the host (for example, armhf/armel dynamic linkers).
+	LinuxdynldFallbacks []string
+	Freebsddynld        string
+	Netbsddynld         string
+	Openbsddynld        string
+	Dragonflydynld      string
+	Solarisdynld        string
 
 	Reloc1    func(*Link, *OutBuf, *loader.Loader, loader.Sym, loader.ExtReloc, int, int64) bool
 	RelocSize uint32 // size of an ELF relocation record, must match Reloc1.
@@ -1568,8 +1572,8 @@ func (ctxt *Link) doelf() {
 			Elfwritedynent(ctxt.Arch, dynamic, elf.DT_RELENT, ELF32RELSIZE)
 		}
 
-		if rpath.val != "" {
-			Elfwritedynent(ctxt.Arch, dynamic, elf.DT_RUNPATH, uint64(dynstr.Addstring(rpath.val)))
+		if rp := internalRpaths(); len(rp) > 0 {
+			Elfwritedynent(ctxt.Arch, dynamic, elf.DT_RUNPATH, uint64(dynstr.Addstring(strings.Join(rp, ":"))))
 		}
 
 		if ctxt.IsPPC64() {
@@ -1835,13 +1839,22 @@ func asmbElf(ctxt *Link) {
 					}
 				} else {
 					interpreter = thearch.ELF.Linuxdynld
-					// If interpreter does not exist, try musl instead.
-					// This lets the same cmd/link binary work on
-					// both glibc-based and musl-based systems.
+					// If interpreter does not exist, try musl instead (and on native
+					// builds, any arch-specific fallbacks such as armhf/armel).
+					// This lets the same cmd/link binary work on both glibc-based and
+					// musl-based systems, and on armhf/armel hosts regardless of GOARM.
 					if _, err := os.Stat(interpreter); err != nil {
 						if musl := thearch.ELF.LinuxdynldMusl; musl != "" {
 							if _, err := os.Stat(musl); err == nil {
 								interpreter = musl
+							}
+						}
+						if interpreter == thearch.ELF.Linuxdynld && buildcfg.GOOS == runtime.GOOS && buildcfg.GOARCH == runtime.GOARCH {
+							for _, alt := range thearch.ELF.LinuxdynldFallbacks {
+								if _, err := os.Stat(alt); err == nil {
+									interpreter = alt
+									break
+								}
 							}
 						}
 					}
@@ -2099,6 +2112,18 @@ func asmbElf(ctxt *Link) {
 		ph := newElfPhdr()
 		ph.Type = elf.PT_SUNWSTACK
 		ph.Flags = elf.PF_W + elf.PF_R
+	}
+
+	if s := ldr.Lookup(".eh_frame_hdr", 0); s != 0 && ldr.AttrReachable(s) {
+		sh := elfshname(".eh_frame_hdr")
+		sh.Type = uint32(elf.SHT_PROGBITS)
+		sh.Flags = uint64(elf.SHF_ALLOC)
+		sh.Addralign = 4
+		shsym(sh, ldr, s)
+		ph := newElfPhdr()
+		ph.Type = elf.PT_GNU_EH_FRAME
+		ph.Flags = elf.PF_R
+		phsh(ph, sh)
 	}
 
 elfobj:
