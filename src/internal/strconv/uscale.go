@@ -288,3 +288,215 @@ func numDigits(d uint64) int {
 	nd := log10Pow2(bits.Len64(d))
 	return nd + bool2[int](d >= uint64pow10[nd])
 }
+
+// ParseFloat64Fast parses d * 10^p (where d has at most 19 decimal digits)
+// to an exact IEEE-754 float64. It returns (0, false) on overflow or out-of-range p.
+func ParseFloat64Fast(d uint64, p int, neg bool) (float64, bool) {
+	if d == 0 {
+		if neg {
+			return float64frombits(1 << 63), true
+		}
+		return 0, true
+	}
+	if p > 310 {
+		return 0, false
+	}
+	if p < -345 {
+		if neg {
+			return float64frombits(1 << 63), true
+		}
+		return 0, true
+	}
+	if f, ok := atof64exact(d, p, neg); ok {
+		return f, true
+	}
+	sign := bool2[uint64](neg) << 63
+	f, err := parseFloat64(d, p, sign)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+// ParseFloat32Fast parses d * 10^p (where d has at most 19 decimal digits)
+// to an exact IEEE-754 float32. It returns (0, false) on overflow or out-of-range p.
+func ParseFloat32Fast(d uint64, p int, neg bool) (float32, bool) {
+	if d == 0 {
+		if neg {
+			return float32frombits(1 << 31), true
+		}
+		return 0, true
+	}
+	if p > 40 {
+		return 0, false
+	}
+	if p < -70 {
+		if neg {
+			return float32frombits(1 << 31), true
+		}
+		return 0, true
+	}
+	if f, ok := atof32exact(d, p, neg); ok {
+		return f, true
+	}
+	sign := bool2[uint32](neg) << 31
+	f, err := parseFloat32(d, p, sign)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+// AppendFloatECMA appends val to dst in ECMA-262 shortest JSON format for bits (32 or 64).
+func AppendFloatECMA(dst []byte, val float64, bitsArg int) []byte {
+	var neg, useE bool
+	var d uint64
+	var p int
+	if bitsArg == 32 {
+		f32 := float32(val)
+		b := float32bits(f32)
+		neg = b>>31 != 0
+		exp := int(b>>23) & 0xFF
+		mant := uint64(b & (1<<23 - 1))
+		if exp == 0xFF {
+			return ftoa32(dst, f32, 'g', -1)
+		}
+		if mant == 0 && exp == 0 {
+			if neg {
+				return append(dst, '-', '0')
+			}
+			return append(dst, '0')
+		}
+		abs32 := float32frombits(b &^ (1 << 31))
+		if abs32 < 1<<23 {
+			if i := int64(f32); float32(i) == f32 {
+				return AppendInt10(dst, i)
+			}
+		}
+		if exp == 0 {
+			exp++
+		} else {
+			mant |= 1 << float32MantBits
+		}
+		exp += float32Bias
+		s := 64 - bits.Len64(mant)
+		d, p = shortFloat[float32](mant<<s, exp-s-float32MantBits)
+		useE = abs32 < 1e-6 || abs32 >= 1e21
+	} else {
+		b := float64bits(val)
+		neg = b>>63 != 0
+		exp := int(b>>52) & 0x7FF
+		mant := b & (1<<52 - 1)
+		if exp == 0x7FF {
+			return ftoa64(dst, val, 'g', -1)
+		}
+		if mant == 0 && exp == 0 {
+			if neg {
+				return append(dst, '-', '0')
+			}
+			return append(dst, '0')
+		}
+		abs := float64frombits(b &^ (1 << 63))
+		if abs < 1<<52 {
+			if i := int64(val); float64(i) == val {
+				return AppendInt10(dst, i)
+			}
+		}
+		if exp == 0 {
+			exp++
+		} else {
+			mant |= 1 << float64MantBits
+		}
+		exp += float64Bias
+		s := 64 - bits.Len64(mant)
+		d, p = shortFloat[float64](mant<<s, exp-s-float64MantBits)
+		useE = abs < 1e-6 || abs >= 1e21
+	}
+
+	nd := numDigits(d)
+	dp := nd + p
+	for d >= 100 && d%100 == 0 {
+		d /= 100
+		nd -= 2
+	}
+	if d%10 == 0 {
+		d /= 10
+		nd--
+	}
+
+	off := len(dst)
+	if cap(dst)-off < 32 {
+		dst = growBytes(dst, 32)
+	}
+	out := dst[off : off+32 : off+32]
+	pos := 0
+	if neg {
+		out[0] = '-'
+		pos = 1
+	}
+
+	if !useE {
+		if dp <= 0 {
+			out[pos] = '0'
+			out[pos+1] = '.'
+			lz := -dp
+			for k := range lz {
+				out[pos+2+k] = '0'
+			}
+			pos += 2 + lz
+			formatBase10(out[pos:pos+nd], d)
+			return dst[:off+pos+nd]
+		}
+		if dp >= nd {
+			formatBase10(out[pos:pos+nd], d)
+			for k := nd; k < dp; k++ {
+				out[pos+k] = '0'
+			}
+			return dst[:off+pos+dp]
+		}
+		// 0 < dp < nd: format digits at pos+1..pos+1+nd, shift integer part left by 1, insert '.'.
+		formatBase10(out[pos+1:pos+1+nd], d)
+		for k := range dp {
+			out[pos+k] = out[pos+1+k]
+		}
+		out[pos+dp] = '.'
+		return dst[:off+pos+nd+1]
+	}
+
+	if nd == 1 {
+		out[pos] = byte('0' + d)
+		pos++
+	} else {
+		formatBase10(out[pos+1:pos+1+nd], d)
+		out[pos] = out[pos+1]
+		out[pos+1] = '.'
+		pos += nd + 1
+	}
+	out[pos] = 'e'
+	pos++
+	exp10 := dp - 1
+	if exp10 < 0 {
+		out[pos] = '-'
+		exp10 = -exp10
+	} else {
+		out[pos] = '+'
+	}
+	pos++
+	switch {
+	case exp10 < 10:
+		out[pos] = byte('0' + exp10)
+		pos++
+	case exp10 < 100:
+		x := exp10 * 2
+		out[pos] = smalls[x]
+		out[pos+1] = smalls[x+1]
+		pos += 2
+	default:
+		out[pos] = byte('0' + exp10/100)
+		x := (exp10 % 100) * 2
+		out[pos+1] = smalls[x]
+		out[pos+2] = smalls[x+1]
+		pos += 3
+	}
+	return dst[:off+pos]
+}

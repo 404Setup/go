@@ -1221,3 +1221,117 @@ func TestFastGenericOfZeroAlloc(t *testing.T) {
 	}
 }
 
+func TestFastSliceStackBufferAndFloat19(t *testing.T) {
+	t.Run("SliceLengthsAndReuse", func(t *testing.T) {
+		type slicesStruct struct {
+			S  []string     `json:"s"`
+			I  []int        `json:"i"`
+			I6 []int64      `json:"i6"`
+			U6 []uint64     `json:"u6"`
+			F6 []float64    `json:"f6"`
+			P2 [][2]float64 `json:"p2"`
+		}
+		for _, n := range []int{0, 1, 7, 8, 9, 15, 16, 17, 35} {
+			in := slicesStruct{
+				S:  make([]string, n),
+				I:  make([]int, n),
+				I6: make([]int64, n),
+				U6: make([]uint64, n),
+				F6: make([]float64, n),
+				P2: make([][2]float64, n),
+			}
+			for j := range n {
+				in.S[j] = "item-" + strconv.Itoa(j)
+				in.I[j] = -j * 17
+				in.I6[j] = int64(j) * 1000000000003
+				in.U6[j] = uint64(j) * 1000000000007
+				in.F6[j] = -79.123456789012345 + float64(j)*0.000125
+				in.P2[j] = [2]float64{-79.523456789012345 + float64(j)*0.01, 43.654321098765432 - float64(j)*0.01}
+			}
+			raw, err := Marshal(in)
+			if err != nil {
+				t.Fatalf("n=%d Marshal: %v", n, err)
+			}
+			// Also marshal a second time to exercise adaptive sizeHint path (and then shrink).
+			raw2, err := Marshal(in)
+			if err != nil || !bytes.Equal(raw, raw2) {
+				t.Fatalf("n=%d second Marshal mismatch: %v", n, err)
+			}
+			var got slicesStruct
+			if err := Unmarshal(raw, &got); err != nil {
+				t.Fatalf("n=%d Unmarshal: %v", n, err)
+			}
+			if !reflect.DeepEqual(got, in) {
+				t.Fatalf("n=%d roundtrip mismatch:\ngot  %+v\nwant %+v", n, got, in)
+			}
+		}
+	})
+
+	t.Run("Float19DigitAndFallbackParity", func(t *testing.T) {
+		type floatCase struct {
+			raw  string
+			want float64
+		}
+		cases := []floatCase{
+			{`-79.523456789012345`, -79.523456789012345},
+			{`0.123456789012345678`, 0.123456789012345678},
+			{`1234567890123456789`, 1234567890123456789},
+			{`12345678901234567890.5`, 12345678901234567890.5},
+			{`-0`, math.Copysign(0, -1)},
+			{`-0.0`, math.Copysign(0, -1)},
+			{`1e-323`, 1e-323},
+			{`1.7976931348623157e308`, math.MaxFloat64},
+		}
+		for _, tc := range cases {
+			var got float64
+			if err := Unmarshal([]byte(tc.raw), &got); err != nil {
+				t.Fatalf("Unmarshal(%s): %v", tc.raw, err)
+			}
+			if math.Float64bits(got) != math.Float64bits(tc.want) {
+				t.Fatalf("Unmarshal(%s) = %v (%x), want %v (%x)", tc.raw, got, math.Float64bits(got), tc.want, math.Float64bits(tc.want))
+			}
+		}
+		var ov float64
+		if err := Unmarshal([]byte(`1e400`), &ov); err == nil {
+			t.Fatal("expected overflow error for 1e400")
+		}
+	})
+
+	t.Run("UTF8EmojiAndBoundarySequences", func(t *testing.T) {
+		type msg struct {
+			Text string `json:"text"`
+		}
+		samples := []string{
+			"hello 世界 🚀✨🎉",
+			"\u0800\u0fff\ud7ff\ue000\uffff",
+			"line1\u2028line2\u2029end",
+			"mixed \"quotes\" \n\t and 日本語テスト emoji 😀👍🏽!",
+		}
+		for _, s := range samples {
+			in := msg{Text: s}
+			bDefault, err := Marshal(in)
+			if err != nil {
+				t.Fatalf("Marshal(%q): %v", s, err)
+			}
+			var out msg
+			if err := Unmarshal(bDefault, &out); err != nil || out.Text != s {
+				t.Fatalf("roundtrip(%q) = %+v, err=%v", s, out, err)
+			}
+			bJS, err := Marshal(in, flagOpt(jsonflags.EscapeForJS))
+			if err != nil {
+				t.Fatalf("Marshal EscapeForJS(%q): %v", s, err)
+			}
+			if strings.Contains(s, "\u2028") && !strings.Contains(string(bJS), `\u2028`) {
+				t.Fatalf("EscapeForJS failed to escape U+2028: %s", bJS)
+			}
+		}
+		// Invalid UTF-8 sequences must error by default.
+		for _, bad := range []string{"\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe0\x80\x80", "\xc2"} {
+			if _, err := Marshal(msg{Text: bad}); err == nil {
+				t.Fatalf("expected UTF-8 error for %x", bad)
+			}
+		}
+	})
+}
+
+

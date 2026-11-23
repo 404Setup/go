@@ -14,6 +14,7 @@ import (
 	"internal/abi"
 	"internal/byteorder"
 	"internal/runtime/maps"
+	istrconv "internal/strconv"
 	"internal/unsafeheader"
 	"math"
 	"math/bits"
@@ -22,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"sync/v2"
 	"time"
 	"unicode/utf8"
@@ -230,15 +232,43 @@ func v1AppendQuoteStringSlow(dst []byte, src string, b []byte, i int, escapeHTML
 			if b0 < utf8.RuneSelf {
 				break
 			}
-			if b0 >= 0xE3 && b0 <= 0xEC || b0 == 0xE1 || b0 == 0xEE || b0 == 0xEF {
-				if i+2 < len(b) && b[i+1]&0xC0 == 0x80 && b[i+2]&0xC0 == 0x80 {
-					i += 3
-					continue
-				}
-			} else if b0 >= 0xC2 && b0 <= 0xDF {
+			if b0 >= 0xC2 && b0 <= 0xDF {
 				if i+1 < len(b) && b[i+1]&0xC0 == 0x80 {
 					i += 2
 					continue
+				}
+			} else if b0 >= 0xE0 && b0 <= 0xEF {
+				if i+2 < len(b) && b[i+2]&0xC0 == 0x80 {
+					b1 := b[i+1]
+					if b0 == 0xE2 {
+						if b1&0xC0 == 0x80 && (b1 != 0x80 || (b[i+2] != 0xA8 && b[i+2] != 0xA9)) {
+							i += 3
+							continue
+						}
+					} else if b0 == 0xE0 {
+						if b1 >= 0xA0 && b1 <= 0xBF {
+							i += 3
+							continue
+						}
+					} else if b0 == 0xED {
+						if b1 >= 0x80 && b1 <= 0x9F {
+							i += 3
+							continue
+						}
+					} else if b1&0xC0 == 0x80 {
+						i += 3
+						continue
+					}
+				}
+			} else if b0 >= 0xF0 && b0 <= 0xF4 {
+				if i+3 < len(b) && b[i+2]&0xC0 == 0x80 && b[i+3]&0xC0 == 0x80 {
+					b1 := b[i+1]
+					if (b0 == 0xF0 && b1 >= 0x90 && b1 <= 0xBF) ||
+						(b0 >= 0xF1 && b0 <= 0xF3 && b1&0xC0 == 0x80) ||
+						(b0 == 0xF4 && b1 >= 0x80 && b1 <= 0x8F) {
+						i += 4
+						continue
+					}
 				}
 			}
 			r, size := utf8.DecodeRuneInString(src[i:])
@@ -265,39 +295,7 @@ func v1AppendQuoteStringSlow(dst []byte, src string, b []byte, i int, escapeHTML
 }
 
 func v1AppendFloat(b []byte, f float64, bits int) []byte {
-	if f == 0 {
-		if math.Signbit(f) {
-			return append(b, '-', '0')
-		}
-		return append(b, '0')
-	}
-	abs := math.Abs(f)
-	if bits == 64 {
-		if abs < 1<<52 {
-			if i := int64(f); float64(i) == f {
-				return strconv.AppendInt(b, i, 10)
-			}
-		}
-	} else {
-		if abs < 1<<23 {
-			if i := int64(f); float64(i) == f {
-				return strconv.AppendInt(b, i, 10)
-			}
-		}
-	}
-	fmt := byte('f')
-	if bits == 64 && (abs < 1e-6 || abs >= 1e21) || bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
-		fmt = 'e'
-	}
-	b = strconv.AppendFloat(b, f, fmt, -1, bits)
-	if fmt == 'e' {
-		n := len(b)
-		if n >= 4 && b[n-4] == 'e' && b[n-3] == '-' && b[n-2] == '0' {
-			b[n-2] = b[n-1]
-			b = b[:n-1]
-		}
-	}
-	return b
+	return istrconv.AppendFloatECMA(b, f, bits)
 }
 
 type v1FastBuf struct {
@@ -429,20 +427,21 @@ type v1FastMarshalField struct {
 }
 
 type v1FastMarshalPlan struct {
-	typ       *abi.Type
-	rt        reflect.Type
-	mapType   *abi.MapType
-	ifaceTab  unsafe.Pointer
-	kind      v1FastKind
-	keyBits   uint8
-	canFast   bool
-	hasCustom bool
-	hasCycle  bool
-	building  bool
+	typ         *abi.Type
+	rt          reflect.Type
+	mapType     *abi.MapType
+	ifaceTab    unsafe.Pointer
+	kind        v1FastKind
+	keyBits     uint8
+	canFast     bool
+	hasCustom   bool
+	hasCycle    bool
+	building    bool
 	hasOmit     bool
 	hasQuoted   bool
 	isFlatSmall bool
 	minSize     int
+	sizeHint    atomic.Uint32
 	elemSize    uintptr
 	arrayLen    int
 	elemPlan    *v1FastMarshalPlan
@@ -803,27 +802,27 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 	case v1fkString:
 		return v1AppendQuoteString(b, *(*string)(ptr), escapeHTML), nil
 	case v1fkInt:
-		return strconv.AppendInt(b, int64(*(*int)(ptr)), 10), nil
+		return istrconv.AppendInt10(b, int64(*(*int)(ptr))), nil
 	case v1fkInt8:
-		return strconv.AppendInt(b, int64(*(*int8)(ptr)), 10), nil
+		return istrconv.AppendInt10(b, int64(*(*int8)(ptr))), nil
 	case v1fkInt16:
-		return strconv.AppendInt(b, int64(*(*int16)(ptr)), 10), nil
+		return istrconv.AppendInt10(b, int64(*(*int16)(ptr))), nil
 	case v1fkInt32:
-		return strconv.AppendInt(b, int64(*(*int32)(ptr)), 10), nil
+		return istrconv.AppendInt10(b, int64(*(*int32)(ptr))), nil
 	case v1fkInt64:
-		return strconv.AppendInt(b, *(*int64)(ptr), 10), nil
+		return istrconv.AppendInt10(b, *(*int64)(ptr)), nil
 	case v1fkUint:
-		return strconv.AppendUint(b, uint64(*(*uint)(ptr)), 10), nil
+		return istrconv.AppendUint10(b, uint64(*(*uint)(ptr))), nil
 	case v1fkUint8:
-		return strconv.AppendUint(b, uint64(*(*uint8)(ptr)), 10), nil
+		return istrconv.AppendUint10(b, uint64(*(*uint8)(ptr))), nil
 	case v1fkUint16:
-		return strconv.AppendUint(b, uint64(*(*uint16)(ptr)), 10), nil
+		return istrconv.AppendUint10(b, uint64(*(*uint16)(ptr))), nil
 	case v1fkUint32:
-		return strconv.AppendUint(b, uint64(*(*uint32)(ptr)), 10), nil
+		return istrconv.AppendUint10(b, uint64(*(*uint32)(ptr))), nil
 	case v1fkUint64:
-		return strconv.AppendUint(b, *(*uint64)(ptr), 10), nil
+		return istrconv.AppendUint10(b, *(*uint64)(ptr)), nil
 	case v1fkUintptr:
-		return strconv.AppendUint(b, uint64(*(*uintptr)(ptr)), 10), nil
+		return istrconv.AppendUint10(b, uint64(*(*uintptr)(ptr))), nil
 	case v1fkFloat32:
 		fv := float64(*(*float32)(ptr))
 		if math.IsNaN(fv) || math.IsInf(fv, 0) {
@@ -904,12 +903,15 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 		if len(s) == 0 {
 			return append(b, "[]"...), nil
 		}
+		if len(s) >= 8 {
+			b = slices.Grow(b, len(s)*4+2)
+		}
 		b = append(b, '[')
 		for i, v := range s {
 			if i > 0 {
 				b = append(b, ',')
 			}
-			b = strconv.AppendInt(b, int64(v), 10)
+			b = istrconv.AppendInt10(b, int64(v))
 		}
 		return append(b, ']'), nil
 	case v1fkSliceInt64:
@@ -920,12 +922,15 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 		if len(s) == 0 {
 			return append(b, "[]"...), nil
 		}
+		if len(s) >= 8 {
+			b = slices.Grow(b, len(s)*4+2)
+		}
 		b = append(b, '[')
 		for i, v := range s {
 			if i > 0 {
 				b = append(b, ',')
 			}
-			b = strconv.AppendInt(b, v, 10)
+			b = istrconv.AppendInt10(b, v)
 		}
 		return append(b, ']'), nil
 	case v1fkSliceUint64:
@@ -936,12 +941,15 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 		if len(s) == 0 {
 			return append(b, "[]"...), nil
 		}
+		if len(s) >= 8 {
+			b = slices.Grow(b, len(s)*4+2)
+		}
 		b = append(b, '[')
 		for i, v := range s {
 			if i > 0 {
 				b = append(b, ',')
 			}
-			b = strconv.AppendUint(b, v, 10)
+			b = istrconv.AppendUint10(b, v)
 		}
 		return append(b, ']'), nil
 	case v1fkSliceFloat64:
@@ -991,7 +999,7 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 		if len(s) == 0 {
 			return append(b, "[]"...), nil
 		}
-		b = slices.Grow(b, len(s)*24+2)
+		b = slices.Grow(b, len(s)*38+2)
 		b = append(b, '[')
 		for i, pt := range s {
 			if i > 0 {
@@ -1005,9 +1013,9 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 				return nil, v1UnsupportedFloatError(p.elemPlan.elemPlan.rt, unsafe.Pointer(&s[i][1]), v1, 64)
 			}
 			b = append(b, '[')
-			b = v1AppendFloat(b, v0, 64)
+			b = istrconv.AppendFloatECMA(b, v0, 64)
 			b = append(b, ',')
-			b = v1AppendFloat(b, v1, 64)
+			b = istrconv.AppendFloatECMA(b, v1, 64)
 			b = append(b, ']')
 		}
 		return append(b, ']'), nil
@@ -1318,29 +1326,29 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 			case v1fkString:
 				b = v1AppendQuoteString(b, *(*string)(fp), escapeHTML)
 			case v1fkInt:
-				b = strconv.AppendInt(b, int64(*(*int)(fp)), 10)
+				b = istrconv.AppendInt10(b, int64(*(*int)(fp)))
 			case v1fkInt32:
-				b = strconv.AppendInt(b, int64(*(*int32)(fp)), 10)
+				b = istrconv.AppendInt10(b, int64(*(*int32)(fp)))
 			case v1fkInt64:
-				b = strconv.AppendInt(b, *(*int64)(fp), 10)
+				b = istrconv.AppendInt10(b, *(*int64)(fp))
 			case v1fkUint:
-				b = strconv.AppendUint(b, uint64(*(*uint)(fp)), 10)
+				b = istrconv.AppendUint10(b, uint64(*(*uint)(fp)))
 			case v1fkUint32:
-				b = strconv.AppendUint(b, uint64(*(*uint32)(fp)), 10)
+				b = istrconv.AppendUint10(b, uint64(*(*uint32)(fp)))
 			case v1fkUint64:
-				b = strconv.AppendUint(b, *(*uint64)(fp), 10)
+				b = istrconv.AppendUint10(b, *(*uint64)(fp))
 			case v1fkFloat64:
 				fv := *(*float64)(fp)
 				if math.IsNaN(fv) || math.IsInf(fv, 0) {
 					return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 64)
 				}
-				b = v1AppendFloat(b, fv, 64)
+				b = istrconv.AppendFloatECMA(b, fv, 64)
 			case v1fkFloat32:
 				fv := float64(*(*float32)(fp))
 				if math.IsNaN(fv) || math.IsInf(fv, 0) {
 					return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 32)
 				}
-				b = v1AppendFloat(b, fv, 32)
+				b = istrconv.AppendFloatECMA(b, fv, 32)
 			case v1fkBool:
 				if *(*bool)(fp) {
 					b = append(b, "true"...)
@@ -1390,29 +1398,29 @@ func (p *v1FastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, escapeHT
 				b = v1AppendQuoteString(b, *(*string)(fp), escapeHTML)
 			}
 		case v1fkInt:
-			b = strconv.AppendInt(b, int64(*(*int)(fp)), 10)
+			b = istrconv.AppendInt10(b, int64(*(*int)(fp)))
 		case v1fkInt32:
-			b = strconv.AppendInt(b, int64(*(*int32)(fp)), 10)
+			b = istrconv.AppendInt10(b, int64(*(*int32)(fp)))
 		case v1fkInt64:
-			b = strconv.AppendInt(b, *(*int64)(fp), 10)
+			b = istrconv.AppendInt10(b, *(*int64)(fp))
 		case v1fkUint:
-			b = strconv.AppendUint(b, uint64(*(*uint)(fp)), 10)
+			b = istrconv.AppendUint10(b, uint64(*(*uint)(fp)))
 		case v1fkUint32:
-			b = strconv.AppendUint(b, uint64(*(*uint32)(fp)), 10)
+			b = istrconv.AppendUint10(b, uint64(*(*uint32)(fp)))
 		case v1fkUint64:
-			b = strconv.AppendUint(b, *(*uint64)(fp), 10)
+			b = istrconv.AppendUint10(b, *(*uint64)(fp))
 		case v1fkFloat64:
 			fv := *(*float64)(fp)
 			if math.IsNaN(fv) || math.IsInf(fv, 0) {
 				return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 64)
 			}
-			b = v1AppendFloat(b, fv, 64)
+			b = istrconv.AppendFloatECMA(b, fv, 64)
 		case v1fkFloat32:
 			fv := float64(*(*float32)(fp))
 			if math.IsNaN(fv) || math.IsInf(fv, 0) {
 				return nil, v1UnsupportedFloatError(f.plan.rt, fp, fv, 32)
 			}
-			b = v1AppendFloat(b, fv, 32)
+			b = istrconv.AppendFloatECMA(b, fv, 32)
 		case v1fkBool:
 			if *(*bool)(fp) {
 				b = append(b, "true"...)
@@ -1717,7 +1725,7 @@ func (p *v1FastMarshalPlan) marshalMapIntElem(b []byte, ptr unsafe.Pointer, esca
 		it.Init(p.mapType, m)
 		for it.Next(); it.Key() != nil; it.Next() {
 			b = append(b, '"')
-			b = strconv.AppendInt(b, v1ReadSignedKey(it.Key(), keyBits), 10)
+			b = istrconv.AppendInt10(b, v1ReadSignedKey(it.Key(), keyBits))
 			b = append(b, '"', ':')
 			if b, err = elemPlan.marshal(b, it.Elem(), escapeHTML, depth); err != nil {
 				return nil, err
@@ -1734,7 +1742,7 @@ func (p *v1FastMarshalPlan) marshalMapIntElem(b []byte, ptr unsafe.Pointer, esca
 		e := &entries[i]
 		e.v = it.Elem()
 		buf := append(e.buf[:0], '"')
-		buf = strconv.AppendInt(buf, v1ReadSignedKey(it.Key(), keyBits), 10)
+		buf = istrconv.AppendInt10(buf, v1ReadSignedKey(it.Key(), keyBits))
 		buf = append(buf, '"', ':')
 		e.n = uint8(len(buf))
 		i++
@@ -1779,7 +1787,7 @@ func (p *v1FastMarshalPlan) marshalMapUintElem(b []byte, ptr unsafe.Pointer, esc
 		it.Init(p.mapType, m)
 		for it.Next(); it.Key() != nil; it.Next() {
 			b = append(b, '"')
-			b = strconv.AppendUint(b, v1ReadUnsignedKey(it.Key(), keyBits), 10)
+			b = istrconv.AppendUint10(b, v1ReadUnsignedKey(it.Key(), keyBits))
 			b = append(b, '"', ':')
 			if b, err = elemPlan.marshal(b, it.Elem(), escapeHTML, depth); err != nil {
 				return nil, err
@@ -1796,7 +1804,7 @@ func (p *v1FastMarshalPlan) marshalMapUintElem(b []byte, ptr unsafe.Pointer, esc
 		e := &entries[i]
 		e.v = it.Elem()
 		buf := append(e.buf[:0], '"')
-		buf = strconv.AppendUint(buf, v1ReadUnsignedKey(it.Key(), keyBits), 10)
+		buf = istrconv.AppendUint10(buf, v1ReadUnsignedKey(it.Key(), keyBits))
 		buf = append(buf, '"', ':')
 		e.n = uint8(len(buf))
 		i++
@@ -1869,7 +1877,7 @@ func v1MarshalFastMapStringInt(b []byte, m map[string]int, escapeHTML bool) ([]b
 		for k, v := range m {
 			b = v1AppendQuoteString(b, k, escapeHTML)
 			b = append(b, ':')
-			b = strconv.AppendInt(b, int64(v), 10)
+			b = istrconv.AppendInt10(b, int64(v))
 		}
 		return append(b, '}'), nil
 	}
@@ -1886,7 +1894,7 @@ func v1MarshalFastMapStringInt(b []byte, m map[string]int, escapeHTML bool) ([]b
 		}
 		b = v1AppendQuoteString(b, k, escapeHTML)
 		b = append(b, ':')
-		b = strconv.AppendInt(b, int64(m[k]), 10)
+		b = istrconv.AppendInt10(b, int64(m[k]))
 	}
 	putV1Strings(names)
 	return append(b, '}'), nil
@@ -1952,17 +1960,17 @@ func v1MarshalFastAny(b []byte, val any, escapeHTML bool, depth int) ([]byte, er
 	case string:
 		return v1AppendQuoteString(b, v, escapeHTML), nil
 	case int:
-		return strconv.AppendInt(b, int64(v), 10), nil
+		return istrconv.AppendInt10(b, int64(v)), nil
 	case int64:
-		return strconv.AppendInt(b, v, 10), nil
+		return istrconv.AppendInt10(b, v), nil
 	case int32:
-		return strconv.AppendInt(b, int64(v), 10), nil
+		return istrconv.AppendInt10(b, int64(v)), nil
 	case uint:
-		return strconv.AppendUint(b, uint64(v), 10), nil
+		return istrconv.AppendUint10(b, uint64(v)), nil
 	case uint64:
-		return strconv.AppendUint(b, v, 10), nil
+		return istrconv.AppendUint10(b, v), nil
 	case uint32:
-		return strconv.AppendUint(b, uint64(v), 10), nil
+		return istrconv.AppendUint10(b, uint64(v)), nil
 	case float64:
 		if math.IsNaN(v) || math.IsInf(v, 0) {
 			return nil, &UnsupportedValueError{Value: reflect.ValueOf(v), Str: strconv.FormatFloat(v, 'g', -1, 64)}
@@ -2006,7 +2014,7 @@ func v1MarshalFastAny(b []byte, val any, escapeHTML bool, depth int) ([]byte, er
 			if i > 0 {
 				b = append(b, ',')
 			}
-			b = strconv.AppendInt(b, int64(x), 10)
+			b = istrconv.AppendInt10(b, int64(x))
 		}
 		return append(b, ']'), nil
 	case []string:
@@ -2048,7 +2056,7 @@ func v1MarshalFastAnyEface(b []byte, val any, escapeHTML bool, depth int) ([]byt
 	plan := lookupV1FastMarshalPlan(at)
 	if plan.canFast {
 		out, err := plan.marshal(b, ptr, escapeHTML, depth+1)
-		runtime.KeepAlive(&val)
+		runtime.KeepAlive(val)
 		return out, err
 	}
 	return v1MarshalReflect(b, val, escapeHTML, depth+1)
@@ -2090,37 +2098,37 @@ func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML 
 		}
 	case v1fkInt:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendInt10(scratch[:0], int64(*(*int)(ptr)))), nil
 	case v1fkInt8:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int8)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendInt10(scratch[:0], int64(*(*int8)(ptr)))), nil
 	case v1fkInt16:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int16)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendInt10(scratch[:0], int64(*(*int16)(ptr)))), nil
 	case v1fkInt32:
 		var scratch [16]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], int64(*(*int32)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendInt10(scratch[:0], int64(*(*int32)(ptr)))), nil
 	case v1fkInt64:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendInt(scratch[:0], *(*int64)(ptr), 10)), nil
+		return bytes.Clone(istrconv.AppendInt10(scratch[:0], *(*int64)(ptr))), nil
 	case v1fkUint:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendUint10(scratch[:0], uint64(*(*uint)(ptr)))), nil
 	case v1fkUint8:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint8)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendUint10(scratch[:0], uint64(*(*uint8)(ptr)))), nil
 	case v1fkUint16:
 		var scratch [8]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint16)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendUint10(scratch[:0], uint64(*(*uint16)(ptr)))), nil
 	case v1fkUint32:
 		var scratch [16]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uint32)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendUint10(scratch[:0], uint64(*(*uint32)(ptr)))), nil
 	case v1fkUint64:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], *(*uint64)(ptr), 10)), nil
+		return bytes.Clone(istrconv.AppendUint10(scratch[:0], *(*uint64)(ptr))), nil
 	case v1fkUintptr:
 		var scratch [32]byte
-		return bytes.Clone(strconv.AppendUint(scratch[:0], uint64(*(*uintptr)(ptr)), 10)), nil
+		return bytes.Clone(istrconv.AppendUint10(scratch[:0], uint64(*(*uintptr)(ptr)))), nil
 	case v1fkFloat32:
 		fv := float64(*(*float32)(ptr))
 		if math.IsNaN(fv) || math.IsInf(fv, 0) {
@@ -2144,6 +2152,18 @@ func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML 
 		}
 		return b, nil
 	}
+	if hint := int(plan.sizeHint.Load()); hint > 0 {
+		b, err := plan.marshal(make([]byte, 0, hint), ptr, escapeHTML, 0)
+		if err != nil {
+			return nil, err
+		}
+		if len(b) > hint {
+			plan.sizeHint.Store(uint32(min(len(b)+len(b)>>5+64, 64<<20)))
+		} else if len(b)*2 < hint {
+			plan.sizeHint.Store(uint32(max(len(b)+len(b)>>4+64, 256)))
+		}
+		return b, nil
+	}
 	fb := getV1FastBuf()
 	b, err := plan.marshal(fb.b, ptr, escapeHTML, 0)
 	if err != nil {
@@ -2154,6 +2174,9 @@ func v1MarshalFastAlloc(plan *v1FastMarshalPlan, ptr unsafe.Pointer, escapeHTML 
 		}
 		v1FastBufPool.Put(fb)
 		return nil, err
+	}
+	if len(b) >= 64 {
+		plan.sizeHint.CompareAndSwap(0, uint32(min(len(b)+len(b)>>5+64, 64<<20)))
 	}
 	fb.b = b
 	out := bytes.Clone(b)

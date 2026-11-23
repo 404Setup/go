@@ -80,6 +80,44 @@ func AppendUint(dst []byte, i uint64, base int) []byte {
 	return dst
 }
 
+//go:noinline
+func growBytes(dst []byte, n int) []byte {
+	var zero [32]byte
+	cur := len(dst)
+	dst = append(dst, zero[:n]...)
+	return dst[:cur]
+}
+
+// AppendInt10 appends the base-10 string form of i directly to dst.
+func AppendInt10(dst []byte, i int64) []byte {
+	u := uint64(i)
+	if i < 0 {
+		dst = append(dst, '-')
+		u = -u
+	}
+	return AppendUint10(dst, u)
+}
+
+// AppendUint10 appends the base-10 string form of i directly to dst without
+// an intermediate stack copy.
+func AppendUint10(dst []byte, i uint64) []byte {
+	if i < 10 {
+		return append(dst, byte('0'+i))
+	}
+	if i < nSmalls {
+		x := i * 2
+		return append(dst, smalls[x], smalls[x+1])
+	}
+	nd := numDigits(i)
+	off := len(dst)
+	if cap(dst)-off < nd {
+		dst = growBytes(dst, nd)
+	}
+	dst = dst[:off+nd]
+	formatBase10(dst[off:], i)
+	return dst
+}
+
 const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 // formatBits computes the string representation of u in the given base.

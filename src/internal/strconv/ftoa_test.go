@@ -388,3 +388,105 @@ func BenchmarkAppendFloat(b *testing.B) {
 		})
 	}
 }
+
+func TestAppendFloatECMAAndParseFast(t *testing.T) {
+	refECMA := func(f float64, bits int) string {
+		if bits == 32 {
+			f = float64(float32(f))
+		}
+		if f == 0 {
+			if math.Signbit(f) {
+				return "-0"
+			}
+			return "0"
+		}
+		abs := math.Abs(f)
+		if bits == 64 && abs < 1<<52 {
+			if i := int64(f); float64(i) == f {
+				return FormatInt(i, 10)
+			}
+		} else if bits == 32 && abs < 1<<23 {
+			if i := int64(f); float64(i) == f {
+				return FormatInt(i, 10)
+			}
+		}
+		fmt := byte('f')
+		if bits == 64 && (abs < 1e-6 || abs >= 1e21) || bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
+			fmt = 'e'
+		}
+		dst := AppendFloat(nil, f, fmt, -1, bits)
+		if fmt == 'e' {
+			n := len(dst)
+			if n >= 4 && dst[n-4] == 'e' && dst[n-3] == '-' && dst[n-2] == '0' {
+				dst[n-2] = dst[n-1]
+				dst = dst[:n-1]
+			}
+		}
+		return string(dst)
+	}
+
+	vals := []float64{
+		0, math.Copysign(0, -1), 1, -1, 0.5, -0.5, 98.75, -79.52345678901234,
+		1e-6, -1e-6, math.Nextafter(1e-6, 0), math.Nextafter(1e-6, 1),
+		1e-7, 1e-9, 1e-10, 1e-100, 1e-308, math.SmallestNonzeroFloat64,
+		1e15, 1e16, 1e20, math.Nextafter(1e21, 0), 1e21, -1e21, 1e100, math.MaxFloat64,
+		float64(math.SmallestNonzeroFloat32), float64(math.MaxFloat32),
+		float64(float32(1e-6)), float64(math.Nextafter32(1e-6, 0)),
+		float64(float32(1e20)), float64(math.Nextafter32(1e21, 0)), float64(float32(1e21)),
+	}
+	var seed uint64 = 0x9e3779b97f4a7c15
+	for range 5000 {
+		seed ^= seed >> 12
+		seed ^= seed << 25
+		seed ^= seed >> 27
+		x := seed * 0x2545F4914F6CDD1D
+		f := math.Float64frombits(x)
+		if !math.IsNaN(f) && !math.IsInf(f, 0) {
+			vals = append(vals, f)
+		}
+	}
+	for _, f := range vals {
+		if got, want := string(AppendFloatECMA(nil, f, 64)), refECMA(f, 64); got != want {
+			t.Fatalf("AppendFloatECMA(%v, 64) = %q, want %q", f, got, want)
+		}
+		f32 := float32(f)
+		if !math.IsNaN(float64(f32)) && !math.IsInf(float64(f32), 0) {
+			if got, want := string(AppendFloatECMA(nil, float64(f32), 32)), refECMA(float64(f32), 32); got != want {
+				t.Fatalf("AppendFloatECMA(%v, 32) = %q, want %q", f32, got, want)
+			}
+		}
+	}
+
+	// Verify ParseFloat64Fast and ParseFloat32Fast against ParseFloat for 1..19 digits.
+	parseCases := []struct {
+		mant uint64
+		exp  int
+		neg  bool
+	}{
+		{0, 0, false}, {0, 0, true}, {0, -500, true},
+		{1, 0, false}, {79523456789012345, -15, true},
+		{1234567890123456789, -18, false}, {9999999999999999999, -25, true},
+		{1234567890123456789, 250, false}, {1234567890123456789, -330, true},
+		{5, -324, false}, {17976931348623157, 292, false},
+	}
+	for _, tc := range parseCases {
+		s := FormatUint(tc.mant, 10) + "e" + FormatInt(int64(tc.exp), 10)
+		if tc.neg {
+			s = "-" + s
+		}
+		if got, ok := ParseFloat64Fast(tc.mant, tc.exp, tc.neg); ok {
+			want, err := ParseFloat(s, 64)
+			if err != nil || math.Float64bits(got) != math.Float64bits(want) {
+				t.Fatalf("ParseFloat64Fast(%d,%d,%v) = %v (%x), want %v (%x), err=%v", tc.mant, tc.exp, tc.neg, got, math.Float64bits(got), want, math.Float64bits(want), err)
+			}
+		}
+		if got, ok := ParseFloat32Fast(tc.mant, tc.exp, tc.neg); ok {
+			want64, err := ParseFloat(s, 32)
+			want := float32(want64)
+			if err != nil || math.Float32bits(got) != math.Float32bits(want) {
+				t.Fatalf("ParseFloat32Fast(%d,%d,%v) = %v (%x), want %v (%x), err=%v", tc.mant, tc.exp, tc.neg, got, math.Float32bits(got), want, math.Float32bits(want), err)
+			}
+		}
+	}
+}
+

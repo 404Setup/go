@@ -793,3 +793,91 @@ func TestFastV1RegressionAndSecurity(t *testing.T) {
 	})
 }
 
+func TestFastV1SliceStackBufferFloat19AndUTF8(t *testing.T) {
+	type slicesStruct struct {
+		S  []string     `json:"s"`
+		I  []int        `json:"i"`
+		I6 []int64      `json:"i6"`
+		U6 []uint64     `json:"u6"`
+		F6 []float64    `json:"f6"`
+		P2 [][2]float64 `json:"p2"`
+	}
+	for _, n := range []int{0, 1, 7, 8, 9, 15, 16, 17, 35} {
+		in := slicesStruct{
+			S:  make([]string, n),
+			I:  make([]int, n),
+			I6: make([]int64, n),
+			U6: make([]uint64, n),
+			F6: make([]float64, n),
+			P2: make([][2]float64, n),
+		}
+		for j := range n {
+			in.S[j] = "tag-" + strconv.Itoa(j)
+			in.I[j] = -j * 13
+			in.I6[j] = int64(j) * 1000000000003
+			in.U6[j] = uint64(j) * 1000000000007
+			in.F6[j] = -79.123456789012345 + float64(j)*0.000125
+			in.P2[j] = [2]float64{-79.523456789012345 + float64(j)*0.01, 43.654321098765432 - float64(j)*0.01}
+		}
+		raw, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("n=%d Marshal: %v", n, err)
+		}
+		raw2, err := json.Marshal(in)
+		if err != nil || !bytes.Equal(raw, raw2) {
+			t.Fatalf("n=%d second Marshal mismatch: %v", n, err)
+		}
+		var got slicesStruct
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("n=%d Unmarshal: %v", n, err)
+		}
+		if !reflect.DeepEqual(got, in) {
+			t.Fatalf("n=%d roundtrip mismatch:\ngot  %+v\nwant %+v", n, got, in)
+		}
+	}
+
+	// 16-19 digit float roundtrip & overflow rejection.
+	for _, tc := range []struct {
+		raw  string
+		want float64
+	}{
+		{`-79.523456789012345`, -79.523456789012345},
+		{`0.123456789012345678`, 0.123456789012345678},
+		{`12345678901234567890.5`, 12345678901234567890.5},
+		{`-0`, math.Copysign(0, -1)},
+	} {
+		var got float64
+		if err := json.Unmarshal([]byte(tc.raw), &got); err != nil {
+			t.Fatalf("Unmarshal(%s): %v", tc.raw, err)
+		}
+		if math.Float64bits(got) != math.Float64bits(tc.want) {
+			t.Fatalf("Unmarshal(%s) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+	var ov float64
+	if err := json.Unmarshal([]byte(`1e400`), &ov); err == nil {
+		t.Fatal("expected overflow error for 1e400")
+	}
+
+	// UTF-8 2/3/4-byte and JS separator escaping parity.
+	type msg struct {
+		Text string `json:"text"`
+	}
+	for _, s := range []string{
+		"hello 世界 🚀✨🎉",
+		"line1\u2028line2\u2029end",
+		"x\xed\xa0\x80y",
+		"x\xf4\x90\x80\x80y",
+	} {
+		b, err := json.Marshal(msg{Text: s})
+		if err != nil {
+			t.Fatalf("Marshal(%x): %v", s, err)
+		}
+		var out msg
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatalf("Unmarshal(%s): %v", b, err)
+		}
+	}
+}
+
+

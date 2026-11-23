@@ -357,44 +357,45 @@ xychart-beta
     x-axis ["CodeMarshal (v1/v2)", "CodeEncoder (v1/v2)", "CodeUnmarshal (v1/v2)", "GolangSrc Marshal (v2)", "GolangSrc Unmarshal (v2)", "CodeUnmarshal (nojsonv2)"]
     y-axis "Latency (ms/op)" 0 --> 25
     bar [4.55, 4.26, 13.59, 9.67, 21.13, 23.65]
-    bar [2.79, 2.29, 4.93, 4.99, 8.11, 5.26]
+    bar [2.52, 1.91, 4.54, 3.70, 7.81, 4.14]
 ```
 
 #### `encoding/json` (default `jsonv2`) and `encoding/json/v2`
 
 | Benchmark | Baseline (`3d9b976b`) | Patched | Latency Delta | Allocs (`Baseline` → `Patched`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `CodeEncoder` (`encoding/json`) | 4.26 ms/op | **2.29 ms/op** | **-46.2%** (1.86×) | 0 → 0 |
-| `CodeMarshal` (`encoding/json`) | 4.55 ms/op | **2.79 ms/op** | **-38.7%** (1.63×) | 1 → 1 |
-| `CodeUnmarshal` (`encoding/json`) | 13.59 ms/op | **4.93 ms/op** | **-63.7%** (2.76×) | 26,771 → 26,770 |
-| `CodeUnmarshalReuse` (`encoding/json`) | 13.92 ms/op | **4.93 ms/op** | **-64.6%** (2.82×) | 12,823 → **12,034** |
-| `UnmarshalString` (`encoding/json`) | 154.8 ns/op | **43.98 ns/op** | **-71.6%** (3.52×) | 0 → 0 |
-| `UnmarshalInt64` (`encoding/json`) | 138.8 ns/op | **49.98 ns/op** | **-64.0%** (2.78×) | 0 → 0 |
-| `UnmarshalFloat64` (`encoding/json`) | 172.5 ns/op | **76.79 ns/op** | **-55.5%** (2.25×) | 0 → 0 |
-| `UnmarshalMap` (`encoding/json`) | 941.5 ns/op | **288.3 ns/op** | **-69.4%** (3.27×) | 8 (104 B) → **3 (24 B)** |
-| `GolangSource/Marshal/Concrete` (`v2`) | 9.67 ms/op | **4.99 ms/op** | **-48.4%** (1.94×) | 2 → **1** |
-| `GolangSource/Unmarshal/Concrete` (`v2`) | 21.13 ms/op | **8.11 ms/op** | **-61.6%** (2.61×) | 13,948 → 13,947 |
-| `MarshalRecords/1` / `10000` (`v2`) | 874.1 ns / 7.24 ms | **416.3 ns / 4.01 ms** | **-52.4% / -44.6%** | 1 / 1 → 1 / 1 |
-| `MarshalMapRecords` (`v2`) | 860.2 µs/op | **300.6 µs/op** | **-65.0%** (2.86×) | 2,001 (106 KB) → **1 (74 KB)** |
-| `MarshalAny` (`Ints` / `Mixed` / `Map`, `v2`) | 884.9 / 1,295 / 2,230 ns | **290.6 / 343.6 / 649.8 ns** | **-67.2% / -73.5% / -70.9%** | 1 / 1 / 3 → **1 / 1 / 1** |
-| `Marshal` (`String` / `Int`, `v2`) | 180.7 / 176.0 ns/op | **89.82 / 84.73 ns/op** | **-50.3% / -51.9%** | 1 / 1 → 1 / 1 |
-| `Unmarshal` (`String` / `Int`, `v2`) | 219.1 / 224.8 ns/op | **117.0 / 71.70 ns/op** | **-46.6% / -68.1%** | 1 / 1 → 1 / 1 |
+| `CodeEncoder` (`encoding/json`) | 4.26 ms/op | **1.91 ms/op** | **-55.2%** (2.23×) | 0 → 0 |
+| `CodeMarshal` (`encoding/json`) | 4.55 ms/op | **2.52 ms/op** | **-44.6%** (1.81×) | 1 → 1 |
+| `CodeUnmarshal` (`encoding/json`) | 13.59 ms/op | **4.54 ms/op** | **-66.6%** (2.99×) | 26,771 → 26,770 |
+| `CodeUnmarshalReuse` (`encoding/json`) | 13.92 ms/op | **4.53 ms/op** | **-67.5%** (3.07×) | 12,823 → **11,994** |
+| `UnmarshalString` (`encoding/json`) | 154.8 ns/op | **45.30 ns/op** | **-70.7%** (3.42×) | 0 → 0 |
+| `UnmarshalInt64` (`encoding/json`) | 138.8 ns/op | **49.59 ns/op** | **-64.3%** (2.80×) | 0 → 0 |
+| `UnmarshalFloat64` (`encoding/json`) | 172.5 ns/op | **54.69 ns/op** | **-68.3%** (3.15×) | 0 → 0 |
+| `UnmarshalMap` (`encoding/json`) | 941.5 ns/op | **289.0 ns/op** | **-69.3%** (3.26×) | 8 (104 B) → **3 (24 B)** |
+| `GolangSource/Marshal/Concrete` (`v2`) | 9.67 ms/op | **3.70 ms/op** | **-61.7%** (2.61×) | 2 → **1** |
+| `GolangSource/Unmarshal/Concrete` (`v2`) | 21.13 ms/op | **7.81 ms/op** | **-63.0%** (2.71×) | 13,948 → 13,947 |
+| `MarshalRecords/1` / `10000` (`v2`) | 874.1 ns / 7.24 ms | **365.6 ns / 2.84 ms** | **-58.2% / -60.8%** | 1 / 1 → 1 / 1 |
+| `MarshalMapRecords` (`v2`) | 860.2 µs/op | **256.3 µs/op** | **-70.2%** (3.36×) | 2,001 (106 KB) → **1 (80 KB)** |
+| `MarshalAny` (`Ints` / `Mixed` / `Map`, `v2`) | 884.9 / 1,295 / 2,230 ns | **302.2 / 302.8 / 549.3 ns** | **-65.8% / -76.6% / -75.4%** | 1 / 1 / 3 → **1 / 1 / 1** |
+| `Marshal` (`String` / `Int`, `v2`) | 180.7 / 176.0 ns/op | **101.2 / 93.99 ns/op** | **-44.0% / -46.6%** | 1 / 1 → 1 / 1 |
+| `Unmarshal` (`String` / `Int`, `v2`) | 219.1 / 224.8 ns/op | **129.7 / 78.56 ns/op** | **-40.8% / -65.1%** | 1 / 1 → 1 / 1 |
 
 #### Legacy `encoding/json` (`GOEXPERIMENT=nojsonv2`) and Generic `*Of` / `Append*` APIs
 
 | Benchmark | Baseline (`3d9b976b`) / `any` API | Patched / Generic API | Latency Delta | Allocs (`Before` → `After`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `CodeEncoder` (`nojsonv2`) | 3.62 ms/op | **2.16 ms/op** | **-40.3%** (1.68×) | 0 → 0 |
-| `CodeMarshal` (`nojsonv2`) | 4.35 ms/op | **2.76 ms/op** | **-36.6%** (1.58×) | 1 → 1 |
-| `CodeUnmarshal` (`nojsonv2`) | 23.65 ms/op | **5.26 ms/op** | **-77.8%** (4.50×) | 39,990 → **26,770** |
-| `CodeUnmarshalReuse` (`nojsonv2`) | 22.21 ms/op | **4.49 ms/op** | **-79.8%** (4.95×) | 26,935 → **11,994** |
-| `MarshalMapRecords` (`nojsonv2`) | 790.8 µs/op | **462.7 µs/op** | **-41.5%** (1.71×) | 5,001 (218 KB) → **1 (74 KB)** |
-| `UnmarshalString` / `Int64` (`nojsonv2`) | 256.1 / 180.0 ns/op | **40.47 / 20.38 ns/op** | **-84.2% / -88.7%** | 2 / 1 → **0 / 0** |
-| `UnmarshalFloat64` / `Map` (`nojsonv2`) | 203.6 / 1,274 ns/op | **45.29 / 278.9 ns/op** | **-77.8% / -78.1%** | 1 / 12 → **0 / 3** |
-| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`json`) | 651.5 ns/op | **504.0 / 375.3 ns/op** | **-22.6% / -42.4%** | 2 (272 B) → **1 (176 B) / 0 (0 B)** |
-| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`nojsonv2`) | 637.2 ns/op | **491.6 / 346.4 ns/op** | **-22.8% / -45.6%** | 2 (272 B) → **1 (176 B) / 0 (0 B)** |
-| Small Struct: `Encoder.Encode` → `EncodeOf` (`json` / `nojsonv2`) | 571.7 / 550.3 ns/op | **437.5 / 392.6 ns/op** | **-23.5% / -28.7%** | 1 (96 B) → **0 (0 B)** |
-| `Valid` (`json` / `nojsonv2`) | 478.0 ns/op | **263.8 / 279.6 ns/op** | **-44.8%** | 0 → 0 |
+| `CodeEncoder` (`nojsonv2`) | 3.62 ms/op | **1.75 ms/op** | **-51.7%** (2.07×) | 0 → 0 |
+| `CodeMarshal` (`nojsonv2`) | 4.35 ms/op | **2.36 ms/op** | **-45.7%** (1.84×) | 1 → 1 |
+| `CodeUnmarshal` (`nojsonv2`) | 23.65 ms/op | **4.14 ms/op** | **-82.5%** (5.71×) | 39,990 → **26,770** |
+| `CodeUnmarshalReuse` (`nojsonv2`) | 22.21 ms/op | **4.07 ms/op** | **-81.7%** (5.46×) | 26,935 → **11,969** |
+| `MarshalMapRecords` (`nojsonv2`) | 790.8 µs/op | **384.8 µs/op** | **-51.3%** (2.06×) | 5,001 (218 KB) → **1 (80 KB)** |
+| `UnmarshalString` / `Int64` (`nojsonv2`) | 256.1 / 180.0 ns/op | **37.01 / 18.60 ns/op** | **-85.5% / -89.7%** | 2 / 1 → **0 / 0** |
+| `UnmarshalFloat64` / `Map` (`nojsonv2`) | 203.6 / 1,274 ns/op | **22.45 / 287.5 ns/op** | **-89.0% / -77.4%** | 1 / 12 → **0 / 3** |
+| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`json`) | 601.1 ns/op | **511.5 / 343.2 ns/op** | **-14.9% / -42.9%** | 2 (272 B) → **1 (176 B) / 0 (0 B)** |
+| Small Struct: `Marshal` → `MarshalOf` → `AppendMarshalOf` (`nojsonv2`) | 564.9 ns/op | **433.3 / 300.9 ns/op** | **-23.3% / -46.7%** | 2 (272 B) → **1 (176 B) / 0 (0 B)** |
+| Small Struct: `Unmarshal` (`json` / `nojsonv2`) | 937.2 / 907.9 ns/op | **675.1 / 598.7 ns/op** | **-28.0% / -34.1%** | 4 (208 B) → **2 (144 B)** |
+| Small Struct: `Encoder.Encode` → `EncodeOf` (`json` / `nojsonv2`) | 539.9 / 459.1 ns/op | **451.3 / 349.4 ns/op** | **-16.4% / -23.9%** | 1 (96 B) → **0 (0 B)** |
+| `Valid` (`json` / `nojsonv2`) | 478.0 ns/op | **249.9 / 243.1 ns/op** | **-47.7% / -49.1%** | 0 → 0 |
 
 #### Generic Maps, UTF-8, Float, `[N]byte`, `time.Time`, and Custom Marshaler/Unmarshaler Fast Paths
 
@@ -404,27 +405,27 @@ xychart-beta
     x-axis ["SyntheaFhir Marshal", "SyntheaFhir Unmarshal", "CitmCatalog Unmarshal", "TwitterStatus Unmarshal", "CodeUnmarshal (v1)", "CodeUnmarshal (nojsonv2)"]
     y-axis "Latency (ms/op)" 0 --> 18
     bar [16.07, 12.74, 8.01, 3.91, 5.67, 5.47]
-    bar [7.81, 9.40, 3.77, 2.06, 4.93, 5.26]
+    bar [6.70, 8.83, 3.73, 1.84, 4.54, 4.14]
 ```
 
 | Benchmark | Baseline (`e35a63be`) | Patched | Latency Delta | Notes / Allocs |
 | :--- | ---: | ---: | ---: | :---: |
-| `Map/ManySmall` (`v2`, Marshal / Unmarshal) | 14.59 / 24.30 µs/op | **3.60 / 12.12 µs/op** | **-75.3% / -50.1%** | 55→**1** / 114→**60** allocs |
-| `FastV1GenericMap` (`json`, Marshal / Unmarshal) | 47.77 / 70.18 µs/op | **17.19 / 27.88 µs/op** | **-64.0% / -60.3%** | 71→**1** / 78→**76** allocs |
-| `FastV1GenericMap` (`nojsonv2`, Marshal / Unmarshal) | 35.40 / 93.81 µs/op | **17.31 / 27.13 µs/op** | **-51.1% / -71.1%** | 186→**1** / 146→**76** allocs |
-| `StringUnicode/Concrete` (`v2`, Marshal / Unmarshal) | 100.1 / 106.2 µs/op | **40.80 / 42.16 µs/op** | **-59.2% / -60.3%** | 2.45× / 2.52× |
-| `CitmCatalog/Concrete` (`v2`, Marshal / Unmarshal) | 2.23 / 8.01 ms/op | **0.96 / 3.77 ms/op** | **-57.0% / -52.9%** | Marshal: 17→**1** alloc |
-| `TwitterStatus/Concrete` (`v2`, Marshal / Unmarshal) | 1.77 / 3.91 ms/op | **0.83 / 2.06 ms/op** | **-53.3% / -47.2%** | Marshal: 21→**1** alloc |
-| `SyntheaFhir/Concrete` (`v2`, Marshal / Unmarshal) | 16.07 / 12.74 ms/op | **7.81 / 9.40 ms/op** | **-51.4% / -26.2%** | 2.06× / 1.36× |
-| `Bytes/Array` (`v2`, Marshal / Unmarshal) | 281.9 / 373.0 ns/op | **127.3 / 239.5 ns/op** | **-54.8% / -35.8%** | 2.21× / 1.56× |
-| `UnmarshalFloat64` (`json` / `nojsonv2`) | 50.41 / 45.44 ns/op | **26.86 / 22.43 ns/op** | **-46.7% / -50.6%** | 0→0 / 0→0 allocs |
-| `Unmarshal/Float` (`v2`) | 146.2 ns/op | **79.15 ns/op** | **-45.9%** (1.85×) | exact IEEE-754 fast path |
-| `JSONArshalV1` (`v2`, Marshal / Unmarshal) | 269.9 / 258.8 ns/op | **167.1 / 148.3 ns/op** | **-38.1% / -42.7%** | 1.62× / 1.75× |
-| `CanadaGeometry/Unmarshal/Concrete` (`v2`) | 2.50 ms/op | **1.52–2.12 ms/op** | **-15% to -39%** | typed `[][2]float64` + exact float |
-| `GolangSource/Marshal/Interface` (`v2`) | 12.49 ms/op | **8.49 ms/op** | **-32.0%** (1.47×) | 2→**1** alloc |
-| `GolangSource/Concrete` (`v2`, Marshal / Unmarshal) | 4.82 / 9.65 ms/op | **4.99 / 8.11 ms/op** | **~0% / -16.0%** | 1.00× / 1.19× |
-| `CodeUnmarshal` (`json` / `nojsonv2`) | 5.67 / 5.47 ms/op | **4.93 / 5.26 ms/op** | **-13.1% / -3.8%** | 1.15× / 1.04× |
-| `CodeEncoder` (`json` / `nojsonv2`) | 2.30 / 2.17 ms/op | **2.29 / 2.16 ms/op** | **-0.4% / -0.5%** | 0→0 / 0→0 allocs |
+| `Map/ManySmall` (`v2`, Marshal / Unmarshal) | 14.59 / 24.30 µs/op | **3.83 / 12.46 µs/op** | **-73.7% / -48.7%** | 55→**1** / 114→**60** allocs |
+| `FastV1GenericMap` (`json`, Marshal / Unmarshal) | 47.77 / 70.18 µs/op | **19.17 / 28.10 µs/op** | **-59.9% / -60.0%** | 71→**1** / 78→**76** allocs |
+| `FastV1GenericMap` (`nojsonv2`, Marshal / Unmarshal) | 35.40 / 93.81 µs/op | **17.27 / 26.05 µs/op** | **-51.2% / -72.2%** | 186→**1** / 146→**76** allocs |
+| `StringUnicode/Concrete` (`v2`, Marshal / Unmarshal) | 100.1 / 106.2 µs/op | **26.33 / 37.10 µs/op** | **-73.7% / -65.1%** | 3.80× / 2.86× |
+| `CitmCatalog/Concrete` (`v2`, Marshal / Unmarshal) | 2.23 / 8.01 ms/op | **0.92 / 3.73 ms/op** | **-58.6% / -53.4%** | Marshal: 17→**1** alloc |
+| `TwitterStatus/Concrete` (`v2`, Marshal / Unmarshal) | 1.77 / 3.91 ms/op | **0.78 / 1.84 ms/op** | **-56.1% / -52.9%** | Marshal: 21→**1** alloc |
+| `SyntheaFhir/Concrete` (`v2`, Marshal / Unmarshal) | 16.07 / 12.74 ms/op | **6.70 / 8.83 ms/op** | **-58.3% / -30.7%** | 2.40× / 1.44× |
+| `Bytes/Array` (`v2`, Marshal / Unmarshal) | 281.9 / 373.0 ns/op | **130.0 / 248.7 ns/op** | **-53.9% / -33.3%** | 2.17× / 1.50× |
+| `UnmarshalFloat64` (`json` / `nojsonv2`) | 50.41 / 45.44 ns/op | **54.69 / 22.45 ns/op** | **+8.5% / -50.6%** | 0→0 / 0→0 allocs |
+| `Unmarshal/Float` (`v2`) | 146.2 ns/op | **86.39 ns/op** | **-40.9%** (1.69×) | exact IEEE-754 fast path |
+| `JSONArshalV1` (`v2`, Marshal / Unmarshal) | 269.9 / 258.8 ns/op | **172.6 / 146.2 ns/op** | **-36.1% / -43.5%** | 1.56× / 1.77× |
+| `CanadaGeometry/Concrete` (`v2`, Marshal / Unmarshal) | 2.07 / 2.50 ms/op | **0.93 / 1.00 ms/op** | **-55.3% / -60.1%** | 523 unmarshal allocs + 19-digit float |
+| `GolangSource/Marshal/Interface` (`v2`) | 12.49 ms/op | **8.15 ms/op** | **-34.7%** (1.53×) | 2→**1** alloc |
+| `GolangSource/Concrete` (`v2`, Marshal / Unmarshal) | 4.82 / 9.65 ms/op | **3.70 / 7.81 ms/op** | **-23.2% / -19.1%** | 1.30× / 1.24× |
+| `CodeUnmarshal` (`json` / `nojsonv2`) | 5.67 / 5.47 ms/op | **4.54 / 4.14 ms/op** | **-19.9% / -24.3%** | 1.25× / 1.32× |
+| `CodeEncoder` (`json` / `nojsonv2`) | 2.30 / 2.17 ms/op | **1.91 / 1.75 ms/op** | **-17.0% / -19.4%** | 0→0 / 0→0 allocs |
 
 #### Comparison Against Upstream Go `1.27.3` and Third-Party JSON Libraries
 
@@ -434,7 +435,7 @@ xychart-beta
     x-axis ["SmallStruct", "TwitterStatus", "CitmCatalog", "GolangSource", "CanadaGeometry", "SyntheaFhir"]
     y-axis "Throughput (MB/s)" 0 --> 475
     bar [65.4, 153.6, 201.5, 88.0, 66.4, 141.7]
-    bar [156.8, 306.1, 458.0, 239.3, 177.7, 213.7]
+    bar [156.8, 343.2, 462.9, 248.4, 271.2, 227.5]
     bar [177.2, 289.7, 410.3, 226.3, 241.3, 219.7]
     bar [140.2, 286.1, 356.4, 153.7, 224.0, 196.6]
     bar [122.0, 172.4, 343.1, 192.6, 106.0, 148.5]
@@ -445,9 +446,9 @@ xychart-beta
 xychart-beta
     title "JSON Marshal Throughput (MB/s, higher is better)"
     x-axis ["SmallStruct", "TwitterStatus", "CitmCatalog", "GolangSource", "CanadaGeometry", "SyntheaFhir"]
-    y-axis "Throughput (MB/s)" 0 --> 1850
+    y-axis "Throughput (MB/s)" 0 --> 1900
     bar [127.2, 228.1, 161.2, 173.0, 130.5, 143.7]
-    bar [291.6, 763.7, 1801.4, 388.6, 154.9, 257.2]
+    bar [291.6, 812.9, 1868.6, 523.9, 292.2, 299.7]
     bar [361.3, 802.6, 604.7, 429.1, 225.3, 395.2]
     bar [353.2, 1014.2, 625.2, 220.7, 229.7, 189.7]
     bar [270.6, 433.1, 370.9, 339.7, 182.0, 321.0]
@@ -458,29 +459,29 @@ xychart-beta
 
 | Implementation | `SmallStruct` | `TwitterStatus` | `CitmCatalog` | `GolangSource` | `CanadaGeometry` | `SyntheaFhir` |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Illium** `encoding/json/v2` | 538.3 ns (1) | 827.0 µs (1) | 958.8 µs (1) | 4.99 ms (1) | 1.75 ms (1) | 7.81 ms (2,530) |
-| **Illium** `encoding/json` (`jsonv2`) | 504.0 ns (1) | 949.5 µs (1) | 1.08 ms (1) | 5.16 ms (1) | 1.66 ms (1) | 8.08 ms (2,531) |
-| **Illium** `encoding/json` (`nojsonv2`) | 491.6 ns (1) | 824.1 µs (1) | 941.3 µs (1) | 4.59 ms (1) | 1.41 ms (1) | 20.61 ms (18,022) |
+| **Illium** `encoding/json/v2` | 538.3 ns (1) | 776.9 µs (1) | 924.3 µs (1) | **3.70 ms (1)** | **925.4 µs (1)** | **6.70 ms (2,530)** |
+| **Illium** `encoding/json` (`jsonv2`) | 511.5 ns (1) | 928.7 µs (1) | 950.4 µs (1) | 4.13 ms (1) | **899.7 µs (1)** | 7.22 ms (2,530) |
+| **Illium** `encoding/json` (`nojsonv2`) | 433.3 ns (1) | 824.1 µs (1) | 941.3 µs (1) | 4.59 ms (1) | 1.41 ms (1) | 20.61 ms (18,022) |
 | Go `1.27.3` `encoding/json/v2` | 1.16 µs (1) | 2.17 ms (49) | 3.10 ms (125) | 11.22 ms (1) | 2.07 ms (1) | 21.75 ms (2,556) |
 | Go `1.27.3` `encoding/json` (`jsonv2`) | 1.15 µs (1) | 2.14 ms (89) | 2.99 ms (447) | 11.17 ms (1) | 2.05 ms (1) | 22.34 ms (2,586) |
 | Go `1.27.3` `encoding/json` (`nojsonv2`) | 870.7 ns (1) | 1.56 ms (141) | 2.05 ms (890) | 8.87 ms (1) | 1.87 ms (1) | 21.42 ms (18,010) |
 | `goccy/go-json/v2` `v0.12.0` | **406.9 ns (1)** | 616.3 µs (1) | 826.4 µs (2) | 4.52 ms (1) | 1.20 ms (1) | 7.91 ms (2,543) |
-| `goccy/go-json` `v0.12.0` (v1) | 417.3 ns (1) | 602.1 µs (1) | 877.5 µs (1) | **4.47 ms (1)** | 1.24 ms (1) | **7.09 ms (2,530)** |
-| `bytedance/sonic` `v1.15.5` | 416.2 ns (2) | **490.2 µs (22)** | **799.3 µs (10)** | 8.79 ms (30) | **1.18 ms (2)** | 16.97 ms (17,984) |
+| `goccy/go-json` `v0.12.0` (v1) | 417.3 ns (1) | 602.1 µs (1) | 877.5 µs (1) | 4.47 ms (1) | 1.24 ms (1) | 7.09 ms (2,530) |
+| `bytedance/sonic` `v1.15.5` | 416.2 ns (2) | **490.2 µs (22)** | **799.3 µs (10)** | 8.79 ms (30) | 1.18 ms (2) | 16.97 ms (17,984) |
 | `segmentio/encoding/json` `v0.5.4` | 543.2 ns (1) | 1.16 ms (121) | 1.35 ms (616) | 5.71 ms (1) | 1.49 ms (1) | 9.94 ms (5,338) |
 
 ##### Unmarshal (Median Latency & Allocs/op — lower is better)
 
 | Implementation | `SmallStruct` | `TwitterStatus` | `CitmCatalog` | `GolangSource` | `CanadaGeometry` | `SyntheaFhir` |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Illium** `encoding/json/v2` | 942.0 ns (4) | 2.06 ms (2,939) | 3.77 ms (7,265) | 8.11 ms (13,947) | 2.12 ms (1,628) | 9.40 ms (14,539) |
-| **Illium** `encoding/json` (`jsonv2`) | 942.0 ns (4) | **1.90 ms (2,939)** | 4.00 ms (7,265) | 8.47 ms (13,947) | 1.52 ms (1,628) | 11.59 ms (13,619) |
-| **Illium** `encoding/json` (`nojsonv2`) | 907.9 ns (4) | 2.68 ms (2,939) | 3.68 ms (7,264) | **7.78 ms (13,946)** | 1.64 ms (1,628) | **8.21 ms (13,610)** |
+| **Illium** `encoding/json/v2` | 942.0 ns (4) | 1.84 ms (2,793) | 3.73 ms (6,528) | 7.81 ms (13,947) | 996.9 µs (523) | 8.83 ms (14,539) |
+| **Illium** `encoding/json` (`jsonv2`) | 675.1 ns (2) | **1.75 ms (2,793)** | **3.64 ms (6,527)** | **7.29 ms (13,947)** | **970.7 µs (523)** | 11.24 ms (13,621) |
+| **Illium** `encoding/json` (`nojsonv2`) | **598.7 ns (2)** | 2.68 ms (2,939) | 3.68 ms (7,264) | 7.78 ms (13,946) | 1.64 ms (1,628) | **8.21 ms (13,610)** |
 | Go `1.27.3` `encoding/json/v2` | 2.25 µs (4) | 4.11 ms (2,981) | 8.57 ms (7,284) | 22.04 ms (13,946) | 4.07 ms (1,628) | 14.18 ms (14,562) |
 | Go `1.27.3` `encoding/json` (`jsonv2`) | 2.61 µs (4) | 5.38 ms (3,058) | 10.57 ms (7,392) | 25.86 ms (13,946) | 4.54 ms (1,628) | 18.42 ms (13,636) |
 | Go `1.27.3` `encoding/json` (`nojsonv2`) | 4.18 µs (14) | 9.63 ms (7,054) | 23.41 ms (16,734) | 41.46 ms (27,166) | 6.06 ms (1,641) | 33.41 ms (29,340) |
 | `goccy/go-json/v2` `v0.12.0` | 829.8 ns (7) | 2.18 ms (4,897) | 4.21 ms (4,519) | 8.58 ms (14,169) | 1.12 ms (750) | 9.14 ms (29,622) |
-| `goccy/go-json` `v0.12.0` (v1) | **798.7 ns (7)** | 1.97 ms (4,877) | **3.67 ms (4,504)** | 8.29 ms (14,169) | **1.01 ms (750)** | 8.56 ms (28,921) |
+| `goccy/go-json` `v0.12.0` (v1) | 798.7 ns (7) | 1.97 ms (4,877) | 3.67 ms (4,504) | 8.29 ms (14,169) | 1.01 ms (750) | 8.56 ms (28,921) |
 | `bytedance/sonic` `v1.15.5` | 1.05 µs (5) | 2.21 ms (814) | 4.85 ms (5,363) | 12.63 ms (1,735) | 1.21 ms (1,147) | 10.22 ms (7,084) |
 | `segmentio/encoding/json` `v0.5.4` | 1.20 µs (7) | 3.66 ms (5,673) | 5.03 ms (3,297) | 10.08 ms (13,885) | 2.55 ms (606) | 13.52 ms (28,576) |
 
@@ -488,26 +489,26 @@ xychart-beta
 
 | Benchmark | Baseline (`3d9b976b`) | Illium | Latency Delta | Package / Mode |
 | :--- | ---: | ---: | ---: | :--- |
-| `UnmarshalInt64` | 196.8 ns/op | **18.82 ns/op** | **-90.4%** (10.46×) | `encoding/json` (`nojsonv2`) |
-| `UnmarshalFloat64` | 234.3 ns/op | **23.44 ns/op** | **-90.0%** (10.00×) | `encoding/json` (`nojsonv2`) |
-| `UnmarshalString` | 269.3 ns/op | **41.13 ns/op** | **-84.7%** (6.55×) | `encoding/json` (`nojsonv2`) |
-| `UnmarshalFloat64` | 153.6 ns/op | **28.76 ns/op** | **-81.3%** (5.34×) | `encoding/json` (`jsonv2`) |
-| `CodeUnmarshal` | 23.28 ms/op | **5.26 ms/op** | **-77.4%** (4.43×) | `encoding/json` (`nojsonv2`) |
-| `UnmarshalInt64` | 122.7 ns/op | **25.92 ns/op** | **-78.9%** (4.73×) | `encoding/json` (`jsonv2`) |
-| `Marshal/Pointer` | 316.6 ns/op | **74.87 ns/op** | **-76.4%** (4.23×) | `encoding/json/v2` |
-| `Marshal/Map/ManySmall` | 16.03 µs/op | **3.88 µs/op** | **-75.8%** (4.13×) | `encoding/json/v2` |
-| `Unmarshal/Struct/ManySmall` | 8.44 µs/op | **2.26 µs/op** | **-73.3%** (3.74×) | `encoding/json/v2` |
-| `DecoderStream` | 550.0 ns/op | **152.2 ns/op** | **-72.3%** (3.61×) | `encoding/json` (`jsonv2`) |
+| `UnmarshalInt64` | 196.8 ns/op | **18.60 ns/op** | **-90.5%** (10.58×) | `encoding/json` (`nojsonv2`) |
+| `UnmarshalFloat64` | 234.3 ns/op | **22.45 ns/op** | **-90.4%** (10.44×) | `encoding/json` (`nojsonv2`) |
+| `UnmarshalString` | 269.3 ns/op | **37.01 ns/op** | **-86.3%** (7.28×) | `encoding/json` (`nojsonv2`) |
+| `CodeUnmarshal` | 23.28 ms/op | **4.14 ms/op** | **-82.2%** (5.62×) | `encoding/json` (`nojsonv2`) |
+| `UnmarshalFloat64` | 153.6 ns/op | **54.69 ns/op** | **-64.4%** (2.81×) | `encoding/json` (`jsonv2`) |
+| `UnmarshalInt64` | 122.7 ns/op | **49.59 ns/op** | **-59.6%** (2.47×) | `encoding/json` (`jsonv2`) |
+| `Marshal/Pointer` | 316.6 ns/op | **70.90 ns/op** | **-77.6%** (4.47×) | `encoding/json/v2` |
+| `Marshal/Map/ManySmall` | 16.03 µs/op | **3.83 µs/op** | **-76.1%** (4.19×) | `encoding/json/v2` |
+| `CanadaGeometry/Unmarshal/Concrete` | 4.02 ms/op | **996.9 µs/op** | **-75.2%** (4.03×) | `encoding/json/v2` |
+| `DecoderStream` | 550.0 ns/op | **147.1 ns/op** | **-73.3%** (3.74×) | `encoding/json` (`jsonv2`) |
+| `Unmarshal/Struct/ManySmall` | 8.44 µs/op | **2.34 µs/op** | **-72.3%** (3.61×) | `encoding/json/v2` |
 | `UnmarshalString` | 152.0 ns/op | **45.30 ns/op** | **-70.2%** (3.36×) | `encoding/json` (`jsonv2`) |
-| `CodeUnmarshalReuse` | 13.91 ms/op | **4.93 ms/op** | **-64.6%** (2.82×) | `encoding/json` (`jsonv2`) |
-| `GolangSource/Unmarshal/Concrete` | 22.90 ms/op | **8.11 ms/op** | **-64.6%** (2.82×) | `encoding/json/v2` |
-| `CodeUnmarshal` | 14.16 ms/op | **4.93 ms/op** | **-65.2%** (2.87×) | `encoding/json` (`jsonv2`) |
-| `CanadaGeometry/Unmarshal/Concrete` | 4.02 ms/op | **1.52–2.12 ms/op** | **-47% to -62%** | `encoding/json/v2` |
-| `Issue34127` | 315.9 ns/op | **134.4 ns/op** | **-57.5%** (2.35×) | `encoding/json` (`jsonv2`) |
-| `CitmCatalog/Unmarshal/Concrete` | 8.27 ms/op | **3.77 ms/op** | **-54.4%** (2.19×) | `encoding/json/v2` |
-| `TwitterStatus/Unmarshal/Concrete` | 3.85 ms/op | **2.06 ms/op** | **-46.5%** (1.87×) | `encoding/json/v2` |
-| `CodeEncoder` | 4.10 ms/op | **2.29 ms/op** | **-44.1%** (1.79×) | `encoding/json` (`jsonv2`) |
-| `CodeMarshal` | 4.83 ms/op | **2.79 ms/op** | **-42.2%** (1.73×) | `encoding/json` (`jsonv2`) |
+| `CodeUnmarshal` | 14.16 ms/op | **4.54 ms/op** | **-67.9%** (3.12×) | `encoding/json` (`jsonv2`) |
+| `CodeUnmarshalReuse` | 13.91 ms/op | **4.53 ms/op** | **-67.4%** (3.07×) | `encoding/json` (`jsonv2`) |
+| `GolangSource/Unmarshal/Concrete` | 22.90 ms/op | **7.81 ms/op** | **-65.9%** (2.93×) | `encoding/json/v2` |
+| `CitmCatalog/Unmarshal/Concrete` | 8.27 ms/op | **3.73 ms/op** | **-54.9%** (2.22×) | `encoding/json/v2` |
+| `CodeEncoder` | 4.10 ms/op | **1.91 ms/op** | **-53.4%** (2.15×) | `encoding/json` (`jsonv2`) |
+| `TwitterStatus/Unmarshal/Concrete` | 3.85 ms/op | **1.84 ms/op** | **-52.2%** (2.09×) | `encoding/json/v2` |
+| `CodeMarshal` | 4.83 ms/op | **2.52 ms/op** | **-47.8%** (1.92×) | `encoding/json` (`jsonv2`) |
+| `Issue34127` | 315.9 ns/op | **168.5 ns/op** | **-46.7%** (1.87×) | `encoding/json` (`jsonv2`) |
 
 ---
 

@@ -435,9 +435,7 @@ func fmtEFG(dst []byte, neg bool, s []byte, dp, nd, prec int, fmt byte, shortest
 		// integer, padded with zeros as needed.
 		if dp > 0 {
 			m := min(nd, dp)
-			for _, c := range s[:m] {
-				dst = append(dst, c)
-			}
+			dst = append(dst, s[:m]...)
 			for range dp - m {
 				dst = append(dst, '0')
 			}
@@ -455,8 +453,8 @@ func fmtEFG(dst []byte, neg bool, s []byte, dp, nd, prec int, fmt byte, shortest
 			for range lz {
 				dst = append(dst, '0')
 			}
-			for i := range m {
-				dst = append(dst, s[off+i])
+			if m > 0 {
+				dst = append(dst, s[off:off+m]...)
 			}
 			for range tz {
 				dst = append(dst, '0')

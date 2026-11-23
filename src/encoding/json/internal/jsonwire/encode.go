@@ -8,6 +8,7 @@ package jsonwire
 
 import (
 	"internal/byteorder"
+	istrconv "internal/strconv"
 	"math"
 	"math/bits"
 	"slices"
@@ -190,20 +191,16 @@ func appendQuoteBytesSlow(dst, src []byte, n int, flags *jsonflags.Flags) ([]byt
 	var i int
 	var hasInvalidUTF8 bool
 	escapeHTML := flags.Get(jsonflags.EscapeForHTML)
+	escapeJS := flags.Get(jsonflags.EscapeForJS)
+	if cap(dst)-len(dst) < len(src)+18 {
+		dst = slices.Grow(dst, len(src)+18)
+	}
 	dst = append(dst, '"')
 	first := true
 	for uint(len(src)) > uint(n) {
 		if !first {
 			if len(src)-n >= 8 {
-				peelEnd := n + 4
 				if !escapeHTML {
-					for n < peelEnd {
-						c := src[n]
-						if c >= utf8.RuneSelf || c < ' ' || c == '"' || c == '\\' {
-							goto found
-						}
-						n++
-					}
 					for len(src)-n >= 8 {
 						if m := escapeMaskNoHTML(byteorder.LEUint64(src[n:])); m != 0 {
 							n += bits.TrailingZeros64(m) >> 3
@@ -212,13 +209,6 @@ func appendQuoteBytesSlow(dst, src []byte, n int, flags *jsonflags.Flags) ([]byt
 						n += 8
 					}
 				} else {
-					for n < peelEnd {
-						c := src[n]
-						if c >= utf8.RuneSelf || escapeASCII[c] > 0 {
-							goto found
-						}
-						n++
-					}
 					for len(src)-n >= 8 {
 						if m := escapeMaskHTML(byteorder.LEUint64(src[n:])); m != 0 {
 							n += bits.TrailingZeros64(m) >> 3
@@ -228,7 +218,6 @@ func appendQuoteBytesSlow(dst, src []byte, n int, flags *jsonflags.Flags) ([]byt
 					}
 				}
 			}
-		found:
 			if uint(len(src)) <= uint(n) {
 				break
 			}
@@ -248,24 +237,47 @@ func appendQuoteBytesSlow(dst, src []byte, n int, flags *jsonflags.Flags) ([]byt
 				i = n
 			}
 		} else {
-			// Fast-skip runs of valid 2-byte (0xC2..0xDF) and safe 3-byte (0xE1, 0xE3..0xEC, 0xEE..0xEF) UTF-8.
+			// Fast-skip valid 2-byte, 3-byte, and 4-byte UTF-8 runs inline.
 			for uint(len(src)) > uint(n) {
 				b0 := src[n]
 				if b0 < utf8.RuneSelf {
 					break
 				}
-				if b0 >= 0xE3 && b0 <= 0xEC || b0 == 0xE1 || b0 == 0xEE || b0 == 0xEF {
-					if n+2 < len(src) && src[n+1]&0xC0 == 0x80 && src[n+2]&0xC0 == 0x80 {
-						n += 3
-						continue
+				if b0 >= 0xE1 && b0 <= 0xEC || b0 == 0xEE || b0 == 0xEF {
+					if n+2 < len(src) {
+						b1, b2 := src[n+1], src[n+2]
+						if ((b1^0x80)|(b2^0x80)) < 0x40 && (b0 != 0xE2 || !escapeJS || b1 != 0x80 || (b2 != 0xA8 && b2 != 0xA9)) {
+							n += 3
+							continue
+						}
 					}
 				} else if b0 >= 0xC2 && b0 <= 0xDF {
 					if n+1 < len(src) && src[n+1]&0xC0 == 0x80 {
 						n += 2
 						continue
 					}
+				} else if b0 == 0xE0 {
+					if n+2 < len(src) && src[n+1] >= 0xA0 && src[n+1] <= 0xBF && src[n+2]&0xC0 == 0x80 {
+						n += 3
+						continue
+					}
+				} else if b0 == 0xED {
+					if n+2 < len(src) && src[n+1] >= 0x80 && src[n+1] <= 0x9F && src[n+2]&0xC0 == 0x80 {
+						n += 3
+						continue
+					}
+				} else if b0 >= 0xF0 && b0 <= 0xF4 {
+					if n+3 < len(src) && ((src[n+2]^0x80)|(src[n+3]^0x80)) < 0x40 {
+						b1 := src[n+1]
+						if (b0 == 0xF0 && b1 >= 0x90 && b1 <= 0xBF) ||
+							(b0 >= 0xF1 && b0 <= 0xF3 && b1&0xC0 == 0x80) ||
+							(b0 == 0xF4 && b1 >= 0x80 && b1 <= 0x8F) {
+							n += 4
+							continue
+						}
+					}
 				}
-				// Handle remaining / boundary multi-byte Unicode via utf8.DecodeRune.
+				// Handle invalid UTF-8 and U+2028/U+2029 when EscapeForJS is set.
 				r, rn := utf8.DecodeRune(src[n:])
 				n += rn
 				if r != utf8.RuneError && r != '\u2028' && r != '\u2029' {
@@ -277,7 +289,7 @@ func appendQuoteBytesSlow(dst, src []byte, n int, flags *jsonflags.Flags) ([]byt
 					dst = append(dst, src[i:n-rn]...)
 					dst = append(dst, "\ufffd"...)
 					i = n
-				case (r == '\u2028' || r == '\u2029') && flags.Get(jsonflags.EscapeForJS):
+				case (r == '\u2028' || r == '\u2029') && escapeJS:
 					dst = append(dst, src[i:n-rn]...)
 					dst = appendEscapedUnicode(dst, r)
 					i = n
@@ -395,47 +407,7 @@ func ReformatString(dst, src []byte, flags *jsonflags.Flags) ([]byte, int, error
 // the output is a 32-bit equivalent of the algorithm.
 // Note that ECMA-262 specifies no algorithm for 32-bit numbers.
 func AppendFloat(dst []byte, src float64, bits int) []byte {
-	if bits == 32 {
-		src = float64(float32(src))
-	}
-
-	if src == 0 {
-		if math.Signbit(src) {
-			return append(dst, '-', '0')
-		}
-		return append(dst, '0')
-	}
-
-	abs := math.Abs(src)
-	if bits == 64 {
-		if abs < 1<<52 {
-			if i := int64(src); float64(i) == src {
-				return strconv.AppendInt(dst, i, 10)
-			}
-		}
-	} else {
-		if abs < 1<<23 {
-			if i := int64(src); float64(i) == src {
-				return strconv.AppendInt(dst, i, 10)
-			}
-		}
-	}
-
-	fmt := byte('f')
-	if bits == 64 && (float64(abs) < 1e-6 || float64(abs) >= 1e21) ||
-		bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
-		fmt = 'e'
-	}
-	dst = strconv.AppendFloat(dst, src, fmt, -1, bits)
-	if fmt == 'e' {
-		// Clean up e-09 to e-9.
-		n := len(dst)
-		if n >= 4 && dst[n-4] == 'e' && dst[n-3] == '-' && dst[n-2] == '0' {
-			dst[n-2] = dst[n-1]
-			dst = dst[:n-1]
-		}
-	}
-	return dst
+	return istrconv.AppendFloatECMA(dst, src, bits)
 }
 
 // ReformatNumber consumes a JSON number from src and appends it to dst,

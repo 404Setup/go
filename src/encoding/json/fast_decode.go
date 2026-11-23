@@ -13,6 +13,7 @@ import (
 	"internal/abi"
 	"internal/byteorder"
 	"internal/runtime/maps"
+	istrconv "internal/strconv"
 	"internal/unsafeheader"
 	"math"
 	"math/bits"
@@ -933,7 +934,7 @@ func (d *v1FastDecoder) readFloat(bits int) (float64, error) {
 	}
 	var mant uint64
 	exact := true
-	const maxMantDiv10 = (1<<53 - 1) / 10
+	const maxMantDiv10 = 999999999999999999
 	c := data[i]
 	if c == '0' {
 		i++
@@ -949,7 +950,7 @@ func (d *v1FastDecoder) readFloat(bits int) (float64, error) {
 				break
 			}
 			if exact {
-				if mant < maxMantDiv10 {
+				if mant <= maxMantDiv10 {
 					mant = mant*10 + uint64(dc-'0')
 				} else {
 					exact = false
@@ -973,7 +974,7 @@ func (d *v1FastDecoder) readFloat(bits int) (float64, error) {
 				break
 			}
 			if exact {
-				if mant < maxMantDiv10 {
+				if mant <= maxMantDiv10 {
 					mant = mant*10 + uint64(dc-'0')
 					exp--
 				} else {
@@ -1014,7 +1015,7 @@ func (d *v1FastDecoder) readFloat(bits int) (float64, error) {
 
 	if exact {
 		if bits == 64 {
-			if exp >= -22 && exp <= 22 {
+			if mant < 1<<53 && exp >= -22 && exp <= 22 {
 				f := float64(mant)
 				if exp > 0 {
 					f *= v1ExactPow10F64[exp]
@@ -1027,18 +1028,28 @@ func (d *v1FastDecoder) readFloat(bits int) (float64, error) {
 				d.pos = i
 				return f, nil
 			}
-		} else if mant < 1<<24 && exp >= -10 && exp <= 10 {
-			f := float32(mant)
-			if exp > 0 {
-				f *= v1ExactPow10F32[exp]
-			} else if exp < 0 {
-				f /= v1ExactPow10F32[-exp]
+			if f, ok := istrconv.ParseFloat64Fast(mant, exp, neg); ok {
+				d.pos = i
+				return f, nil
 			}
-			if neg {
-				f = -f
+		} else {
+			if mant < 1<<24 && exp >= -10 && exp <= 10 {
+				f := float32(mant)
+				if exp > 0 {
+					f *= v1ExactPow10F32[exp]
+				} else if exp < 0 {
+					f /= v1ExactPow10F32[-exp]
+				}
+				if neg {
+					f = -f
+				}
+				d.pos = i
+				return float64(f), nil
 			}
-			d.pos = i
-			return float64(f), nil
+			if f, ok := istrconv.ParseFloat32Fast(mant, exp, neg); ok {
+				d.pos = i
+				return float64(f), nil
+			}
 		}
 	}
 
@@ -2006,8 +2017,61 @@ func (d *v1FastDecoder) unmarshalSliceString(ptr unsafe.Pointer) error {
 	sp := (*[]string)(ptr)
 	s := *sp
 	oldCap := cap(s)
-	s = s[:oldCap]
 	i := 0
+	if oldCap == 0 {
+		var stackBuf [8]string
+		for {
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			var elem string
+			switch d.data[d.pos] {
+			case '"':
+				b, err := d.readString()
+				if err != nil {
+					return err
+				}
+				elem = v1MakeString(d.strCache, b)
+			case 'n':
+				if !d.consumeNull() {
+					return errV1FastFallback
+				}
+			default:
+				return errV1FastFallback
+			}
+			stackBuf[i] = elem
+			i++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				if i == len(stackBuf) {
+					s = make([]string, len(stackBuf), 32)
+					copy(s, stackBuf[:])
+					s = s[:32]
+					break
+				}
+				continue
+			}
+			if d.data[d.pos] == ']' {
+				d.pos++
+				out := make([]string, i)
+				copy(out, stackBuf[:i])
+				*sp = out
+				return nil
+			}
+			return errV1FastFallback
+		}
+	} else {
+		s = s[:oldCap]
+	}
 	for {
 		d.skipWS()
 		if d.pos >= len(d.data) {
@@ -2078,8 +2142,58 @@ func (d *v1FastDecoder) unmarshalSliceInt(ptr unsafe.Pointer) error {
 	sp := (*[]int)(ptr)
 	s := *sp
 	oldCap := cap(s)
-	s = s[:oldCap]
 	i := 0
+	if oldCap == 0 {
+		var stackBuf [8]int
+		for {
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			var elem int
+			if d.data[d.pos] == 'n' {
+				if !d.consumeNull() {
+					return errV1FastFallback
+				}
+			} else {
+				v, err := d.readInt64(strconv.IntSize)
+				if err != nil {
+					return err
+				}
+				elem = int(v)
+			}
+			stackBuf[i] = elem
+			i++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				if i == len(stackBuf) {
+					s = make([]int, len(stackBuf), 32)
+					copy(s, stackBuf[:])
+					s = s[:32]
+					break
+				}
+				continue
+			}
+			if d.data[d.pos] == ']' {
+				d.pos++
+				out := make([]int, i)
+				copy(out, stackBuf[:i])
+				*sp = out
+				return nil
+			}
+			return errV1FastFallback
+		}
+	} else {
+		s = s[:oldCap]
+	}
 	for {
 		d.skipWS()
 		if d.pos >= len(d.data) {
@@ -2147,8 +2261,58 @@ func (d *v1FastDecoder) unmarshalSliceInt64(ptr unsafe.Pointer) error {
 	sp := (*[]int64)(ptr)
 	s := *sp
 	oldCap := cap(s)
-	s = s[:oldCap]
 	i := 0
+	if oldCap == 0 {
+		var stackBuf [8]int64
+		for {
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			var elem int64
+			if d.data[d.pos] == 'n' {
+				if !d.consumeNull() {
+					return errV1FastFallback
+				}
+			} else {
+				v, err := d.readInt64(64)
+				if err != nil {
+					return err
+				}
+				elem = v
+			}
+			stackBuf[i] = elem
+			i++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				if i == len(stackBuf) {
+					s = make([]int64, len(stackBuf), 32)
+					copy(s, stackBuf[:])
+					s = s[:32]
+					break
+				}
+				continue
+			}
+			if d.data[d.pos] == ']' {
+				d.pos++
+				out := make([]int64, i)
+				copy(out, stackBuf[:i])
+				*sp = out
+				return nil
+			}
+			return errV1FastFallback
+		}
+	} else {
+		s = s[:oldCap]
+	}
 	for {
 		d.skipWS()
 		if d.pos >= len(d.data) {
@@ -2216,8 +2380,58 @@ func (d *v1FastDecoder) unmarshalSliceUint64(ptr unsafe.Pointer) error {
 	sp := (*[]uint64)(ptr)
 	s := *sp
 	oldCap := cap(s)
-	s = s[:oldCap]
 	i := 0
+	if oldCap == 0 {
+		var stackBuf [8]uint64
+		for {
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			var elem uint64
+			if d.data[d.pos] == 'n' {
+				if !d.consumeNull() {
+					return errV1FastFallback
+				}
+			} else {
+				v, err := d.readUint64(64)
+				if err != nil {
+					return err
+				}
+				elem = v
+			}
+			stackBuf[i] = elem
+			i++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				if i == len(stackBuf) {
+					s = make([]uint64, len(stackBuf), 32)
+					copy(s, stackBuf[:])
+					s = s[:32]
+					break
+				}
+				continue
+			}
+			if d.data[d.pos] == ']' {
+				d.pos++
+				out := make([]uint64, i)
+				copy(out, stackBuf[:i])
+				*sp = out
+				return nil
+			}
+			return errV1FastFallback
+		}
+	} else {
+		s = s[:oldCap]
+	}
 	for {
 		d.skipWS()
 		if d.pos >= len(d.data) {
@@ -2285,8 +2499,58 @@ func (d *v1FastDecoder) unmarshalSliceFloat64(ptr unsafe.Pointer) error {
 	sp := (*[]float64)(ptr)
 	s := *sp
 	oldCap := cap(s)
-	s = s[:oldCap]
 	i := 0
+	if oldCap == 0 {
+		var stackBuf [8]float64
+		for {
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			var elem float64
+			if d.data[d.pos] == 'n' {
+				if !d.consumeNull() {
+					return errV1FastFallback
+				}
+			} else {
+				v, err := d.readFloat(64)
+				if err != nil {
+					return err
+				}
+				elem = v
+			}
+			stackBuf[i] = elem
+			i++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				if i == len(stackBuf) {
+					s = make([]float64, len(stackBuf), 32)
+					copy(s, stackBuf[:])
+					s = s[:32]
+					break
+				}
+				continue
+			}
+			if d.data[d.pos] == ']' {
+				d.pos++
+				out := make([]float64, i)
+				copy(out, stackBuf[:i])
+				*sp = out
+				return nil
+			}
+			return errV1FastFallback
+		}
+	} else {
+		s = s[:oldCap]
+	}
 	for {
 		d.skipWS()
 		if d.pos >= len(d.data) {
@@ -2502,15 +2766,92 @@ func (d *v1FastDecoder) unmarshalSlicePoint2F64(ptr unsafe.Pointer) error {
 	}
 	sp := (*[][2]float64)(ptr)
 	s := *sp
-	s = s[:cap(s)]
 	i := 0
+	if cap(s) == 0 {
+		var stackBuf [16][2]float64
+		for {
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) || d.data[d.pos] != '[' {
+				return errV1FastFallback
+			}
+			d.pos++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			v0, err := d.readFloat(64)
+			if err != nil {
+				return err
+			}
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) || d.data[d.pos] != ',' {
+				return errV1FastFallback
+			}
+			d.pos++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			v1, err := d.readFloat(64)
+			if err != nil {
+				return err
+			}
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) || d.data[d.pos] != ']' {
+				return errV1FastFallback
+			}
+			d.pos++
+			stackBuf[i] = [2]float64{v0, v1}
+			i++
+			if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+				d.v1SkipWSSlow()
+			}
+			if d.pos >= len(d.data) {
+				return errV1FastFallback
+			}
+			if d.data[d.pos] == ',' {
+				d.pos++
+				if i == len(stackBuf) {
+					s = make([][2]float64, len(stackBuf), 64)
+					copy(s, stackBuf[:])
+					s = s[:64]
+					break
+				}
+				continue
+			}
+			if d.data[d.pos] == ']' {
+				d.pos++
+				out := make([][2]float64, i)
+				copy(out, stackBuf[:i])
+				*sp = out
+				return nil
+			}
+			return errV1FastFallback
+		}
+	} else {
+		s = s[:cap(s)]
+	}
 	for {
-		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+			d.v1SkipWSSlow()
+		}
 		if d.pos >= len(d.data) || d.data[d.pos] != '[' {
 			return errV1FastFallback
 		}
 		d.pos++
-		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+			d.v1SkipWSSlow()
+		}
 		if d.pos >= len(d.data) {
 			return errV1FastFallback
 		}
@@ -2518,12 +2859,16 @@ func (d *v1FastDecoder) unmarshalSlicePoint2F64(ptr unsafe.Pointer) error {
 		if err != nil {
 			return err
 		}
-		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+			d.v1SkipWSSlow()
+		}
 		if d.pos >= len(d.data) || d.data[d.pos] != ',' {
 			return errV1FastFallback
 		}
 		d.pos++
-		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+			d.v1SkipWSSlow()
+		}
 		if d.pos >= len(d.data) {
 			return errV1FastFallback
 		}
@@ -2531,7 +2876,9 @@ func (d *v1FastDecoder) unmarshalSlicePoint2F64(ptr unsafe.Pointer) error {
 		if err != nil {
 			return err
 		}
-		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+			d.v1SkipWSSlow()
+		}
 		if d.pos >= len(d.data) || d.data[d.pos] != ']' {
 			return errV1FastFallback
 		}
@@ -2544,7 +2891,9 @@ func (d *v1FastDecoder) unmarshalSlicePoint2F64(ptr unsafe.Pointer) error {
 			s = s[:cap(s)]
 		}
 		i++
-		d.skipWS()
+		if d.pos < len(d.data) && d.data[d.pos] <= ' ' {
+			d.v1SkipWSSlow()
+		}
 		if d.pos >= len(d.data) {
 			return errV1FastFallback
 		}
@@ -3264,6 +3613,26 @@ func (d *v1FastDecoder) unmarshalStruct(p *v1FastUnmarshalPlan, ptr unsafe.Point
 	}
 }
 
+func v1IsZeroMemFast(ptr unsafe.Pointer, n uintptr) bool {
+	if n == 0 {
+		return true
+	}
+	b := unsafe.Slice((*byte)(ptr), n)
+	i := uintptr(0)
+	for n-i >= 8 {
+		if *(*uint64)(unsafe.Pointer(&b[i])) != 0 {
+			return false
+		}
+		i += 8
+	}
+	for ; i < n; i++ {
+		if b[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func v1IsTargetZero(p *v1FastUnmarshalPlan, ptr unsafe.Pointer) bool {
 	switch p.kind {
 	case v1fkPtr:
@@ -3283,6 +3652,9 @@ func v1IsTargetZero(p *v1FastUnmarshalPlan, ptr unsafe.Pointer) bool {
 	case v1fkAny:
 		return *(*any)(ptr) == nil
 	case v1fkStruct, v1fkArray, v1fkUnmarshaler:
+		if sz := p.typ.Size(); sz <= 1024 && v1IsZeroMemFast(ptr, sz) {
+			return true
+		}
 		return reflect.NewAt(p.rt, ptr).Elem().IsZero()
 	}
 	return false
