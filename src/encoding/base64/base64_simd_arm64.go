@@ -58,7 +58,7 @@ func encodeSIMD(dst, src []byte, kind encodingKind) (si, di int) {
 		lut = &neonEncURL[0]
 	}
 	if haveSVE2 && chunks >= 2 {
-		n, m := encodeSVE2(&dst[0], &src[0], chunks*48, lut)
+		n, m := encodeSVE2(&dst[di], &src[si], chunks*48, lut)
 		si += n
 		di += m
 		if len(src)-si < 48 || len(dst)-di < 64 {

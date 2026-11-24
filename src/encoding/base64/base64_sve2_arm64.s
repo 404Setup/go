@@ -40,10 +40,12 @@ TEXT ·encodeSVE2(SB), NOSPLIT|NOFRAME, $0-48
 	WORD	$0x25281ce1	// PWHILELO R8, R7, P1.B (0..min(64, VL)-1)
 
 	WORD	$0xa400a470	// ZLD1B (VL*0)(R3), P1.Z, [Z16.B]
-	CMP	$32, R4
-	BGT	elut_zero
-	ADD	$32, R3, R8
-	WORD	$0xa400a511	// ZLD1B (VL*0)(R8), P1.Z, [Z17.B]
+	CMP	$64, R4
+	BGE	elut_zero
+	SUB	R4, R8, R8	// 64 - VL
+	WORD	$0x25281ce2	// PWHILELO R8, R7, P2.B (0..64-VL-1)
+	ADD	R4, R3, R8
+	WORD	$0xa400a911	// ZLD1B (VL*0)(R8), P2.Z, [Z17.B]
 	B	elut_done
 elut_zero:
 	WORD	$0x2538c011	// ZDUP $0, Z17.B
@@ -120,12 +122,14 @@ TEXT ·decodeSVE2(SB), NOSPLIT|NOFRAME, $0-40
 	WORD	$0xa400a470	// ZLD1B (VL*0)(R3), P1.Z, [Z16.B]
 	ADD	$64, R3, R10
 	WORD	$0xa400a554	// ZLD1B (VL*0)(R10), P1.Z, [Z20.B]
-	CMP	$32, R4
-	BGT	dlut_zero
-	ADD	$32, R3, R8
-	WORD	$0xa400a511	// ZLD1B (VL*0)(R8), P1.Z, [Z17.B]
-	ADD	$96, R3, R10
-	WORD	$0xa400a555	// ZLD1B (VL*0)(R10), P1.Z, [Z21.B]
+	CMP	$64, R4
+	BGE	dlut_zero
+	SUB	R4, R8, R8	// 64 - VL
+	WORD	$0x25281ce2	// PWHILELO R8, R7, P2.B (0..64-VL-1)
+	ADD	R4, R3, R8
+	WORD	$0xa400a911	// ZLD1B (VL*0)(R8), P2.Z, [Z17.B]
+	ADD	R4, R10, R10
+	WORD	$0xa400a955	// ZLD1B (VL*0)(R10), P2.Z, [Z21.B]
 	B	dlut_done
 dlut_zero:
 	WORD	$0x2538c011	// ZDUP $0, Z17.B

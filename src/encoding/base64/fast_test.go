@@ -259,6 +259,101 @@ func TestFastSIMDCorruptAndBoundarySecurity(t *testing.T) {
 	}
 }
 
+func TestFastAllAlphabetAndByteCoverage(t *testing.T) {
+	// Cover all 256 byte values across multiple NEON/AVX2/SVE2 vector blocks.
+	raw := make([]byte, 512)
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	for _, enc := range []*Encoding{StdEncoding, URLEncoding, RawStdEncoding, RawURLEncoding} {
+		got := enc.EncodeToString(raw)
+		dec, err := enc.DecodeString(got)
+		if err != nil {
+			t.Fatalf("DecodeString failed: %v", err)
+		}
+		if !bytes.Equal(dec, raw) {
+			t.Fatalf("roundtrip mismatch for 512-byte all-byte pattern")
+		}
+	}
+
+	// Cover every valid alphabet symbol repeated across 64..512 byte boundaries.
+	for _, tc := range []struct {
+		enc   *Encoding
+		alpha string
+	}{
+		{StdEncoding, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"},
+		{URLEncoding, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"},
+	} {
+		rep := strings.Repeat(tc.alpha, 8) // 512 bytes
+		oracle := NewEncoding(tc.alpha)
+		got, err := tc.enc.DecodeString(rep)
+		want, wantErr := oracle.DecodeString(rep)
+		if err != wantErr || !bytes.Equal(got, want) {
+			t.Fatalf("all-alphabet decode mismatch: err=(%v,%v) eq=%v", err, wantErr, bytes.Equal(got, want))
+		}
+	}
+}
+
+func TestFastLargeSIMDCorruptAndNewlinePositions(t *testing.T) {
+	stdAlpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	urlAlpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	encs := []struct {
+		enc    *Encoding
+		oracle *Encoding
+	}{
+		{StdEncoding, NewEncoding(stdAlpha)},
+		{URLEncoding, NewEncoding(urlAlpha)},
+		{RawStdEncoding, NewEncoding(stdAlpha).WithPadding(NoPadding)},
+		{RawURLEncoding, NewEncoding(urlAlpha).WithPadding(NoPadding)},
+	}
+	sizes := []int{128, 192, 256, 384, 512, 768, 1024}
+	positions := []int{0, 1, 15, 16, 31, 32, 47, 48, 63, 64, 95, 96, 127, 128, 191, 192, 255, 256, 383, 384, 511, 512}
+	badBytes := []byte{0x00, 0x01, 0x1f, ' ', '!', '+', '-', '/', '_', '=', 0x7f, 0x80, 0xbf, 0xc1, 0xff}
+
+	for _, pair := range encs {
+		for _, n := range sizes {
+			src := makeDeterministicBytes(n, 23)
+			encoded := []byte(pair.enc.EncodeToString(src))
+
+			for _, pos := range positions {
+				if pos >= len(encoded) {
+					continue
+				}
+				// Newline injection at SIMD chunk boundary
+				withNL := make([]byte, 0, len(encoded)+2)
+				withNL = append(withNL, encoded[:pos]...)
+				withNL = append(withNL, '\r', '\n')
+				withNL = append(withNL, encoded[pos:]...)
+				dst := make([]byte, pair.enc.DecodedLen(len(withNL)))
+				dn, err := pair.enc.Decode(dst, withNL)
+				if err != nil || !bytes.Equal(dst[:dn], src) {
+					t.Fatalf("newline at pos=%d n=%d failed: err=%v", pos, n, err)
+				}
+
+				for _, bad := range badBytes {
+					corrupt := slices.Clone(encoded)
+					corrupt[pos] = bad
+					out := make([]byte, pair.enc.DecodedLen(len(corrupt)))
+					wantOut := make([]byte, pair.oracle.DecodedLen(len(corrupt)))
+					gotN, gotErr := pair.enc.Decode(out, corrupt)
+					wantN, wantErr := pair.oracle.Decode(wantOut, corrupt)
+					if !errors.Is(gotErr, wantErr) || (gotErr != nil && wantErr != nil && gotErr.Error() != wantErr.Error()) {
+						t.Fatalf("n=%d pos=%d bad=%#x err mismatch: got (%d, %v), want (%d, %v)", n, pos, bad, gotN, gotErr, wantN, wantErr)
+					}
+					if gotN != wantN || !bytes.Equal(out[:gotN], wantOut[:wantN]) {
+						t.Fatalf("n=%d pos=%d bad=%#x partial decoded mismatch: got %d, want %d", n, pos, bad, gotN, wantN)
+					}
+				}
+			}
+		}
+	}
+
+	// Empty DecodeString must return non-nil empty slice.
+	if b, err := StdEncoding.DecodeString(""); err != nil || b == nil || len(b) != 0 {
+		t.Fatalf("DecodeString(\"\") = (%#v, %v), want non-nil empty slice", b, err)
+	}
+}
+
 func BenchmarkFastSuite(b *testing.B) {
 	sizes := []struct {
 		name string
