@@ -769,9 +769,9 @@ func appendSimpleXML(out []byte, k xmlFastKind, ptr unsafe.Pointer, rt reflect.T
 	case xkUintptr:
 		return istrconv.AppendUint10(out, uint64(*(*uintptr)(ptr))), nil
 	case xkFloat32:
-		return strconv.AppendFloat(out, float64(*(*float32)(ptr)), 'g', -1, 32), nil
+		return istrconv.AppendFloat(out, float64(*(*float32)(ptr)), 'g', -1, 32), nil
 	case xkFloat64:
-		return strconv.AppendFloat(out, *(*float64)(ptr), 'g', -1, 64), nil
+		return istrconv.AppendFloat(out, *(*float64)(ptr), 'g', -1, 64), nil
 	case xkBool:
 		if *(*bool)(ptr) {
 			return append(out, "true"...), nil
@@ -1392,7 +1392,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 
 		switch fe.mode {
 		case fCDATA, fCharData:
-			if plan.hasParents {
+			if plan.hasParents && len(p.parentStack) > parentBase {
 				if err := p.trimParents(parentBase, fe.parents); err != nil {
 					return err
 				}
@@ -1480,7 +1480,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 				b = istrconv.AppendUint10(scratch[:0], rv.Uint())
 			case reflect.Float32, reflect.Float64:
-				b = strconv.AppendFloat(scratch[:0], rv.Float(), 'g', -1, rv.Type().Bits())
+				b = istrconv.AppendFloat(scratch[:0], rv.Float(), 'g', -1, rv.Type().Bits())
 			case reflect.Bool:
 				b = strconv.AppendBool(scratch[:0], rv.Bool())
 			case reflect.String:
@@ -1503,7 +1503,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 			continue
 
 		case fComment:
-			if plan.hasParents {
+			if plan.hasParents && len(p.parentStack) > parentBase {
 				if err := p.trimParents(parentBase, fe.parents); err != nil {
 					return err
 				}
@@ -1601,8 +1601,10 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 
 		case fElement, fElement | fAny:
 			if plan.hasParents {
-				if err := p.trimParents(parentBase, fe.parents); err != nil {
-					return err
+				if len(p.parentStack) > parentBase {
+					if err := p.trimParents(parentBase, fe.parents); err != nil {
+						return err
+					}
 				}
 				if cur := len(p.parentStack) - parentBase; len(fe.parents) > cur {
 					if (fe.kind != xkPtr && fe.kind != xkInterface) || !xmlIsEmpty(fe.kind, fptr, fe.rt) {

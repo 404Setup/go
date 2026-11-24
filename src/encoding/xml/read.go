@@ -201,6 +201,12 @@ func putXmlUnmarshalDecoder(d *Decoder) {
 		clear(d.attrScratch[:cap(d.attrScratch)])
 		d.attrScratch = d.attrScratch[:0]
 	}
+	if cap(d.attrRawScratch) > 64 {
+		d.attrRawScratch = nil
+	} else if len(d.attrRawScratch) > 0 {
+		clear(d.attrRawScratch[:cap(d.attrRawScratch)])
+		d.attrRawScratch = d.attrRawScratch[:0]
+	}
 	if d.buf.Cap() > 4096 {
 		d.buf = bytes.Buffer{}
 	} else {

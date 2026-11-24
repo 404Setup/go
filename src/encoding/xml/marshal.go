@@ -101,7 +101,7 @@ func Marshal(v any) ([]byte, error) {
 			putXmlMarshalEncoder(eb)
 			return nil, nil
 		}
-		res := bytealg.MakeNoZero(len(out))
+		res := bytealg.MakeNoZero(len(out))[:len(out):len(out)]
 		copy(res, out)
 		putXmlMarshalEncoder(eb)
 		return res, nil
@@ -119,7 +119,7 @@ func Marshal(v any) ([]byte, error) {
 		putXmlMarshalEncoder(eb)
 		return nil, nil
 	}
-	res := bytealg.MakeNoZero(len(out))
+	res := bytealg.MakeNoZero(len(out))[:len(out):len(out)]
 	copy(res, out)
 	putXmlMarshalEncoder(eb)
 	return res, nil
@@ -186,7 +186,7 @@ func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
 			putXmlMarshalEncoder(eb)
 			return nil, nil
 		}
-		res := bytealg.MakeNoZero(len(out))
+		res := bytealg.MakeNoZero(len(out))[:len(out):len(out)]
 		copy(res, out)
 		putXmlMarshalEncoder(eb)
 		return res, nil
@@ -204,7 +204,7 @@ func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
 		putXmlMarshalEncoder(eb)
 		return nil, nil
 	}
-	res := bytealg.MakeNoZero(len(out))
+	res := bytealg.MakeNoZero(len(out))[:len(out):len(out)]
 	copy(res, out)
 	putXmlMarshalEncoder(eb)
 	return res, nil

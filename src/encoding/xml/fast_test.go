@@ -49,39 +49,39 @@ type testRecursiveNode struct {
 }
 
 type testComplexDoc struct {
-	XMLName   Name              `xml:"doc"`
-	ID        int64             `xml:"id,attr"`
-	Flag      bool              `xml:"flag,attr,omitempty"`
-	Tags      []string          `xml:"tag,attr,omitempty"`
-	PtrCode   *testEmbeddedAttr `xml:",omitempty"`
-	Count     uint32            `xml:"count"`
-	Ratio     float64           `xml:"ratio"`
-	Created   time.Time         `xml:"created"`
-	Custom    customTextTag     `xml:"custom"`
-	Raw       []byte            `xml:"raw"`
-	EmptyRaw  []byte            `xml:"emptyRaw"`
-	PathVal   string            `xml:"a>b>c"`
-	Items     []string          `xml:"item"`
-	Unknown   []string          `xml:",any"`
-	Comment   string            `xml:",comment"`
-	Inner     string            `xml:",innerxml"`
+	XMLName  Name              `xml:"doc"`
+	ID       int64             `xml:"id,attr"`
+	Flag     bool              `xml:"flag,attr,omitempty"`
+	Tags     []string          `xml:"tag,attr,omitempty"`
+	PtrCode  *testEmbeddedAttr `xml:",omitempty"`
+	Count    uint32            `xml:"count"`
+	Ratio    float64           `xml:"ratio"`
+	Created  time.Time         `xml:"created"`
+	Custom   customTextTag     `xml:"custom"`
+	Raw      []byte            `xml:"raw"`
+	EmptyRaw []byte            `xml:"emptyRaw"`
+	PathVal  string            `xml:"a>b>c"`
+	Items    []string          `xml:"item"`
+	Unknown  []string          `xml:",any"`
+	Comment  string            `xml:",comment"`
+	Inner    string            `xml:",innerxml"`
 }
 
 func TestFastMarshalUnmarshalEdgeCases(t *testing.T) {
 	ts := time.Date(2026, 3, 15, 10, 20, 30, 0, time.UTC)
 	in := testComplexDoc{
-		ID:      42,
-		Flag:    true,
-		Tags:    []string{"alpha", "beta"},
-		PtrCode: &testEmbeddedAttr{Code: 7},
-		Count:   999,
-		Ratio:   3.25,
-		Created: ts,
-		Custom:  "hello",
-		Raw:     []byte("<escaped & \"quoted\" 'attr'>"),
+		ID:       42,
+		Flag:     true,
+		Tags:     []string{"alpha", "beta"},
+		PtrCode:  &testEmbeddedAttr{Code: 7},
+		Count:    999,
+		Ratio:    3.25,
+		Created:  ts,
+		Custom:   "hello",
+		Raw:      []byte("<escaped & \"quoted\" 'attr'>"),
 		EmptyRaw: []byte{},
-		PathVal: "nested-leaf",
-		Items:   []string{"first", "second"},
+		PathVal:  "nested-leaf",
+		Items:    []string{"first", "second"},
 	}
 
 	b, err := Marshal(in)
@@ -580,4 +580,268 @@ func BenchmarkFastSuite(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestFastMarshalCapNoHeapLeak(t *testing.T) {
+	type smallItem struct {
+		ID   int    `xml:"id,attr"`
+		Name string `xml:"name"`
+	}
+	for _, n := range []int{1, 7, 33, 129} {
+		items := make([]smallItem, n)
+		for i := range items {
+			items[i] = smallItem{ID: i, Name: "item"}
+		}
+		doc := struct {
+			XMLName Name        `xml:"root"`
+			Items   []smallItem `xml:"item"`
+		}{Items: items}
+
+		b, err := Marshal(&doc)
+		if err != nil {
+			t.Fatalf("Marshal(%d) failed: %v", n, err)
+		}
+		if cap(b) != len(b) {
+			t.Fatalf("Marshal(%d): cap(b)=%d != len(b)=%d; trailing heap capacity exposed", n, cap(b), len(b))
+		}
+		bi, err := MarshalIndent(&doc, "", "  ")
+		if err != nil {
+			t.Fatalf("MarshalIndent(%d) failed: %v", n, err)
+		}
+		if cap(bi) != len(bi) {
+			t.Fatalf("MarshalIndent(%d): cap(bi)=%d != len(bi)=%d; trailing heap capacity exposed", n, cap(bi), len(bi))
+		}
+	}
+}
+
+func TestFastIntParseBoundaries(t *testing.T) {
+	type intDoc struct {
+		XMLName Name   `xml:"n"`
+		AI8     int8   `xml:"ai8,attr"`
+		AI16    int16  `xml:"ai16,attr"`
+		AI32    int32  `xml:"ai32,attr"`
+		AI64    int64  `xml:"ai64,attr"`
+		AU8     uint8  `xml:"au8,attr"`
+		AU16    uint16 `xml:"au16,attr"`
+		AU32    uint32 `xml:"au32,attr"`
+		AU64    uint64 `xml:"au64,attr"`
+		I8      int8   `xml:"i8"`
+		I64     int64  `xml:"i64"`
+		U64     uint64 `xml:"u64"`
+	}
+	raw := `<n ai8="-128" ai16="32767" ai32="-2147483648" ai64="9223372036854775807" au8="255" au16="65535" au32="4294967295" au64="18446744073709551615"><i8>+127</i8><i64>-9223372036854775808</i64><u64>10000000000000000000</u64></n>`
+	var got intDoc
+	if err := Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("Unmarshal valid bounds failed: %v", err)
+	}
+	want := intDoc{
+		XMLName: Name{Local: "n"},
+		AI8:     -128,
+		AI16:    32767,
+		AI32:    -2147483648,
+		AI64:    9223372036854775807,
+		AU8:     255,
+		AU16:    65535,
+		AU32:    4294967295,
+		AU64:    18446744073709551615,
+		I8:      127,
+		I64:     -9223372036854775808,
+		U64:     10000000000000000000,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("bounds mismatch: got %+v want %+v", got, want)
+	}
+
+	invalidCases := []string{
+		`<n ai8="128"/>`,
+		`<n ai8="-129"/>`,
+		`<n ai64="9223372036854775808"/>`,
+		`<n ai64="-9223372036854775809"/>`,
+		`<n au8="256"/>`,
+		`<n au8="-1"/>`,
+		`<n au64="18446744073709551616"/>`,
+		`<n><i8>12x</i8></n>`,
+		`<n><u64>-</u64></n>`,
+		`<n><i64>+</i64></n>`,
+		`<n><i64>abc</i64></n>`,
+	}
+	for _, tc := range invalidCases {
+		var bad intDoc
+		if err := Unmarshal([]byte(tc), &bad); err == nil {
+			t.Fatalf("expected error for %s, got %+v", tc, bad)
+		}
+	}
+	// Empty scalar element sets zero value without error per encoding/xml semantics.
+	zeroDoc := intDoc{I64: 99, U64: 88}
+	if err := Unmarshal([]byte(`<n><i64></i64><u64></u64></n>`), &zeroDoc); err != nil {
+		t.Fatalf("Unmarshal empty scalar element failed: %v", err)
+	}
+	if zeroDoc.I64 != 0 || zeroDoc.U64 != 0 {
+		t.Fatalf("empty scalar elements not reset to 0: got %+v", zeroDoc)
+	}
+}
+
+func TestFastAttrRawAndStreamingTokens(t *testing.T) {
+	// Exercise raw attr bytes, entities, newlines inside large >32B strings, and InputPos line tracking.
+	longText := strings.Repeat("a", 31) + "\t" + strings.Repeat("b", 32) + "\n" + strings.Repeat("c", 33) + "&amp;end"
+	longAttr := strings.Repeat("x", 35) + "\n" + strings.Repeat("y", 35) + "&lt;1&gt;"
+	docXML := `<root id="42" ok="true" f="3.25" tm="2026-07-04T15:30:45Z" big="` + longAttr + `">` +
+		`<val>` + longText + `</val><empty/><nilbytes></nilbytes>` +
+		`</root>`
+
+	type streamDoc struct {
+		ID       int       `xml:"id,attr"`
+		OK       bool      `xml:"ok,attr"`
+		F        float64   `xml:"f,attr"`
+		TM       time.Time `xml:"tm,attr"`
+		Big      string    `xml:"big,attr"`
+		Val      string    `xml:"val"`
+		Empty    []byte    `xml:"empty"`
+		Missing  []byte    `xml:"missing"`
+		NilBytes []byte    `xml:"nilbytes"`
+	}
+	var got streamDoc
+	if err := Unmarshal([]byte(docXML), &got); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	wantAttr := strings.Repeat("x", 35) + "\n" + strings.Repeat("y", 35) + "<1>"
+	wantText := strings.Repeat("a", 31) + "\t" + strings.Repeat("b", 32) + "\n" + strings.Repeat("c", 33) + "&end"
+	if got.ID != 42 || !got.OK || got.F != 3.25 || got.TM.Year() != 2026 ||
+		got.Big != wantAttr || got.Val != wantText ||
+		got.Empty == nil || len(got.Empty) != 0 ||
+		got.Missing != nil || got.NilBytes == nil || len(got.NilBytes) != 0 {
+		t.Fatalf("decoded mismatch: %+v", got)
+	}
+
+	// Verify Token() API line tracking across >32-byte SIMD CharData and Attr cloning.
+	dec := NewDecoder(strings.NewReader(docXML))
+	var attrs []Attr
+	var lineAfterVal int
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Token() error: %v", err)
+		}
+		switch tok := tok.(type) {
+		case StartElement:
+			if tok.Name.Local == "root" {
+				attrs = tok.Copy().Attr
+			}
+		case EndElement:
+			if tok.Name.Local == "val" {
+				lineAfterVal, _ = dec.InputPos()
+			}
+		}
+	}
+	if lineAfterVal != 3 {
+		t.Fatalf("InputPos line after multiline CharData/Attr = %d, want 3", lineAfterVal)
+	}
+	if len(attrs) != 5 || attrs[0].Value != "42" || attrs[4].Value != wantAttr {
+		t.Fatalf("Token().Copy().Attr mismatch: %+v", attrs)
+	}
+
+	// Verify Strict=false with HTMLAutoClose and DefaultSpace.
+	htmlInput := `<p>hello<br>world</p>`
+	decHTML := NewDecoder(strings.NewReader(htmlInput))
+	decHTML.Strict = false
+	decHTML.AutoClose = HTMLAutoClose
+	decHTML.DefaultSpace = "urn:html"
+	var p struct {
+		XMLName Name   `xml:"urn:html p"`
+		Text    string `xml:",chardata"`
+		Br      string `xml:"urn:html br"`
+	}
+	if err := decHTML.Decode(&p); err != nil {
+		t.Fatalf("HTML AutoClose decode failed: %v", err)
+	}
+	if !strings.Contains(p.Text, "hello") {
+		t.Fatalf("unexpected p.Text: %q", p.Text)
+	}
+}
+
+type customEscapeWriter struct {
+	buf bytes.Buffer
+}
+
+func (w *customEscapeWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
+func TestFastEscapeTextWritersAndBoundaries(t *testing.T) {
+	specials := []byte{'<', '>', '&', '\'', '"', '\n', '\r', '\t', 0x00, 0x1f, 0xff}
+	for size := 0; size <= 160; size++ {
+		for _, sp := range specials {
+			src := bytes.Repeat([]byte{'A'}, size)
+			for _, pos := range []int{0, size / 2, size - 1} {
+				if pos >= 0 && pos < len(src) {
+					src[pos] = sp
+				}
+			}
+			var ref customEscapeWriter
+			if err := EscapeText(&ref, src); err != nil {
+				t.Fatalf("EscapeText(customWriter) size=%d sp=%x error: %v", size, sp, err)
+			}
+			var bb bytes.Buffer
+			if err := EscapeText(&bb, src); err != nil {
+				t.Fatalf("EscapeText(bytes.Buffer) size=%d sp=%x error: %v", size, sp, err)
+			}
+			var sb strings.Builder
+			if err := EscapeText(&sb, src); err != nil {
+				t.Fatalf("EscapeText(strings.Builder) size=%d sp=%x error: %v", size, sp, err)
+			}
+			if !bytes.Equal(ref.buf.Bytes(), bb.Bytes()) || sb.String() != ref.buf.String() {
+				t.Fatalf("EscapeText writer mismatch size=%d sp=%x:\nref=%q\nbb =%q\nsb =%q",
+					size, sp, ref.buf.Bytes(), bb.Bytes(), sb.String())
+			}
+		}
+	}
+	// Test "]]>" spanning across 32-byte boundaries.
+	cdataEnd := strings.Repeat("Z", 30) + "]]>" + strings.Repeat("Z", 35) + "]]>"
+	var sb strings.Builder
+	var cw customEscapeWriter
+	if err := EscapeText(&sb, []byte(cdataEnd)); err != nil {
+		t.Fatal(err)
+	}
+	if err := EscapeText(&cw, []byte(cdataEnd)); err != nil {
+		t.Fatal(err)
+	}
+	if sb.String() != cw.buf.String() || !strings.Contains(sb.String(), "]]&gt;") {
+		t.Fatalf("EscapeText ]]> mismatch: %q vs %q", sb.String(), cw.buf.String())
+	}
+}
+
+func TestFastMixedPathsAndNilTextAttr(t *testing.T) {
+	type mixedDoc struct {
+		XMLName  Name           `xml:"root"`
+		Flat     string         `xml:"flat"`
+		DeepA    string         `xml:"a>b>c"`
+		DeepB    int            `xml:"a>b>d"`
+		Conflict string         `xml:"a>x"`
+		TextAttr *customTextTag `xml:"ta,attr"`
+		NilTime  *time.Time     `xml:"nt,attr"`
+	}
+	xmlData := `<root ta="[tag]"><flat>ok</flat><a><b><c>deep</c><d>77</d></b><x>cx</x></a></root>`
+	var decoded mixedDoc
+	if err := Unmarshal([]byte(xmlData), &decoded); err != nil {
+		t.Fatalf("Unmarshal mixed paths failed: %v", err)
+	}
+	if decoded.Flat != "ok" || decoded.DeepA != "deep" || decoded.DeepB != 77 || decoded.Conflict != "cx" ||
+		decoded.TextAttr == nil || *decoded.TextAttr != "tag" || decoded.NilTime != nil {
+		t.Fatalf("mixed paths mismatch: %+v", decoded)
+	}
+
+	bMarshal, err := Marshal(&decoded)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	var encBuf bytes.Buffer
+	if err := NewEncoder(&encBuf).Encode(&decoded); err != nil {
+		t.Fatalf("Encoder.Encode failed: %v", err)
+	}
+	if !bytes.Equal(bMarshal, encBuf.Bytes()) {
+		t.Fatalf("Marshal vs Encoder.Encode mismatch:\n%s\nvs\n%s", bMarshal, encBuf.Bytes())
+	}
 }

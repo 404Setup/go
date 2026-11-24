@@ -323,17 +323,26 @@ func buildXmlDecodePlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Type]*x
 			}
 		}
 
-		if !p.hasParents && len(p.elems) > 6 {
+		if len(p.elems) > 4 {
 			m := make(map[string]int, len(p.elems))
 			for i := range p.elems {
 				e := &p.elems[i]
 				if e.mode != fElement {
 					continue
 				}
-				if _, dup := m[e.name.Local]; dup {
-					m[e.name.Local] = -1
+				key := e.name.Local
+				isParent := len(e.parents) > 0
+				if isParent {
+					key = e.parents[0]
+				}
+				if prev, dup := m[key]; dup {
+					if !(isParent && prev == -2) {
+						m[key] = -1
+					}
+				} else if isParent {
+					m[key] = -2
 				} else {
-					m[e.name.Local] = i
+					m[key] = i
 				}
 			}
 			p.elemByLocal = m
@@ -412,13 +421,25 @@ func buildXmlDecodeElem(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []
 	return fe
 }
 
-func cloneAttrs(attrs []Attr) []Attr {
+func cloneAttrs(attrs []Attr, attrRaw [][]byte) []Attr {
 	if len(attrs) == 0 {
 		return []Attr{}
 	}
 	cp := make([]Attr, len(attrs))
 	copy(cp, attrs)
+	for i := range cp {
+		if i < len(attrRaw) && attrRaw[i] != nil {
+			cp[i].Value = string(attrRaw[i])
+		}
+	}
 	return cp
+}
+
+func materializeAttrVal(a Attr, raw []byte) Attr {
+	if raw != nil {
+		a.Value = string(raw)
+	}
+	return a
 }
 
 func (d *Decoder) fastUnmarshal(plan *xmlDecodePlan, ptr unsafe.Pointer, start *StartElement) error {
@@ -427,6 +448,7 @@ func (d *Decoder) fastUnmarshal(plan *xmlDecodePlan, ptr unsafe.Pointer, start *
 	}
 	var startName Name
 	var startAttr []Attr
+	var startAttrRaw [][]byte
 	if start == nil {
 		var tok xmlTok
 		for {
@@ -436,6 +458,7 @@ func (d *Decoder) fastUnmarshal(plan *xmlDecodePlan, ptr unsafe.Pointer, start *
 			if tok.kind == xtStartElement {
 				startName = tok.name
 				startAttr = tok.attr
+				startAttrRaw = tok.attrRaw
 				break
 			}
 		}
@@ -443,10 +466,10 @@ func (d *Decoder) fastUnmarshal(plan *xmlDecodePlan, ptr unsafe.Pointer, start *
 		startName = start.Name
 		startAttr = start.Attr
 	}
-	return d.fastUnmarshalStart(plan, ptr, startName, startAttr)
+	return d.fastUnmarshalStart(plan, ptr, startName, startAttr, startAttrRaw)
 }
 
-func (d *Decoder) fastUnmarshalStart(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr) error {
+func (d *Decoder) fastUnmarshalStart(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) error {
 	if d.stkDepth > maxUnmarshalDepth || runtime.GOARCH == "wasm" && d.stkDepth > maxUnmarshalDepthWasm {
 		return errUnmarshalDepth
 	}
@@ -465,7 +488,7 @@ func (d *Decoder) fastUnmarshalStart(plan *xmlDecodePlan, ptr unsafe.Pointer, st
 	}
 
 	if plan.isUnmarshaler || plan.ptrUnmarshaler {
-		st := StartElement{Name: startName, Attr: cloneAttrs(startAttr)}
+		st := StartElement{Name: startName, Attr: cloneAttrs(startAttr, startAttrRaw)}
 		pv := reflect.NewAt(plan.rt, ptr)
 		if plan.isUnmarshaler {
 			if u, ok := reflect.TypeAssert[Unmarshaler](pv.Elem()); ok {
@@ -485,7 +508,7 @@ func (d *Decoder) fastUnmarshalStart(plan *xmlDecodePlan, ptr unsafe.Pointer, st
 
 	switch plan.kind {
 	case xkSlice:
-		return d.fastUnmarshalSlice(plan, ptr, startName, startAttr)
+		return d.fastUnmarshalSlice(plan, ptr, startName, startAttr, startAttrRaw)
 	case xkBytes:
 		return d.fastUnmarshalLeaf(xkBytes, ptr)
 	case xkBool, xkString,
@@ -497,14 +520,14 @@ func (d *Decoder) fastUnmarshalStart(plan *xmlDecodePlan, ptr unsafe.Pointer, st
 		*(*Name)(ptr) = startName
 		return d.fastSkip()
 	case xkStruct:
-		return d.fastUnmarshalStruct(plan, ptr, startName, startAttr)
+		return d.fastUnmarshalStruct(plan, ptr, startName, startAttr, startAttrRaw)
 	default:
-		st := StartElement{Name: startName, Attr: cloneAttrs(startAttr)}
+		st := StartElement{Name: startName, Attr: cloneAttrs(startAttr, startAttrRaw)}
 		return d.unmarshal(reflect.NewAt(plan.rt, ptr).Elem(), &st)
 	}
 }
 
-func (d *Decoder) fastUnmarshalSlice(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr) error {
+func (d *Decoder) fastUnmarshalSlice(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) error {
 	sh := (*xmlSliceHeader)(ptr)
 	n := sh.len
 	var elemPtr unsafe.Pointer
@@ -517,7 +540,7 @@ func (d *Decoder) fastUnmarshalSlice(plan *xmlDecodePlan, ptr unsafe.Pointer, st
 		sv.SetLen(n + 1)
 		elemPtr = unsafe.Add((*xmlSliceHeader)(ptr).data, uintptr(n)*plan.elemSize)
 	}
-	if err := d.fastUnmarshalStart(plan.elemPlan, elemPtr, startName, startAttr); err != nil {
+	if err := d.fastUnmarshalStart(plan.elemPlan, elemPtr, startName, startAttr, startAttrRaw); err != nil {
 		sh.len = n
 		return err
 	}
@@ -730,24 +753,39 @@ func assignUintPtr[T ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr](pt
 	return nil
 }
 
-func assignAttrString(kind xmlFastKind, ptr unsafe.Pointer, rt reflect.Type, s string) error {
+func assignAttrRaw(kind xmlFastKind, ptr unsafe.Pointer, rt reflect.Type, s string, raw []byte) error {
 	switch kind {
 	case xkString:
-		*(*string)(ptr) = s
+		if raw != nil {
+			*(*string)(ptr) = string(raw)
+		} else {
+			*(*string)(ptr) = s
+		}
 		return nil
 	case xkBytes:
-		if len(s) == 0 {
+		if raw != nil {
+			b := make([]byte, len(raw))
+			copy(b, raw)
+			*(*[]byte)(ptr) = b
+		} else if len(s) == 0 {
 			*(*[]byte)(ptr) = []byte{}
 		} else {
 			*(*[]byte)(ptr) = []byte(s)
 		}
 		return nil
 	default:
+		if raw != nil {
+			return assignLeafBytes(kind, ptr, rt, raw, false, false)
+		}
 		return assignLeafBytes(kind, ptr, rt, unsafe.Slice(unsafe.StringData(s), len(s)), false, false)
 	}
 }
 
-func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a Attr) error {
+func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a Attr, raw []byte) error {
+	valBytes := raw
+	if valBytes == nil {
+		valBytes = unsafe.Slice(unsafe.StringData(a.Value), len(a.Value))
+	}
 	if fa.isPtr {
 		pp := (*unsafe.Pointer)(fptr)
 		if *pp == nil {
@@ -755,23 +793,23 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 		}
 		fptr = *pp
 		if fa.isTime {
-			return (*time.Time)(fptr).UnmarshalText(unsafe.Slice(unsafe.StringData(a.Value), len(a.Value)))
+			return (*time.Time)(fptr).UnmarshalText(valBytes)
 		}
 		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm {
-			return d.unmarshalAttr(reflect.NewAt(fa.elemRT, fptr).Elem(), a)
+			return d.unmarshalAttr(reflect.NewAt(fa.elemRT, fptr).Elem(), materializeAttrVal(a, raw))
 		}
 		if fa.elemKind == xkAttr {
-			*(*Attr)(fptr) = a
+			*(*Attr)(fptr) = materializeAttrVal(a, raw)
 			return nil
 		}
-		return assignAttrString(fa.elemKind, fptr, fa.elemRT, a.Value)
+		return assignAttrRaw(fa.elemKind, fptr, fa.elemRT, a.Value, raw)
 	}
 
 	if fa.isUnmarshaler || fa.ptrUnmarshaler || fa.isTextUnmarshaler || fa.ptrTextUnmarshaler {
 		if fa.isTime {
-			return (*time.Time)(fptr).UnmarshalText(unsafe.Slice(unsafe.StringData(a.Value), len(a.Value)))
+			return (*time.Time)(fptr).UnmarshalText(valBytes)
 		}
-		return d.unmarshalAttr(reflect.NewAt(fa.rt, fptr).Elem(), a)
+		return d.unmarshalAttr(reflect.NewAt(fa.rt, fptr).Elem(), materializeAttrVal(a, raw))
 	}
 
 	if fa.isSlice {
@@ -788,17 +826,17 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 			elemPtr = unsafe.Add((*xmlSliceHeader)(fptr).data, uintptr(n)*fa.elemSize)
 		}
 		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm || fa.elemKind == xkPtr || fa.elemKind == xkSlice {
-			if err := d.unmarshalAttr(reflect.NewAt(fa.elemRT, elemPtr).Elem(), a); err != nil {
+			if err := d.unmarshalAttr(reflect.NewAt(fa.elemRT, elemPtr).Elem(), materializeAttrVal(a, raw)); err != nil {
 				sh.len = n
 				return err
 			}
 			return nil
 		}
 		if fa.elemKind == xkAttr {
-			*(*Attr)(elemPtr) = a
+			*(*Attr)(elemPtr) = materializeAttrVal(a, raw)
 			return nil
 		}
-		if err := assignAttrString(fa.elemKind, elemPtr, fa.elemRT, a.Value); err != nil {
+		if err := assignAttrRaw(fa.elemKind, elemPtr, fa.elemRT, a.Value, raw); err != nil {
 			sh.len = n
 			return err
 		}
@@ -806,13 +844,13 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 	}
 
 	if fa.kind == xkAttr {
-		*(*Attr)(fptr) = a
+		*(*Attr)(fptr) = materializeAttrVal(a, raw)
 		return nil
 	}
-	return assignAttrString(fa.kind, fptr, fa.rt, a.Value)
+	return assignAttrRaw(fa.kind, fptr, fa.rt, a.Value, raw)
 }
 
-func (d *Decoder) fastUnmarshalStruct(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr) error {
+func (d *Decoder) fastUnmarshalStruct(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) error {
 	if plan.hasXMLName {
 		if plan.xmlName != "" && plan.xmlName != startName.Local {
 			return UnmarshalError("expected element type <" + plan.xmlName + "> but have <" + startName.Local + ">")
@@ -833,7 +871,11 @@ func (d *Decoder) fastUnmarshalStruct(plan *xmlDecodePlan, ptr unsafe.Pointer, s
 	}
 
 	if len(startAttr) > 0 && len(plan.attrs) > 0 {
-		for _, a := range startAttr {
+		for ai, a := range startAttr {
+			var raw []byte
+			if ai < len(startAttrRaw) {
+				raw = startAttrRaw[ai]
+			}
 			handled := false
 			for i := range plan.attrs {
 				fa := &plan.attrs[i]
@@ -842,7 +884,7 @@ func (d *Decoder) fastUnmarshalStruct(plan *xmlDecodePlan, ptr unsafe.Pointer, s
 				}
 				if a.Name.Local == fa.name.Local && (fa.name.Space == "" || fa.name.Space == a.Name.Space) {
 					fptr := resolveDecodeFieldPtr(ptr, fa.steps, fa.offset)
-					if err := d.fastUnmarshalAttr(fa, fptr, a); err != nil {
+					if err := d.fastUnmarshalAttr(fa, fptr, a, raw); err != nil {
 						return err
 					}
 					handled = true
@@ -851,7 +893,7 @@ func (d *Decoder) fastUnmarshalStruct(plan *xmlDecodePlan, ptr unsafe.Pointer, s
 			if !handled && plan.anyAttrIdx >= 0 {
 				fa := &plan.attrs[plan.anyAttrIdx]
 				fptr := resolveDecodeFieldPtr(ptr, fa.steps, fa.offset)
-				if err := d.fastUnmarshalAttr(fa, fptr, a); err != nil {
+				if err := d.fastUnmarshalAttr(fa, fptr, a, raw); err != nil {
 					return err
 				}
 			}
@@ -921,10 +963,26 @@ Loop:
 		switch tok.kind {
 		case xtStartElement:
 			var consumed bool
-			if !plan.hasParents {
-				consumed, err = d.fastMatchFlatElement(plan, ptr, tok.name, tok.attr)
+			if plan.elemByLocal != nil {
+				idx, ok := plan.elemByLocal[tok.name.Local]
+				if ok {
+					if idx >= 0 {
+						fe := &plan.elems[idx]
+						if fe.name.Space == "" || fe.name.Space == tok.name.Space {
+							fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+							consumed = true
+							err = d.fastUnmarshalElem(fe, fptr, tok.name, tok.attr, tok.attrRaw)
+						}
+					} else if idx == -2 || plan.hasParents {
+						consumed, err = d.fastUnmarshalPath(plan, ptr, nil, tok.name, tok.attr, tok.attrRaw)
+					} else {
+						consumed, err = d.fastMatchFlatElement(plan, ptr, tok.name, tok.attr, tok.attrRaw)
+					}
+				}
+			} else if !plan.hasParents {
+				consumed, err = d.fastMatchFlatElement(plan, ptr, tok.name, tok.attr, tok.attrRaw)
 			} else {
-				consumed, err = d.fastUnmarshalPath(plan, ptr, nil, tok.name, tok.attr)
+				consumed, err = d.fastUnmarshalPath(plan, ptr, nil, tok.name, tok.attr, tok.attrRaw)
 			}
 			if err != nil {
 				return err
@@ -932,11 +990,11 @@ Loop:
 			if !consumed {
 				if saveAnyPtr != nil {
 					if saveAnyElem.plan != nil && saveAnyElem.plan.canFast {
-						if err := d.fastUnmarshalStart(saveAnyElem.plan, saveAnyPtr, tok.name, tok.attr); err != nil {
+						if err := d.fastUnmarshalStart(saveAnyElem.plan, saveAnyPtr, tok.name, tok.attr, tok.attrRaw); err != nil {
 							return err
 						}
 					} else {
-						st := StartElement{Name: tok.name, Attr: cloneAttrs(tok.attr)}
+						st := StartElement{Name: tok.name, Attr: cloneAttrs(tok.attr, tok.attrRaw)}
 						if err := d.unmarshal(reflect.NewAt(saveAnyElem.rt, saveAnyPtr).Elem(), &st); err != nil {
 							return err
 						}
@@ -1024,21 +1082,7 @@ Loop:
 	return nil
 }
 
-func (d *Decoder) fastMatchFlatElement(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr) (bool, error) {
-	if plan.elemByLocal != nil {
-		idx, ok := plan.elemByLocal[startName.Local]
-		if !ok {
-			return false, nil
-		}
-		if idx >= 0 {
-			fe := &plan.elems[idx]
-			if fe.name.Space == "" || fe.name.Space == startName.Space {
-				fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
-				return true, d.fastUnmarshalElem(fe, fptr, startName, startAttr)
-			}
-			return false, nil
-		}
-	}
+func (d *Decoder) fastMatchFlatElement(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) (bool, error) {
 	for i := range plan.elems {
 		fe := &plan.elems[i]
 		if fe.mode != fElement || fe.name.Local != startName.Local {
@@ -1048,12 +1092,12 @@ func (d *Decoder) fastMatchFlatElement(plan *xmlDecodePlan, ptr unsafe.Pointer, 
 			continue
 		}
 		fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
-		return true, d.fastUnmarshalElem(fe, fptr, startName, startAttr)
+		return true, d.fastUnmarshalElem(fe, fptr, startName, startAttr, startAttrRaw)
 	}
 	return false, nil
 }
 
-func (d *Decoder) fastUnmarshalPath(plan *xmlDecodePlan, ptr unsafe.Pointer, parents []string, startName Name, startAttr []Attr) (bool, error) {
+func (d *Decoder) fastUnmarshalPath(plan *xmlDecodePlan, ptr unsafe.Pointer, parents []string, startName Name, startAttr []Attr, startAttrRaw [][]byte) (bool, error) {
 	recurse := false
 Loop:
 	for i := range plan.elems {
@@ -1068,7 +1112,7 @@ Loop:
 		}
 		if len(fe.parents) == len(parents) && fe.name.Local == startName.Local {
 			fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
-			return true, d.fastUnmarshalElem(fe, fptr, startName, startAttr)
+			return true, d.fastUnmarshalElem(fe, fptr, startName, startAttr, startAttrRaw)
 		}
 		if len(fe.parents) > len(parents) && fe.parents[len(parents)] == startName.Local {
 			recurse = true
@@ -1090,7 +1134,7 @@ Loop:
 		}
 		switch tok.kind {
 		case xtStartElement:
-			consumed2, err := d.fastUnmarshalPath(plan, ptr, parents, tok.name, tok.attr)
+			consumed2, err := d.fastUnmarshalPath(plan, ptr, parents, tok.name, tok.attr, tok.attrRaw)
 			if err != nil {
 				return true, err
 			}
@@ -1105,10 +1149,10 @@ Loop:
 	}
 }
 
-func (d *Decoder) fastUnmarshalElem(fe *xmlDecodeElem, fptr unsafe.Pointer, startName Name, startAttr []Attr) error {
+func (d *Decoder) fastUnmarshalElem(fe *xmlDecodeElem, fptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) error {
 	if fe.plan != nil && fe.plan.canFast {
-		return d.fastUnmarshalStart(fe.plan, fptr, startName, startAttr)
+		return d.fastUnmarshalStart(fe.plan, fptr, startName, startAttr, startAttrRaw)
 	}
-	st := StartElement{Name: startName, Attr: cloneAttrs(startAttr)}
+	st := StartElement{Name: startName, Attr: cloneAttrs(startAttr, startAttrRaw)}
 	return d.unmarshal(reflect.NewAt(fe.rt, fptr).Elem(), &st)
 }

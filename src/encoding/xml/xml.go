@@ -227,6 +227,7 @@ type Decoder struct {
 	sawCustomUnmarshaler bool
 	nameCache            [64]string
 	attrScratch          []Attr
+	attrRawScratch       [][]byte
 }
 
 // NewDecoder creates a new XML parser reading from r.
@@ -600,15 +601,27 @@ const (
 )
 
 type xmlTok struct {
-	kind   xmlTokKind
-	name   Name
-	attr   []Attr
-	data   []byte
-	target string
-	other  Token
+	kind    xmlTokKind
+	name    Name
+	attr    []Attr
+	attrRaw [][]byte
+	data    []byte
+	target  string
+	other   Token
+}
+
+func (tok *xmlTok) materializeAttrs() []Attr {
+	for i := range tok.attr {
+		if i < len(tok.attrRaw) && tok.attrRaw[i] != nil {
+			tok.attr[i].Value = string(tok.attrRaw[i])
+			tok.attrRaw[i] = nil
+		}
+	}
+	return tok.attr
 }
 
 func (tok *xmlTok) fromToken(t Token) {
+	tok.attrRaw = nil
 	switch t1 := t.(type) {
 	case StartElement:
 		tok.kind = xtStartElement
@@ -654,7 +667,7 @@ func (tok *xmlTok) fromToken(t Token) {
 func (tok *xmlTok) toToken() Token {
 	switch tok.kind {
 	case xtStartElement:
-		return StartElement{tok.name, tok.attr}
+		return StartElement{tok.name, tok.materializeAttrs()}
 	case xtEndElement:
 		return EndElement{tok.name}
 	case xtCharData:
@@ -718,16 +731,28 @@ func (d *Decoder) nextTokenInto(tok *xmlTok) error {
 		for i := range tok.attr {
 			a := &tok.attr[i]
 			if a.Name.Space == xmlnsPrefix {
+				val := a.Value
+				if i < len(tok.attrRaw) && tok.attrRaw[i] != nil {
+					val = string(tok.attrRaw[i])
+					a.Value = val
+					tok.attrRaw[i] = nil
+				}
 				if d.ns == nil {
 					d.ns = make(map[string]string)
 				}
 				v, ok := d.ns[a.Name.Local]
 				d.pushNs(a.Name.Local, v, ok)
-				d.ns[a.Name.Local] = a.Value
+				d.ns[a.Name.Local] = val
 			}
 			if a.Name.Space == "" && a.Name.Local == xmlnsPrefix {
+				val := a.Value
+				if i < len(tok.attrRaw) && tok.attrRaw[i] != nil {
+					val = string(tok.attrRaw[i])
+					a.Value = val
+					tok.attrRaw[i] = nil
+				}
 				d.pushNs("", d.defaultNS, d.hasDefaultNS)
-				d.defaultNS = a.Value
+				d.defaultNS = val
 				d.hasDefaultNS = true
 			}
 		}
@@ -857,17 +882,26 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 				}
 				return d.err
 			}
-			d.space()
-			if b, ok = d.mustgetc(); !ok {
-				return d.err
-			}
-			if b != '>' {
-				d.err = d.syntaxError("invalid characters between </" + name.Local + " and >")
-				return d.err
+			if d.nextByte < 0 && d.pos < len(d.src) && d.src[d.pos] == '>' {
+				d.pos++
+				d.offset++
+				if d.saved != nil {
+					d.saved.WriteByte('>')
+				}
+			} else {
+				d.space()
+				if b, ok = d.mustgetc(); !ok {
+					return d.err
+				}
+				if b != '>' {
+					d.err = d.syntaxError("invalid characters between </" + name.Local + " and >")
+					return d.err
+				}
 			}
 			tok.kind = xtEndElement
 			tok.name = name
 			tok.attr = nil
+			tok.attrRaw = nil
 			tok.data = nil
 			return nil
 
@@ -1087,8 +1121,10 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 		return d.err
 	}
 
+	var attrRaw [][]byte
 	if reuseAttr {
 		attr = d.attrScratch[:0]
+		attrRaw = d.attrRawScratch[:0]
 	} else {
 		attr = []Attr{}
 	}
@@ -1146,6 +1182,7 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 		if b, ok = d.mustgetc(); !ok {
 			return d.err
 		}
+		var rawVal []byte
 		if b != '=' {
 			if d.Strict {
 				d.err = d.syntaxError("attribute name without = in element")
@@ -1159,9 +1196,16 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 			if data == nil {
 				return d.err
 			}
-			a.Value = string(data)
+			if reuseAttr && d.rRaw == nil && d.r == nil && d.buf.Len() == 0 && len(data) > 0 {
+				rawVal = data
+			} else if len(data) > 0 {
+				a.Value = string(data)
+			}
 		}
 		attr = append(attr, a)
+		if reuseAttr {
+			attrRaw = append(attrRaw, rawVal)
+		}
 	}
 	if empty {
 		d.needClose = true
@@ -1169,10 +1213,12 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 	}
 	if reuseAttr {
 		d.attrScratch = attr
+		d.attrRawScratch = attrRaw
 	}
 	tok.kind = xtStartElement
 	tok.name = name
 	tok.attr = attr
+	tok.attrRaw = attrRaw
 	tok.data = nil
 	return nil
 }
@@ -1430,6 +1476,18 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 		start := d.pos
 		i := start
 		if quote < 0 {
+			if haveXMLSIMD && len(s)-i >= 32 {
+				for len(s)-i >= 32 {
+					i, _ = xmlCharDataIndexSIMD(s, i)
+					if i < len(s) && s[i] == '\n' {
+						i++
+						d.line++
+						d.linestart = d.offset + int64(i-d.pos)
+						continue
+					}
+					break
+				}
+			}
 			for len(s)-i >= 8 {
 				if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
@@ -1473,6 +1531,18 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 		} else {
 			q8 := uint64(byte(quote)) * xmlSwarLo
 			qb := byte(quote)
+			if haveXMLSIMD && len(s)-i >= 32 {
+				for len(s)-i >= 32 {
+					i, _ = xmlAttrValIndexSIMD(s, i, qb)
+					if i < len(s) && s[i] == '\n' {
+						i++
+						d.line++
+						d.linestart = d.offset + int64(i-d.pos)
+						continue
+					}
+					break
+				}
+			}
 			for len(s)-i >= 8 {
 				if m := xmlAttrValMask(byteorder.LEUint64(s[i:]), q8); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
@@ -1531,6 +1601,18 @@ Input:
 			start := d.pos
 			i := start
 			if quote < 0 {
+				if haveXMLSIMD && len(s)-i >= 32 {
+					for len(s)-i >= 32 {
+						i, _ = xmlCharDataIndexSIMD(s, i)
+						if i < len(s) && s[i] == '\n' {
+							i++
+							d.line++
+							d.linestart = d.offset + int64(i-d.pos)
+							continue
+						}
+						break
+					}
+				}
 				for len(s)-i >= 8 {
 					if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
 						i += bits.TrailingZeros64(m) >> 3
@@ -1575,6 +1657,18 @@ Input:
 			} else {
 				q8 := uint64(byte(quote)) * xmlSwarLo
 				qb := byte(quote)
+				if haveXMLSIMD && len(s)-i >= 32 {
+					for len(s)-i >= 32 {
+						i, _ = xmlAttrValIndexSIMD(s, i, qb)
+						if i < len(s) && s[i] == '\n' {
+							i++
+							d.line++
+							d.linestart = d.offset + int64(i-d.pos)
+							continue
+						}
+						break
+					}
+				}
 				for len(s)-i >= 8 {
 					if m := xmlAttrValMask(byteorder.LEUint64(s[i:]), q8); m != 0 {
 						i += bits.TrailingZeros64(m) >> 3
@@ -1812,8 +1906,18 @@ func (d *Decoder) internName(b []byte) string {
 		if s := d.nameCache[idx]; len(s) == len(b) && s == string(b) {
 			return s
 		}
+		alt := idx ^ 1
+		if s := d.nameCache[alt]; len(s) == len(b) && s == string(b) {
+			return s
+		}
 		s := string(b)
-		d.nameCache[idx] = s
+		if d.nameCache[idx] == "" {
+			d.nameCache[idx] = s
+		} else if d.nameCache[alt] == "" {
+			d.nameCache[alt] = s
+		} else {
+			d.nameCache[idx] = s
+		}
 		return s
 	}
 	return string(b)

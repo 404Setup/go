@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/bits"
 	"strconv"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 	"unsafe"
@@ -84,6 +85,13 @@ func appendEscapeXMLString(dst []byte, s string, escapeNewline bool) []byte {
 
 func appendEscapeXMLBytes(dst, s []byte, escapeNewline bool) []byte {
 	i := 0
+	if haveXMLSIMD && len(s) >= 32 {
+		var found bool
+		i, found = xmlEscapeIndexSIMD(s, 0)
+		if found {
+			return appendEscapeXMLSlow(dst, s, i, escapeNewline)
+		}
+	}
 	for len(s)-i >= 8 {
 		if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
 			i += bits.TrailingZeros64(m) >> 3
@@ -103,25 +111,27 @@ func appendEscapeXMLBytes(dst, s []byte, escapeNewline bool) []byte {
 
 func appendEscapeXMLSlow(dst, s []byte, i int, escapeNewline bool) []byte {
 	last := 0
-	first := true
 	for i < len(s) {
-		if !first {
-			for len(s)-i >= 8 {
-				if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
-					i += bits.TrailingZeros64(m) >> 3
-					break
-				}
-				i += 8
-			}
-			if i >= len(s) {
-				break
-			}
-		}
-		first = false
 		c := s[i]
 		if c < utf8.RuneSelf {
 			if !xmlEscapeASCII[c] {
 				i++
+				if i-last >= 16 {
+					if haveXMLSIMD && len(s)-i >= 32 {
+						var found bool
+						i, found = xmlEscapeIndexSIMD(s, i)
+						if found {
+							continue
+						}
+					}
+					for len(s)-i >= 8 {
+						if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
+							i += bits.TrailingZeros64(m) >> 3
+							break
+						}
+						i += 8
+					}
+				}
 				continue
 			}
 			var esc []byte
@@ -302,6 +312,38 @@ func trimSpaceBytes(s []byte) []byte {
 
 func parseIntBytes(b []byte, bitSize int) (int64, error) {
 	tb := trimSpaceBytes(b)
+	if n := len(tb); n > 0 && n <= 18 {
+		neg := false
+		i := 0
+		if tb[0] == '-' {
+			neg = true
+			i = 1
+		}
+		if i < n {
+			var v uint64
+			ok := true
+			for ; i < n; i++ {
+				d := tb[i] - '0'
+				if d > 9 {
+					ok = false
+					break
+				}
+				v = v*10 + uint64(d)
+			}
+			if ok {
+				if neg {
+					iv := -int64(v)
+					if bitSize == 64 || iv >= -(int64(1)<<(bitSize-1)) {
+						return iv, nil
+					}
+				} else {
+					if bitSize == 64 || v <= (uint64(1)<<(bitSize-1))-1 {
+						return int64(v), nil
+					}
+				}
+			}
+		}
+	}
 	s := unsafe.String(unsafe.SliceData(tb), len(tb))
 	v, err := istrconv.ParseInt(s, 10, bitSize)
 	if err != nil {
@@ -312,6 +354,21 @@ func parseIntBytes(b []byte, bitSize int) (int64, error) {
 
 func parseUintBytes(b []byte, bitSize int) (uint64, error) {
 	tb := trimSpaceBytes(b)
+	if n := len(tb); n > 0 && n <= 18 {
+		var v uint64
+		ok := true
+		for i := 0; i < n; i++ {
+			d := tb[i] - '0'
+			if d > 9 {
+				ok = false
+				break
+			}
+			v = v*10 + uint64(d)
+		}
+		if ok && (bitSize == 64 || v <= (uint64(1)<<bitSize)-1) {
+			return v, nil
+		}
+	}
 	s := unsafe.String(unsafe.SliceData(tb), len(tb))
 	v, err := istrconv.ParseUint(s, 10, bitSize)
 	if err != nil {
@@ -352,6 +409,31 @@ func parseBoolBytes(b []byte) (bool, error) {
 	return strconv.ParseBool(string(tb))
 }
 
+func escapeTextIndex(s []byte) (int, bool) {
+	i := 0
+	if haveXMLSIMD && len(s) >= 32 {
+		var found bool
+		i, found = xmlEscapeIndexSIMD(s, 0)
+		if found {
+			return i, true
+		}
+	}
+	for len(s)-i >= 8 {
+		if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
+			return i + bits.TrailingZeros64(m)>>3, true
+		}
+		i += 8
+	}
+	for i < len(s) {
+		c := s[i]
+		if c >= utf8.RuneSelf || xmlEscapeASCII[c] {
+			return i, true
+		}
+		i++
+	}
+	return len(s), false
+}
+
 func escapeTextFast(w io.Writer, s []byte, escapeNewline bool) error {
 	if p, ok := w.(*printer); ok && p.w == nil {
 		if p.closed && p.err == nil {
@@ -369,42 +451,27 @@ func escapeTextFast(w io.Writer, s []byte, escapeNewline bool) error {
 		return err
 	}
 	if bw, ok := w.(*bytes.Buffer); ok {
-		i := 0
-		for len(s)-i >= 8 {
-			if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
-				i += bits.TrailingZeros64(m) >> 3
-				bw.Grow(len(s) + len(s)>>2 + 16)
-				bw.Write(appendEscapeXMLSlow(bw.AvailableBuffer(), s, i, escapeNewline))
-				return nil
-			}
-			i += 8
-		}
-		for i < len(s) {
-			c := s[i]
-			if c >= utf8.RuneSelf || xmlEscapeASCII[c] {
-				bw.Grow(len(s) + len(s)>>2 + 16)
-				bw.Write(appendEscapeXMLSlow(bw.AvailableBuffer(), s, i, escapeNewline))
-				return nil
-			}
-			i++
+		if i, found := escapeTextIndex(s); found {
+			bw.Grow(len(s) + len(s)>>2 + 16)
+			bw.Write(appendEscapeXMLSlow(bw.AvailableBuffer(), s, i, escapeNewline))
+			return nil
 		}
 		bw.Write(s)
 		return nil
 	}
-	i := 0
-	for len(s)-i >= 8 {
-		if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
-			i += bits.TrailingZeros64(m) >> 3
-			return escapeTextFastSlow(w, s, i, escapeNewline)
+	if sb, ok := w.(*strings.Builder); ok {
+		if i, found := escapeTextIndex(s); found {
+			fb := getXmlFastBuf()
+			fb.b = appendEscapeXMLSlow(fb.b, s, i, escapeNewline)
+			sb.Write(fb.b)
+			putXmlFastBuf(fb)
+			return nil
 		}
-		i += 8
+		sb.Write(s)
+		return nil
 	}
-	for i < len(s) {
-		c := s[i]
-		if c >= utf8.RuneSelf || xmlEscapeASCII[c] {
-			return escapeTextFastSlow(w, s, i, escapeNewline)
-		}
-		i++
+	if i, found := escapeTextIndex(s); found {
+		return escapeTextFastSlow(w, s, i, escapeNewline)
 	}
 	_, err := w.Write(s)
 	return err
@@ -413,25 +480,27 @@ func escapeTextFast(w io.Writer, s []byte, escapeNewline bool) error {
 func escapeTextFastSlow(w io.Writer, s []byte, i int, escapeNewline bool) error {
 	var esc []byte
 	last := 0
-	first := true
 	for i < len(s) {
-		if !first {
-			for len(s)-i >= 8 {
-				if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
-					i += bits.TrailingZeros64(m) >> 3
-					break
-				}
-				i += 8
-			}
-			if i >= len(s) {
-				break
-			}
-		}
-		first = false
 		c := s[i]
 		if c < utf8.RuneSelf {
 			if !xmlEscapeASCII[c] {
 				i++
+				if i-last >= 16 {
+					if haveXMLSIMD && len(s)-i >= 32 {
+						var found bool
+						i, found = xmlEscapeIndexSIMD(s, i)
+						if found {
+							continue
+						}
+					}
+					for len(s)-i >= 8 {
+						if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
+							i += bits.TrailingZeros64(m) >> 3
+							break
+						}
+						i += 8
+					}
+				}
 				continue
 			}
 			switch c {
