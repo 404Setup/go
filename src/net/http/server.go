@@ -879,13 +879,13 @@ func putConnWorker(w *connWorker) bool {
 	connWorkerPool.free = append(connWorkerPool.free, w)
 	if len(connWorkerPool.free) > retainedIdleConnWorkers && !connWorkerPool.gcArmed {
 		connWorkerPool.gcArmed = true
-		runtime.SetFinalizer(new(byte), pruneConnWorkers)
+		runtime.AddCleanup(new([16]byte), pruneConnWorkers, struct{}{})
 	}
 	connWorkerPool.mu.Unlock()
 	return true
 }
 
-func pruneConnWorkers(_ *byte) {
+func pruneConnWorkers(_ struct{}) {
 	connWorkerPool.mu.Lock()
 	connWorkerPool.gcArmed = false
 	for len(connWorkerPool.free) > retainedIdleConnWorkers {
@@ -950,13 +950,13 @@ func putBgReadWorker(w *bgReadWorker) bool {
 	bgReadWorkerPool.free = append(bgReadWorkerPool.free, w)
 	if len(bgReadWorkerPool.free) > retainedIdleBgWorkers && !bgReadWorkerPool.gcArmed {
 		bgReadWorkerPool.gcArmed = true
-		runtime.SetFinalizer(new(byte), pruneBgReadWorkers)
+		runtime.AddCleanup(new([16]byte), pruneBgReadWorkers, struct{}{})
 	}
 	bgReadWorkerPool.mu.Unlock()
 	return true
 }
 
-func pruneBgReadWorkers(_ *byte) {
+func pruneBgReadWorkers(_ struct{}) {
 	bgReadWorkerPool.mu.Lock()
 	bgReadWorkerPool.gcArmed = false
 	for len(bgReadWorkerPool.free) > retainedIdleBgWorkers {
