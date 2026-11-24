@@ -217,11 +217,7 @@ func kemKeyGen1024(dk *DecapsulationKey1024, d, z *[32]byte) {
 	dk.ρ = [32]byte(ρ)
 
 	A := &dk.a
-	for i := byte(0); i < k1024; i++ {
-		for j := byte(0); j < k1024; j++ {
-			A[i*k1024+j] = sampleNTT(ρ, j, i)
-		}
-	}
+	sampleNTTMatrix(A[:], ρ, k1024)
 
 	var N byte
 	s := &dk.s
@@ -235,11 +231,16 @@ func kemKeyGen1024(dk *DecapsulationKey1024, d, z *[32]byte) {
 		N++
 	}
 
+	sGamma := make([][n / 2]fieldElement, k1024)
+	for i := range s {
+		nttMulPrecompute(&sGamma[i], &s[i])
+	}
+
 	t := &dk.t
 	for i := range t { // t = A ◦ s + e
 		t[i] = e[i]
 		for j := range s {
-			t[i] = polyAdd(t[i], nttMul(A[i*k1024+j], s[j]))
+			nttMulAddPrecomputed(&t[i], &A[i*k1024+j], &s[j], &sGamma[j])
 		}
 	}
 
@@ -342,11 +343,7 @@ func parseEK1024(ek *EncapsulationKey1024, ekPKE []byte) (*EncapsulationKey1024,
 	}
 	copy(ek.ρ[:], ekPKE)
 
-	for i := byte(0); i < k1024; i++ {
-		for j := byte(0); j < k1024; j++ {
-			ek.a[i*k1024+j] = sampleNTT(ek.ρ[:], j, i)
-		}
-	}
+	sampleNTTMatrix(ek.a[:], ek.ρ[:], k1024)
 
 	return ek, nil
 }
@@ -368,12 +365,17 @@ func pkeEncrypt1024(cc *[CiphertextSize1024]byte, ex *encryptionKey1024, m *[mes
 	}
 	e2 := samplePolyCBD(rnd, N)
 
+	rGamma := make([][n / 2]fieldElement, k1024)
+	for i := range r {
+		nttMulPrecompute(&rGamma[i], &r[i])
+	}
+
 	u := make([]ringElement, k1024) // NTT⁻¹(AT ◦ r) + e1
 	for i := range u {
 		var uHat nttElement
 		for j := range r {
 			// Note that i and j are inverted, as we need the transposed of A.
-			uHat = polyAdd(uHat, nttMul(ex.a[j*k1024+i], r[j]))
+			nttMulAddPrecomputed(&uHat, &ex.a[j*k1024+i], &r[j], &rGamma[j])
 		}
 		u[i] = polyAdd(e1[i], inverseNTT(uHat))
 	}
@@ -382,7 +384,7 @@ func pkeEncrypt1024(cc *[CiphertextSize1024]byte, ex *encryptionKey1024, m *[mes
 
 	var vNTT nttElement // t⊺ ◦ r
 	for i := range ex.t {
-		vNTT = polyAdd(vNTT, nttMul(ex.t[i], r[i]))
+		nttMulAddPrecomputed(&vNTT, &ex.t[i], &r[i], &rGamma[i])
 	}
 	v := polyAdd(polyAdd(inverseNTT(vNTT), e2), μ)
 
@@ -456,7 +458,8 @@ func pkeDecrypt1024(dx *decryptionKey1024, c *[CiphertextSize1024]byte) []byte {
 
 	var mask nttElement // s⊺ ◦ NTT(u)
 	for i := range dx.s {
-		mask = polyAdd(mask, nttMul(dx.s[i], ntt(u[i])))
+		uHat := ntt(u[i])
+		nttMulAdd(&mask, &dx.s[i], &uHat)
 	}
 	w := polySub(v, inverseNTT(mask))
 

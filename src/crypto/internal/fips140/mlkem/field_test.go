@@ -162,6 +162,65 @@ func randomRingElement() ringElement {
 	return r
 }
 
+// ringCompressAndEncode appends an encoding of a ring element to s,
+// compressing each coefficient to d bits.
+//
+// It implements Compress, according to FIPS 203, Definition 4.7,
+// followed by ByteEncode, according to FIPS 203, Algorithm 5.
+func ringCompressAndEncode(s []byte, f ringElement, d uint8) []byte {
+	var b byte
+	var bIdx uint8
+	for i := 0; i < n; i++ {
+		c := compress(f[i], d)
+		var cIdx uint8
+		for cIdx < d {
+			b |= byte(c>>cIdx) << bIdx
+			bits := min(8-bIdx, d-cIdx)
+			bIdx += bits
+			cIdx += bits
+			if bIdx == 8 {
+				s = append(s, b)
+				b = 0
+				bIdx = 0
+			}
+		}
+	}
+	if bIdx != 0 {
+		panic("mlkem: internal error: bitsFilled != 0")
+	}
+	return s
+}
+
+// ringDecodeAndDecompress decodes an encoding of a ring element where
+// each d bits are mapped to an equidistant distribution.
+//
+// It implements ByteDecode, according to FIPS 203, Algorithm 6,
+// followed by Decompress, according to FIPS 203, Definition 4.8.
+func ringDecodeAndDecompress(b []byte, d uint8) ringElement {
+	var f ringElement
+	var bIdx uint8
+	for i := 0; i < n; i++ {
+		var c uint16
+		var cIdx uint8
+		for cIdx < d {
+			c |= uint16(b[0]>>bIdx) << cIdx
+			c &= (1 << d) - 1
+			bits := min(8-bIdx, d-cIdx)
+			bIdx += bits
+			cIdx += bits
+			if bIdx == 8 {
+				b = b[1:]
+				bIdx = 0
+			}
+		}
+		f[i] = fieldElement(decompress(c, d))
+	}
+	if len(b) != 0 {
+		panic("mlkem: internal error: leftover bytes")
+	}
+	return f
+}
+
 func TestEncodeDecode(t *testing.T) {
 	f := randomRingElement()
 	b := make([]byte, 12*n/8)
@@ -183,6 +242,16 @@ func TestEncodeDecode(t *testing.T) {
 	if !bytes.Equal(e1, e2) {
 		t.Errorf("ringCompressAndEncode = %x, ringCompressAndEncode1 = %x", e1, e2)
 	}
+	e1 = ringCompressAndEncode(nil, f, 11)
+	e2 = ringCompressAndEncode11(nil, f)
+	if !bytes.Equal(e1, e2) {
+		t.Errorf("ringCompressAndEncode = %x, ringCompressAndEncode11 = %x", e1, e2)
+	}
+	e1 = ringCompressAndEncode(nil, f, 5)
+	e2 = ringCompressAndEncode5(nil, f)
+	if !bytes.Equal(e1, e2) {
+		t.Errorf("ringCompressAndEncode = %x, ringCompressAndEncode5 = %x", e1, e2)
+	}
 
 	// Compare ringDecodeAndDecompress to ringDecodeAndDecompressN.
 	g1 := ringDecodeAndDecompress(b[:encodingSize10], 10)
@@ -199,6 +268,16 @@ func TestEncodeDecode(t *testing.T) {
 	g2 = ringDecodeAndDecompress1((*[encodingSize1]byte)(b))
 	if g1 != g2 {
 		t.Errorf("ringDecodeAndDecompress = %v, ringDecodeAndDecompress1 = %v", g1, g2)
+	}
+	g1 = ringDecodeAndDecompress(b[:encodingSize11], 11)
+	g2 = ringDecodeAndDecompress11((*[encodingSize11]byte)(b))
+	if g1 != g2 {
+		t.Errorf("ringDecodeAndDecompress = %v, ringDecodeAndDecompress11 = %v", g1, g2)
+	}
+	g1 = ringDecodeAndDecompress(b[:encodingSize5], 5)
+	g2 = ringDecodeAndDecompress5((*[encodingSize5]byte)(b))
+	if g1 != g2 {
+		t.Errorf("ringDecodeAndDecompress = %v, ringDecodeAndDecompress5 = %v", g1, g2)
 	}
 
 	// Round-trip ringCompressAndEncode and ringDecodeAndDecompress.
@@ -226,6 +305,16 @@ func TestEncodeDecode(t *testing.T) {
 	out = ringCompressAndEncode1(nil, g)
 	if !bytes.Equal(out, b[:encodingSize1]) {
 		t.Errorf("roundtrip failed for specialized 1")
+	}
+	g = ringDecodeAndDecompress11((*[encodingSize11]byte)(b))
+	out = ringCompressAndEncode11(nil, g)
+	if !bytes.Equal(out, b[:encodingSize11]) {
+		t.Errorf("roundtrip failed for specialized 11")
+	}
+	g = ringDecodeAndDecompress5((*[encodingSize5]byte)(b))
+	out = ringCompressAndEncode5(nil, g)
+	if !bytes.Equal(out, b[:encodingSize5]) {
+		t.Errorf("roundtrip failed for specialized 5")
 	}
 }
 
@@ -265,5 +354,90 @@ func TestGammas(t *testing.T) {
 		if big.NewInt(int64(gamma)).Cmp(exp) != 0 {
 			t.Errorf("gammas[%d] = %v, expected %v", k, gamma, exp)
 		}
+	}
+}
+
+// nttMul multiplies two nttElements.
+//
+// It implements MultiplyNTTs, according to FIPS 203, Algorithm 11.
+func nttMul(f, g nttElement) nttElement {
+	var h nttElement
+	for i := 0; i < n; i += 2 {
+		a0, a1 := f[i], f[i+1]
+		b0, b1 := g[i], g[i+1]
+		h[i] = fieldAddMul(a0, b0, fieldMul(a1, b1), gammas[i/2])
+		h[i+1] = fieldAddMul(a0, b1, a1, b0)
+	}
+	return h
+}
+
+func TestNTTMulAdd(t *testing.T) {
+	impls := []struct {
+		name string
+		fn   func(h, f, g *nttElement)
+	}{
+		{"nttMulAdd", nttMulAdd},
+		{"nttMulAddPrecomputed", func(h, f, g *nttElement) {
+			var gamma [n / 2]fieldElement
+			nttMulPrecompute(&gamma, g)
+			nttMulAddPrecomputed(h, f, g, &gamma)
+		}},
+	}
+
+	var zero, one, max nttElement
+	for i := range max {
+		one[i] = 1
+		max[i] = q - 1
+	}
+	inputs := [][3]nttElement{
+		{max, max, max},
+		{zero, zero, zero},
+		{one, one, one},
+		{
+			nttElement(randomRingElement()),
+			nttElement(randomRingElement()),
+			nttElement(randomRingElement()),
+		},
+	}
+
+	for _, impl := range impls {
+		t.Run(impl.name, func(t *testing.T) {
+			for _, in := range inputs {
+				h, f, g := in[0], in[1], in[2]
+
+				x, y, z := h, f, g
+				impl.fn(&x, &y, &z)
+				if exp := polyAdd(h, nttMul(f, g)); x != exp {
+					t.Fatalf("h += f*g: got %v, expected %v", x, exp)
+				}
+				if y != f || z != g {
+					t.Errorf("h += f*g: inputs were modified")
+				}
+
+				x, z = f, g
+				impl.fn(&x, &x, &z)
+				if exp := polyAdd(f, nttMul(f, g)); x != exp {
+					t.Fatalf("f += f*g: got %v, expected %v", x, exp)
+				}
+				if z != g {
+					t.Errorf("f += f*g: g was modified")
+				}
+
+				x, y = g, f
+				impl.fn(&x, &y, &x)
+				if exp := polyAdd(g, nttMul(f, g)); x != exp {
+					t.Fatalf("g += f*g: got %v, expected %v", x, exp)
+				}
+				if y != f {
+					t.Errorf("g += f*g: f was modified")
+				}
+
+				x = f
+				impl.fn(&x, &x, &x)
+				if exp := polyAdd(f, nttMul(f, f)); x != exp {
+					t.Fatalf("f += f*f: got %v, expected %v", x, exp)
+				}
+			}
+		})
 	}
 }

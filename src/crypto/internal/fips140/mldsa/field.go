@@ -7,8 +7,9 @@ package mldsa
 import (
 	"crypto/internal/constanttime"
 	"crypto/internal/fips140/sha3"
+	"crypto/internal/fips140deps/byteorder"
 	"errors"
-	"math/bits"
+	"unsafe"
 )
 
 const (
@@ -23,6 +24,10 @@ const (
 // fieldElement is an element n of ℤ_q in the Montgomery domain, represented as
 // an integer x in [0, q) such that x ≡ n * R (mod q) where R = 2³².
 type fieldElement uint32
+
+// fieldElementPartiallyReduced is an element n of ℤ_q in the Montgomery domain,
+// as an integer x in [0, 2q) such that x ≡ n * R (mod q) where R = 2³².
+type fieldElementPartiallyReduced uint32
 
 var errUnreducedFieldElement = errors.New("mldsa: unreduced field element")
 
@@ -39,8 +44,8 @@ func fieldToMontgomery(a uint32) (fieldElement, error) {
 // fieldSubToMontgomery converts a difference a - b to Montgomery form.
 // a and b must be < q. (This bound can probably be relaxed.)
 func fieldSubToMontgomery(a, b uint32) fieldElement {
-	x := a - b + q
-	return fieldMontgomeryMul(fieldElement(x), RR)
+	x := fieldElementPartiallyReduced(a - b + q)
+	return fieldReduceOnce(fieldMontgomeryPartialMul(x, RR))
 }
 
 // fieldFromMontgomery converts a value a in Montgomery form back to
@@ -68,49 +73,82 @@ func fieldInfinityNorm(r fieldElement) uint32 {
 }
 
 // fieldReduceOnce reduces a value a < 2q.
-func fieldReduceOnce(a uint32) fieldElement {
-	x, b := bits.Sub64(uint64(a), uint64(q), 0)
-	return fieldElement(x + b*q)
+func fieldReduceOnce(a fieldElementPartiallyReduced) fieldElement {
+	// a and q-1 are non-negative and fit int32, as LessOrEq requires.
+	v := constanttime.LessOrEq(int(a), q-1)
+	return fieldElement(constanttime.Select(v, int(a), int(a)-q))
+}
+
+// fieldPartialReduce reduces an arbitrary uint32 to a value less than 2q.
+func fieldPartialReduce(a uint32) fieldElementPartiallyReduced {
+	// Split a into the 23 low bits a₂ and the remaining 9 high bits a₁
+	//
+	//	a = a₁·2²³ + a₂
+	//
+	// then apply the shape of q = 2²³ - 2¹³ + 1 where
+	//
+	//	2²³ ≡ 2¹³ - 1 (mod q)
+	//
+	// to get
+	//
+	//	a ≡ a₂ + a₁·(2¹³ - 1) ≡ a₂ + a₁·2¹³ - a₁ (mod q)
+	//
+	// and observe that
+	//
+	//  a₂ + a₁·2¹³ - a₁ ≤ 2²³ + 2⁹·2¹³ = 2²³ + 2²² < 2q
+	//
+	a1 := a >> 23
+	a2 := a & 0b01111111_11111111_11111111
+	return fieldElementPartiallyReduced(a2 + a1<<13 - a1)
 }
 
 // fieldAdd returns a + b mod q.
 func fieldAdd(a, b fieldElement) fieldElement {
-	x := uint32(a + b)
+	x := fieldElementPartiallyReduced(a + b)
 	return fieldReduceOnce(x)
 }
 
 // fieldSub returns a - b mod q.
 func fieldSub(a, b fieldElement) fieldElement {
-	x := uint32(a - b + q)
+	x := fieldElementPartiallyReduced(a - b + q)
 	return fieldReduceOnce(x)
+}
+
+// fieldMontgomeryPartialMul returns a * b * R⁻¹ mod q, only
+// reduced to a value less than 2q.
+func fieldMontgomeryPartialMul(a, b fieldElementPartiallyReduced) fieldElementPartiallyReduced {
+	x := uint64(a) * uint64(b)
+	// x < 2q * 2q = 4q² < q * R, so the product is below q * R.
+	return fieldMontgomeryPartialReduce(x)
 }
 
 // fieldMontgomeryMul returns a * b * R⁻¹ mod q.
 func fieldMontgomeryMul(a, b fieldElement) fieldElement {
-	x := uint64(a) * uint64(b)
-	return fieldMontgomeryReduce(x)
+	return fieldReduceOnce(fieldMontgomeryPartialMul(
+		fieldElementPartiallyReduced(a), fieldElementPartiallyReduced(b)))
 }
 
-// fieldMontgomeryReduce returns x * R⁻¹ mod q for x < q * R.
-func fieldMontgomeryReduce(x uint64) fieldElement {
+// fieldMontgomeryMulShortByWide returns a * b * R⁻¹ mod q, where a is a
+// fieldElement and b is an arbitrary uint32.
+func fieldMontgomeryMulShortByWide(a fieldElement, b uint32) fieldElementPartiallyReduced {
+	// a < q and b < 2³², so the product is below q * R.
+	return fieldMontgomeryPartialReduce(uint64(a) * uint64(b))
+}
+
+// fieldMontgomeryPartialReduce returns x * R⁻¹ mod q for x ≤ q * R, only
+// reduced to a value less than 2q.
+//
+// It is the same as [fieldMontgomeryReduce] without the final subtraction of q,
+// for use in the NTT loops where values are kept unreduced across butterflies.
+func fieldMontgomeryPartialReduce(x uint64) fieldElementPartiallyReduced {
 	t := uint32(x) * qNegInv
 	u := (x + uint64(t)*q) >> 32
-	return fieldReduceOnce(uint32(u))
+	return fieldElementPartiallyReduced(u)
 }
 
-// fieldMontgomeryMulSub returns a * (b - c). This operation is fused to save a
-// fieldReduceOnce after the subtraction.
-func fieldMontgomeryMulSub(a, b, c fieldElement) fieldElement {
-	x := uint64(a) * uint64(b-c+q)
-	return fieldMontgomeryReduce(x)
-}
-
-// fieldMontgomeryAddMul returns a * b + c * d. This operation is fused to save
-// a fieldReduceOnce and a fieldReduce.
-func fieldMontgomeryAddMul(a, b, c, d fieldElement) fieldElement {
-	x := uint64(a) * uint64(b)
-	x += uint64(c) * uint64(d)
-	return fieldMontgomeryReduce(x)
+// fieldMontgomeryReduce returns x * R⁻¹ mod q for x ≤ q * R.
+func fieldMontgomeryReduce(x uint64) fieldElement {
+	return fieldReduceOnce(fieldMontgomeryPartialReduce(x))
 }
 
 const n = 256
@@ -118,24 +156,36 @@ const n = 256
 // ringElement is a polynomial, an element of R_q.
 type ringElement [n]fieldElement
 
-// polyAdd adds two ringElements or nttElements.
-func polyAdd[T ~[n]fieldElement](a, b T) (s T) {
+// polyAdd adds two ringElements.
+func polyAdd(a, b ringElement) (s ringElement) {
 	for i := range s {
 		s[i] = fieldAdd(a[i], b[i])
 	}
 	return s
 }
 
-// polySub subtracts two ringElements or nttElements.
-func polySub[T ~[n]fieldElement](a, b T) (s T) {
+// polySub subtracts two ringElements.
+func polySub(a, b ringElement) (s ringElement) {
 	for i := range s {
 		s[i] = fieldSub(a[i], b[i])
 	}
 	return s
 }
 
+// stripType converts a ringElement or nttElement to an array of uint32. It's
+// safer than aliasing fieldElement to uint32 because it only allows going from
+// a stricter type to a looser one, not the other way around.
+//
+// The returned array aliases a, which should be discarded.
+func stripType[T ringElement | nttElement](a *T) (s *[n]uint32) {
+	return (*[n]uint32)(unsafe.Pointer(a))
+}
+
 // nttElement is an NTT representation, an element of T_q.
-type nttElement [n]fieldElement
+//
+// Its coefficients are lazily reduced to [0, 2q).
+// Elements must not be compared or serialized directly.
+type nttElement [n]fieldElementPartiallyReduced
 
 // zetas are the values ζ^BitRev₈(k) mod q for each index k, converted to the
 // Montgomery domain.
@@ -143,8 +193,15 @@ var zetas = [256]fieldElement{4193792, 25847, 5771523, 7861508, 237124, 7602457,
 
 // ntt maps a ringElement to its nttElement representation.
 //
-// It implements NTT, according to FIPS 203, Algorithm 9.
-func ntt(f ringElement) nttElement {
+// It implements NTT, according to FIPS 204, Algorithm 41.
+func ntt(g ringElement) nttElement {
+	// At each of the 8 iterations of the len loop (including the unrolled len =
+	// 4, 2, 1 passes), each element of f is written exactly once, to the sum of
+	// an element from the previous iteration plus a value at most 2q (t or 2q -
+	// t), so the final value of each element is less than q + 8·2q = 17q < 2³².
+	// See ntt.svg for a diagram of this butterfly structure and its bounds.
+	f := stripType(&g)
+
 	var m uint8
 
 	for len := 128; len >= 8; len /= 2 {
@@ -155,14 +212,15 @@ func ntt(f ringElement) nttElement {
 			// Bounds check elimination hint.
 			f, flen := f[start:start+len], f[start+len:start+len+len]
 			for j := 0; j < len; j += 2 {
-				t := fieldMontgomeryMul(zeta, flen[j])
-				flen[j] = fieldSub(f[j], t)
-				f[j] = fieldAdd(f[j], t)
+				t := fieldMontgomeryMulShortByWide(zeta, flen[j])
+				// t < 2q, so 2q - t (≡ -t mod q) doesn't underflow.
+				flen[j] = f[j] + uint32(2*q-t)
+				f[j] += uint32(t)
 
 				// Unroll by 2 for performance.
-				t = fieldMontgomeryMul(zeta, flen[j+1])
-				flen[j+1] = fieldSub(f[j+1], t)
-				f[j+1] = fieldAdd(f[j+1], t)
+				t = fieldMontgomeryMulShortByWide(zeta, flen[j+1])
+				flen[j+1] = f[j+1] + uint32(2*q-t)
+				f[j+1] += uint32(t)
 			}
 		}
 	}
@@ -172,92 +230,112 @@ func ntt(f ringElement) nttElement {
 		m++
 		zeta := zetas[m]
 
-		t := fieldMontgomeryMul(zeta, f[start+4])
-		f[start+4] = fieldSub(f[start], t)
-		f[start] = fieldAdd(f[start], t)
+		t := fieldMontgomeryMulShortByWide(zeta, f[start+4])
+		f[start+4] = f[start] + uint32(2*q-t)
+		f[start] += uint32(t)
 
-		t = fieldMontgomeryMul(zeta, f[start+5])
-		f[start+5] = fieldSub(f[start+1], t)
-		f[start+1] = fieldAdd(f[start+1], t)
+		t = fieldMontgomeryMulShortByWide(zeta, f[start+5])
+		f[start+5] = f[start+1] + uint32(2*q-t)
+		f[start+1] += uint32(t)
 
-		t = fieldMontgomeryMul(zeta, f[start+6])
-		f[start+6] = fieldSub(f[start+2], t)
-		f[start+2] = fieldAdd(f[start+2], t)
+		t = fieldMontgomeryMulShortByWide(zeta, f[start+6])
+		f[start+6] = f[start+2] + uint32(2*q-t)
+		f[start+2] += uint32(t)
 
-		t = fieldMontgomeryMul(zeta, f[start+7])
-		f[start+7] = fieldSub(f[start+3], t)
-		f[start+3] = fieldAdd(f[start+3], t)
+		t = fieldMontgomeryMulShortByWide(zeta, f[start+7])
+		f[start+7] = f[start+3] + uint32(2*q-t)
+		f[start+3] += uint32(t)
 	}
 	for start := 0; start < 256; start += 4 {
 		m++
 		zeta := zetas[m]
 
-		t := fieldMontgomeryMul(zeta, f[start+2])
-		f[start+2] = fieldSub(f[start], t)
-		f[start] = fieldAdd(f[start], t)
+		t := fieldMontgomeryMulShortByWide(zeta, f[start+2])
+		f[start+2] = f[start] + uint32(2*q-t)
+		f[start] += uint32(t)
 
-		t = fieldMontgomeryMul(zeta, f[start+3])
-		f[start+3] = fieldSub(f[start+1], t)
-		f[start+1] = fieldAdd(f[start+1], t)
+		t = fieldMontgomeryMulShortByWide(zeta, f[start+3])
+		f[start+3] = f[start+1] + uint32(2*q-t)
+		f[start+1] += uint32(t)
 	}
 	for start := 0; start < 256; start += 2 {
 		m++
 		zeta := zetas[m]
 
-		t := fieldMontgomeryMul(zeta, f[start+1])
-		f[start+1] = fieldSub(f[start], t)
-		f[start] = fieldAdd(f[start], t)
+		t := fieldMontgomeryMulShortByWide(zeta, f[start+1])
+		f[start+1] = f[start] + uint32(2*q-t)
+		f[start] += uint32(t)
 	}
 
-	return nttElement(f)
+	// Reduce the coefficients to [0, 2q).
+	var h nttElement
+	for i := range f {
+		h[i] = fieldPartialReduce(f[i])
+	}
+	return h
 }
 
 // inverseNTT maps a nttElement back to the ringElement it represents.
 //
-// It implements NTT⁻¹, according to FIPS 203, Algorithm 10.
-func inverseNTT(f nttElement) ringElement {
+// It implements NTT⁻¹, according to FIPS 204, Algorithm 42.
+func inverseNTT(g nttElement) ringElement {
+	// At each of the 8 iterations of the len loop (including the unrolled len =
+	// 1, 2, 4 passes), each element of f is written exactly once, to either the
+	// sum of two elements from the previous iteration, or a partial reduction
+	// output less than 2q, so the bound on the elements doubles at each
+	// iteration, from 2q on the inputs to 2q * 2⁸ = 512q < 2³² on the outputs.
+	// See ntt.svg for a diagram of this butterfly structure and its bounds.
+	f := stripType(&g)
+
 	var m uint8 = 255
 
-	// Unroll len = 1, 2, and 4.
+	// Unroll len = 1, 2, and 4. (See below for the explanation.)
 	for start := 0; start < 256; start += 2 {
 		zeta := zetas[m]
 		m--
 
 		t := f[start]
-		f[start] = fieldAdd(t, f[start+1])
-		f[start+1] = fieldMontgomeryMulSub(zeta, f[start+1], t)
+		f[start] = t + f[start+1]
+		d := f[start+1] + 256*q - t
+		f[start+1] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 	}
 	for start := 0; start < 256; start += 4 {
 		zeta := zetas[m]
 		m--
 
 		t := f[start]
-		f[start] = fieldAdd(t, f[start+2])
-		f[start+2] = fieldMontgomeryMulSub(zeta, f[start+2], t)
+		f[start] = t + f[start+2]
+		d := f[start+2] + 256*q - t
+		f[start+2] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 
 		t = f[start+1]
-		f[start+1] = fieldAdd(t, f[start+3])
-		f[start+3] = fieldMontgomeryMulSub(zeta, f[start+3], t)
+		f[start+1] = t + f[start+3]
+		d = f[start+3] + 256*q - t
+		f[start+3] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 	}
 	for start := 0; start < 256; start += 8 {
 		zeta := zetas[m]
 		m--
 
 		t := f[start]
-		f[start] = fieldAdd(t, f[start+4])
-		f[start+4] = fieldMontgomeryMulSub(zeta, f[start+4], t)
+		f[start] = t + f[start+4]
+		d := f[start+4] + 256*q - t
+		f[start+4] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 
 		t = f[start+1]
-		f[start+1] = fieldAdd(t, f[start+5])
-		f[start+5] = fieldMontgomeryMulSub(zeta, f[start+5], t)
+		f[start+1] = t + f[start+5]
+		d = f[start+5] + 256*q - t
+		f[start+5] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 
 		t = f[start+2]
-		f[start+2] = fieldAdd(t, f[start+6])
-		f[start+6] = fieldMontgomeryMulSub(zeta, f[start+6], t)
+		f[start+2] = t + f[start+6]
+		d = f[start+6] + 256*q - t
+		f[start+6] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 
 		t = f[start+3]
-		f[start+3] = fieldAdd(t, f[start+7])
-		f[start+7] = fieldMontgomeryMulSub(zeta, f[start+7], t)
+		f[start+3] = t + f[start+7]
+		d = f[start+7] + 256*q - t
+		f[start+7] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 	}
 
 	for len := 8; len < 256; len *= 2 {
@@ -269,59 +347,131 @@ func inverseNTT(f nttElement) ringElement {
 			f, flen := f[start:start+len], f[start+len:start+len+len]
 			for j := 0; j < len; j += 2 {
 				t := f[j]
-				f[j] = fieldAdd(t, flen[j])
-				// -z * (t - flen[j]) = z * (flen[j] - t)
-				flen[j] = fieldMontgomeryMulSub(zeta, flen[j], t)
+				f[j] = t + flen[j]
+				// The spec does
+				//
+				//    flen[j] = -zetas[m] * (t - flen[j])
+				//
+				// but we can rewrite it as
+				//
+				//    flen[j] = zeta * (flen[j] - t) = zeta * (flen[j] + 256q - t)
+				//
+				// t < 2q * 2⁷ = 256q, so 256q - t (≡ -t mod q) doesn't underflow.
+				// Also, flen[j] < 2q * 2⁷, so d < 256q + 256q = 512q < 2³².
+				d := flen[j] + 256*q - t
+				flen[j] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 
 				// Unroll by 2 for performance.
 				t = f[j+1]
-				f[j+1] = fieldAdd(t, flen[j+1])
-				flen[j+1] = fieldMontgomeryMulSub(zeta, flen[j+1], t)
+				f[j+1] = t + flen[j+1]
+				d = flen[j+1] + 256*q - t
+				flen[j+1] = uint32(fieldMontgomeryMulShortByWide(zeta, d))
 			}
 		}
 	}
 
+	// Scale by 256⁻¹ and reduce the coefficients to [0, q).
+	var h ringElement
 	for i := range f {
-		f[i] = fieldMontgomeryMul(f[i], 16382) // 16382 = 256⁻¹ * R mod q
+		// 16382 = 256⁻¹ * R mod q.
+		// f[i] < 512q, so the product is below q * R.
+		h[i] = fieldMontgomeryReduce(uint64(f[i]) * 16382)
 	}
-	return ringElement(f)
+	return h
 }
 
 // nttMul multiplies two nttElements.
 func nttMul(a, b nttElement) (p nttElement) {
 	for i := range p {
-		p[i] = fieldMontgomeryMul(a[i], b[i])
+		p[i] = fieldMontgomeryPartialMul(a[i], b[i])
 	}
 	return p
 }
 
-// sampleNTT samples an nttElement uniformly at random from the seed rho and the
-// indices s and r. It implements Step 3 of ExpandA, RejNTTPoly, and
-// CoeffFromThreeBytes from FIPS 204, passing in ρ, s, and r instead of ρ'.
-func sampleNTT(rho []byte, s, r byte) nttElement {
-	G := sha3.NewShake128()
-	G.Write(rho)
-	G.Write([]byte{s, r})
+// wideNTTElement is a representation of an NTT polynomial with unreduced
+// coefficients in the double Montgomery domain, i.e. as integers x in
+// [0, q * R] such that x ≡ n * R² (mod q) where R = 2³².
+type wideNTTElement [n]uint64
 
-	var a nttElement
-	var j int         // index into a
-	var buf [168]byte // buffered reads from B, matching the rate of SHAKE-128
-	off := len(buf)   // index into buf, starts in a "buffer fully consumed" state
-	for j < n {
-		if off >= len(buf) {
-			G.Read(buf[:])
-			off = 0
-		}
-		v := uint32(buf[off]) | uint32(buf[off+1])<<8 | uint32(buf[off+2])<<16
-		off += 3
-		f, err := fieldToMontgomery(v & 0b01111111_11111111_11111111) // 23 bits
-		if err != nil {
-			continue
-		}
-		a[j] = f
-		j++
+// nttWiden initializes the wide accumulator p to a.
+//
+// The bound of the coefficients of p is 2q².
+func nttWiden(p *wideNTTElement, a *nttElement) {
+	for i := range p {
+		// Bring the coefficient from the regular Montgomery domain into the
+		// double Montgomery domain by adding an R factor.
+		p[i] = uint64(a[i]) * one
 	}
-	return a
+}
+
+// nttMulAdd adds the product of a and b to the wide accumulator p.
+//
+// The bound of coefficients of p grows by 4q².
+func nttMulAdd(p *wideNTTElement, a, b *nttElement) {
+	for i := range p {
+		// Note that we don't apply the R⁻¹ factor here, because the two inputs
+		// are in the regular Montgomery domain, so the product is naturally in
+		// the double Montgomery domain: (a * R) * (b * R) ≡ a * b * R².
+		p[i] += uint64(a[i]) * uint64(b[i])
+	}
+}
+
+// nttMulSub subtracts the product of a and b from the wide accumulator p.
+//
+// The bound of coefficients of p grows by 4q².
+func nttMulSub(p *wideNTTElement, a, b *nttElement) {
+	for i := range p {
+		// -a[i]*b[i] ≡ 4q² - a[i]*b[i] mod q, and a[i]*b[i] < 4q²
+		// because a[i], b[i] < 2q, so this doesn't underflow.
+		p[i] += 4*q*q - uint64(a[i])*uint64(b[i])
+	}
+}
+
+// nttReduce reduces the coefficients of the wide accumulator p.
+func nttReduce(p *wideNTTElement) (r nttElement) {
+	for i := range r {
+		// Apply the R⁻¹ factor to take coefficients from the double Montgomery
+		// domain back to the regular Montgomery domain.
+		r[i] = fieldMontgomeryPartialReduce(p[i])
+	}
+	return r
+}
+
+// parseSampleNTT consumes buf, whose length must be a multiple of three,
+// filling a from index j on with accepted values, and returns the updated
+// index. It implements RejNTTPoly and CoeffFromThreeBytes from FIPS 204.
+//
+// On return, coefficients at or beyond the updated index may be clobbered.
+func parseSampleNTT(a *nttElement, j int, buf []byte) int {
+	// For as long as there are enough bytes in buf and enough remaining slots
+	// in a, consume 6 bytes (48 bits) at a time as two 24-bit values, convert
+	// them to the Montgomery domain by multiplying by R², and do a branchless
+	// rejection: every candidate is stored at a[j], and a rejected one is
+	// simply overwritten by the next candidate because j doesn't move.
+	_ = a[0]                                  // hoist a's nil check out of the loops below
+	const mask = 0b01111111_11111111_11111111 // 23 bits
+	for len(buf) >= 8 && uint(j) <= n-2 {     // uint to avoid bounds checks on a[j]
+		w := byteorder.LEUint64(buf)
+		v1 := fieldElementPartiallyReduced(w) & mask
+		v2 := fieldElementPartiallyReduced(w>>24) & mask
+		a[j] = fieldMontgomeryPartialMul(v1, RR)
+		j += int((v1 - q) >> 31)
+		a[j] = fieldMontgomeryPartialMul(v2, RR)
+		j += int((v2 - q) >> 31)
+		buf = buf[6:]
+	}
+	// Consume the rest of the buffer 3 bytes (one value) at a time, in the
+	// same way. This handles both the last six bytes (which we actually have
+	// negligible chance of reaching) and a sole final element (which the loop
+	// above can't fill, as it would write past the end of a).
+	for len(buf) > 0 && j < n {
+		w := uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16
+		buf = buf[3:]
+		v := fieldElementPartiallyReduced(w) & mask
+		a[j] = fieldMontgomeryPartialMul(v, RR)
+		j += int((v - q) >> 31)
+	}
+	return j
 }
 
 // sampleBoundedPoly samples a ringElement with coefficients in [−η, η] from the

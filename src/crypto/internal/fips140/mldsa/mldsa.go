@@ -59,7 +59,6 @@ type PrivateKey struct {
 	seed [32]byte
 	pub  PublicKey
 	a    [maxK * maxL]nttElement
-	t1   [maxK]nttElement // NTT(t₁ ⋅ 2ᵈ)
 	s1   [maxL]nttElement
 	s2   [maxK]nttElement
 	t0   [maxK]nttElement
@@ -195,18 +194,18 @@ func newPrivateKey(seed *[32]byte, p parameters) *PrivateKey {
 		s2[r] = ntt(sampleBoundedPoly(ρs, byte(l+r), p))
 	}
 
-	// ˆt = Â ∘ ŝ₁ + ŝ₂
-	tHat := make([]nttElement, k, maxK)
-	for i := range tHat {
-		tHat[i] = s2[i]
-		for j := range s1 {
-			tHat[i] = polyAdd(tHat[i], nttMul(A[i*l+j], s1[j]))
-		}
-	}
-	// t = NTT⁻¹(ˆt)
+	// t = NTT⁻¹(Â ∘ ŝ₁ + ŝ₂)
 	t := make([]ringElement, k, maxK)
-	for i := range tHat {
-		t[i] = inverseNTT(tHat[i])
+	for i := range t {
+		var tHat wideNTTElement
+		// The bound starts at 2q².
+		nttWiden(&tHat, &s2[i])
+		for j := range s1 {
+			// Each nttMulAdd adds 4q² to the bound, for a total of
+			// 2q² + 4l * q² = 30q² < q * R.
+			nttMulAdd(&tHat, &A[i*l+j], &s1[j])
+		}
+		t[i] = inverseNTT(nttReduce(&tHat))
 	}
 	// (t₁, _) = Power2Round(t)
 	// (_, ˆt₀) = NTT(Power2Round(t))
@@ -221,17 +220,52 @@ func newPrivateKey(seed *[32]byte, p parameters) *PrivateKey {
 
 	pk := pkEncode(priv.pub.raw[:0], ρ, t1, p)
 	priv.pub.tr = computePublicKeyHash(pk)
-	computeT1Hat(priv.t1[:k], t1) // NTT(t₁ ⋅ 2ᵈ)
 
 	return priv
 }
 
+// computeMatrixA fills A so that A[r*l+s] is drawn from the XOF seeded with
+// ρ, s, and r, sampling the underlying streams in parallel with
+// sha3.ReadMulti.
+//
+// It implements ExpandA from FIPS 204.
 func computeMatrixA(A []nttElement, ρ []byte, p parameters) {
 	k, l := p.k, p.l
-	for r := range k {
-		for s := range l {
-			A[r*l+s] = sampleNTT(ρ, byte(s), byte(r))
+	// Compute up to four elements at a time in parallel.
+	for len(A) > 0 {
+		lanesCount := min(4, len(A))
+		lanes := [4]*sha3.SHAKE{
+			sha3.NewShake128(), sha3.NewShake128(),
+			sha3.NewShake128(), sha3.NewShake128(),
 		}
+		// Squeeze 5 blocks (each of 168 bytes, the rate of SHAKE-128) at once
+		// from each lane, the minimum to draw 256 values, which is enough to
+		// fill a full nttElement almost always due to the 2⁻¹⁰ rejection rate.
+		var bufs [4][5 * 168]byte
+		var outs [4][]byte
+		for i := range lanesCount {
+			// The index of A[i] in the full k×l matrix.
+			m := k*l - len(A) + i
+			lanes[i].Write(ρ)
+			lanes[i].Write([]byte{byte(m % l), byte(m / l)}) // s, r
+			outs[i] = bufs[i][:]
+		}
+		sha3.ReadMulti(lanes[:lanesCount], outs[:lanesCount])
+		for i := range lanesCount {
+			a := &A[i]
+			j := parseSampleNTT(a, 0, bufs[i][:])
+			// The probability of more than 24 rejections in 5 * 168 / 3 = 280
+			// samples is less than 2⁻¹³², so it is less likely than a cosmic
+			// ray flipping a CPU register while this for is evaluated.
+			// Unfortunately, FIPS 204 still has a "shall" for at least 894
+			// bytes of XOF output, so we have this unreachable, untestable code
+			// sitting here, instead of a much more reasonable panic.
+			for j < n {
+				lanes[i].Read(bufs[i][:168])
+				j = parseSampleNTT(a, j, bufs[i][:168])
+			}
+		}
+		A = A[lanesCount:]
 	}
 }
 
@@ -445,19 +479,29 @@ sign:
 		// check causes the rejection and which coefficient failed the check
 		// (but not the value or sign of the coefficient).
 
+		// y[r] is drawn from the XOF seeded with ρ″ (the nonce) and κ+r.
+		// This implements ExpandMask from FIPS 204.
 		y := make([]ringElement, l, maxL)
+		lanes := [maxL]*sha3.SHAKE{sha3.NewShake256(),
+			sha3.NewShake256(), sha3.NewShake256(),
+			sha3.NewShake256(), sha3.NewShake256(),
+			sha3.NewShake256(), sha3.NewShake256()}
+		// Squeeze the whole (γ₁+1)·n-bit mask at once from each lane.
+		var bufs [maxL][(maxγ1 + 1) * n / 8]byte
+		var outs [maxL][]byte
+		vLen := (p.γ1 + 1) * n / 8
 		for r := range y {
 			counter := make([]byte, 2)
 			byteorder.LEPutUint16(counter, uint16(κ))
 			κ++
 
-			H.Reset()
-			H.Write(nonce)
-			H.Write(counter)
-			v := make([]byte, (p.γ1+1)*n/8, (maxγ1+1)*n/8)
-			H.Read(v)
-
-			y[r] = bitUnpack(v, p)
+			lanes[r].Write(nonce)
+			lanes[r].Write(counter[:])
+			outs[r] = bufs[r][:vLen]
+		}
+		sha3.ReadMulti(lanes[:len(y)], outs[:len(y)])
+		for r := range y {
+			y[r] = bitUnpack(outs[r], p)
 		}
 
 		// w = NTT⁻¹(Â ∘ NTT(y))
@@ -467,11 +511,13 @@ sign:
 		}
 		w := make([]ringElement, k, maxK)
 		for i := range w {
-			var wHat nttElement
+			var wHat wideNTTElement
 			for j := range l {
-				wHat = polyAdd(wHat, nttMul(A[i*l+j], yHat[j]))
+				// Each nttMulAdd adds 4q² to the bound, for a total of
+				// 4l * q² = 28q² < q * R.
+				nttMulAdd(&wHat, &A[i*l+j], &yHat[j])
 			}
-			w[i] = inverseNTT(wHat)
+			w[i] = inverseNTT(nttReduce(&wHat))
 		}
 
 		H.Reset()
@@ -486,18 +532,10 @@ sign:
 		// leaking rejected ch values being acceptable.
 		c := ntt(sampleInBall(ch, p))
 
-		cs1 := make([]ringElement, l, maxL)
-		for i := range cs1 {
-			cs1[i] = inverseNTT(nttMul(c, s1[i]))
-		}
-		cs2 := make([]ringElement, k, maxK)
-		for i := range cs2 {
-			cs2[i] = inverseNTT(nttMul(c, s2[i]))
-		}
-
 		z := make([]ringElement, l, maxL)
-		for i := range y {
-			z[i] = polyAdd(y[i], cs1[i])
+		for i := range z {
+			cs1 := inverseNTT(nttMul(c, s1[i]))
+			z[i] = polyAdd(y[i], cs1)
 
 			// Reject if ||z||∞ ≥ γ1 − β
 			if coefficientsExceedBound(z[i], γ1β) {
@@ -508,7 +546,9 @@ sign:
 			}
 		}
 
+		cs2 := make([]ringElement, k, maxK)
 		for i := range w {
+			cs2[i] = inverseNTT(nttMul(c, s2[i]))
 			r0 := polySub(w[i], cs2[i])
 
 			// Reject if ||LowBits(r0)||∞ ≥ γ2 − β
@@ -682,12 +722,15 @@ func verifyInternal(pub *PublicKey, μ *[64]byte, sig []byte) error {
 	}
 	w := make([]ringElement, k, maxK)
 	for i := range w {
-		var wHat nttElement
+		var wHat wideNTTElement
 		for j := range l {
-			wHat = polyAdd(wHat, nttMul(A[i*l+j], zHat[j]))
+			// Each nttMulAdd adds 4q² to the bound: 4l * q² = 28q².
+			nttMulAdd(&wHat, &A[i*l+j], &zHat[j])
 		}
-		wHat = polySub(wHat, nttMul(c, t1Hat[i]))
-		w[i] = inverseNTT(wHat)
+		// nttMulSub adds 4q² to the bound, for a total of
+		// 28q² + 4q² = 32q² < q * R.
+		nttMulSub(&wHat, &c, &t1Hat[i])
+		w[i] = inverseNTT(nttReduce(&wHat))
 	}
 
 	// Use hints h to compute w₁ from w(approx).

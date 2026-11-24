@@ -5,6 +5,7 @@
 package mlkem
 
 import (
+	"crypto/internal/constanttime"
 	"crypto/internal/fips140/sha3"
 	"crypto/internal/fips140deps/byteorder"
 	"errors"
@@ -23,10 +24,9 @@ func fieldCheckReduced(a uint16) (fieldElement, error) {
 
 // fieldReduceOnce reduces a value a < 2q.
 func fieldReduceOnce(a uint16) fieldElement {
-	x := a - q
-	// If x underflowed, then x >= 2¹⁶ - q > 2¹⁵, so the top bit is set.
-	x += (x >> 15) * q
-	return fieldElement(x)
+	// a and q-1 are non-negative and fit int32, as LessOrEq requires.
+	v := constanttime.LessOrEq(int(a), q-1)
+	return fieldElement(constanttime.Select(v, int(a), int(a)-q))
 }
 
 func fieldAdd(a, b fieldElement) fieldElement {
@@ -294,72 +294,31 @@ func ringDecodeAndDecompress10(bb *[encodingSize10]byte) ringElement {
 	return f
 }
 
-// ringCompressAndEncode appends an encoding of a ring element to s,
-// compressing each coefficient to d bits.
-//
-// It implements Compress, according to FIPS 203, Definition 4.7,
-// followed by ByteEncode, according to FIPS 203, Algorithm 5.
-func ringCompressAndEncode(s []byte, f ringElement, d uint8) []byte {
-	var b byte
-	var bIdx uint8
-	for i := 0; i < n; i++ {
-		c := compress(f[i], d)
-		var cIdx uint8
-		for cIdx < d {
-			b |= byte(c>>cIdx) << bIdx
-			bits := min(8-bIdx, d-cIdx)
-			bIdx += bits
-			cIdx += bits
-			if bIdx == 8 {
-				s = append(s, b)
-				b = 0
-				bIdx = 0
-			}
-		}
-	}
-	if bIdx != 0 {
-		panic("mlkem: internal error: bitsFilled != 0")
-	}
-	return s
-}
-
-// ringDecodeAndDecompress decodes an encoding of a ring element where
-// each d bits are mapped to an equidistant distribution.
-//
-// It implements ByteDecode, according to FIPS 203, Algorithm 6,
-// followed by Decompress, according to FIPS 203, Definition 4.8.
-func ringDecodeAndDecompress(b []byte, d uint8) ringElement {
-	var f ringElement
-	var bIdx uint8
-	for i := 0; i < n; i++ {
-		var c uint16
-		var cIdx uint8
-		for cIdx < d {
-			c |= uint16(b[0]>>bIdx) << cIdx
-			c &= (1 << d) - 1
-			bits := min(8-bIdx, d-cIdx)
-			bIdx += bits
-			cIdx += bits
-			if bIdx == 8 {
-				b = b[1:]
-				bIdx = 0
-			}
-		}
-		f[i] = fieldElement(decompress(c, d))
-	}
-	if len(b) != 0 {
-		panic("mlkem: internal error: leftover bytes")
-	}
-	return f
-}
-
 // ringCompressAndEncode5 appends a 160-byte encoding of a ring element to s,
 // compressing eight coefficients per five bytes.
 //
 // It implements Compress₅, according to FIPS 203, Definition 4.7,
 // followed by ByteEncode₅, according to FIPS 203, Algorithm 5.
 func ringCompressAndEncode5(s []byte, f ringElement) []byte {
-	return ringCompressAndEncode(s, f, 5)
+	s, b := sliceForAppend(s, encodingSize5)
+	for i := 0; i < n; i += 8 {
+		var v uint64
+		v |= uint64(compress(f[i+0], 5)) << 0
+		v |= uint64(compress(f[i+1], 5)) << 5
+		v |= uint64(compress(f[i+2], 5)) << 10
+		v |= uint64(compress(f[i+3], 5)) << 15
+		v |= uint64(compress(f[i+4], 5)) << 20
+		v |= uint64(compress(f[i+5], 5)) << 25
+		v |= uint64(compress(f[i+6], 5)) << 30
+		v |= uint64(compress(f[i+7], 5)) << 35
+		b[0] = byte(v >> 0)
+		b[1] = byte(v >> 8)
+		b[2] = byte(v >> 16)
+		b[3] = byte(v >> 24)
+		b[4] = byte(v >> 32)
+		b = b[5:]
+	}
+	return s
 }
 
 // ringDecodeAndDecompress5 decodes a 160-byte encoding of a ring element where
@@ -368,7 +327,21 @@ func ringCompressAndEncode5(s []byte, f ringElement) []byte {
 // It implements ByteDecode₅, according to FIPS 203, Algorithm 6,
 // followed by Decompress₅, according to FIPS 203, Definition 4.8.
 func ringDecodeAndDecompress5(bb *[encodingSize5]byte) ringElement {
-	return ringDecodeAndDecompress(bb[:], 5)
+	b := bb[:]
+	var f ringElement
+	for i := 0; i < n; i += 8 {
+		v := uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 | uint64(b[4])<<32
+		f[i+0] = decompress(uint16(v>>0)&31, 5)
+		f[i+1] = decompress(uint16(v>>5)&31, 5)
+		f[i+2] = decompress(uint16(v>>10)&31, 5)
+		f[i+3] = decompress(uint16(v>>15)&31, 5)
+		f[i+4] = decompress(uint16(v>>20)&31, 5)
+		f[i+5] = decompress(uint16(v>>25)&31, 5)
+		f[i+6] = decompress(uint16(v>>30)&31, 5)
+		f[i+7] = decompress(uint16(v>>35)&31, 5)
+		b = b[5:]
+	}
+	return f
 }
 
 // ringCompressAndEncode11 appends a 352-byte encoding of a ring element to s,
@@ -377,7 +350,30 @@ func ringDecodeAndDecompress5(bb *[encodingSize5]byte) ringElement {
 // It implements Compress₁₁, according to FIPS 203, Definition 4.7,
 // followed by ByteEncode₁₁, according to FIPS 203, Algorithm 5.
 func ringCompressAndEncode11(s []byte, f ringElement) []byte {
-	return ringCompressAndEncode(s, f, 11)
+	s, b := sliceForAppend(s, encodingSize11)
+	for i := 0; i < n; i += 8 {
+		t0 := compress(f[i+0], 11)
+		t1 := compress(f[i+1], 11)
+		t2 := compress(f[i+2], 11)
+		t3 := compress(f[i+3], 11)
+		t4 := compress(f[i+4], 11)
+		t5 := compress(f[i+5], 11)
+		t6 := compress(f[i+6], 11)
+		t7 := compress(f[i+7], 11)
+		b[0] = byte(t0)
+		b[1] = byte(t0>>8 | t1<<3)
+		b[2] = byte(t1>>5 | t2<<6)
+		b[3] = byte(t2 >> 2)
+		b[4] = byte(t2>>10 | t3<<1)
+		b[5] = byte(t3>>7 | t4<<4)
+		b[6] = byte(t4>>4 | t5<<7)
+		b[7] = byte(t5 >> 1)
+		b[8] = byte(t5>>9 | t6<<2)
+		b[9] = byte(t6>>6 | t7<<5)
+		b[10] = byte(t7 >> 3)
+		b = b[11:]
+	}
+	return s
 }
 
 // ringDecodeAndDecompress11 decodes a 352-byte encoding of a ring element where
@@ -386,7 +382,28 @@ func ringCompressAndEncode11(s []byte, f ringElement) []byte {
 // It implements ByteDecode₁₁, according to FIPS 203, Algorithm 6,
 // followed by Decompress₁₁, according to FIPS 203, Definition 4.8.
 func ringDecodeAndDecompress11(bb *[encodingSize11]byte) ringElement {
-	return ringDecodeAndDecompress(bb[:], 11)
+	b := bb[:]
+	var f ringElement
+	for i := 0; i < n; i += 8 {
+		t0 := uint16(b[0]) | uint16(b[1])<<8
+		f[i+0] = decompress(t0&2047, 11)
+		t1 := uint16(b[1])>>3 | uint16(b[2])<<5
+		f[i+1] = decompress(t1&2047, 11)
+		t2 := uint16(b[2])>>6 | uint16(b[3])<<2 | uint16(b[4])<<10
+		f[i+2] = decompress(t2&2047, 11)
+		t3 := uint16(b[4])>>1 | uint16(b[5])<<7
+		f[i+3] = decompress(t3&2047, 11)
+		t4 := uint16(b[5])>>4 | uint16(b[6])<<4
+		f[i+4] = decompress(t4&2047, 11)
+		t5 := uint16(b[6])>>7 | uint16(b[7])<<1 | uint16(b[8])<<9
+		f[i+5] = decompress(t5&2047, 11)
+		t6 := uint16(b[8])>>2 | uint16(b[9])<<6
+		f[i+6] = decompress(t6&2047, 11)
+		t7 := uint16(b[9])>>5 | uint16(b[10])<<3
+		f[i+7] = decompress(t7&2047, 11)
+		b = b[11:]
+	}
+	return f
 }
 
 // samplePolyCBD draws a ringElement from the special Dη distribution given a
@@ -421,19 +438,36 @@ type nttElement [n]fieldElement
 // FIPS 203, Appendix A (with negative values reduced to positive).
 var gammas = [128]fieldElement{17, 3312, 2761, 568, 583, 2746, 2649, 680, 1637, 1692, 723, 2606, 2288, 1041, 1100, 2229, 1409, 1920, 2662, 667, 3281, 48, 233, 3096, 756, 2573, 2156, 1173, 3015, 314, 3050, 279, 1703, 1626, 1651, 1678, 2789, 540, 1789, 1540, 1847, 1482, 952, 2377, 1461, 1868, 2687, 642, 939, 2390, 2308, 1021, 2437, 892, 2388, 941, 733, 2596, 2337, 992, 268, 3061, 641, 2688, 1584, 1745, 2298, 1031, 2037, 1292, 3220, 109, 375, 2954, 2549, 780, 2090, 1239, 1645, 1684, 1063, 2266, 319, 3010, 2773, 556, 757, 2572, 2099, 1230, 561, 2768, 2466, 863, 2594, 735, 2804, 525, 1092, 2237, 403, 2926, 1026, 2303, 1143, 2186, 2150, 1179, 2775, 554, 886, 2443, 1722, 1607, 1212, 2117, 1874, 1455, 1029, 2300, 2110, 1219, 2935, 394, 885, 2444, 2154, 1175}
 
-// nttMul multiplies two nttElements.
-//
-// It implements MultiplyNTTs, according to FIPS 203, Algorithm 11.
-func nttMul(f, g nttElement) nttElement {
-	var h nttElement
-	// We use i += 2 for bounds check elimination. See https://go.dev/issue/66826.
-	for i := 0; i < 256; i += 2 {
+// nttMulAdd adds f*g to h without materializing the product.
+// All inputs and outputs are reduced. h may alias f or g.
+func nttMulAdd(h, f, g *nttElement) {
+	for i := 0; i < n; i += 2 {
 		a0, a1 := f[i], f[i+1]
 		b0, b1 := g[i], g[i+1]
-		h[i] = fieldAddMul(a0, b0, fieldMul(a1, b1), gammas[i/2])
-		h[i+1] = fieldAddMul(a0, b1, a1, b0)
+		// Both sums are at most 2(q-1)^2 + (q-1) < 2q².
+		h[i] = fieldReduce(uint32(h[i]) + uint32(a0)*uint32(b0) + uint32(fieldMul(a1, b1))*uint32(gammas[i/2]))
+		h[i+1] = fieldReduce(uint32(h[i+1]) + uint32(a0)*uint32(b1) + uint32(a1)*uint32(b0))
 	}
-	return h
+}
+
+// nttMulPrecompute computes the gamma-scaled odd coefficients of g.
+// The result is local to one matrix/vector multiplication.
+func nttMulPrecompute(p *[n / 2]fieldElement, g *nttElement) {
+	for i := range p {
+		p[i] = fieldMul(g[2*i+1], gammas[i])
+	}
+}
+
+// nttMulAddPrecomputed adds f*g to h, given nttMulPrecompute(g).
+// All inputs and outputs are reduced. h may alias f or g.
+func nttMulAddPrecomputed(h, f, g *nttElement, gamma *[n / 2]fieldElement) {
+	for i := 0; i < n; i += 2 {
+		a0, a1 := f[i], f[i+1]
+		b0, b1 := g[i], g[i+1]
+		// Both sums are at most 2(q-1)^2 + (q-1) < 2q².
+		h[i] = fieldReduce(uint32(h[i]) + uint32(a0)*uint32(b0) + uint32(a1)*uint32(gamma[i/2]))
+		h[i+1] = fieldReduce(uint32(h[i+1]) + uint32(a0)*uint32(b1) + uint32(a1)*uint32(b0))
+	}
 }
 
 // zetas are the values ζ^BitRev7(k) mod q for each index k, according to FIPS
@@ -466,7 +500,7 @@ func ntt(f ringElement) nttElement {
 // It implements NTT⁻¹, according to FIPS 203, Algorithm 10.
 func inverseNTT(f nttElement) ringElement {
 	k := 127
-	for len := 2; len <= 128; len *= 2 {
+	for len := 2; len < 128; len *= 2 {
 		for start := 0; start < 256; start += 2 * len {
 			zeta := zetas[k]
 			k--
@@ -479,70 +513,121 @@ func inverseNTT(f nttElement) ringElement {
 			}
 		}
 	}
-	for i := range f {
-		f[i] = fieldMul(f[i], 3303) // 3303 = 128⁻¹ mod q
+	// The first six stages consume zetas[127] through zetas[2].
+	// Fuse the final stage (zeta = zetas[1]) with scaling by 128⁻¹.
+	const scale = 3303
+	const zetaScaled = 1729 * scale % q // zetas[1] * 128⁻¹ mod q
+	for i := 0; i < 128; i++ {
+		a, b := f[i], f[i+128]
+		// a+b < 2q, so (a+b)*scale < 2q², within fieldReduce's bound.
+		f[i] = fieldReduce(uint32(a+b) * scale)
+		f[i+128] = fieldMulSub(zetaScaled, b, a)
 	}
 	return ringElement(f)
 }
 
-// sampleNTT draws a uniformly random nttElement from a stream of uniformly
-// random bytes generated by the XOF function, according to FIPS 203,
-// Algorithm 7.
-func sampleNTT(rho []byte, ii, jj byte) nttElement {
-	B := sha3.NewShake128()
-	B.Write(rho)
-	B.Write([]byte{ii, jj})
-
-	// SampleNTT essentially draws 12 bits at a time from r, interprets them in
-	// little-endian, and rejects values higher than q, until it drew 256
-	// values. (The rejection rate is approximately 19%.)
-	//
-	// To do this from a bytes stream, it draws three bytes at a time, and
-	// splits them into two uint16 appropriately masked.
-	//
-	//               r₀              r₁              r₂
-	//       |- - - - - - - -|- - - - - - - -|- - - - - - - -|
-	//
-	//               Uint16(r₀ || r₁)
-	//       |- - - - - - - - - - - - - - - -|
-	//       |- - - - - - - - - - - -|
-	//                   d₁
-	//
-	//                                Uint16(r₁ || r₂)
-	//                       |- - - - - - - - - - - - - - - -|
-	//                               |- - - - - - - - - - - -|
-	//                                           d₂
-	//
-	// Note that in little-endian, the rightmost bits are the most significant
-	// bits (dropped with a mask) and the leftmost bits are the least
-	// significant bits (dropped with a right shift).
-
-	var a nttElement
-	var j int        // index into a
-	var buf [24]byte // buffered reads from B
-	off := len(buf)  // index into buf, starts in a "buffer fully consumed" state
-	for {
-		if off >= len(buf) {
-			B.Read(buf[:])
-			off = 0
+// sampleNTTMatrix fills A so that A[i*k+j] is drawn from the XOF seeded with
+// ρ, j, and i, sampling the underlying streams in batches with
+// sha3.ReadMulti.
+//
+// It implements the matrix generation loops of K-PKE.KeyGen and K-PKE.Encrypt
+// according to FIPS 203, Algorithms 13 and 14, with SampleNTT according to
+// FIPS 203, Algorithm 7.
+func sampleNTTMatrix(A []nttElement, rho []byte, k int) {
+	// Compute up to four elements at a time in parallel.
+	for len(A) > 0 {
+		lanesCount := min(4, len(A))
+		lanes := [4]*sha3.SHAKE{
+			sha3.NewShake128(), sha3.NewShake128(),
+			sha3.NewShake128(), sha3.NewShake128(),
 		}
-		d1 := byteorder.LEUint16(buf[off:]) & 0b1111_1111_1111
-		d2 := byteorder.LEUint16(buf[off+1:]) >> 4
-		off += 3
+		// Squeeze 3 blocks (each of 168 bytes, the rate of SHAKE-128) at once
+		// from each lane, which is enough to fill a full nttElement more than
+		// 99% of the time.
+		var bufs [4][3 * 168]byte
+		var outs [4][]byte
+		for i := range lanesCount {
+			// The index of A[i] in the full k×k matrix.
+			m := k*k - len(A) + i
+			lanes[i].Write(rho)
+			lanes[i].Write([]byte{byte(m % k), byte(m / k)})
+			outs[i] = bufs[i][:]
+		}
+		sha3.ReadMulti(lanes[:lanesCount], outs[:lanesCount])
+		for i := range lanesCount {
+			a := &A[i]
+			j := parseSampleNTT(a, 0, bufs[i][:])
+			// If the eager read above wasn't enough, draw a block at a time
+			// from this lane until the element is filled.
+			for j < n {
+				lanes[i].Read(bufs[i][:168])
+				j = parseSampleNTT(a, j, bufs[i][:168])
+			}
+		}
+		A = A[lanesCount:]
+	}
+}
+
+// parseSampleNTT consumes buf, whose length must be a multiple of three,
+// filling a from index j on with accepted values, and returns the updated
+// index.
+//
+// SampleNTT essentially draws 12 bits at a time from buf, interprets them
+// in little-endian, and rejects values higher than q, until it drew 256
+// values. (The rejection rate is approximately 19%.)
+func parseSampleNTT(a *nttElement, j int, buf []byte) int {
+	// For as long as there are enough bytes in buf and enough remaining slots
+	// in a, consume 6 bytes (48 bits) at a time as four 12-bit values,
+	// advancing j branchlessly. (The uint conversion lets the compiler prove
+	// j is non-negative and drop the bounds checks on the stores below.)
+	_ = a[0] // hoist a's nil check out of the loops below
+	const mask = 0b1111_1111_1111
+	for len(buf) >= 8 && uint(j) <= n-4 {
+		w := byteorder.LEUint64(buf)
+		d1 := uint32(w) & mask
+		d2 := uint32(w>>12) & mask
+		d3 := uint32(w>>24) & mask
+		d4 := uint32(w>>36) & mask
+		a[j] = fieldElement(d1)
+		j += int((d1 - q) >> 31)
+		a[j] = fieldElement(d2)
+		j += int((d2 - q) >> 31)
+		a[j] = fieldElement(d3)
+		j += int((d3 - q) >> 31)
+		a[j] = fieldElement(d4)
+		j += int((d4 - q) >> 31)
+		buf = buf[6:]
+	}
+	// Consume the rest of the buffer 3 bytes (two values) at a time. This
+	// handles both the last six bytes (which the loop above can't load, as it
+	// would read past the end of buf) and the last three elements (which the
+	// loop above can't fill, as it would write past the end of a).
+	for len(buf) > 0 && j < n {
+		//
+		//          r₀              r₁              r₂
+		//  |- - - - - - - -|- - - - - - - -|- - - - - - - -|
+		//
+		//             Uint16(buf)
+		//  |- - - - - - - - - - - - - - - -|
+		//  |- - - - - - - - - - - -|
+		//              d₁
+		//
+		//                            Uint16(buf[1:])
+		//                  |- - - - - - - - - - - - - - - -|
+		//                          |- - - - - - - - - - - -|
+		//                                      d₂
+		//
+		d1 := byteorder.LEUint16(buf) & mask
+		d2 := byteorder.LEUint16(buf[1:]) >> 4
 		if d1 < q {
 			a[j] = fieldElement(d1)
 			j++
 		}
-		if j >= len(a) {
-			break
-		}
-		if d2 < q {
+		if d2 < q && j < n {
 			a[j] = fieldElement(d2)
 			j++
 		}
-		if j >= len(a) {
-			break
-		}
+		buf = buf[3:]
 	}
-	return a
+	return j
 }
