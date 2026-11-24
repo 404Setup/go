@@ -10,9 +10,9 @@ This fork is a personal Go branch maintained by 404Setup.
 > This fork does not modify language syntax or break existing standard library APIs.
 
 ### Standard Library & Runtime
-- **`encoding/base64`**: 2× unrolled AVX2 (`simd/archsimd`), ARM64 NEON, and ARMv9 SVE2 (`GOARM64=v9.0`) vector codecs for standard and URL alphabets, AVX2 CR/LF newline stripping, in-place large-buffer `Decoder.Read`, 6→8 byte scalar chunking, and `bytealg.MakeNoZero` string buffers.
+- **`encoding/base64`**: 2× unrolled AVX2 and SSSE3 assembly (`amd64`), ARM64 NEON, and runtime-detected ARM64 SVE2 vector codecs for standard and URL alphabets, AVX2 CR/LF newline stripping, in-place large-buffer `Decoder.Read`, `4×256` `uint32` little-endian scalar decode LUTs with 6→8 byte chunking, and single-allocation `EncodeToString`.
 - **`encoding/json`, `encoding/json/v2`**: Compiled marshal/unmarshal fast paths, SWAR scanning and validation, pooled buffers, exact float paths, and generic `*Of` / `Append*` APIs for both `jsonv2` and `GOEXPERIMENT=nojsonv2`.
-- **`encoding/xml`**: Compiled marshal/unmarshal struct plans (`sync/v2.Map`) with O(1) element lookup, pooled encoders and decoders, AVX2/SWAR XML scanning and `EscapeText` (`*bytes.Buffer` / `*strings.Builder`), 2-way per-decoder name interning cache, deferred attribute materialization, and `internal/strconv` / inline base-10 numeric parsing.
+- **`encoding/xml`**: Compiled marshal/unmarshal struct plans (`sync/v2.Map`) with O(1) element lookup, pooled encoders and decoders, AVX2/SWAR XML scanning and `EscapeText` (`*bytes.Buffer` / `*strings.Builder`), direct `fastReadSimpleLeafBytes` leaf text decoding, pre-filtered `autoClose` matching, 2-way per-decoder name interning cache, deferred attribute materialization, and `internal/strconv` / inline base-10 numeric parsing.
 - **`io`**: Pooled overflow buffers and exact-sized final allocations in `ReadAll`.
 - **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with `Shrink()` and single-load `Load` fast path).
 - **`sync/v2/container`**: Generic ordered/sorted maps (`OrderedMap`, `ConcurrentSkipListMap`, `LinkedHashMap`, `TreeMap`) with zero-alloc `internal/abi` CAS/CAD equality, capped node freelists, and lock-free `ConcurrentSkipListMap.First`.
@@ -542,66 +542,72 @@ xychart-beta
 
 ### 8. `encoding/base64` and `encoding/xml`
 
-Benchmarked on `linux/amd64` (`Intel Xeon @ 2.30 GHz`, `-cpu=2`, 5 runs median).
+Benchmarked on `linux/amd64` (`Intel Xeon @ 2.30 GHz`, `-cpu=2`, 3 runs median).
 
 ```mermaid
 xychart-beta
     title "encoding/base64 & encoding/xml: Upstream 63977818 (left) vs Current (right) — Latency (µs/op, lower is better)"
     x-axis ["base64 Encode (4KB)", "base64 Decode (4KB)", "xml Marshal", "xml Unmarshal", "xml MarshalFeed10", "xml UnmarshalFeed10"]
-    y-axis "Latency (µs/op)" 0 --> 180
-    bar [5.40, 6.26, 8.06, 21.37, 47.69, 176.25]
-    bar [0.64, 0.66, 1.18, 4.93, 8.56, 33.56]
+    y-axis "Latency (µs/op)" 0 --> 185
+    bar [5.41, 6.43, 7.80, 21.11, 45.37, 177.9]
+    bar [0.43, 0.51, 1.19, 4.54, 8.75, 27.12]
 ```
 
 #### `encoding/base64` (`63977818` → Current, `-cpu=2`)
 
 | Benchmark | Upstream (`63977818`) | Current | Latency Delta | Throughput / Allocs (`Upstream` → `Current`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `BenchmarkEncode` (8 KB) | 10.80 µs/op | **1.27 µs/op** | **-88.3%** (8.51×) | 758 → **6,456 MB/s**, 0 → 0 allocs |
-| `BenchmarkEncodeToString` (8 KB) | 17.93 µs/op | **5.48 µs/op** | **-69.5%** (3.28×) | 2 → **1 allocs** |
-| `BenchmarkDecodeString/64` | 119.0 ns/op | **82.80 ns/op** | **-30.4%** (1.44×) | 0 → 0 allocs |
-| `BenchmarkDecodeString/8192` | 15.32 µs/op | **6.40 µs/op** | **-58.3%** (2.40×) | 9,472 B (1 alloc) → 9,472 B (1 alloc) |
-| `BenchmarkDecoder/Unwrapped` | 19.34 µs/op | **3.29 µs/op** | **-83.0%** (5.88×) | 565 → **3,322 MB/s**, 3 → 3 allocs |
-| `BenchmarkDecoder/Wrapped` | 21.08 µs/op | **5.35 µs/op** | **-74.6%** (3.94×) | 532 → **2,096 MB/s**, 3 → 3 allocs |
-| `FastSuite/Encode/256B` | 342.8 ns/op | **63.69 ns/op** | **-81.4%** (5.38×) | **4,019 MB/s**, 0 → 0 allocs |
-| `FastSuite/Decode/256B` | 418.6 ns/op | **109.0 ns/op** | **-74.0%** (3.84×) | **3,156 MB/s**, 0 → 0 allocs |
-| `FastSuite/Encode/4KB` | 5,401 ns/op | **637.5 ns/op** | **-88.2%** (8.47×) | **6,425 MB/s**, 0 → 0 allocs |
-| `FastSuite/Decode/4KB` | 6,261 ns/op | **661.1 ns/op** | **-89.4%** (9.47×) | **8,265 MB/s**, 0 → 0 allocs |
-| `FastSuite/Encode/32KB` | 42.30 µs/op | **4.97 µs/op** | **-88.2%** (8.51×) | **6,591 MB/s**, 0 → 0 allocs |
-| `FastSuite/Decode/32KB` | 49.54 µs/op | **5.08 µs/op** | **-89.8%** (9.76×) | **8,607 MB/s**, 0 → 0 allocs |
-| `FastSuite/AppendDecode/32KB` | 50.61 µs/op | **5.07 µs/op** | **-90.0%** (9.99×) | **8,622 MB/s**, 0 → 0 allocs |
+| `BenchmarkEncode` (8 KB) | 10.78 µs/op | **0.82 µs/op** | **-92.4%** (13.21×) | 760 → **10,039 MB/s**, 0 → 0 allocs |
+| `BenchmarkEncodeToString` (8 KB) | 19.28 µs/op | **4.70 µs/op** | **-75.6%** (4.11×) | 2 → **1 allocs** |
+| `BenchmarkDecoder/Unwrapped` | 19.14 µs/op | **2.71 µs/op** | **-85.8%** (7.05×) | 571 → **4,026 MB/s**, 3 → 3 allocs |
+| `BenchmarkDecoder/Wrapped` | 20.89 µs/op | **3.54 µs/op** | **-83.0%** (5.90×) | 537 → **3,165 MB/s**, 3 → 3 allocs |
+| `FastSuite/Encode/16B` | 25.68 ns/op | **22.42 ns/op** | **-12.7%** (1.15×) | 623 → **714 MB/s**, 0 → 0 allocs |
+| `FastSuite/Decode/16B` | 50.71 ns/op | **41.91 ns/op** | **-17.4%** (1.21×) | 473 → **573 MB/s**, 0 → 0 allocs |
+| `FastSuite/Encode/256B` | 338.6 ns/op | **61.61 ns/op** | **-81.8%** (5.50×) | 756 → **4,155 MB/s**, 0 → 0 allocs |
+| `FastSuite/Decode/256B` | 429.1 ns/op | **100.4 ns/op** | **-76.6%** (4.27×) | 802 → **3,427 MB/s**, 0 → 0 allocs |
+| `FastSuite/DecodeString/256B` | 526.2 ns/op | **238.7 ns/op** | **-54.6%** (2.20×) | 288 B (1 alloc) → 288 B (1 alloc) |
+| `FastSuite/Encode/4KB` | 5,410 ns/op | **431.4 ns/op** | **-92.0%** (12.54×) | 757 → **9,495 MB/s**, 0 → 0 allocs |
+| `FastSuite/Decode/4KB` | 6,427 ns/op | **509.5 ns/op** | **-92.1%** (12.61×) | 850 → **10,725 MB/s**, 0 → 0 allocs |
+| `FastSuite/DecodeString/4KB` | 8,316 ns/op | **2,663 ns/op** | **-68.0%** (3.12×) | 4,864 B (1 alloc) → 4,864 B (1 alloc) |
+| `FastSuite/Encode/32KB` | 42.42 µs/op | **3.31 µs/op** | **-92.2%** (12.83×) | 773 → **9,910 MB/s**, 0 → 0 allocs |
+| `FastSuite/Decode/32KB` | 49.04 µs/op | **4.35 µs/op** | **-91.1%** (11.27×) | 891 → **10,044 MB/s**, 0 → 0 allocs |
+| `FastSuite/DecodeString/32KB` | 63.20 µs/op | **19.08 µs/op** | **-69.8%** (3.31×) | 40,960 B (1 alloc) → 40,960 B (1 alloc) |
+| `FastSuite/AppendDecode/32KB` | 49.06 µs/op | **4.45 µs/op** | **-90.9%** (11.02×) | 891 → **9,810 MB/s**, 0 → 0 allocs |
 
 #### `encoding/base64` vs Third-Party Libraries (`-cpu=2`, `StdEncoding`)
 
 | Operation / Size | `encoding/base64` (Fork) | `cristalhq/base64` (`v0.1.2`) | `segmentio/asm/base64` (`v1.2.1`) |
 | :--- | ---: | ---: | ---: |
-| `Encode` (256 B) | **65.18 ns/op** (3,928 MB/s) | 169.2 ns/op (1,513 MB/s) | 177.9 ns/op (1,439 MB/s) |
-| `EncodeToString` (256 B) | **246.5 ns/op** (1 alloc) | 338.2 ns/op (1 alloc) | 446.4 ns/op (2 allocs) |
-| `Decode` (256 B) | **109.2 ns/op** (3,149 MB/s) | 244.9 ns/op (1,404 MB/s) | 110.5 ns/op (3,114 MB/s) |
-| `DecodeString` (256 B) | 248.5 ns/op (1 alloc) | 388.0 ns/op (1 alloc) | **237.0 ns/op** (1 alloc) |
-| `Encode` (4 KB) | 639.4 ns/op (6,406 MB/s) | 2,683 ns/op (1,526 MB/s) | **583.5 ns/op** (7,020 MB/s) |
-| `EncodeToString` (4 KB) | **2,612 ns/op** (1 alloc) | 4,774 ns/op (1 alloc) | 5,355 ns/op (2 allocs) |
-| `Decode` (4 KB) | **654.1 ns/op** (8,353 MB/s) | 3,409 ns/op (1,603 MB/s) | 676.3 ns/op (8,079 MB/s) |
-| `DecodeString` (4 KB) | **2,380 ns/op** (1 alloc) | 5,145 ns/op (1 alloc) | 2,625 ns/op (1 alloc) |
-| `Encode` (32 KB) | 4,982 ns/op (6,577 MB/s) | 21,040 ns/op (1,557 MB/s) | **3,995 ns/op** (8,202 MB/s) |
-| `EncodeToString` (32 KB) | **27,651 ns/op** (1 alloc) | 48,013 ns/op (1 alloc) | 61,313 ns/op (2 allocs) |
-| `Decode` (32 KB) | 5,098 ns/op (8,570 MB/s) | 27,385 ns/op (1,595 MB/s) | **4,910 ns/op** (8,898 MB/s) |
-| `DecodeString` (32 KB) | **27,298 ns/op** (1 alloc) | 50,892 ns/op (1 alloc) | 29,135 ns/op (1 alloc) |
+| `Encode` (16 B) | 22.33 ns/op (717 MB/s) | **20.93 ns/op** (764 MB/s) | 25.28 ns/op (633 MB/s) |
+| `EncodeToString` (16 B) | **34.04 ns/op** (0 allocs) | 49.91 ns/op (1 alloc) | 79.71 ns/op (2 allocs) |
+| `Decode` (16 B) | 41.52 ns/op (578 MB/s) | **28.26 ns/op** (849 MB/s) | 53.93 ns/op (445 MB/s) |
+| `Encode` (256 B) | **56.92 ns/op** (4,498 MB/s) | 169.5 ns/op (1,511 MB/s) | 63.17 ns/op (4,052 MB/s) |
+| `EncodeToString` (256 B) | **230.3 ns/op** (1 alloc) | 317.6 ns/op (1 alloc) | 491.8 ns/op (2 allocs) |
+| `Decode` (256 B) | **96.71 ns/op** (3,557 MB/s) | 238.3 ns/op (1,444 MB/s) | 97.13 ns/op (3,542 MB/s) |
+| `DecodeString` (256 B) | **226.2 ns/op** (1 alloc) | 362.9 ns/op (1 alloc) | 277.2 ns/op (1 alloc) |
+| `Encode` (4 KB) | **538.2 ns/op** (7,611 MB/s) | 2,562 ns/op (1,599 MB/s) | 590.6 ns/op (6,935 MB/s) |
+| `EncodeToString` (4 KB) | **2,435 ns/op** (1 alloc) | 4,611 ns/op (1 alloc) | 5,140 ns/op (2 allocs) |
+| `Decode` (4 KB) | **520.9 ns/op** (10,489 MB/s) | 3,449 ns/op (1,584 MB/s) | 630.1 ns/op (8,672 MB/s) |
+| `DecodeString` (4 KB) | **2,265 ns/op** (1 alloc) | 5,014 ns/op (1 alloc) | 2,668 ns/op (1 alloc) |
+| `Encode` (32 KB) | **3,350 ns/op** (9,781 MB/s) | 20,834 ns/op (1,573 MB/s) | 4,014 ns/op (8,164 MB/s) |
+| `EncodeToString` (32 KB) | **20,508 ns/op** (1 alloc) | 39,923 ns/op (1 alloc) | 42,958 ns/op (2 allocs) |
+| `Decode` (32 KB) | **4,311 ns/op** (10,134 MB/s) | 26,634 ns/op (1,640 MB/s) | 4,835 ns/op (9,036 MB/s) |
+| `DecodeString` (32 KB) | 23,544 ns/op (1 alloc) | 40,746 ns/op (1 alloc) | **20,498 ns/op** (1 alloc) |
 
 #### `encoding/xml` (`63977818` → Current, `-cpu=2`)
 
 | Benchmark | Upstream (`63977818`) | Current | Latency Delta | Allocs (`Upstream` → `Current`) |
 | :--- | ---: | ---: | ---: | :---: |
-| `BenchmarkMarshal` | 8,059 ns/op | **1,180 ns/op** | **-85.4%** (6.83×) | 23 (5,704 B) → **1 (576 B)** |
-| `BenchmarkUnmarshal` | 21.37 µs/op | **4.93 µs/op** | **-76.9%** (4.33×) | 184 (7,736 B) → **33 (1,128 B)** |
-| `BenchmarkHTMLAutoClose` | 7,397 ns/op | **6,646 ns/op** | **-10.2%** (1.11×) | 93 (3,580 B) → **78 (3,216 B)** |
-| `FastSuite/MarshalFeed10` | 47.69 µs/op | **8.56 µs/op** | **-82.0%** (5.57×) | 83 (10.7 KB) → **1 (3.4 KB)** |
-| `FastSuite/MarshalIndentFeed10` | 51.84 µs/op | **13.02 µs/op** | **-74.9%** (3.98×) | 83 (11.3 KB) → **1 (4.0 KB)** |
-| `FastSuite/MarshalFeed100` | 438.0 µs/op | **82.64 µs/op** | **-81.1%** (5.30×) | 716 (90.6 KB) → **1 (32.0 KB)** |
-| `FastSuite/UnmarshalFeed10` | 176.3 µs/op | **33.56 µs/op** | **-81.0%** (5.25×) | 852 (34.4 KB) → **60 (5.5 KB)** |
-| `FastSuite/UnmarshalFeed100` | 1,707 µs/op | **311.8 µs/op** | **-81.7%** (5.47×) | 8,055 (317 KB) → **423 (46.5 KB)** |
-| `FastSuite/EscapeTextPlain` | 12.25 µs/op | **263.6 ns/op** | **-97.8%** (46.47×) | 0 → 0 |
-| `FastSuite/EscapeTextMixed` | 14.09 µs/op | **8.66 µs/op** | **-38.5%** (1.63×) | 0 → 0 |
+| `BenchmarkMarshal` | 7,802 ns/op | **1,185 ns/op** | **-84.8%** (6.58×) | 23 (5,704 B) → **1 (576 B)** |
+| `BenchmarkUnmarshal` | 21.11 µs/op | **4.54 µs/op** | **-78.5%** (4.65×) | 184 (7,736 B) → **33 (1,128 B)** |
+| `BenchmarkHTMLAutoClose` | 7,267 ns/op | **6,933 ns/op** | **-4.6%** (1.05×) | 93 (3,580 B) → **78 (3,216 B)** |
+| `FastSuite/MarshalFeed10` | 45.37 µs/op | **8.75 µs/op** | **-80.7%** (5.19×) | 83 (10.7 KB) → **1 (3.4 KB)** |
+| `FastSuite/MarshalIndentFeed10` | 50.68 µs/op | **12.17 µs/op** | **-76.0%** (4.16×) | 83 (11.3 KB) → **1 (4.0 KB)** |
+| `FastSuite/MarshalFeed100` | 426.2 µs/op | **85.59 µs/op** | **-79.9%** (4.98×) | 716 (90.6 KB) → **1 (32.8 KB)** |
+| `FastSuite/UnmarshalFeed10` | 177.9 µs/op | **27.12 µs/op** | **-84.8%** (6.56×) | 852 (34.4 KB) → **60 (5.6 KB)** |
+| `FastSuite/UnmarshalFeed100` | 1,728 µs/op | **255.5 µs/op** | **-85.2%** (6.76×) | 8,055 (317 KB) → **423 (47.6 KB)** |
+| `FastSuite/EscapeTextPlain` | 12.31 µs/op | **250.6 ns/op** | **-98.0%** (49.12×) | 0 → 0 |
+| `FastSuite/EscapeTextMixed` | 14.28 µs/op | **7.82 µs/op** | **-45.2%** (1.83×) | 0 → 0 |
 
 ---
 
