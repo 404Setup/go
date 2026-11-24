@@ -5,11 +5,13 @@
 package container
 
 import (
+	"internal/abi"
 	"iter"
 	"math/bits"
 	"math/rand/v2"
 	"sync/atomic"
 	"sync/v2"
+	"unsafe"
 )
 
 // ConcurrentSkipListMap is a concurrent map ordered by a comparison function.
@@ -17,10 +19,10 @@ import (
 // deletes, and boundary queries. Comparator-equal keys identify the same entry;
 // replacing a value preserves the originally stored key.
 //
-// Loads and ascending iteration do not acquire locks. Writes and boundary
-// queries serialize on a mutex. Iteration is weakly consistent: it may observe
-// concurrent changes, but visits keys in order without duplicates. Callbacks
-// may call any method on the map.
+// Loads, First, and ascending iteration do not acquire locks. Writes and
+// other boundary queries serialize on a mutex. Iteration is weakly consistent: it
+// may observe concurrent changes, but visits keys in order without duplicates.
+// Callbacks may call any method on the map.
 //
 // A ConcurrentSkipListMap must be created with NewConcurrentSkipListMap and
 // must not be copied after first use. Unlike Java's ConcurrentSkipListMap,
@@ -257,13 +259,16 @@ func (m *ConcurrentSkipListMap[K, V]) Delete(key K) { m.LoadAndDelete(key) }
 // panics if V is not comparable, or if the comparison involves an uncomparable
 // dynamic value.
 func (m *ConcurrentSkipListMap[K, V]) CompareAndSwap(key K, old, new V) bool {
-	mapCheckComparable[V]("CompareAndSwap")
+	eq := mapValueEqualFunc[V]("CompareAndSwap")
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s := m.state.Load(); s != nil {
-		if n, exact := m.find(s, key, nil); exact && any(n.value.Load().value) == any(old) {
-			n.value.Store(&skipListValue[V]{value: new})
-			return true
+		if n, exact := m.find(s, key, nil); exact {
+			current := n.value.Load()
+			if current != nil && eq(unsafe.Pointer(&current.value), abi.NoEscape(unsafe.Pointer(&old))) {
+				n.value.Store(&skipListValue[V]{value: new})
+				return true
+			}
 		}
 	}
 	return false
@@ -272,7 +277,7 @@ func (m *ConcurrentSkipListMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 // CompareAndDelete atomically removes key if its value equals old. It has the
 // same comparability requirements as CompareAndSwap.
 func (m *ConcurrentSkipListMap[K, V]) CompareAndDelete(key K, old V) bool {
-	mapCheckComparable[V]("CompareAndDelete")
+	eq := mapValueEqualFunc[V]("CompareAndDelete")
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.state.Load()
@@ -281,7 +286,11 @@ func (m *ConcurrentSkipListMap[K, V]) CompareAndDelete(key K, old V) bool {
 	}
 	var predecessors [skipListLevels]*skipListNode[K, V]
 	n, exact := m.find(s, key, &predecessors)
-	if !exact || any(n.value.Load().value) != any(old) {
+	if !exact {
+		return false
+	}
+	current := n.value.Load()
+	if current == nil || !eq(unsafe.Pointer(&current.value), abi.NoEscape(unsafe.Pointer(&old))) {
 		return false
 	}
 	n.value.Store(nil)
@@ -358,7 +367,18 @@ func (m *ConcurrentSkipListMap[K, V]) edge(last, remove bool) (key K, value V, o
 }
 
 // First returns the least entry according to the comparator.
-func (m *ConcurrentSkipListMap[K, V]) First() (key K, value V, ok bool) { return m.edge(false, false) }
+func (m *ConcurrentSkipListMap[K, V]) First() (key K, value V, ok bool) {
+	s := m.state.Load()
+	if s == nil {
+		return key, value, false
+	}
+	for n := s.head.next[0].Load(); n != nil; n = n.next[0].Load() {
+		if current := n.value.Load(); current != nil {
+			return n.key, current.value, true
+		}
+	}
+	return key, value, false
+}
 
 // Last returns the greatest entry according to the comparator.
 func (m *ConcurrentSkipListMap[K, V]) Last() (key K, value V, ok bool) { return m.edge(true, false) }

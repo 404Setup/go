@@ -124,15 +124,11 @@ func (p *Pool[T]) GetOK() (value T, ok bool) {
 	var item poolItem[T]
 	if l.privateSet {
 		item = l.private
-		var zero poolItem[T]
-		l.private = zero
+		l.private = poolItem[T]{}
 		l.privateSet = false
 		ok = true
 	} else {
-		item, ok = l.shared.popHead()
-		if !ok {
-			item, ok = p.getSlow(pid)
-		}
+		item, ok = p.getSlow(l, pid)
 	}
 	runtime_procUnpin()
 	poolRaceGetDone(&item, ok)
@@ -145,7 +141,10 @@ func (p *Pool[T]) GetOK() (value T, ok bool) {
 	return value, false
 }
 
-func (p *Pool[T]) getSlow(pid int) (poolItem[T], bool) {
+func (p *Pool[T]) getSlow(l *poolLocal[T], pid int) (poolItem[T], bool) {
+	if item, ok := l.shared.popHead(); ok {
+		return item, true
+	}
 	// See the comment in pin regarding ordering of the loads.
 	size := rtatomic.LoadAcquintptr(&p.localSize) // load-acquire
 	locals := p.local                             // load-consume
@@ -163,7 +162,7 @@ func (p *Pool[T]) getSlow(pid int) (poolItem[T], bool) {
 		return poolItem[T]{}, false
 	}
 	locals = p.victim
-	l := indexLocal[T](locals, pid)
+	l = indexLocal[T](locals, pid)
 	if l.privateSet {
 		item := l.private
 		var zero poolItem[T]

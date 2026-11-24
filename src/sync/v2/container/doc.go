@@ -8,12 +8,18 @@
 // with at least one writer.
 package container
 
-import "reflect"
+import (
+	"internal/abi"
+	"unsafe"
+)
 
-func mapCheckComparable[V any](operation string) {
-	if !reflect.TypeFor[V]().Comparable() {
+func mapValueEqualFunc[V any](operation string) func(unsafe.Pointer, unsafe.Pointer) bool {
+	var p *V
+	eq := abi.TypeOf(p).Elem().Equal
+	if eq == nil {
 		panic("called " + operation + " when value is not of comparable type")
 	}
+	return eq
 }
 
 // noCopy may be added to structs which must not be copied after the first use.

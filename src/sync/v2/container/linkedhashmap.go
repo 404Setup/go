@@ -4,7 +4,11 @@
 
 package container
 
-import "iter"
+import (
+	"internal/abi"
+	"iter"
+	"unsafe"
+)
 
 // LinkedHashMap is a hash map with a doubly linked iteration order. The zero
 // value is ready for use and iterates in insertion order. Updating a key keeps
@@ -21,6 +25,7 @@ type LinkedHashMap[K comparable, V any] struct {
 	index       map[K]*linkedHashMapNode[K, V]
 	order       linkedHashMapList[K, V]
 	free        *linkedHashMapNode[K, V]
+	freeLen     int
 	accessOrder bool
 	version     uint64
 }
@@ -141,8 +146,11 @@ func (m *LinkedHashMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 	}
 	e := m.free
 	if e != nil {
-		m.free = nil
-		*e = linkedHashMapNode[K, V]{key: key, value: value}
+		m.free = e.next
+		m.freeLen--
+		e.next = nil
+		e.key = key
+		e.value = value
 	} else {
 		e = &linkedHashMapNode[K, V]{key: key, value: value}
 	}
@@ -155,10 +163,26 @@ func (m *LinkedHashMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 // LoadOrStore returns the existing value, or stores and returns value if absent.
 // The loaded result reports whether the key was already present.
 func (m *LinkedHashMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
-	if actual, loaded = m.Load(key); loaded {
-		return actual, true
+	if e := m.index[key]; e != nil {
+		m.touch(e)
+		return e.value, true
 	}
-	m.Store(key, value)
+	if m.index == nil {
+		m.index = make(map[K]*linkedHashMapNode[K, V])
+	}
+	e := m.free
+	if e != nil {
+		m.free = e.next
+		m.freeLen--
+		e.next = nil
+		e.key = key
+		e.value = value
+	} else {
+		e = &linkedHashMapNode[K, V]{key: key, value: value}
+	}
+	m.index[key] = e
+	m.order.pushBack(e)
+	m.version++
 	return value, false
 }
 
@@ -177,9 +201,9 @@ func (m *LinkedHashMap[K, V]) Delete(key K) { m.LoadAndDelete(key) }
 // CompareAndSwap replaces the value for key if it equals old. It panics if V
 // is not comparable, or if the comparison involves an uncomparable dynamic value.
 func (m *LinkedHashMap[K, V]) CompareAndSwap(key K, old, new V) bool {
-	mapCheckComparable[V]("CompareAndSwap")
+	eq := mapValueEqualFunc[V]("CompareAndSwap")
 	if e := m.index[key]; e != nil {
-		if any(e.value) == any(old) {
+		if eq(unsafe.Pointer(&e.value), abi.NoEscape(unsafe.Pointer(&old))) {
 			e.value = new
 			m.touch(e)
 			return true
@@ -191,8 +215,8 @@ func (m *LinkedHashMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 // CompareAndDelete removes key if its value equals old. It has the same
 // comparability requirements as CompareAndSwap.
 func (m *LinkedHashMap[K, V]) CompareAndDelete(key K, old V) bool {
-	mapCheckComparable[V]("CompareAndDelete")
-	if e := m.index[key]; e != nil && any(e.value) == any(old) {
+	eq := mapValueEqualFunc[V]("CompareAndDelete")
+	if e := m.index[key]; e != nil && eq(unsafe.Pointer(&e.value), abi.NoEscape(unsafe.Pointer(&old))) {
 		m.remove(e)
 		return true
 	}
@@ -204,12 +228,18 @@ func (m *LinkedHashMap[K, V]) Clear() {
 	m.index = nil
 	m.order.init()
 	m.free = nil
+	m.freeLen = 0
 	m.version++
 }
 
 // Shrink rebuilds the hash index to fit the current entries, preserving order.
 func (m *LinkedHashMap[K, V]) Shrink() {
 	m.free = nil
+	m.freeLen = 0
+	if m.order.len == 0 {
+		m.index = nil
+		return
+	}
 	m.index = make(map[K]*linkedHashMapNode[K, V], m.order.len)
 	for e := m.order.head; e != nil; e = e.next {
 		m.index[e.key] = e
@@ -258,8 +288,10 @@ func (m *LinkedHashMap[K, V]) remove(e *linkedHashMapNode[K, V]) (key K, value V
 	}
 	var zero linkedHashMapNode[K, V]
 	*e = zero
-	if m.free == nil {
+	if m.freeLen < 64 {
+		e.next = m.free
 		m.free = e
+		m.freeLen++
 	}
 	m.version++
 	return

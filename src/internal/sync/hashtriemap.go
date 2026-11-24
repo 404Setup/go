@@ -43,14 +43,14 @@ func (ht *HashTrieMap[K, V]) initSlow() {
 		return
 	}
 
-	// Set up root node, derive the hash function for the key, and the
-	// equal function for the value, if any.
+	// Set up key hash, value equality, and hash seed before publishing the root
+	// node so Load only needs a single atomic load on the fast path.
 	var m map[K]V
 	mapType := abi.TypeOf(m).MapType()
-	ht.root.Store(newIndirectNode[K, V](nil))
 	ht.keyHash = mapType.Hasher
 	ht.valEqual = mapType.Elem.Equal
 	ht.seed = uintptr(runtime_rand())
+	ht.root.Store(newIndirectNode[K, V](nil))
 
 	ht.inited.Store(1)
 }
@@ -92,9 +92,6 @@ func (ht *HashTrieMap[K, V]) ensureRoot() *indirect[K, V] {
 // value is present.
 // The ok result indicates whether value was found in the map.
 func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
-	if ht.inited.Load() == 0 {
-		return value, false
-	}
 	i := loadPointer(&ht.root)
 	if i == nil {
 		return value, false

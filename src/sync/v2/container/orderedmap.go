@@ -5,11 +5,13 @@
 package container
 
 import (
+	"internal/abi"
 	isync "internal/sync"
 	"iter"
 	"runtime"
 	"sync/atomic"
 	"sync/v2"
+	"unsafe"
 )
 
 // OrderedMap is like a Go map[K]V but is safe for concurrent use and iterates
@@ -79,11 +81,11 @@ func (s *orderedMapState[K, V]) loadOrInsert(key K, initial *orderedMapValue[K, 
 	} else {
 		s.head.Store(candidate)
 	}
+	// Publish the value before exposing the entry through tail/index so a
+	// concurrent Delete finding it in index cannot race with initial publication.
+	candidate.value.Store(initial)
 	s.tail.Store(candidate)
 	s.index.Store(key, candidate)
-	// Publish the value last. Lookups and iterators that observe the entry
-	// before this point treat it as an insertion still in progress.
-	candidate.value.Store(initial)
 	return candidate, false
 }
 
@@ -273,7 +275,7 @@ func (m *OrderedMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 // CompareAndSwap swaps the old and new values for key if the value stored in
 // the map is equal to old. It panics if V is not a comparable type.
 func (m *OrderedMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
-	mapCheckComparable[V]("CompareAndSwap")
+	eq := mapValueEqualFunc[V]("CompareAndSwap")
 	if m.state.Load() == nil {
 		return false
 	}
@@ -294,7 +296,7 @@ func (m *OrderedMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 			runtime.Gosched()
 			continue
 		}
-		if any(current.value) != any(old) {
+		if !eq(unsafe.Pointer(&current.value), abi.NoEscape(unsafe.Pointer(&old))) {
 			return false
 		}
 		if replacement == nil {
@@ -311,7 +313,7 @@ func (m *OrderedMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 //
 // If there is no current value for key, CompareAndDelete returns false.
 func (m *OrderedMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
-	mapCheckComparable[V]("CompareAndDelete")
+	eq := mapValueEqualFunc[V]("CompareAndDelete")
 	if m.state.Load() == nil {
 		return false
 	}
@@ -331,7 +333,7 @@ func (m *OrderedMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 			runtime.Gosched()
 			continue
 		}
-		if any(current.value) != any(old) {
+		if !eq(unsafe.Pointer(&current.value), abi.NoEscape(unsafe.Pointer(&old))) {
 			return false
 		}
 		if !entry.value.CompareAndSwap(current, nil) {

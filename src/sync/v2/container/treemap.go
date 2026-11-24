@@ -4,7 +4,11 @@
 
 package container
 
-import "iter"
+import (
+	"internal/abi"
+	"iter"
+	"unsafe"
+)
 
 // TreeMap is a red-black tree whose entries are ordered by a comparison
 // function. Lookups, stores, deletes, and boundary queries take O(log n) time.
@@ -18,6 +22,7 @@ type TreeMap[K, V any] struct {
 	compare func(K, K) int
 	root    *treeMapNode[K, V]
 	free    *treeMapNode[K, V]
+	freeLen int
 	length  int
 	version uint64
 }
@@ -31,7 +36,8 @@ type treeMapNode[K, V any] struct {
 
 func (m *TreeMap[K, V]) allocNode(key K, value V) *treeMapNode[K, V] {
 	if n := m.free; n != nil {
-		m.free = nil
+		m.free = n.left
+		m.freeLen--
 		*n = treeMapNode[K, V]{key: key, value: value, red: true}
 		return n
 	}
@@ -41,8 +47,10 @@ func (m *TreeMap[K, V]) allocNode(key K, value V) *treeMapNode[K, V] {
 func (m *TreeMap[K, V]) recycle(n *treeMapNode[K, V]) {
 	var zero treeMapNode[K, V]
 	*n = zero
-	if m.free == nil {
+	if m.freeLen < 64 {
+		n.left = m.free
 		m.free = n
+		m.freeLen++
 	}
 }
 
@@ -104,7 +112,7 @@ func (m *TreeMap[K, V]) store(key K, value V, overwrite bool) (previous V, loade
 	if m.compare == nil {
 		panic("sync/v2/container: uninitialized TreeMap")
 	}
-	var path [64]*treeMapNode[K, V]
+	var path [80]*treeMapNode[K, V]
 	depth := 0
 	n := m.root
 	var c int
@@ -192,8 +200,8 @@ func (m *TreeMap[K, V]) Delete(key K) { m.LoadAndDelete(key) }
 // CompareAndSwap replaces the value for key if it equals old. It panics if V
 // is not comparable, or if the comparison involves an uncomparable dynamic value.
 func (m *TreeMap[K, V]) CompareAndSwap(key K, old, new V) bool {
-	mapCheckComparable[V]("CompareAndSwap")
-	if n := m.find(key); n != nil && any(n.value) == any(old) {
+	eq := mapValueEqualFunc[V]("CompareAndSwap")
+	if n := m.find(key); n != nil && eq(unsafe.Pointer(&n.value), abi.NoEscape(unsafe.Pointer(&old))) {
 		n.value = new
 		return true
 	}
@@ -203,8 +211,8 @@ func (m *TreeMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 // CompareAndDelete removes key if its value equals old. It has the same
 // comparability requirements as CompareAndSwap.
 func (m *TreeMap[K, V]) CompareAndDelete(key K, old V) bool {
-	mapCheckComparable[V]("CompareAndDelete")
-	if n := m.find(key); n != nil && any(n.value) == any(old) {
+	eq := mapValueEqualFunc[V]("CompareAndDelete")
+	if n := m.find(key); n != nil && eq(unsafe.Pointer(&n.value), abi.NoEscape(unsafe.Pointer(&old))) {
 		m.deletePresent(key)
 		return true
 	}
@@ -215,6 +223,7 @@ func (m *TreeMap[K, V]) CompareAndDelete(key K, old V) bool {
 func (m *TreeMap[K, V]) Clear() {
 	m.root = nil
 	m.free = nil
+	m.freeLen = 0
 	m.length = 0
 	m.version++
 }
@@ -338,7 +347,7 @@ func (m *TreeMap[K, V]) bound(key K, upper, inclusive bool) (candidate *treeMapN
 func (m *TreeMap[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		version := m.version
-		var stack [64]*treeMapNode[K, V]
+		var stack [80]*treeMapNode[K, V]
 		sp := 0
 		n := m.root
 		for n != nil || sp > 0 {
@@ -364,7 +373,7 @@ func (m *TreeMap[K, V]) All() iter.Seq2[K, V] {
 func (m *TreeMap[K, V]) Backward() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		version := m.version
-		var stack [64]*treeMapNode[K, V]
+		var stack [80]*treeMapNode[K, V]
 		sp := 0
 		n := m.root
 		for n != nil || sp > 0 {
@@ -395,7 +404,7 @@ func (m *TreeMap[K, V]) RangeBetween(lower, upper K) iter.Seq2[K, V] {
 			return
 		}
 		version := m.version
-		var stack [64]*treeMapNode[K, V]
+		var stack [80]*treeMapNode[K, V]
 		sp := 0
 		for n := m.root; n != nil; {
 			if m.compare(n.key, lower) >= 0 {
