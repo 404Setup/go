@@ -9,10 +9,10 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"internal/abi"
 	"reflect"
 	"runtime"
-	"strconv"
-	"strings"
+	"unsafe"
 )
 
 // BUG(rsc): Mapping between XML elements and data structures is inherently flawed:
@@ -131,7 +131,13 @@ import (
 // If the field is a slice, a zero value will be appended to the field. Otherwise, the
 // field will be set to its zero value.
 func Unmarshal(data []byte, v any) error {
-	return NewDecoder(bytes.NewReader(data)).Decode(v)
+	d := Decoder{
+		src:      data,
+		nextByte: -1,
+		line:     1,
+		Strict:   true,
+	}
+	return d.Decode(v)
 }
 
 // Decode works like [Unmarshal], except it reads the decoder
@@ -145,15 +151,19 @@ func (d *Decoder) Decode(v any) error {
 // It is useful when a client reads some raw XML tokens itself
 // but also wants to defer to [Unmarshal] for some elements.
 func (d *Decoder) DecodeElement(v any, start *StartElement) error {
-	val := reflect.ValueOf(v)
-	if val.Kind() != reflect.Pointer {
+	at, ptr := xmlEfacePtr(&v)
+	if at == nil || at.Kind() != abi.Pointer {
 		return errors.New("non-pointer passed to Unmarshal")
 	}
-
-	if val.IsNil() {
+	elemPtr := *(*unsafe.Pointer)(ptr)
+	if elemPtr == nil {
 		return errors.New("nil pointer passed to Unmarshal")
 	}
-	return d.unmarshal(val.Elem(), start)
+	plan := lookupXmlDecodePlan(at.Elem())
+	if plan.canFast {
+		return d.fastUnmarshal(plan, elemPtr, start)
+	}
+	return d.unmarshal(reflect.ValueOf(v).Elem(), start)
 }
 
 // An UnmarshalError represents an error in the unmarshaling process.
@@ -479,8 +489,8 @@ func (d *Decoder) unmarshal(val reflect.Value, start *StartElement) error {
 				finfo := &tinfo.fields[i]
 				switch finfo.flags & fMode {
 				case fAttr:
-					strv := finfo.value(sv, initNilPointers)
 					if a.Name.Local == finfo.name && (finfo.xmlns == "" || finfo.xmlns == a.Name.Space) {
+						strv := finfo.value(sv, initNilPointers)
 						if err := d.unmarshalAttr(strv, a); err != nil {
 							return err
 						}
@@ -654,7 +664,7 @@ func copyValue(dst reflect.Value, src []byte) (err error) {
 			dst.SetInt(0)
 			return nil
 		}
-		itmp, err := strconv.ParseInt(strings.TrimSpace(string(src)), 10, dst.Type().Bits())
+		itmp, err := parseIntBytes(src, dst.Type().Bits())
 		if err != nil {
 			return err
 		}
@@ -664,7 +674,7 @@ func copyValue(dst reflect.Value, src []byte) (err error) {
 			dst.SetUint(0)
 			return nil
 		}
-		utmp, err := strconv.ParseUint(strings.TrimSpace(string(src)), 10, dst.Type().Bits())
+		utmp, err := parseUintBytes(src, dst.Type().Bits())
 		if err != nil {
 			return err
 		}
@@ -674,7 +684,7 @@ func copyValue(dst reflect.Value, src []byte) (err error) {
 			dst.SetFloat(0)
 			return nil
 		}
-		ftmp, err := strconv.ParseFloat(strings.TrimSpace(string(src)), dst.Type().Bits())
+		ftmp, err := parseFloatBytes(src, dst.Type().Bits())
 		if err != nil {
 			return err
 		}
@@ -684,7 +694,7 @@ func copyValue(dst reflect.Value, src []byte) (err error) {
 			dst.SetBool(false)
 			return nil
 		}
-		value, err := strconv.ParseBool(strings.TrimSpace(string(src)))
+		value, err := parseBoolBytes(src)
 		if err != nil {
 			return err
 		}

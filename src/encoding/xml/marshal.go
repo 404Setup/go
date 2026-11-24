@@ -8,8 +8,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding"
-	"errors"
 	"fmt"
+	"internal/bytealg"
 	"io"
 	"reflect"
 	"strconv"
@@ -80,15 +80,49 @@ const (
 //
 // Marshal will return an error if asked to marshal a channel, function, or map.
 func Marshal(v any) ([]byte, error) {
-	var b bytes.Buffer
-	enc := NewEncoder(&b)
-	if err := enc.Encode(v); err != nil {
+	eb := getXmlMarshalEncoder()
+	at, ptr := xmlEfacePtr(&v)
+	if at == nil {
+		putXmlMarshalEncoder(eb)
+		return nil, nil
+	}
+	plan := lookupXmlMarshalPlan(at)
+	if plan.canFast {
+		err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
+		if err == nil {
+			err = eb.enc.p.Close()
+		}
+		if err != nil {
+			putXmlMarshalEncoder(eb)
+			return nil, err
+		}
+		out := eb.enc.p.out
+		if len(out) == 0 {
+			putXmlMarshalEncoder(eb)
+			return nil, nil
+		}
+		res := bytealg.MakeNoZero(len(out))
+		copy(res, out)
+		putXmlMarshalEncoder(eb)
+		return res, nil
+	}
+	if err := eb.enc.p.marshalValue(reflect.ValueOf(v), nil, nil); err != nil {
+		putXmlMarshalEncoder(eb)
 		return nil, err
 	}
-	if err := enc.Close(); err != nil {
+	if err := eb.enc.p.Close(); err != nil {
+		putXmlMarshalEncoder(eb)
 		return nil, err
 	}
-	return b.Bytes(), nil
+	out := eb.enc.p.out
+	if len(out) == 0 {
+		putXmlMarshalEncoder(eb)
+		return nil, nil
+	}
+	res := bytealg.MakeNoZero(len(out))
+	copy(res, out)
+	putXmlMarshalEncoder(eb)
+	return res, nil
 }
 
 // Marshaler is the interface implemented by objects that can marshal
@@ -130,16 +164,50 @@ type MarshalerAttr interface {
 // indented line that starts with prefix and is followed by one or more
 // copies of indent according to the nesting depth.
 func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
-	var b bytes.Buffer
-	enc := NewEncoder(&b)
-	enc.Indent(prefix, indent)
-	if err := enc.Encode(v); err != nil {
+	eb := getXmlMarshalEncoder()
+	eb.enc.Indent(prefix, indent)
+	at, ptr := xmlEfacePtr(&v)
+	if at == nil {
+		putXmlMarshalEncoder(eb)
+		return nil, nil
+	}
+	plan := lookupXmlMarshalPlan(at)
+	if plan.canFast {
+		err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
+		if err == nil {
+			err = eb.enc.p.Close()
+		}
+		if err != nil {
+			putXmlMarshalEncoder(eb)
+			return nil, err
+		}
+		out := eb.enc.p.out
+		if len(out) == 0 {
+			putXmlMarshalEncoder(eb)
+			return nil, nil
+		}
+		res := bytealg.MakeNoZero(len(out))
+		copy(res, out)
+		putXmlMarshalEncoder(eb)
+		return res, nil
+	}
+	if err := eb.enc.p.marshalValue(reflect.ValueOf(v), nil, nil); err != nil {
+		putXmlMarshalEncoder(eb)
 		return nil, err
 	}
-	if err := enc.Close(); err != nil {
+	if err := eb.enc.p.Close(); err != nil {
+		putXmlMarshalEncoder(eb)
 		return nil, err
 	}
-	return b.Bytes(), nil
+	out := eb.enc.p.out
+	if len(out) == 0 {
+		putXmlMarshalEncoder(eb)
+		return nil, nil
+	}
+	res := bytealg.MakeNoZero(len(out))
+	copy(res, out)
+	putXmlMarshalEncoder(eb)
+	return res, nil
 }
 
 // An Encoder writes XML data to an output stream.
@@ -169,6 +237,33 @@ func (enc *Encoder) Indent(prefix, indent string) {
 //
 // Encode calls [Encoder.Flush] before returning.
 func (enc *Encoder) Encode(v any) error {
+	if enc.p.w != nil && len(enc.p.tags) == 0 && len(enc.p.attrNS) == 0 && len(enc.p.prefixes) == 0 {
+		at, ptr := xmlEfacePtr(&v)
+		if at == nil {
+			return enc.p.w.Flush()
+		}
+		plan := lookupXmlMarshalPlan(at)
+		if plan.canFast && !plan.hasCustom {
+			eb := getXmlMarshalEncoder()
+			eb.enc.p.prefix = enc.p.prefix
+			eb.enc.p.indent = enc.p.indent
+			eb.enc.p.putNewline = enc.p.putNewline
+			err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
+			if err != nil {
+				putXmlMarshalEncoder(eb)
+				return err
+			}
+			enc.p.putNewline = eb.enc.p.putNewline
+			if len(eb.enc.p.out) > 0 {
+				_, err = enc.p.Write(eb.enc.p.out)
+			}
+			putXmlMarshalEncoder(eb)
+			if err != nil {
+				return err
+			}
+			return enc.p.w.Flush()
+		}
+	}
 	err := enc.p.marshalValue(reflect.ValueOf(v), nil, nil)
 	if err != nil {
 		return err
@@ -238,7 +333,7 @@ func (enc *Encoder) EncodeToken(t Token) error {
 	case ProcInst:
 		// First token to be encoded which is also a ProcInst with target of xml
 		// is the xml declaration. The only ProcInst where target of xml is allowed.
-		if t.Target == "xml" && p.w.Buffered() != 0 {
+		if t.Target == "xml" && p.bufferedLen() != 0 {
 			return fmt.Errorf("xml: EncodeToken of ProcInst xml target only valid for xml declaration, first token encoded")
 		}
 		if !isNameString(t.Target) {
@@ -311,6 +406,9 @@ func isValidDirective(dir Directive) bool {
 // Flush flushes any buffered XML to the underlying writer.
 // See the [Encoder.EncodeToken] documentation for details about when it is necessary.
 func (enc *Encoder) Flush() error {
+	if enc.p.w == nil {
+		return nil
+	}
 	return enc.p.w.Flush()
 }
 
@@ -323,6 +421,7 @@ func (enc *Encoder) Close() error {
 
 type printer struct {
 	w          *bufio.Writer
+	out        []byte
 	encoder    *Encoder
 	seq        int
 	indent     string
@@ -336,6 +435,13 @@ type printer struct {
 	tags       []Name
 	closed     bool
 	err        error
+}
+
+func (p *printer) bufferedLen() int {
+	if p.w != nil {
+		return p.w.Buffered()
+	}
+	return len(p.out)
 }
 
 // createAttrPrefix finds the name space prefix attribute to use for the given name space,
@@ -1008,9 +1114,13 @@ func (p *printer) marshalStruct(tinfo *typeInfo, val reflect.Value) error {
 // Write implements io.Writer
 func (p *printer) Write(b []byte) (n int, err error) {
 	if p.closed && p.err == nil {
-		p.err = errors.New("use of closed Encoder")
+		p.err = errClosedEncoder
 	}
 	if p.err == nil {
+		if p.w == nil {
+			p.out = append(p.out, b...)
+			return len(b), nil
+		}
 		n, p.err = p.w.Write(b)
 	}
 	return n, p.err
@@ -1019,9 +1129,13 @@ func (p *printer) Write(b []byte) (n int, err error) {
 // WriteString implements io.StringWriter
 func (p *printer) WriteString(s string) (n int, err error) {
 	if p.closed && p.err == nil {
-		p.err = errors.New("use of closed Encoder")
+		p.err = errClosedEncoder
 	}
 	if p.err == nil {
+		if p.w == nil {
+			p.out = append(p.out, s...)
+			return len(s), nil
+		}
 		n, p.err = p.w.WriteString(s)
 	}
 	return n, p.err
@@ -1030,9 +1144,13 @@ func (p *printer) WriteString(s string) (n int, err error) {
 // WriteByte implements io.ByteWriter
 func (p *printer) WriteByte(c byte) error {
 	if p.closed && p.err == nil {
-		p.err = errors.New("use of closed Encoder")
+		p.err = errClosedEncoder
 	}
 	if p.err == nil {
+		if p.w == nil {
+			p.out = append(p.out, c)
+			return nil
+		}
 		p.err = p.w.WriteByte(c)
 	}
 	return p.err
@@ -1046,8 +1164,10 @@ func (p *printer) Close() error {
 		return nil
 	}
 	p.closed = true
-	if err := p.w.Flush(); err != nil {
-		return err
+	if p.w != nil {
+		if err := p.w.Flush(); err != nil {
+			return err
+		}
 	}
 	if len(p.tags) > 0 {
 		return fmt.Errorf("unclosed tag <%s>", p.tags[len(p.tags)-1].Local)
@@ -1057,6 +1177,9 @@ func (p *printer) Close() error {
 
 // return the bufio Writer's cached write error
 func (p *printer) cachedWriteError() error {
+	if p.w == nil {
+		return p.err
+	}
 	_, err := p.Write(nil)
 	return err
 }
