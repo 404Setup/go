@@ -2,32 +2,31 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Entropy generation in FIPS 140-3 mode uses a scratch buffer in the BSS
-// section (see below). Exclude it from non-FIPS builds so the buffer is not
-// mapped into binaries that can never use it. FIPS 140-3 mode is not supported
-// on Wasm, where the buffer would also consume linear memory eagerly.
+// Exclude the FIPS 140-3 entropy source from non-FIPS builds so binaries that
+// cannot enable FIPS 140-3 mode do not pull it in.
 //
-//go:build gofips140 && !wasm
+//go:build gofips140
 
 package drbg
 
-import entropy "crypto/internal/entropy/v1.0.0"
+import (
+	"crypto/internal/entropy/scratch"
+	entropy "crypto/internal/entropy/v1.0.0"
+)
 
-// memory is a scratch buffer that is accessed between samples by the entropy
-// source to expose it to memory access timings.
-//
-// We reuse it and share it between Seed calls to avoid the significant (~500µs)
-// cost of zeroing a new allocation every time. The entropy source accesses it
-// using atomics (and doesn't care about its contents).
-//
-// It should end up in the .noptrbss section, and become backed by physical pages
-// at first use. This ensures that programs that do not use the FIPS 140-3 module
-// do not incur any memory use or initialization penalties.
-var memory entropy.ScratchBuffer
+var testingOnlyGetEntropy func()
 
 func getEntropy() *[SeedSize]byte {
+	if testingOnlyGetEntropy != nil {
+		testingOnlyGetEntropy()
+	}
+
+	b := scratch.Acquire(len(entropy.ScratchBuffer{}))
+	defer scratch.Release(b)
+	buf := (*entropy.ScratchBuffer)(b)
+
 	var retries int
-	seed, err := entropy.Seed(&memory)
+	seed, err := entropy.Seed(buf)
 	for err != nil {
 		// The CPU jitter-based SP 800-90B entropy source has a non-negligible
 		// chance of failing the startup health tests.
@@ -38,7 +37,7 @@ func getEntropy() *[SeedSize]byte {
 		if retries++; retries > 100 {
 			panic("fips140/drbg: failed to obtain initial entropy")
 		}
-		seed, err = entropy.Seed(&memory)
+		seed, err = entropy.Seed(buf)
 	}
 	return &seed
 }

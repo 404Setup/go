@@ -10,6 +10,7 @@ import (
 	"internal/nettest"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/internal"
 	"net/netip"
@@ -736,8 +737,46 @@ func TestServerShutdownGoaway(t *testing.T) {
 			ts.s.shutdown(t.Context())
 			shutdownComplete <- struct{}{}
 		}()
-		control.wantGoaway((requestCount - 1) * 4) // Request stream ID goes from 0, 4, 8, ...
+		control.wantGoaway(requestCount * 4) // Request stream ID goes from 0, 4, 8, ...
 		<-shutdownComplete
+	})
+}
+
+func TestServerConnState(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ts := newTestServer(t, nil)
+		var state http.ConnState
+		ts.s.srv1.ConnState = func(_ net.Conn, s http.ConnState) {
+			state = s
+		}
+		wantState := func(want http.ConnState) {
+			t.Helper()
+			synctest.Wait()
+			if state != want {
+				t.Fatalf("ConnState = %v, want %v", state, want)
+			}
+		}
+
+		tc := ts.connect()
+		tc.greet()
+		wantState(http.StateNew)
+
+		// The connection stays active until all of its requests are done.
+		st1 := tc.newStream(streamTypeRequest)
+		st1.writeHeaders(requestHeader(nil))
+		call1 := tc.nextHandlerCall()
+		st2 := tc.newStream(streamTypeRequest)
+		st2.writeHeaders(requestHeader(nil))
+		call2 := tc.nextHandlerCall()
+		call1.exit()
+		st1.wantSomeHeaders(http.Header{":status": {"200"}})
+		wantState(http.StateActive)
+		call2.exit()
+		st2.wantSomeHeaders(http.Header{":status": {"200"}})
+		wantState(http.StateIdle)
+
+		tc.qconn.Abort(nil)
+		wantState(http.StateClosed)
 	})
 }
 

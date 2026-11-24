@@ -6006,18 +6006,26 @@ func TestServerSetKeepAlivesEnabledClosesConns(t *testing.T) {
 	})
 }
 
-func TestServerShutdown(t *testing.T) { runNoSynctest(t, testServerShutdown, http3SkippedMode) }
+func TestServerShutdown(t *testing.T) { runNoSynctest(t, testServerShutdown) }
 func testServerShutdown(t *testing.T, mode testMode) {
 	var cst *clientServerTest
 
 	var once sync.Once
+	var connStatesMu sync.Mutex
+	connStates := map[net.Conn]ConnState{}
 	statesRes := make(chan map[ConnState]int, 1)
 	shutdownRes := make(chan error, 1)
 	gotOnShutdown := make(chan struct{})
 	handler := HandlerFunc(func(w ResponseWriter, r *Request) {
 		first := false
 		once.Do(func() {
-			statesRes <- cst.ts.Config.ExportAllConnsByState()
+			states := map[ConnState]int{}
+			connStatesMu.Lock()
+			for _, st := range connStates {
+				states[st]++
+			}
+			connStatesMu.Unlock()
+			statesRes <- states
 			go func() {
 				shutdownRes <- cst.ts.Config.Shutdown(context.Background())
 			}()
@@ -6031,6 +6039,8 @@ func testServerShutdown(t *testing.T, mode testMode) {
 			<-gotOnShutdown
 			// TODO(#59038): The HTTP/2 server empirically does not always reject new
 			// requests. As a workaround, loop until we see a failure.
+			// TODO(#70914): The HTTP/3 server also has the same quirk as the
+			// HTTP/2 server.
 			for !t.Failed() {
 				res, err := cst.c.Get(cst.ts.URL)
 				if err != nil {
@@ -6038,7 +6048,7 @@ func testServerShutdown(t *testing.T, mode testMode) {
 				}
 				out, _ := io.ReadAll(res.Body)
 				res.Body.Close()
-				if mode == http2Mode {
+				if mode == http2Mode || mode == http3Mode {
 					t.Logf("%v: unexpected success (%q). Listener should be closed before OnShutdown is called.", cst.ts.URL, out)
 					t.Logf("Retrying to work around https://go.dev/issue/59038.")
 					continue
@@ -6052,6 +6062,11 @@ func testServerShutdown(t *testing.T, mode testMode) {
 
 	cst = newClientServerTest(t, mode, handler, optRealNet, func(srv *httptest.Server) {
 		srv.Config.RegisterOnShutdown(func() { close(gotOnShutdown) })
+		srv.Config.ConnState = func(c net.Conn, st ConnState) {
+			connStatesMu.Lock()
+			defer connStatesMu.Unlock()
+			connStates[c] = st
+		}
 	})
 
 	out := get(t, cst.c, cst.ts.URL) // calls t.Fail on failure
@@ -6126,9 +6141,9 @@ func TestServerCloseDeadlock(t *testing.T) {
 }
 
 // Issue 17717: tests that Server.SetKeepAlivesEnabled is respected by
-// both HTTP/1 and HTTP/2.
+// HTTP/1, HTTP/2, and HTTP/3.
 func TestServerKeepAlivesEnabled(t *testing.T) {
-	runSynctest(t, testServerKeepAlivesEnabled, http3SkippedMode)
+	runSynctest(t, testServerKeepAlivesEnabled)
 }
 func testServerKeepAlivesEnabled(t *testing.T, mode testMode) {
 	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {}))

@@ -808,6 +808,8 @@ func cpuinit(env string) {
 		riscv64HasV = cpu.RISCV64.HasV
 		riscv64HasZbb = cpu.RISCV64.HasZbb
 	}
+
+	xRegInitCPU()
 }
 
 // getGodebugEarly extracts the environment variable GODEBUG from the environment on
@@ -941,7 +943,9 @@ func schedinit() {
 	// mcommoninit runs before parsedebugvars, so init profstacks again.
 	mProfStackInit(gp.m)
 	defaultGOMAXPROCSInit()
-	sysRSSInit()
+	if memoryProfileEnabled() {
+		sysRSSInit()
+	}
 
 	lock(&sched.lock)
 	sched.lastpoll.Store(nanotime())

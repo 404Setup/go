@@ -109,6 +109,7 @@ import (
 //	goroutineleak  - stack traces of all leaked goroutines
 //	allocs         - a sampling of all past memory allocations
 //	heap           - a sampling of memory allocations of live objects
+//	memory         - a breakdown of process memory usage at the last completed GC
 //	threadcreate   - stack traces that led to the creation of new OS threads
 //	block          - stack traces that led to blocking on synchronization primitives
 //	mutex          - stack traces of holders of contended mutexes
@@ -140,6 +141,22 @@ import (
 // The allocs profile is the same as the heap profile but changes the default
 // pprof display to -alloc_space, the total number of bytes allocated since
 // the program began (including garbage-collected bytes).
+//
+// # Memory profile
+//
+// The memory profile is a superset of the inuse_space heap profile. It breaks
+// down the process's resident set size (RSS) into Go and non-Go memory. Go
+// memory is further split into the heap, stacks, and runtime metadata, using
+// the runtime's memory metrics (see [runtime/metrics]). The heap includes the
+// same live object samples as the heap profile, as well as dead objects the
+// most recently completed garbage collection found unreachable. Both are
+// attributed to the allocation stacks of sampled objects, scaled to match the
+// runtime's heap metrics.
+//
+// Non-Go memory, such as memory allocated by C libraries, is estimated as RSS
+// minus Go memory and is only reported where RSS is available (currently
+// Linux and Darwin). On Linux, it is further split into file-backed and shared
+// memory, and anonymous memory. Prefer this profile to the heap profile.
 //
 // # Block profile
 //
@@ -262,6 +279,7 @@ func lockProfiles() {
 			"allocs":        allocsProfile,
 			"block":         blockProfile,
 			"mutex":         mutexProfile,
+			"memory":        memoryProfile,
 			"goroutineleak": goroutineLeakProfile,
 		}
 	}
@@ -610,7 +628,7 @@ func WriteHeapProfile(w io.Writer) error {
 
 // countHeap returns the number of records in the heap profile.
 func countHeap() int {
-	n, _ := runtime.MemProfile(nil, true)
+	n, _ := pprof_memProfileInternal(nil, true, nil)
 	return n
 }
 
@@ -635,26 +653,28 @@ func writeHeapInternal(w io.Writer, debug int, defaultSampleType string) error {
 	}
 
 	// Find out how many records there are (the call
-	// pprof_memProfileInternal(nil, true) below),
+	// pprof_memProfileInternal(nil, true, nil) below),
 	// allocate that many records, and get the data.
 	// There's a race—more records might be added between
 	// the two calls—so allocate a few extra records for safety
 	// and also try again if we're very unlucky.
 	// The loop should only execute one iteration in the common case.
 	var p []profilerecord.MemProfileRecord
-	n, ok := pprof_memProfileInternal(nil, true)
+	var metrics profilerecord.MemProfileMetrics
+	n, ok := pprof_memProfileInternal(nil, true, nil)
 	for {
 		// Allocate room for a slightly bigger profile,
 		// in case a few more entries have been added
 		// since the call to MemProfile.
 		p = make([]profilerecord.MemProfileRecord, n+50)
-		n, ok = pprof_memProfileInternal(p, true)
+		n, ok = pprof_memProfileInternal(p, true, &metrics)
 		if ok {
 			p = p[0:n]
 			break
 		}
 		// Profile grew; try again.
 	}
+	_ = metrics // reserved for future use by the memory profile
 
 	if debug == 0 {
 		return writeHeapProto(w, p, int64(runtime.MemProfileRate), defaultSampleType)
@@ -1038,8 +1058,11 @@ func pprof_goroutineLeakProfileWithLabels(p []profilerecord.StackRecord, labels 
 //go:linkname pprof_cyclesPerSecond runtime/pprof.runtime_cyclesPerSecond
 func pprof_cyclesPerSecond() int64
 
-//go:linkname pprof_memProfileInternal runtime.pprof_memProfileInternal
-func pprof_memProfileInternal(p []profilerecord.MemProfileRecord, inuseZero bool) (n int, ok bool)
+//go:linknamestd pprof_memProfileInternal
+func pprof_memProfileInternal(p []profilerecord.MemProfileRecord, inuseZero bool, metrics *profilerecord.MemProfileMetrics) (n int, ok bool)
+
+//go:linknamestd pprof_memoryProfileEnabled
+func pprof_memoryProfileEnabled() bool
 
 //go:linkname pprof_blockProfileInternal runtime.pprof_blockProfileInternal
 func pprof_blockProfileInternal(p []profilerecord.BlockProfileRecord) (n int, ok bool)

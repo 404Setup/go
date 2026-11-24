@@ -4504,8 +4504,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for _, f := range s.onShutdown {
 		go f()
 	}
+	var h3done chan struct{}
 	if s.h3Server != nil {
-		go s.h3Server.Shutdown(ctx)
+		h3done = make(chan struct{})
+		go func() {
+			s.h3Server.Shutdown(ctx)
+			close(h3done)
+		}()
 	}
 	s.mu.Unlock()
 	s.listenerGroup.Wait()
@@ -4525,12 +4530,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	timer := time.NewTimer(nextPollInterval())
 	defer timer.Stop()
 	for {
-		if s.closeIdleConns() {
+		if s.closeIdleConns() && h3done == nil {
 			return lnerr
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-h3done:
+			h3done = nil
 		case <-timer.C:
 			timer.Reset(nextPollInterval())
 		}
@@ -5079,6 +5086,9 @@ func (s *Server) shuttingDown() bool {
 // resource-constrained environments or servers in the process of
 // shutting down should disable them.
 func (s *Server) SetKeepAlivesEnabled(v bool) {
+	if s.h3Server != nil {
+		s.h3Server.SetKeepAlivesEnabled(v)
+	}
 	if v {
 		s.disableKeepAlives.Store(false)
 		return

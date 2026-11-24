@@ -19,6 +19,7 @@ import (
 	"cmd/compile/internal/inline"
 	"cmd/compile/internal/inline/interleaved"
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/midway"
 	"cmd/compile/internal/objw"
 	"cmd/compile/internal/pgoir"
 	"cmd/compile/internal/reflectdata"
@@ -3670,6 +3671,8 @@ func (r *reader) doPkgInitOrder(initOrder []ir.Node) []ir.Node {
 		rhs := r.expr()
 		pos := lhs[0].Pos()
 
+		simdCond := r.simdInitGuard(pos, lhs)
+
 		var as ir.Node
 		if len(lhs) == 1 {
 			as = typecheck.Stmt(r.curfn, ir.NewAssignStmt(pos, lhs[0], rhs))
@@ -3677,13 +3680,130 @@ func (r *reader) doPkgInitOrder(initOrder []ir.Node) []ir.Node {
 			as = typecheck.Stmt(r.curfn, ir.NewAssignListStmt(pos, ir.OAS2, lhs, []ir.Node{rhs}))
 		}
 
-		for _, v := range lhs {
-			v.(*ir.Name).Defn = as
+		if simdCond != nil {
+			// Leave Defn nil for conditionally initialized vars so staticinit
+			// will not treat a guarded assignment as an unconditional static value.
+			as = typecheck.Stmt(r.curfn, ir.NewIfStmt(pos, simdCond, []ir.Node{as}, nil))
+		} else {
+			for _, v := range lhs {
+				v.(*ir.Name).Defn = as
+			}
 		}
 
 		initOrder[i] = as
 	}
 	return initOrder
+}
+
+// simdInitGuard inspects the LHS of a package-level variable initializer for
+// either:
+//   - synthetic SIMD init proxies ("@simdinit<size>@<target>"), which
+//     represent conditional initializers for non-SIMD-typed variables (or blank
+//     "_") and are rewritten in place on lhs to target the original variable
+//     (or a blank name), or
+//   - SIMD-specialized variables ("<name>@simd<size>"), whose type
+//     depends on SIMD.
+//
+// Package-level variable initializers cannot use a switch in func init()
+// (which would break Go-spec package variable initialization order) or an
+// immediately-invoked func() T { ... }() dispatcher emitted in midway (which
+// cannot spell inferred unexported types from other packages in Go syntax,
+// such as "var V = isimd.F()" in simd/testdata/timport/relay). Instead,
+// midway emits per-size VarDecls/proxies in place and the unified IR reader
+// wraps each specialized initializer in a runtime guard here.
+//
+// If lhs contains neither (or GOEXPERIMENT=simdstable is disabled), it returns nil.
+// Otherwise it returns a runtime boolean expression testing whether the active
+// SIMD configuration matches the initializer's vector bit size (or emulation
+// when size == 0). The guard predicate must stay in sync with the runtime
+// dispatch logic in midway.(*Rewriter).createDispatcherBody.
+func (r *reader) simdInitGuard(pos src.XPos, lhs []ir.Node) ir.Node {
+	if !buildcfg.Experiment.SIMDStable {
+		return nil
+	}
+
+	oldPos := base.Pos
+	base.Pos = pos
+	defer func() { base.Pos = oldPos }()
+
+	vecSize := -1
+	for i, n := range lhs {
+		name := n.(*ir.Name)
+		if name.Sym() == nil {
+			continue
+		}
+		if baseName, size, ok := midway.ParseSimdInitProxy(name.Sym().Name); ok {
+			if vecSize != -1 && vecSize != size {
+				base.FatalfAt(pos, "saw more than one size for SIMD init proxy or suffix, first = %d, second = %d", vecSize, size)
+			}
+			vecSize = size
+			if baseName == "_" {
+				blank := ir.NewDeclNameAt(name.Pos(), ir.ONAME, types.LocalPkg.Lookup("_"))
+				blank.Class = ir.PEXTERN
+				setType(blank, name.Type())
+				lhs[i] = blank
+			} else {
+				origName := lookupPkgVar(baseName)
+				if origName == nil {
+					base.FatalfAt(pos, "failed to lookup local var %q for SIMD init proxy %q", baseName, name.Sym().Name)
+				}
+				lhs[i] = origName
+			}
+			continue
+		}
+		if _, size, ok := midway.ParseSimdSuffix(name.Sym().Name); ok {
+			if vecSize != -1 && vecSize != size {
+				base.FatalfAt(pos, "saw more than one size for SIMD init proxy or suffix, first = %d, second = %d", vecSize, size)
+			}
+			vecSize = size
+		}
+	}
+	if vecSize < 0 {
+		return nil
+	}
+
+	simdPkg := types.NewPkg("simd", "")
+	callSimd := func(fnName string) ir.Node {
+		fn, err := lookupFunction(simdPkg, fnName)
+		if err != nil {
+			base.FatalfAt(pos, "failed to lookup simd.%s: %v", fnName, err)
+		}
+		return typecheck.Call(r.curfn, pos, fn.Nname, nil, false)
+	}
+
+	if vecSize == 0 {
+		return callSimd("Emulated")
+	}
+
+	notEmulated := typecheck.Expr(r.curfn, ir.NewUnaryExpr(pos, ir.ONOT, callSimd("Emulated")))
+	sizeEq := typecheck.Expr(r.curfn, ir.NewBinaryExpr(pos, ir.OEQ, callSimd("VectorBits"), ir.NewInt(pos, int64(vecSize))))
+	return typecheck.Expr(r.curfn, ir.NewLogicalExpr(pos, ir.OANDAND, notEmulated, sizeEq))
+}
+
+// lookupPkgVar looks up a package-level variable (ir.PEXTERN) named baseName
+// in types.LocalPkg, instantiating it from Unified IR via objReader if its
+// symbol definition has not yet been materialized. It returns nil if no such
+// package-level variable exists.
+func lookupPkgVar(baseName string) *ir.Name {
+	sym := types.LocalPkg.Lookup(baseName)
+	if sym.Def != nil {
+		if n, ok := sym.Def.(*ir.Name); ok && n.Op() == ir.ONAME && n.Class == ir.PEXTERN {
+			return n
+		}
+		return nil
+	}
+	pri, ok := objReader[sym]
+	if !ok {
+		return nil
+	}
+	node, err := pri.pr.objIdxMayFail(pri.idx, nil, nil, false)
+	if err != nil {
+		return nil
+	}
+	if n, ok := node.(*ir.Name); ok && n.Op() == ir.ONAME && n.Class == ir.PEXTERN {
+		return n
+	}
+	return nil
 }
 
 func (r *reader) splitLargeInitOrder(initOrder []ir.Node) []*ir.Func {
@@ -3694,8 +3814,26 @@ func (r *reader) splitLargeInitOrder(initOrder []ir.Node) []*ir.Func {
 	return initFuncs
 }
 
+// midwayOriginals is the set of package-level declarations in the
+// local package that the midway rewrite kept only for type checking
+// and export data (see [midway.RewriteWrapper]). The methods of a type
+// in this set are also originals.
+//
+// The reader still reads the originals, because writing the export
+// data requires their IR. But nothing that gets compiled refers to
+// them, so the reader doesn't add them to the target package. That
+// keeps the backend from generating code, type descriptors, or
+// storage for them.
+var midwayOriginals map[*types.Sym]bool
+
 func (r *reader) pkgDecls(target *ir.Package) {
 	r.Sync(pkgbits.SyncDecls)
+	for _, name := range r.Strings() {
+		if midwayOriginals == nil {
+			midwayOriginals = make(map[*types.Sym]bool)
+		}
+		midwayOriginals[types.LocalPkg.Lookup(name)] = true
+	}
 	for {
 		switch code := codeDecl(r.Code(pkgbits.SyncDecl)); code {
 		default:
@@ -3707,6 +3845,9 @@ func (r *reader) pkgDecls(target *ir.Package) {
 		case declFunc:
 			names := r.pkgObjs(target)
 			assert(len(names) == 1)
+			if midwayOriginals[names[0].Sym()] {
+				break
+			}
 			target.Funcs = append(target.Funcs, names[0].Func)
 
 		case declMethod:
@@ -3714,6 +3855,9 @@ func (r *reader) pkgDecls(target *ir.Package) {
 			sym := r.selector()
 
 			method := typecheck.Lookdot1(nil, sym, typ, typ.Methods(), 0)
+			if midwayOriginals[typ.Sym()] {
+				break
+			}
 			target.Funcs = append(target.Funcs, method.Nname.(*ir.Name).Func)
 
 		case declVar:
@@ -3745,7 +3889,7 @@ func (r *reader) pkgObjs(target *ir.Package) []*ir.Name {
 		nodes[i] = name
 
 		sym := name.Sym()
-		if sym.IsBlank() {
+		if sym.IsBlank() || midwayOriginals[sym] {
 			continue
 		}
 
@@ -3765,7 +3909,10 @@ func (r *reader) pkgObjs(target *ir.Package) []*ir.Name {
 			}
 		}
 
-		if base.Ctxt.Flag_dynlink && types.LocalPkg.Name == "main" && types.IsExported(sym.Name) && name.Op() == ir.ONAME {
+		// The size-specialized copies that midway makes of a declaration
+		// are an implementation detail, like the instantiations of a
+		// generic function, so a plugin doesn't export them.
+		if base.Ctxt.Flag_dynlink && types.LocalPkg.Name == "main" && types.IsExported(sym.Name) && name.Op() == ir.ONAME && !midway.IsSpecializedName(sym.Name) {
 			assert(!sym.OnExportList())
 			target.PluginExports = append(target.PluginExports, name)
 			sym.SetOnExportList(true)
@@ -4152,6 +4299,10 @@ func MakeWrappers(target *ir.Package) {
 	haveWrapperTypes = nil
 
 	for _, typ := range needWrapperTypes {
+		if midwayOriginals[typ.Sym()] {
+			// Nothing refers to this type's method wrappers.
+			continue
+		}
 		wrapType(typ, target, seen, true)
 	}
 	needWrapperTypes = nil

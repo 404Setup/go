@@ -182,6 +182,12 @@ func ssaGenSIMDSVEValue(s *ssagen.State, v *ssa.Value) bool {
 		ssaop.OpARM64ZSMULHMergingB,
 		ssaop.OpARM64ZUMULHMergingB,
 		ssaop.OpARM64ZORRMergingB,
+		ssaop.OpARM64ZLSLBvec,
+		ssaop.OpARM64ZLSLMergingBvec,
+		ssaop.OpARM64ZASRBvec,
+		ssaop.OpARM64ZASRMergingBvec,
+		ssaop.OpARM64ZLSRBvec,
+		ssaop.OpARM64ZLSRMergingBvec,
 		ssaop.OpARM64ZSUBMergingB,
 		ssaop.OpARM64ZSQSUBMergingB,
 		ssaop.OpARM64ZUQSUBMergingB,
@@ -219,6 +225,10 @@ func ssaGenSIMDSVEValue(s *ssagen.State, v *ssa.Value) bool {
 		ssaop.OpARM64ZORRMergingD,
 		ssaop.OpARM64ZLSLD,
 		ssaop.OpARM64ZLSLMergingD,
+		ssaop.OpARM64ZASRD,
+		ssaop.OpARM64ZASRMergingD,
+		ssaop.OpARM64ZLSRD,
+		ssaop.OpARM64ZLSRMergingD,
 		ssaop.OpARM64ZFSUBMergingD,
 		ssaop.OpARM64ZSUBMergingD,
 		ssaop.OpARM64ZSQSUBMergingD,
@@ -243,6 +253,12 @@ func ssaGenSIMDSVEValue(s *ssagen.State, v *ssa.Value) bool {
 		ssaop.OpARM64ZSMULHMergingH,
 		ssaop.OpARM64ZUMULHMergingH,
 		ssaop.OpARM64ZORRMergingH,
+		ssaop.OpARM64ZLSLHvec,
+		ssaop.OpARM64ZLSLMergingHvec,
+		ssaop.OpARM64ZASRHvec,
+		ssaop.OpARM64ZASRMergingHvec,
+		ssaop.OpARM64ZLSRHvec,
+		ssaop.OpARM64ZLSRMergingHvec,
 		ssaop.OpARM64ZSUBMergingH,
 		ssaop.OpARM64ZSQSUBMergingH,
 		ssaop.OpARM64ZUQSUBMergingH,
@@ -278,6 +294,12 @@ func ssaGenSIMDSVEValue(s *ssagen.State, v *ssa.Value) bool {
 		ssaop.OpARM64ZSMULHMergingS,
 		ssaop.OpARM64ZUMULHMergingS,
 		ssaop.OpARM64ZORRMergingS,
+		ssaop.OpARM64ZLSLSvec,
+		ssaop.OpARM64ZLSLMergingSvec,
+		ssaop.OpARM64ZASRSvec,
+		ssaop.OpARM64ZASRMergingSvec,
+		ssaop.OpARM64ZLSRSvec,
+		ssaop.OpARM64ZLSRMergingSvec,
 		ssaop.OpARM64ZFSUBMergingS,
 		ssaop.OpARM64ZSUBMergingS,
 		ssaop.OpARM64ZSQSUBMergingS,
@@ -285,12 +307,38 @@ func ssaGenSIMDSVEValue(s *ssagen.State, v *ssa.Value) bool {
 		ssaop.OpARM64ZEORMergingS:
 		p = simdZ2kvPred(s, v, arm64.ARNG_S)
 
+	case ssaop.OpARM64ZSMAXVBB,
+		ssaop.OpARM64ZUMAXVBB,
+		ssaop.OpARM64ZSMINVBB,
+		ssaop.OpARM64ZUMINVBB,
+		ssaop.OpARM64ZUADDVDB:
+		p = simdZkfp(s, v, arm64.ARNG_B)
+
 	case ssaop.OpARM64ZFMAXVDD,
-		ssaop.OpARM64ZFADDVDD:
+		ssaop.OpARM64ZSMAXVDD,
+		ssaop.OpARM64ZUMAXVDD,
+		ssaop.OpARM64ZFMINVDD,
+		ssaop.OpARM64ZSMINVDD,
+		ssaop.OpARM64ZUMINVDD,
+		ssaop.OpARM64ZFADDVDD,
+		ssaop.OpARM64ZUADDVDD:
 		p = simdZkfp(s, v, arm64.ARNG_D)
 
+	case ssaop.OpARM64ZSMAXVHH,
+		ssaop.OpARM64ZUMAXVHH,
+		ssaop.OpARM64ZSMINVHH,
+		ssaop.OpARM64ZUMINVHH,
+		ssaop.OpARM64ZUADDVDH:
+		p = simdZkfp(s, v, arm64.ARNG_H)
+
 	case ssaop.OpARM64ZFMAXVSS,
-		ssaop.OpARM64ZFADDVSS:
+		ssaop.OpARM64ZSMAXVSS,
+		ssaop.OpARM64ZUMAXVSS,
+		ssaop.OpARM64ZFMINVSS,
+		ssaop.OpARM64ZSMINVSS,
+		ssaop.OpARM64ZUMINVSS,
+		ssaop.OpARM64ZFADDVSS,
+		ssaop.OpARM64ZUADDVDS:
 		p = simdZkfp(s, v, arm64.ARNG_S)
 
 	case ssaop.OpARM64ZLSLBconst:

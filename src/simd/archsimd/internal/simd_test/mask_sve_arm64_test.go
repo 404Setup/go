@@ -99,6 +99,28 @@ func testMaskToMask[M sveMask](t *testing.T, name string, laneBytes int, op func
 	}
 }
 
+// testMaskPairToMask checks a binary mask operation against want, applied
+// lane by lane, over every pair of patterns. The result must have only lane
+// bits set.
+func testMaskPairToMask[M sveMask](t *testing.T, name string, laneBytes int, op func(M, M) M, want func(x, y bool) bool) {
+	t.Helper()
+	n := archsimd.Int8s{}.Len() / laneBytes
+	pats := maskPatterns(laneBytes, n)
+	for _, xb := range pats {
+		for _, yb := range pats {
+			got := maskBits(op(maskFromBits[M](xb), maskFromBits[M](yb)))
+			x, y := lanesOf(xb, laneBytes, n), lanesOf(yb, laneBytes, n)
+			lanes := make([]bool, n)
+			for i := range lanes {
+				lanes[i] = want(x[i], y[i])
+			}
+			if w := bitsOf(lanes, laneBytes); got != w {
+				t.Errorf("%s(%#x, %#x) = %#x, want %#x", name, xb, yb, got, w)
+			}
+		}
+	}
+}
+
 // testMaskToBool checks a mask-to-bool accessor against want.
 func testMaskToBool[M sveMask](t *testing.T, name string, laneBytes int, op func(M) bool, want func([]bool) bool) {
 	t.Helper()
@@ -235,6 +257,67 @@ func TestMaskAnySVE(t *testing.T) {
 	testMaskToBool(t, "Mask16s.Any", 2, archsimd.Mask16s.Any, anyWant)
 	testMaskToBool(t, "Mask32s.Any", 4, archsimd.Mask32s.Any, anyWant)
 	testMaskToBool(t, "Mask64s.Any", 8, archsimd.Mask64s.Any, anyWant)
+}
+
+func TestMaskAndSVE(t *testing.T) {
+	if !archsimd.ARM64.SVE() {
+		t.Skip("no SVE")
+	}
+	and := func(x, y bool) bool { return x && y }
+	testMaskPairToMask(t, "Mask8s.And", 1, archsimd.Mask8s.And, and)
+	testMaskPairToMask(t, "Mask16s.And", 2, archsimd.Mask16s.And, and)
+	testMaskPairToMask(t, "Mask32s.And", 4, archsimd.Mask32s.And, and)
+	testMaskPairToMask(t, "Mask64s.And", 8, archsimd.Mask64s.And, and)
+}
+
+func TestMaskAndNotSVE(t *testing.T) {
+	if !archsimd.ARM64.SVE() {
+		t.Skip("no SVE")
+	}
+	andnot := func(x, y bool) bool { return x && !y }
+	testMaskPairToMask(t, "Mask8s.AndNot", 1, archsimd.Mask8s.AndNot, andnot)
+	testMaskPairToMask(t, "Mask16s.AndNot", 2, archsimd.Mask16s.AndNot, andnot)
+	testMaskPairToMask(t, "Mask32s.AndNot", 4, archsimd.Mask32s.AndNot, andnot)
+	testMaskPairToMask(t, "Mask64s.AndNot", 8, archsimd.Mask64s.AndNot, andnot)
+}
+
+func TestMaskOrSVE(t *testing.T) {
+	if !archsimd.ARM64.SVE() {
+		t.Skip("no SVE")
+	}
+	or := func(x, y bool) bool { return x || y }
+	testMaskPairToMask(t, "Mask8s.Or", 1, archsimd.Mask8s.Or, or)
+	testMaskPairToMask(t, "Mask16s.Or", 2, archsimd.Mask16s.Or, or)
+	testMaskPairToMask(t, "Mask32s.Or", 4, archsimd.Mask32s.Or, or)
+	testMaskPairToMask(t, "Mask64s.Or", 8, archsimd.Mask64s.Or, or)
+}
+
+func TestMaskXorSVE(t *testing.T) {
+	if !archsimd.ARM64.SVE() {
+		t.Skip("no SVE")
+	}
+	xor := func(x, y bool) bool { return x != y }
+	testMaskPairToMask(t, "Mask8s.Xor", 1, archsimd.Mask8s.Xor, xor)
+	testMaskPairToMask(t, "Mask16s.Xor", 2, archsimd.Mask16s.Xor, xor)
+	testMaskPairToMask(t, "Mask32s.Xor", 4, archsimd.Mask32s.Xor, xor)
+	testMaskPairToMask(t, "Mask64s.Xor", 8, archsimd.Mask64s.Xor, xor)
+}
+
+func TestMaskNotSVE(t *testing.T) {
+	if !archsimd.ARM64.SVE() {
+		t.Skip("no SVE")
+	}
+	not := func(lanes []bool) []bool {
+		out := make([]bool, len(lanes))
+		for i, l := range lanes {
+			out[i] = !l
+		}
+		return out
+	}
+	testMaskToMask(t, "Mask8s.Not", 1, archsimd.Mask8s.Not, not)
+	testMaskToMask(t, "Mask16s.Not", 2, archsimd.Mask16s.Not, not)
+	testMaskToMask(t, "Mask32s.Not", 4, archsimd.Mask32s.Not, not)
+	testMaskToMask(t, "Mask64s.Not", 8, archsimd.Mask64s.Not, not)
 }
 
 func testMaskToIntAndBack[M sveMask, T signed, V any](t *testing.T, name string, laneBytes int,

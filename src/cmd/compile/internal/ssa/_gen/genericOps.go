@@ -864,6 +864,36 @@ var genericOps = []opData{
 	{name: "Mask16sAny", argLength: 1},
 	{name: "Mask32sAny", argLength: 1},
 	{name: "Mask64sAny", argLength: 1},
+
+	// And returns the lanes active in both arg0 and arg1.
+	{name: "Mask8sAnd", argLength: 2, commutative: true},
+	{name: "Mask16sAnd", argLength: 2, commutative: true},
+	{name: "Mask32sAnd", argLength: 2, commutative: true},
+	{name: "Mask64sAnd", argLength: 2, commutative: true},
+
+	// AndNot returns the lanes active in arg0 but not in arg1.
+	{name: "Mask8sAndNot", argLength: 2},
+	{name: "Mask16sAndNot", argLength: 2},
+	{name: "Mask32sAndNot", argLength: 2},
+	{name: "Mask64sAndNot", argLength: 2},
+
+	// Or returns the lanes active in arg0 or arg1.
+	{name: "Mask8sOr", argLength: 2, commutative: true},
+	{name: "Mask16sOr", argLength: 2, commutative: true},
+	{name: "Mask32sOr", argLength: 2, commutative: true},
+	{name: "Mask64sOr", argLength: 2, commutative: true},
+
+	// Xor returns the lanes active in exactly one of arg0 and arg1.
+	{name: "Mask8sXor", argLength: 2, commutative: true},
+	{name: "Mask16sXor", argLength: 2, commutative: true},
+	{name: "Mask32sXor", argLength: 2, commutative: true},
+	{name: "Mask64sXor", argLength: 2, commutative: true},
+
+	// Not returns the lanes inactive in arg0.
+	{name: "Mask8sNot", argLength: 1},
+	{name: "Mask16sNot", argLength: 1},
+	{name: "Mask32sNot", argLength: 1},
+	{name: "Mask64sNot", argLength: 1},
 }
 
 //     kind          controls          successors   implicit exit

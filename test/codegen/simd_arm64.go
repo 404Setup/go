@@ -123,6 +123,35 @@ func shiftAllLeftConst64(x archsimd.Uint64x2) archsimd.Uint64x2 {
 	return x.ShiftAllLeft(63)
 }
 
+// Truncate-of-immediate-right-shift fuses into the single
+// shift-right-and-narrow VSHRN for amounts in [1, elemBits/2].
+func shiftAllRightConstTrunc16(x archsimd.Uint16x8) archsimd.Uint8x16 {
+	// arm64:`VSHRN [$]4, V\d+\.H8, V\d+\.B8` -`VXTN` -`VUSHR`
+	return x.ShiftAllRight(4).TruncToUint8()
+}
+
+func shiftAllRightConstTruncSigned16(x archsimd.Int16x8) archsimd.Int8x16 {
+	// arm64:`VSHRN [$]4, V\d+\.H8, V\d+\.B8` -`VXTN` -`VSSHR`
+	return x.ShiftAllRight(4).TruncToInt8()
+}
+
+func shiftAllRightConstTrunc32(x archsimd.Uint32x4) archsimd.Uint16x8 {
+	// arm64:`VSHRN [$]9, V\d+\.S4, V\d+\.H4` -`VXTN` -`VUSHR`
+	return x.ShiftAllRight(9).TruncToUint16()
+}
+
+func shiftAllRightConstTrunc64(x archsimd.Uint64x2) archsimd.Uint32x4 {
+	// arm64:`VSHRN [$]31, V\d+\.D2, V\d+\.S2` -`VXTN` -`VUSHR`
+	return x.ShiftAllRight(31).TruncToUint32()
+}
+
+// Above half the lane width the amount is not encodable as VSHRN, so the
+// immediate shift and the narrow stay separate instructions.
+func shiftAllRightConstTruncNoFusion(x archsimd.Uint16x8) archsimd.Uint8x16 {
+	// arm64:`VUSHR [$]9, V\d+\.H8,` `VXTN V\d+\.H8,` -`VSHRN`
+	return x.ShiftAllRight(9).TruncToUint8()
+}
+
 func setHiUint32(x, lo archsimd.Uint32x4) {
 	// arm64:`VMOV V1.D\[0\], V0.D\[1\]`
 	sinkU32 = loToHiUint32Vec(x, lo)
@@ -384,6 +413,36 @@ func sveReduceMax(x archsimd.Float64s) float64 {
 	return x.ReduceMax()
 }
 
+func sveReduceMin(x archsimd.Float32s) float32 {
+	// arm64:`ZFMINVS\s+Z[0-9]+\.S, P[0-9]+, V[0-9]+` -`FMOV`
+	return x.ReduceMin()
+}
+
+// An integer reduction moves its result from the SIMD&FP register to the
+// general-purpose register that an integer is returned in.
+func sveReduceSumInt16(x archsimd.Int16s) int16 {
+	// arm64:`ZUADDVD\s+Z[0-9]+\.H, P[0-9]+, V[0-9]+` `FMOVD\s+F[0-9]+, R[0-9]+`
+	return x.ReduceSum()
+}
+
+// The moved result is not sign-extended, so widening a signed one extends it.
+func sveReduceSumInt8Wide(x archsimd.Int8s) int64 {
+	// arm64:`ZUADDVD\s+Z[0-9]+\.B, P[0-9]+, V[0-9]+` `FMOVD\s+F[0-9]+, R[0-9]+` `MOVB\s+R[0-9]+, R[0-9]+`
+	return int64(x.ReduceSum())
+}
+
+// SMAXV and UMAXV leave a result one element wide, which is moved the same way.
+func sveReduceMaxUint32(x archsimd.Uint32s) uint32 {
+	// arm64:`ZUMAXVS\s+Z[0-9]+\.S, P[0-9]+, V[0-9]+` `FMOVD\s+F[0-9]+, R[0-9]+`
+	return x.ReduceMax()
+}
+
+// SMINV and UMINV are moved the same way.
+func sveReduceMinInt8(x archsimd.Int8s) int8 {
+	// arm64:`ZSMINVB\s+Z[0-9]+\.B, P[0-9]+, V[0-9]+` `FMOVD\s+F[0-9]+, R[0-9]+`
+	return x.ReduceMin()
+}
+
 // ShiftAllLeft by a constant below the element width is LSL (immediate), and
 // by a larger constant the zero vector. A variable amount is broadcast to
 // 64-bit lanes and shifts by wide elements, which gives zero for an amount of
@@ -428,6 +487,61 @@ func sveShiftAllLeftVar64(x archsimd.Uint64s, s uint64) archsimd.Uint64s {
 	// LSL has no wide form for 64-bit elements; LSL (vectors) is predicated.
 	// arm64:`ZLSL\s+Z[0-9]+\.D, Z[0-9]+\.D, P[0-9]+\.M, Z[0-9]+\.D`
 	return x.ShiftAllLeft(s)
+}
+
+// ShiftLeft by vector is LSL (vectors), which is predicated-only, so it runs
+// under an all-true predicate. It yields 0 for an amount of the element width
+// or more, so nothing clamps the amounts.
+
+func sveShiftLeftVec(x archsimd.Int8s, s archsimd.Uint8s) archsimd.Int8s {
+	// arm64:`PWHILELT` `ZLSL\s+Z[0-9]+\.B, Z[0-9]+\.B, P[0-9]+\.M, Z[0-9]+\.B` -`ZSEL` -`ZUMIN`
+	return x.ShiftLeft(s)
+}
+
+func sveShiftLeftVec64(x archsimd.Uint64s, s archsimd.Uint64s) archsimd.Uint64s {
+	// arm64:`PWHILELT` `ZLSL\s+Z[0-9]+\.D, Z[0-9]+\.D, P[0-9]+\.M, Z[0-9]+\.D` -`ZSEL` -`ZUMIN` -`ZDUP`
+	return x.ShiftLeft(s)
+}
+
+func sveShiftLeftVec64Const(x archsimd.Uint64s) archsimd.Uint64s {
+	// 64-bit LSL (vectors) is ShiftAllLeft's instruction too, so a broadcast
+	// constant amount takes its immediate form.
+	// arm64:`ZLSL\s+\$5, Z[0-9]+\.D, Z[0-9]+\.D` -`PWHILELT`
+	return x.ShiftLeft(archsimd.BroadcastUint64s(5))
+}
+
+func sveShiftLeftVecIfElse(x archsimd.Int16s, s archsimd.Uint16s, m archsimd.Mask16s) archsimd.Int16s {
+	// arm64:`ZLSL\s+Z[0-9]+\.H, Z[0-9]+\.H, P[0-9]+\.M, Z[0-9]+\.H` -`ZSEL` -`PWHILELT`
+	return x.ShiftLeft(s).IfElse(m, x)
+}
+
+func sveShiftLeftVecIfElseAmount(x, s archsimd.Uint16s, m archsimd.Mask16s) archsimd.Uint16s {
+	// The merging form keeps x in the inactive lanes, so a select keeping s stays.
+	// arm64:`PWHILELT` `ZSEL`
+	return x.ShiftLeft(s).IfElse(m, s)
+}
+
+// ShiftRight by vector is LSR or ASR (vectors), the same shape as ShiftLeft.
+// For an amount of the element width or more LSR yields 0 and ASR the sign.
+
+func sveShiftRightVec(x archsimd.Int32s, s archsimd.Uint32s) archsimd.Int32s {
+	// arm64:`PWHILELT` `ZASR\s+Z[0-9]+\.S, Z[0-9]+\.S, P[0-9]+\.M, Z[0-9]+\.S` -`ZSEL` -`ZUMIN`
+	return x.ShiftRight(s)
+}
+
+func sveShiftRightVec64(x archsimd.Uint64s, s archsimd.Uint64s) archsimd.Uint64s {
+	// arm64:`PWHILELT` `ZLSR\s+Z[0-9]+\.D, Z[0-9]+\.D, P[0-9]+\.M, Z[0-9]+\.D` -`ZSEL` -`ZUMIN` -`ZDUP`
+	return x.ShiftRight(s)
+}
+
+func sveShiftRightVecIfElse(x archsimd.Uint8s, s archsimd.Uint8s, m archsimd.Mask8s) archsimd.Uint8s {
+	// arm64:`ZLSR\s+Z[0-9]+\.B, Z[0-9]+\.B, P[0-9]+\.M, Z[0-9]+\.B` -`ZSEL` -`PWHILELT`
+	return x.ShiftRight(s).IfElse(m, x)
+}
+
+func sveShiftRightVecIfElse64(x archsimd.Int64s, s archsimd.Uint64s, m archsimd.Mask64s) archsimd.Int64s {
+	// arm64:`ZASR\s+Z[0-9]+\.D, Z[0-9]+\.D, P[0-9]+\.M, Z[0-9]+\.D` -`ZSEL` -`PWHILELT`
+	return x.ShiftRight(s).IfElse(m, x)
 }
 
 // The zero value of a mask is an all-false predicate.
@@ -480,6 +594,45 @@ func sveMaskToInt(m archsimd.Mask8s) archsimd.Int8s {
 	// Broadcast(-1).Masked(m) folds into a single zeroing CPY.
 	// arm64:`ZCPY\s+\$-1, P[0-9]+\.Z, Z[0-9]+\.B` -`ZDUP` -`ZSEL`
 	return m.ToInt8s()
+}
+
+// The predicate logic instructions are always .B; the governing all-true
+// mask is built at the lane size.
+func sveMaskAnd(x, y archsimd.Mask16s) archsimd.Mask16s {
+	// arm64:`PWHILELT.*P[0-9]+\.H` `PAND\s+P[0-9]+\.B, P[0-9]+\.B, P[0-9]+\.Z, P[0-9]+\.B`
+	return x.And(y)
+}
+
+// A Mask8s has a lane for every bit, so x itself governs.
+func sveMask8sAnd(x, y archsimd.Mask8s) archsimd.Mask8s {
+	// arm64:`PAND\s+P[0-9]+\.B, P[0-9]+\.B, P[0-9]+\.Z, P[0-9]+\.B` -`PWHILELT` -`PTRUE`
+	return x.And(y)
+}
+
+func sveMask8sAndNot(x, y archsimd.Mask8s) archsimd.Mask8s {
+	// arm64:`PBIC\s+P[0-9]+\.B, P[0-9]+\.B, P[0-9]+\.Z, P[0-9]+\.B` -`PWHILELT` -`PTRUE`
+	return x.AndNot(y)
+}
+
+func sveMaskAndNot(x, y archsimd.Mask16s) archsimd.Mask16s {
+	// arm64:`PWHILELT.*P[0-9]+\.H` `PBIC\s+P[0-9]+\.B, P[0-9]+\.B, P[0-9]+\.Z, P[0-9]+\.B`
+	return x.AndNot(y)
+}
+
+func sveMaskOr(x, y archsimd.Mask16s) archsimd.Mask16s {
+	// arm64:`PWHILELT.*P[0-9]+\.H` `PORR\s+P[0-9]+\.B, P[0-9]+\.B, P[0-9]+\.Z, P[0-9]+\.B`
+	return x.Or(y)
+}
+
+func sveMaskXor(x, y archsimd.Mask16s) archsimd.Mask16s {
+	// arm64:`PWHILELT.*P[0-9]+\.H` `PEOR\s+P[0-9]+\.B, P[0-9]+\.B, P[0-9]+\.Z, P[0-9]+\.B`
+	return x.Xor(y)
+}
+
+func sveMaskNot(x archsimd.Mask16s) archsimd.Mask16s {
+	// NOT is an EOR under the all-true mask of the lane size.
+	// arm64:`PWHILELT.*P[0-9]+\.H` `PEOR\s+P[0-9]+\.B, P[0-9]+\.B, P[0-9]+\.Z, P[0-9]+\.B`
+	return x.Not()
 }
 
 func sveBroadcastConstIfElse(m archsimd.Mask16s, z archsimd.Int16s) archsimd.Int16s {

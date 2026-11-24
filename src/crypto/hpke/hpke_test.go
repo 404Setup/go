@@ -7,6 +7,7 @@ package hpke
 import (
 	"bytes"
 	"crypto/ecdh"
+	"crypto/internal/cryptotest"
 	"crypto/mlkem"
 	"crypto/mlkem/mlkemtest"
 	"crypto/sha3"
@@ -112,6 +113,13 @@ func TestRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			} else if !bytes.Equal(got, kb) {
 				t.Errorf("re-serialized key mismatch: got %x, want %x", got, kb)
+			}
+			want := bytes.Clone(kb)
+			clear(kb) // the caller owns the slice returned by Bytes
+			if got, err := k.Bytes(); err != nil {
+				t.Fatal(err)
+			} else if !bytes.Equal(got, want) {
+				t.Errorf("Bytes after clearing a previous result: got %x, want %x", got, want)
 			}
 			pk, err := kem.NewPublicKey(k.PublicKey().Bytes())
 			if err != nil {
@@ -253,6 +261,42 @@ func mustDecodeHex(t *testing.T, in string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestKeyEncoding(t *testing.T) {
+	kems := []KEM{
+		DHKEM(ecdh.P256()),
+		DHKEM(ecdh.P384()),
+		DHKEM(ecdh.P521()),
+		DHKEM(ecdh.X25519()),
+		MLKEM768(),
+		MLKEM1024(),
+		MLKEM768P256(),
+		MLKEM1024P384(),
+		MLKEM768X25519(),
+	}
+	for _, kem := range kems {
+		t.Run(fmt.Sprintf("KEM_%04x", kem.ID()), func(t *testing.T) {
+			generated, err := kem.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			derived, err := kem.DeriveKeyPair(make([]byte, 64))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, k := range map[string]PrivateKey{"GenerateKey": generated, "DeriveKeyPair": derived} {
+				t.Run(name, func(t *testing.T) {
+					t.Run("PrivateKey", func(t *testing.T) {
+						cryptotest.TestKeyEncoding(t, k, kem.NewPrivateKey, PrivateKey.Bytes)
+					})
+					t.Run("PublicKey", func(t *testing.T) {
+						cryptotest.TestKeyEncoding(t, k.PublicKey(), kem.NewPublicKey, PublicKey.Bytes)
+					})
+				})
+			}
+		})
+	}
 }
 
 func TestVectors(t *testing.T) {
