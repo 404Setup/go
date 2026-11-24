@@ -420,21 +420,22 @@ func (enc *Encoder) Close() error {
 }
 
 type printer struct {
-	w          *bufio.Writer
-	out        []byte
-	encoder    *Encoder
-	seq        int
-	indent     string
-	prefix     string
-	depth      int
-	indentedIn bool
-	putNewline bool
-	attrNS     map[string]string // map prefix -> name space
-	attrPrefix map[string]string // map name space -> prefix
-	prefixes   []string
-	tags       []Name
-	closed     bool
-	err        error
+	w           *bufio.Writer
+	out         []byte
+	encoder     *Encoder
+	seq         int
+	indent      string
+	prefix      string
+	depth       int
+	indentedIn  bool
+	putNewline  bool
+	attrNS      map[string]string // map prefix -> name space
+	attrPrefix  map[string]string // map name space -> prefix
+	prefixes    []string
+	tags        []Name
+	parentStack []string
+	closed      bool
+	err         error
 }
 
 func (p *printer) bufferedLen() int {

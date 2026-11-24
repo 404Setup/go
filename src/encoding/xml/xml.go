@@ -223,9 +223,10 @@ type Decoder struct {
 	line           int
 	linestart      int64
 	offset         int64
-	inUnmarshalXML bool
-	nameCache      [32]string
-	attrScratch    []Attr
+	inUnmarshalXML       bool
+	sawCustomUnmarshaler bool
+	nameCache            [64]string
+	attrScratch          []Attr
 }
 
 // NewDecoder creates a new XML parser reading from r.
@@ -784,171 +785,12 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 		return nil
 	}
 
-	b, ok := d.getc()
-	if !ok {
-		return d.err
-	}
-
-	if b != '<' {
-		// Text section.
-		d.ungetc(b)
-		data := d.text(-1, false)
-		if data == nil {
-			return d.err
-		}
-		tok.kind = xtCharData
-		tok.data = data
-		tok.attr = nil
-		return nil
-	}
-
-	if b, ok = d.mustgetc(); !ok {
-		return d.err
-	}
-	switch b {
-	case '/':
-		// </: End element
-		var name Name
-		if name, ok = d.nsname(); !ok {
-			if d.err == nil {
-				d.err = d.syntaxError("expected element name after </")
-			}
-			return d.err
-		}
-		d.space()
-		if b, ok = d.mustgetc(); !ok {
-			return d.err
-		}
-		if b != '>' {
-			d.err = d.syntaxError("invalid characters between </" + name.Local + " and >")
-			return d.err
-		}
-		tok.kind = xtEndElement
-		tok.name = name
-		tok.attr = nil
-		tok.data = nil
-		return nil
-
-	case '?':
-		// <?: Processing instruction.
-		var target string
-		if target, ok = d.name(); !ok {
-			if d.err == nil {
-				d.err = d.syntaxError("expected target name after <?")
-			}
-			return d.err
-		}
-		d.space()
-		d.buf.Reset()
-		var b0 byte
-		for {
-			if b, ok = d.mustgetc(); !ok {
-				return d.err
-			}
-			d.buf.WriteByte(b)
-			if b0 == '?' && b == '>' {
-				break
-			}
-			b0 = b
-		}
-		data := d.buf.Bytes()
-		data = data[0 : len(data)-2] // chop ?>
-
-		if target == "xml" {
-			content := string(data)
-			ver := procInst("version", content)
-			if ver != "" && ver != "1.0" {
-				d.err = fmt.Errorf("xml: unsupported version %q; only version 1.0 is supported", ver)
-				return d.err
-			}
-			enc := procInst("encoding", content)
-			if enc != "" && enc != "utf-8" && enc != "UTF-8" && !strings.EqualFold(enc, "utf-8") {
-				if d.CharsetReader == nil {
-					d.err = fmt.Errorf("xml: encoding %q declared but Decoder.CharsetReader is nil", enc)
-					return d.err
-				}
-				var curReader io.Reader
-				if d.r != nil {
-					curReader = d.r.(io.Reader)
-				} else if d.rRaw != nil {
-					if d.pos < len(d.src) {
-						curReader = io.MultiReader(bytes.NewReader(d.src[d.pos:]), d.rRaw)
-					} else {
-						curReader = d.rRaw
-					}
-				} else {
-					curReader = bytes.NewReader(d.src[d.pos:])
-				}
-				newr, err := d.CharsetReader(enc, curReader)
-				if err != nil {
-					d.err = fmt.Errorf("xml: opening charset %q: %w", enc, err)
-					return d.err
-				}
-				if newr == nil {
-					panic("CharsetReader returned a nil Reader for charset " + enc)
-				}
-				d.switchToReader(newr)
-			}
-		}
-		tok.kind = xtProcInst
-		tok.target = target
-		tok.data = data
-		tok.attr = nil
-		return nil
-
-	case '!':
-		// <!: Maybe comment, maybe CDATA.
-		if b, ok = d.mustgetc(); !ok {
-			return d.err
-		}
-		switch b {
-		case '-': // <!-
-			// Probably <!-- for a comment.
-			if b, ok = d.mustgetc(); !ok {
-				return d.err
-			}
-			if b != '-' {
-				d.err = d.syntaxError("invalid sequence <!- not part of <!--")
-				return d.err
-			}
-			// Look for terminator.
-			d.buf.Reset()
-			var b0, b1 byte
-			for {
-				if b, ok = d.mustgetc(); !ok {
-					return d.err
-				}
-				d.buf.WriteByte(b)
-				if b0 == '-' && b1 == '-' {
-					if b != '>' {
-						d.err = d.syntaxError(
-							`invalid sequence "--" not allowed in comments`)
-						return d.err
-					}
-					break
-				}
-				b0, b1 = b1, b
-			}
-			data := d.buf.Bytes()
-			data = data[0 : len(data)-3] // chop -->
-			tok.kind = xtComment
-			tok.data = data
-			tok.attr = nil
-			return nil
-
-		case '[': // <![
-			// Probably <![CDATA[.
-			for i := 0; i < 6; i++ {
-				if b, ok = d.mustgetc(); !ok {
-					return d.err
-				}
-				if b != "CDATA["[i] {
-					d.err = d.syntaxError("invalid <![ sequence")
-					return d.err
-				}
-			}
-			// Have <![CDATA[.  Read text until ]]>.
-			data := d.text(-1, true)
+	var b byte
+	var ok bool
+	if d.nextByte < 0 && d.pos < len(d.src) {
+		b = d.src[d.pos]
+		if b != '<' {
+			data := d.text(-1, false)
 			if data == nil {
 				return d.err
 			}
@@ -957,83 +799,282 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 			tok.attr = nil
 			return nil
 		}
+		d.pos++
+		d.offset++
+		if d.saved != nil {
+			d.saved.WriteByte('<')
+		}
+	} else {
+		b, ok = d.getc()
+		if !ok {
+			return d.err
+		}
 
-		// Probably a directive: <!DOCTYPE ...>, <!ENTITY ...>, etc.
-		// We don't care, but accumulate for caller. Quoted angle
-		// brackets do not count for nesting.
-		d.buf.Reset()
-		d.buf.WriteByte(b)
-		inquote := uint8(0)
-		depth := 0
-		for {
+		if b != '<' {
+			// Text section.
+			d.ungetc(b)
+			data := d.text(-1, false)
+			if data == nil {
+				return d.err
+			}
+			tok.kind = xtCharData
+			tok.data = data
+			tok.attr = nil
+			return nil
+		}
+	}
+
+	isSpecial := false
+	if d.nextByte < 0 && d.pos < len(d.src) {
+		c := d.src[d.pos]
+		if c == '/' || c == '?' || c == '!' {
+			b = c
+			d.pos++
+			d.offset++
+			if d.saved != nil {
+				d.saved.WriteByte(b)
+			}
+			isSpecial = true
+		}
+	} else {
+		if b, ok = d.mustgetc(); !ok {
+			return d.err
+		}
+		if b == '/' || b == '?' || b == '!' {
+			isSpecial = true
+		} else {
+			d.ungetc(b)
+		}
+	}
+	if isSpecial {
+		switch b {
+		case '/':
+			// </: End element
+			var name Name
+			if name, ok = d.nsname(); !ok {
+				if d.err == nil {
+					d.err = d.syntaxError("expected element name after </")
+				}
+				return d.err
+			}
+			d.space()
 			if b, ok = d.mustgetc(); !ok {
 				return d.err
 			}
-			if inquote == 0 && b == '>' && depth == 0 {
-				break
+			if b != '>' {
+				d.err = d.syntaxError("invalid characters between </" + name.Local + " and >")
+				return d.err
 			}
-		HandleB:
-			d.buf.WriteByte(b)
-			switch {
-			case b == inquote:
-				inquote = 0
+			tok.kind = xtEndElement
+			tok.name = name
+			tok.attr = nil
+			tok.data = nil
+			return nil
 
-			case inquote != 0:
-				// in quotes, no special action
+		case '?':
+			// <?: Processing instruction.
+			var target string
+			if target, ok = d.name(); !ok {
+				if d.err == nil {
+					d.err = d.syntaxError("expected target name after <?")
+				}
+				return d.err
+			}
+			d.space()
+			d.buf.Reset()
+			var b0 byte
+			for {
+				if b, ok = d.mustgetc(); !ok {
+					return d.err
+				}
+				d.buf.WriteByte(b)
+				if b0 == '?' && b == '>' {
+					break
+				}
+				b0 = b
+			}
+			data := d.buf.Bytes()
+			data = data[0 : len(data)-2] // chop ?>
 
-			case b == '\'' || b == '"':
-				inquote = b
-
-			case b == '>' && inquote == 0:
-				depth--
-
-			case b == '<' && inquote == 0:
-				// Look for <!-- to begin comment.
-				s := "!--"
-				for i := 0; i < len(s); i++ {
-					if b, ok = d.mustgetc(); !ok {
+			if target == "xml" {
+				content := string(data)
+				ver := procInst("version", content)
+				if ver != "" && ver != "1.0" {
+					d.err = fmt.Errorf("xml: unsupported version %q; only version 1.0 is supported", ver)
+					return d.err
+				}
+				enc := procInst("encoding", content)
+				if enc != "" && enc != "utf-8" && enc != "UTF-8" && !strings.EqualFold(enc, "utf-8") {
+					if d.CharsetReader == nil {
+						d.err = fmt.Errorf("xml: encoding %q declared but Decoder.CharsetReader is nil", enc)
 						return d.err
 					}
-					if b != s[i] {
-						for j := 0; j < i; j++ {
-							d.buf.WriteByte(s[j])
+					var curReader io.Reader
+					if d.r != nil {
+						curReader = d.r.(io.Reader)
+					} else if d.rRaw != nil {
+						if d.pos < len(d.src) {
+							curReader = io.MultiReader(bytes.NewReader(d.src[d.pos:]), d.rRaw)
+						} else {
+							curReader = d.rRaw
 						}
-						depth++
-						goto HandleB
+					} else {
+						curReader = bytes.NewReader(d.src[d.pos:])
 					}
+					newr, err := d.CharsetReader(enc, curReader)
+					if err != nil {
+						d.err = fmt.Errorf("xml: opening charset %q: %w", enc, err)
+						return d.err
+					}
+					if newr == nil {
+						panic("CharsetReader returned a nil Reader for charset " + enc)
+					}
+					d.switchToReader(newr)
 				}
+			}
+			tok.kind = xtProcInst
+			tok.target = target
+			tok.data = data
+			tok.attr = nil
+			return nil
 
-				// Remove < that was written above.
-				d.buf.Truncate(d.buf.Len() - 1)
-
+		case '!':
+			// <!: Maybe comment, maybe CDATA.
+			if b, ok = d.mustgetc(); !ok {
+				return d.err
+			}
+			switch b {
+			case '-': // <!-
+				// Probably <!-- for a comment.
+				if b, ok = d.mustgetc(); !ok {
+					return d.err
+				}
+				if b != '-' {
+					d.err = d.syntaxError("invalid sequence <!- not part of <!--")
+					return d.err
+				}
 				// Look for terminator.
+				d.buf.Reset()
 				var b0, b1 byte
 				for {
 					if b, ok = d.mustgetc(); !ok {
 						return d.err
 					}
-					if b0 == '-' && b1 == '-' && b == '>' {
+					d.buf.WriteByte(b)
+					if b0 == '-' && b1 == '-' {
+						if b != '>' {
+							d.err = d.syntaxError(
+								`invalid sequence "--" not allowed in comments`)
+							return d.err
+						}
 						break
 					}
 					b0, b1 = b1, b
 				}
+				data := d.buf.Bytes()
+				data = data[0 : len(data)-3] // chop -->
+				tok.kind = xtComment
+				tok.data = data
+				tok.attr = nil
+				return nil
 
-				// Replace the comment with a space in the returned Directive
-				// body, so that markup parts that were separated by the comment
-				// (like a "<" and a "!") don't get joined when re-encoding the
-				// Directive, taking new semantic meaning.
-				d.buf.WriteByte(' ')
+			case '[': // <![
+				// Probably <![CDATA[.
+				for i := 0; i < 6; i++ {
+					if b, ok = d.mustgetc(); !ok {
+						return d.err
+					}
+					if b != "CDATA["[i] {
+						d.err = d.syntaxError("invalid <![ sequence")
+						return d.err
+					}
+				}
+				// Have <![CDATA[.  Read text until ]]>.
+				data := d.text(-1, true)
+				if data == nil {
+					return d.err
+				}
+				tok.kind = xtCharData
+				tok.data = data
+				tok.attr = nil
+				return nil
 			}
+
+			// Probably a directive: <!DOCTYPE ...>, <!ENTITY ...>, etc.
+			// We don't care, but accumulate for caller. Quoted angle
+			// brackets do not count for nesting.
+			d.buf.Reset()
+			d.buf.WriteByte(b)
+			inquote := uint8(0)
+			depth := 0
+			for {
+				if b, ok = d.mustgetc(); !ok {
+					return d.err
+				}
+				if inquote == 0 && b == '>' && depth == 0 {
+					break
+				}
+			HandleB:
+				d.buf.WriteByte(b)
+				switch {
+				case b == inquote:
+					inquote = 0
+
+				case inquote != 0:
+					// in quotes, no special action
+
+				case b == '\'' || b == '"':
+					inquote = b
+
+				case b == '>' && inquote == 0:
+					depth--
+
+				case b == '<' && inquote == 0:
+					// Look for <!-- to begin comment.
+					s := "!--"
+					for i := 0; i < len(s); i++ {
+						if b, ok = d.mustgetc(); !ok {
+							return d.err
+						}
+						if b != s[i] {
+							for j := 0; j < i; j++ {
+								d.buf.WriteByte(s[j])
+							}
+							depth++
+							goto HandleB
+						}
+					}
+
+					// Remove < that was written above.
+					d.buf.Truncate(d.buf.Len() - 1)
+
+					// Look for terminator.
+					var b0, b1 byte
+					for {
+						if b, ok = d.mustgetc(); !ok {
+							return d.err
+						}
+						if b0 == '-' && b1 == '-' && b == '>' {
+							break
+						}
+						b0, b1 = b1, b
+					}
+
+					// Replace the comment with a space in the returned Directive
+					// body, so that markup parts that were separated by the comment
+					// (like a "<" and a "!") don't get joined when re-encoding the
+					// Directive, taking new semantic meaning.
+					d.buf.WriteByte(' ')
+				}
+			}
+			tok.kind = xtDirective
+			tok.data = d.buf.Bytes()
+			tok.attr = nil
+			return nil
 		}
-		tok.kind = xtDirective
-		tok.data = d.buf.Bytes()
-		tok.attr = nil
-		return nil
 	}
 
 	// Must be an open element like <a href="foo">
-	d.ungetc(b)
-
 	var (
 		name  Name
 		empty bool
@@ -1053,24 +1094,46 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 	}
 	for {
 		d.space()
-		if b, ok = d.mustgetc(); !ok {
-			return d.err
-		}
-		if b == '/' {
-			empty = true
+		if d.nextByte < 0 && d.pos < len(d.src) {
+			c := d.src[d.pos]
+			if c == '/' || c == '>' {
+				d.pos++
+				d.offset++
+				if d.saved != nil {
+					d.saved.WriteByte(c)
+				}
+				if c == '/' {
+					empty = true
+					if b, ok = d.mustgetc(); !ok {
+						return d.err
+					}
+					if b != '>' {
+						d.err = d.syntaxError("expected /> in element")
+						return d.err
+					}
+				}
+				break
+			}
+		} else {
 			if b, ok = d.mustgetc(); !ok {
 				return d.err
 			}
-			if b != '>' {
-				d.err = d.syntaxError("expected /> in element")
-				return d.err
+			if b == '/' {
+				empty = true
+				if b, ok = d.mustgetc(); !ok {
+					return d.err
+				}
+				if b != '>' {
+					d.err = d.syntaxError("expected /> in element")
+					return d.err
+				}
+				break
 			}
-			break
+			if b == '>' {
+				break
+			}
+			d.ungetc(b)
 		}
-		if b == '>' {
-			break
-		}
-		d.ungetc(b)
 
 		a := Attr{}
 		if a.Name, ok = d.nsname(); !ok {
@@ -1745,7 +1808,7 @@ func (d *Decoder) internName(b []byte) string {
 		return ""
 	}
 	if len(b) <= 32 {
-		idx := (uint32(b[0])*33 + uint32(b[len(b)-1])*7 + uint32(len(b))*13 + uint32(b[len(b)>>1])) & 31
+		idx := (uint32(b[0])*33 + uint32(b[len(b)-1])*7 + uint32(len(b))*13 + uint32(b[len(b)>>1])) & 63
 		if s := d.nameCache[idx]; len(s) == len(b) && s == string(b) {
 			return s
 		}

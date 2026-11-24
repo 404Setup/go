@@ -267,6 +267,192 @@ func TestFastEncoderIndentAndTokenParity(t *testing.T) {
 	}
 }
 
+type byteChunkReader struct {
+	data  []byte
+	chunk int
+}
+
+func (r *byteChunkReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.chunk, len(r.data))
+	copy(p[:n], r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+type errAfterNWriter struct {
+	buf   bytes.Buffer
+	limit int
+	err   error
+}
+
+func (w *errAfterNWriter) Write(p []byte) (int, error) {
+	if w.buf.Len()+len(p) > w.limit {
+		return 0, w.err
+	}
+	return w.buf.Write(p)
+}
+
+type namedInnerStr string
+type namedInnerBytes []byte
+
+type testTimeAndNamedDoc struct {
+	XMLName   Name            `xml:"urn:test doc"`
+	AttrTime  time.Time       `xml:"at,attr"`
+	PtrTime   *time.Time      `xml:"pt,attr,omitempty"`
+	NilTime   *time.Time      `xml:"nt,attr"`
+	TimeSlice []time.Time     `xml:"ts,attr"`
+	ElemTime  time.Time       `xml:"elemTime"`
+	PtrElemT  *time.Time      `xml:"ptrElemTime"`
+	NamedIn   namedInnerStr   `xml:",innerxml"`
+	NamedRaw  namedInnerBytes `xml:",comment"`
+	Nested    struct {
+		XMLName Name `xml:""`
+		Val     int  `xml:"val"`
+	} `xml:"nested"`
+}
+
+type failingUnmarshaler struct{}
+
+func (f *failingUnmarshaler) UnmarshalXML(d *Decoder, start StartElement) error {
+	return io.ErrUnexpectedEOF
+}
+
+func TestFastDifferentialParity(t *testing.T) {
+	ts := time.Date(2026, 7, 4, 15, 30, 45, 0, time.UTC)
+	ts2 := ts.Add(time.Hour)
+	doc := testTimeAndNamedDoc{
+		AttrTime:  ts,
+		PtrTime:   &ts2,
+		TimeSlice: []time.Time{ts, ts2},
+		ElemTime:  ts,
+		PtrElemT:  &ts2,
+		NamedIn:   "wrapped-not-raw",
+		NamedRaw:  namedInnerBytes("comment-body-"),
+	}
+	doc.Nested.Val = 123
+
+	// Compare addressable (&doc) vs non-addressable (doc) vs Encoder.Encode.
+	bPtr, err := Marshal(&doc)
+	if err != nil {
+		t.Fatalf("Marshal(&doc) failed: %v", err)
+	}
+	bVal, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal(doc) failed: %v", err)
+	}
+	if !bytes.Equal(bPtr, bVal) {
+		t.Fatalf("Marshal(&doc) vs Marshal(doc) mismatch:\n%s\nvs\n%s", bPtr, bVal)
+	}
+	var encBuf bytes.Buffer
+	if err := NewEncoder(&encBuf).Encode(doc); err != nil {
+		t.Fatalf("Encoder.Encode(doc) failed: %v", err)
+	}
+	if !bytes.Equal(bVal, encBuf.Bytes()) {
+		t.Fatalf("Encoder.Encode mismatch:\n%s\nvs\n%s", encBuf.Bytes(), bVal)
+	}
+	if !strings.Contains(string(bVal), "<NamedIn>wrapped-not-raw</NamedIn>") {
+		t.Fatalf("named string with ,innerxml must wrap as element, got: %s", bVal)
+	}
+	if !strings.Contains(string(bVal), "<!--comment-body- -->") {
+		t.Fatalf("trailing '-' comment not padded, got: %s", bVal)
+	}
+	if !strings.Contains(string(bVal), `<nested xmlns="">`) {
+		t.Fatalf("nested empty XMLName namespace reset missing, got: %s", bVal)
+	}
+
+	var decoded testTimeAndNamedDoc
+	if err := Unmarshal(bVal, &decoded); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if !decoded.AttrTime.Equal(ts) || decoded.PtrTime == nil || !decoded.PtrTime.Equal(ts2) ||
+		decoded.NilTime != nil || len(decoded.TimeSlice) != 2 || !decoded.ElemTime.Equal(ts) ||
+		decoded.PtrElemT == nil || !decoded.PtrElemT.Equal(ts2) ||
+		!strings.Contains(string(decoded.NamedIn), "<NamedIn>wrapped-not-raw</NamedIn>") ||
+		string(decoded.NamedRaw) != "comment-body- " || decoded.Nested.Val != 123 {
+		t.Fatalf("roundtrip mismatch: got %+v want %+v", decoded, doc)
+	}
+
+	// Verify pooled Decoder state isolation across errors and custom Unmarshaler calls.
+	for range 20 {
+		var bad failingUnmarshaler
+		if err := Unmarshal([]byte(`<failingUnmarshaler><x/></failingUnmarshaler>`), &bad); err == nil {
+			t.Fatal("expected error from failingUnmarshaler")
+		}
+		var badSyntax testComplexDoc
+		if err := Unmarshal([]byte(`<doc><unclosed>`), &badSyntax); err == nil {
+			t.Fatal("expected syntax error")
+		}
+		var okDoc testTimeAndNamedDoc
+		if err := Unmarshal(bVal, &okDoc); err != nil {
+			t.Fatalf("pooled Unmarshal after errors failed: %v", err)
+		}
+		if okDoc.Nested.Val != 123 || !okDoc.AttrTime.Equal(ts) {
+			t.Fatalf("pooled Unmarshal state corrupted: %+v", okDoc)
+		}
+	}
+}
+
+func TestFastEscapeTextComprehensive(t *testing.T) {
+	inputs := [][]byte{
+		{},
+		[]byte("plain-ascii-7"),
+		[]byte("plain-ascii-16-bytes!"),
+		[]byte(strings.Repeat("0123456789abcdef", 20)),
+		[]byte(`<a attr="x" alt='y'>&amp;</a>` + "\t\n\r"),
+		{0x00, 0x01, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1F, 'A', '>', 0x7F},
+		[]byte("valid-utf8: café 日本語 🚀"),
+		{0xEF, 0xBF, 0xBE, 0xEF, 0xBF, 0xBF, 0xED, 0xA0, 0x80, 0xE0, 0x80, 0x80, 0xF4, 0x90, 0x80, 0x80, 0xFF},
+		[]byte(strings.Repeat(`"a"<b&c>'d'`+"\x00\xff", 30)),
+	}
+	for idx, in := range inputs {
+		var buf bytes.Buffer
+		if err := EscapeText(&buf, in); err != nil {
+			t.Fatalf("case %d bytes.Buffer EscapeText error: %v", idx, err)
+		}
+		var sb strings.Builder
+		if err := EscapeText(&sb, in); err != nil {
+			t.Fatalf("case %d strings.Builder EscapeText error: %v", idx, err)
+		}
+		if buf.String() != sb.String() {
+			t.Fatalf("case %d Buffer vs Builder mismatch:\ngot  %q\nwant %q", idx, buf.String(), sb.String())
+		}
+	}
+
+	wantErr := io.ErrShortWrite
+	ew := &errAfterNWriter{limit: 5, err: wantErr}
+	if err := EscapeText(ew, []byte("hello<world>")); err != wantErr {
+		t.Fatalf("EscapeText IO error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestFastDecoderStreamingAndChunked(t *testing.T) {
+	doc := makeBenchFeedDoc(12)
+	raw, err := Marshal(&doc)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	for _, chunkSize := range []int{1, 3, 7, 64} {
+		var out benchFeedDoc
+		dec := NewDecoder(&byteChunkReader{data: raw, chunk: chunkSize})
+		if err := dec.Decode(&out); err != nil {
+			t.Fatalf("chunk=%d Decode failed: %v", chunkSize, err)
+		}
+		if out.ID != doc.ID || out.Title != doc.Title || !out.Updated.Equal(doc.Updated) || len(out.Entries) != len(doc.Entries) {
+			t.Fatalf("chunk=%d decoded mismatch", chunkSize)
+		}
+		for i := range doc.Entries {
+			if out.Entries[i].ID != doc.Entries[i].ID ||
+				out.Entries[i].Author != doc.Entries[i].Author ||
+				!out.Entries[i].Published.Equal(doc.Entries[i].Published) {
+				t.Fatalf("chunk=%d entry %d mismatch: got %+v want %+v", chunkSize, i, out.Entries[i], doc.Entries[i])
+			}
+		}
+	}
+}
+
 type benchFeedDoc struct {
 	XMLName Name             `xml:"feed"`
 	ID      string           `xml:"id"`

@@ -102,6 +102,7 @@ func getXmlMarshalEncoder() *xmlEncoderBuf {
 	}
 	p.prefixes = p.prefixes[:0]
 	p.tags = p.tags[:0]
+	p.parentStack = p.parentStack[:0]
 	p.closed = false
 	p.err = nil
 	return eb
@@ -123,6 +124,11 @@ func putXmlMarshalEncoder(eb *xmlEncoderBuf) {
 		p.prefixes = nil
 	} else {
 		p.prefixes = p.prefixes[:0]
+	}
+	if cap(p.parentStack) > 256 {
+		p.parentStack = nil
+	} else {
+		p.parentStack = p.parentStack[:0]
 	}
 	xmlEncoderPool.Put(eb)
 }
@@ -186,16 +192,18 @@ const (
 )
 
 var (
-	xmlTimeType             = reflect.TypeFor[time.Time]()
-	xmlTimeAbiType          = xmlAbiTypeOfReflect(xmlTimeType)
-	xmlNameAbiType          = xmlAbiTypeOfReflect(nameType)
-	xmlAttrAbiType          = xmlAbiTypeOfReflect(attrType)
-	xmlMarshalerType        = reflect.TypeFor[Marshaler]()
-	xmlMarshalerAttrType    = reflect.TypeFor[MarshalerAttr]()
-	xmlTextMarshalerType    = reflect.TypeFor[encoding.TextMarshaler]()
-	xmlTextUnmarshalerType  = reflect.TypeFor[encoding.TextUnmarshaler]()
-	xmlUnmarshalerType      = reflect.TypeFor[Unmarshaler]()
-	xmlUnmarshalerAttrType  = reflect.TypeFor[UnmarshalerAttr]()
+	xmlTimeType            = reflect.TypeFor[time.Time]()
+	xmlStringType          = reflect.TypeFor[string]()
+	xmlBytesType           = reflect.TypeFor[[]byte]()
+	xmlTimeAbiType         = xmlAbiTypeOfReflect(xmlTimeType)
+	xmlNameAbiType         = xmlAbiTypeOfReflect(nameType)
+	xmlAttrAbiType         = xmlAbiTypeOfReflect(attrType)
+	xmlMarshalerType       = reflect.TypeFor[Marshaler]()
+	xmlMarshalerAttrType   = reflect.TypeFor[MarshalerAttr]()
+	xmlTextMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
+	xmlTextUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+	xmlUnmarshalerType     = reflect.TypeFor[Unmarshaler]()
+	xmlUnmarshalerAttrType = reflect.TypeFor[UnmarshalerAttr]()
 )
 
 type xmlFieldStep struct {
@@ -231,6 +239,7 @@ type xmlFastAttr struct {
 	elemKind         xmlFastKind
 	elemRT           reflect.Type
 	elemPtrRT        reflect.Type
+	elemIsTime       bool
 	elemTextMarsh    bool
 	elemPtrTextMarsh bool
 	elemMarshAttr    bool
@@ -593,6 +602,7 @@ func buildXmlFastAttr(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xm
 		fa.elemRT = ert
 		fa.elemPtrRT = ptrERT
 		fa.elemKind = classifyXmlKind(ert, eat)
+		fa.elemIsTime = eat == xmlTimeAbiType
 		fa.elemMarshAttr = ert.Implements(xmlMarshalerAttrType)
 		fa.elemPtrMarshAttr = ptrERT.Implements(xmlMarshalerAttrType)
 		fa.elemTextMarsh = ert.Implements(xmlTextMarshalerType)
@@ -603,7 +613,7 @@ func buildXmlFastAttr(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xm
 		eat := xmlAbiTypeOfReflect(ert)
 		fa.elemRT = ert
 		fa.elemKind = classifyXmlKind(ert, eat)
-		fa.isTime = eat == xmlTimeAbiType
+		fa.elemIsTime = eat == xmlTimeAbiType
 	}
 	return fa
 }
@@ -669,6 +679,22 @@ func resolveFieldPtr(base unsafe.Pointer, steps []xmlFieldStep, finalOff uintptr
 		}
 	}
 	return unsafe.Add(p, finalOff)
+}
+
+func resolveFieldPtrWithAddr(base unsafe.Pointer, steps []xmlFieldStep, finalOff uintptr, canAddr bool) (unsafe.Pointer, bool) {
+	p := base
+	addr := canAddr
+	for _, s := range steps {
+		p = unsafe.Add(p, s.offset)
+		if s.deref {
+			p = *(*unsafe.Pointer)(p)
+			if p == nil {
+				return nil, false
+			}
+			addr = true
+		}
+	}
+	return unsafe.Add(p, finalOff), addr
 }
 
 func xmlIsEmpty(k xmlFastKind, ptr unsafe.Pointer, rt reflect.Type) bool {
@@ -1326,46 +1352,35 @@ func (p *printer) appendAttrBytes(fa *xmlFastAttr, b []byte) {
 	p.out = append(p.out, '"')
 }
 
-type fastParentStack struct {
-	p      *printer
-	inline [8]string
-	stack  []string
-}
-
-func (s *fastParentStack) trim(parents []string) error {
+func (p *printer) trimParents(base int, parents []string) error {
+	stack := p.parentStack[base:]
 	split := 0
-	for ; split < len(parents) && split < len(s.stack); split++ {
-		if parents[split] != s.stack[split] {
+	for ; split < len(parents) && split < len(stack); split++ {
+		if parents[split] != stack[split] {
 			break
 		}
 	}
-	for i := len(s.stack) - 1; i >= split; i-- {
-		if err := s.p.writeEndFast(Name{Local: s.stack[i]}, false); err != nil {
+	for i := len(stack) - 1; i >= split; i-- {
+		if err := p.writeEndFast(Name{Local: stack[i]}, false); err != nil {
 			return err
 		}
 	}
-	s.stack = s.stack[:split]
+	p.parentStack = p.parentStack[:base+split]
 	return nil
 }
 
-func (s *fastParentStack) push(parents []string) error {
+func (p *printer) pushParents(parents []string) error {
 	for i := 0; i < len(parents); i++ {
-		if err := s.p.writeStartNameFast(Name{Local: parents[i]}, false); err != nil {
+		if err := p.writeStartNameFast(Name{Local: parents[i]}, false); err != nil {
 			return err
 		}
 	}
-	if s.stack == nil {
-		s.stack = s.inline[:0]
-	}
-	s.stack = append(s.stack, parents...)
+	p.parentStack = append(p.parentStack, parents...)
 	return nil
 }
 
 func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer, canAddr bool, depth int) error {
-	var s fastParentStack
-	if plan.hasParents {
-		s.p = p
-	}
+	parentBase := len(p.parentStack)
 	hasIndent := len(p.prefix) != 0 || len(p.indent) != 0
 
 	for i := range plan.elems {
@@ -1378,7 +1393,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 		switch fe.mode {
 		case fCDATA, fCharData:
 			if plan.hasParents {
-				if err := s.trim(fe.parents); err != nil {
+				if err := p.trimParents(parentBase, fe.parents); err != nil {
 					return err
 				}
 			}
@@ -1489,7 +1504,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 
 		case fComment:
 			if plan.hasParents {
-				if err := s.trim(fe.parents); err != nil {
+				if err := p.trimParents(parentBase, fe.parents); err != nil {
 					return err
 				}
 			}
@@ -1586,12 +1601,12 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 
 		case fElement, fElement | fAny:
 			if plan.hasParents {
-				if err := s.trim(fe.parents); err != nil {
+				if err := p.trimParents(parentBase, fe.parents); err != nil {
 					return err
 				}
-				if len(fe.parents) > len(s.stack) {
+				if cur := len(p.parentStack) - parentBase; len(fe.parents) > cur {
 					if (fe.kind != xkPtr && fe.kind != xkInterface) || !xmlIsEmpty(fe.kind, fptr, fe.rt) {
-						if err := s.push(fe.parents[len(s.stack):]); err != nil {
+						if err := p.pushParents(fe.parents[cur:]); err != nil {
 							return err
 						}
 					}
@@ -1652,7 +1667,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 	}
 
 	if plan.hasParents {
-		if err := s.trim(nil); err != nil {
+		if err := p.trimParents(parentBase, nil); err != nil {
 			return err
 		}
 	}

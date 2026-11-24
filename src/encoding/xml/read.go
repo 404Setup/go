@@ -12,6 +12,7 @@ import (
 	"internal/abi"
 	"reflect"
 	"runtime"
+	syncv2 "sync/v2"
 	"unsafe"
 )
 
@@ -130,14 +131,89 @@ import (
 // A missing element or empty attribute value will be unmarshaled as a zero value.
 // If the field is a slice, a zero value will be appended to the field. Otherwise, the
 // field will be set to its zero value.
-func Unmarshal(data []byte, v any) error {
-	d := Decoder{
-		src:      data,
-		nextByte: -1,
-		line:     1,
-		Strict:   true,
+var xmlDecoderPool = syncv2.Pool[*Decoder]{
+	New: func() *Decoder {
+		return &Decoder{}
+	},
+}
+
+func getXmlUnmarshalDecoder(data []byte) *Decoder {
+	d := xmlDecoderPool.Get()
+	d.src = data
+	d.pos = 0
+	d.nextByte = -1
+	d.line = 1
+	d.linestart = 0
+	d.offset = 0
+	d.Strict = true
+	d.err = nil
+	d.readErr = nil
+	d.stk = nil
+	d.stkDepth = 0
+	d.needClose = false
+	d.toClose = Name{}
+	d.nextToken = nil
+	d.defaultNS = ""
+	d.hasDefaultNS = false
+	d.noCopyText = false
+	d.inUnmarshalXML = false
+	d.sawCustomUnmarshaler = false
+	d.saved = nil
+	d.buf.Reset()
+	return d
+}
+
+func putXmlUnmarshalDecoder(d *Decoder) {
+	if d.sawCustomUnmarshaler {
+		return
 	}
-	return d.Decode(v)
+	d.src = nil
+	d.r = nil
+	d.rRaw = nil
+	d.readBuf = nil
+	d.readErr = nil
+	d.t = nil
+	d.saved = nil
+	d.err = nil
+	d.nextToken = nil
+	d.toClose = Name{}
+	d.defaultNS = ""
+	d.hasDefaultNS = false
+	d.AutoClose = nil
+	d.Entity = nil
+	d.CharsetReader = nil
+	d.DefaultSpace = ""
+	for d.stk != nil {
+		s := d.stk
+		d.stk = s.next
+		s.name = Name{}
+		s.next = d.free
+		d.free = s
+	}
+	d.stkDepth = 0
+	if len(d.ns) > 0 {
+		clear(d.ns)
+	}
+	clear(d.nameCache[:])
+	if cap(d.attrScratch) > 64 {
+		d.attrScratch = nil
+	} else if len(d.attrScratch) > 0 {
+		clear(d.attrScratch[:cap(d.attrScratch)])
+		d.attrScratch = d.attrScratch[:0]
+	}
+	if d.buf.Cap() > 4096 {
+		d.buf = bytes.Buffer{}
+	} else {
+		d.buf.Reset()
+	}
+	xmlDecoderPool.Put(d)
+}
+
+func Unmarshal(data []byte, v any) error {
+	d := getXmlUnmarshalDecoder(data)
+	err := d.Decode(v)
+	putXmlUnmarshalDecoder(d)
+	return err
 }
 
 // Decode works like [Unmarshal], except it reads the decoder
@@ -214,6 +290,7 @@ func receiverType(val any) string {
 // unmarshalInterface unmarshals a single XML element into val.
 // start is the opening tag of the element.
 func (d *Decoder) unmarshalInterface(val Unmarshaler, start *StartElement) error {
+	d.sawCustomUnmarshaler = true
 	// Record that decoder must stop at end tag corresponding to start.
 	d.pushEOF()
 

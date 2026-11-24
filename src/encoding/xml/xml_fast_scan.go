@@ -368,6 +368,29 @@ func escapeTextFast(w io.Writer, s []byte, escapeNewline bool) error {
 		_, err := w.Write(s)
 		return err
 	}
+	if bw, ok := w.(*bytes.Buffer); ok {
+		i := 0
+		for len(s)-i >= 8 {
+			if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				bw.Grow(len(s) + len(s)>>2 + 16)
+				bw.Write(appendEscapeXMLSlow(bw.AvailableBuffer(), s, i, escapeNewline))
+				return nil
+			}
+			i += 8
+		}
+		for i < len(s) {
+			c := s[i]
+			if c >= utf8.RuneSelf || xmlEscapeASCII[c] {
+				bw.Grow(len(s) + len(s)>>2 + 16)
+				bw.Write(appendEscapeXMLSlow(bw.AvailableBuffer(), s, i, escapeNewline))
+				return nil
+			}
+			i++
+		}
+		bw.Write(s)
+		return nil
+	}
 	i := 0
 	for len(s)-i >= 8 {
 		if m := xmlEscapeMask(byteorder.LEUint64(s[i:])); m != 0 {
