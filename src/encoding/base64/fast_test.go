@@ -1,0 +1,332 @@
+// Copyright 2026 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package base64_test
+
+import (
+	"bytes"
+	"crypto/sha256"
+	. "encoding/base64"
+	"errors"
+	"io"
+	"slices"
+	"strings"
+	"testing"
+)
+
+func refEncode(alphabet string, padRune rune, src []byte) []byte {
+	var out []byte
+	for i := 0; i < len(src); i += 3 {
+		rem := len(src) - i
+		var b0, b1, b2 uint
+		b0 = uint(src[i])
+		if rem > 1 {
+			b1 = uint(src[i+1])
+		}
+		if rem > 2 {
+			b2 = uint(src[i+2])
+		}
+		val := (b0 << 16) | (b1 << 8) | b2
+		out = append(out, alphabet[(val>>18)&0x3F])
+		out = append(out, alphabet[(val>>12)&0x3F])
+		if rem > 1 {
+			out = append(out, alphabet[(val>>6)&0x3F])
+		} else if padRune != NoPadding {
+			out = append(out, byte(padRune))
+		}
+		if rem > 2 {
+			out = append(out, alphabet[val&0x3F])
+		} else if padRune != NoPadding {
+			out = append(out, byte(padRune))
+		}
+	}
+	return out
+}
+
+func makeDeterministicBytes(n int, seed byte) []byte {
+	out := make([]byte, n)
+	h := sha256.Sum256([]byte{seed, byte(n), byte(n >> 8)})
+	for i := range out {
+		out[i] = h[i%len(h)] ^ byte(i*17+int(seed))
+	}
+	return out
+}
+
+func TestFastDifferentialAllLengthsAndEncodings(t *testing.T) {
+	customAlpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	customAlt := "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`"
+	cases := []struct {
+		name  string
+		enc   *Encoding
+		alpha string
+		pad   rune
+	}{
+		{"Std", StdEncoding, customAlpha, StdPadding},
+		{"URL", URLEncoding, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", StdPadding},
+		{"RawStd", RawStdEncoding, customAlpha, NoPadding},
+		{"RawURL", RawURLEncoding, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", NoPadding},
+		{"StdStrict", StdEncoding.Strict(), customAlpha, StdPadding},
+		{"URLStrict", URLEncoding.Strict(), "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", StdPadding},
+		{"CustomAlt", NewEncoding(customAlt).WithPadding('~'), customAlt, '~'},
+	}
+
+	lengths := make([]int, 0, 260)
+	for n := 0; n <= 160; n++ {
+		lengths = append(lengths, n)
+	}
+	lengths = append(lengths, 191, 192, 193, 255, 256, 257, 511, 512, 513, 768, 1024, 1535, 2048, 4096)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, n := range lengths {
+				src := makeDeterministicBytes(n, byte(len(tc.name)))
+				want := refEncode(tc.alpha, tc.pad, src)
+
+				// Encode
+				dst := make([]byte, tc.enc.EncodedLen(len(src)))
+				tc.enc.Encode(dst, src)
+				if !bytes.Equal(dst, want) {
+					t.Fatalf("len=%d Encode mismatch:\ngot  %q\nwant %q", n, dst, want)
+				}
+
+				// EncodeToString
+				if s := tc.enc.EncodeToString(src); s != string(want) {
+					t.Fatalf("len=%d EncodeToString mismatch", n)
+				}
+
+				// AppendEncode
+				app := tc.enc.AppendEncode([]byte("pre:"), src)
+				if !bytes.Equal(app[4:], want) || string(app[:4]) != "pre:" {
+					t.Fatalf("len=%d AppendEncode mismatch", n)
+				}
+
+				// Decode
+				dec := make([]byte, tc.enc.DecodedLen(len(want)))
+				dn, err := tc.enc.Decode(dec, want)
+				if err != nil {
+					t.Fatalf("len=%d Decode error: %v", n, err)
+				}
+				if !bytes.Equal(dec[:dn], src) {
+					t.Fatalf("len=%d Decode bytes mismatch", n)
+				}
+
+				// DecodeString
+				ds, err := tc.enc.DecodeString(string(want))
+				if err != nil {
+					t.Fatalf("len=%d DecodeString error: %v", n, err)
+				}
+				if !bytes.Equal(ds, src) {
+					t.Fatalf("len=%d DecodeString mismatch", n)
+				}
+
+				// AppendDecode
+				da, err := tc.enc.AppendDecode([]byte("ok:"), want)
+				if err != nil || string(da[:3]) != "ok:" || !bytes.Equal(da[3:], src) {
+					t.Fatalf("len=%d AppendDecode failed: err=%v", n, err)
+				}
+			}
+		})
+	}
+}
+
+func TestFastAlignmentAndInPlaceOverlap(t *testing.T) {
+	encodings := []*Encoding{StdEncoding, URLEncoding, RawStdEncoding, RawURLEncoding}
+	raw := makeDeterministicBytes(1024+64, 99)
+	for _, enc := range encodings {
+		for _, n := range []int{0, 1, 2, 3, 23, 24, 25, 47, 48, 49, 127, 128, 129, 513} {
+			for srcOff := 0; srcOff < 32; srcOff += 7 {
+				src := raw[srcOff : srcOff+n]
+				want := enc.EncodeToString(src)
+				for dstOff := 0; dstOff < 32; dstOff += 5 {
+					dstBuf := make([]byte, dstOff+enc.EncodedLen(n)+16)
+					copy(dstBuf[:dstOff], bytes.Repeat([]byte{0xAA}, dstOff))
+					copy(dstBuf[dstOff+enc.EncodedLen(n):], bytes.Repeat([]byte{0xBB}, 16))
+
+					enc.Encode(dstBuf[dstOff:], src)
+					if string(dstBuf[dstOff:dstOff+len(want)]) != want {
+						t.Fatalf("aligned Encode failed n=%d srcOff=%d dstOff=%d", n, srcOff, dstOff)
+					}
+					// Canary guards
+					if !bytes.Equal(dstBuf[:dstOff], bytes.Repeat([]byte{0xAA}, dstOff)) {
+						t.Fatalf("underflow clobbered prefix dstOff=%d", dstOff)
+					}
+					if !bytes.Equal(dstBuf[dstOff+enc.EncodedLen(n):], bytes.Repeat([]byte{0xBB}, 16)) {
+						t.Fatalf("overflow clobbered suffix n=%d", n)
+					}
+				}
+
+				// Overlapping in-place Decode(buf, buf)
+				buf := make([]byte, len(want)+32)
+				copy(buf, want)
+				dn, err := enc.Decode(buf, buf[:len(want)])
+				if err != nil {
+					t.Fatalf("in-place Decode n=%d err=%v", n, err)
+				}
+				if !bytes.Equal(buf[:dn], src) {
+					t.Fatalf("in-place Decode n=%d mismatch", n)
+				}
+			}
+		}
+	}
+}
+
+func TestFastSIMDCorruptAndBoundarySecurity(t *testing.T) {
+	// Include sizes touching AVX2 32->24, tail 24..31, 16..23, and scalar tails.
+	sizes := []int{1, 2, 3, 16, 23, 24, 31, 32, 33, 47, 48, 49, 64, 95, 96, 97, 256}
+	badBytes := []byte{0x00, 0x09, 0x1f, ' ', '!', ',', '.', '=', 0x7f, 0x80, 0xff}
+	stdAlpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	urlAlpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	encs := []struct {
+		enc    *Encoding
+		oracle *Encoding
+	}{
+		{StdEncoding, NewEncoding(stdAlpha)},
+		{URLEncoding, NewEncoding(urlAlpha)},
+		{RawStdEncoding, NewEncoding(stdAlpha).WithPadding(NoPadding)},
+		{RawURLEncoding, NewEncoding(urlAlpha).WithPadding(NoPadding)},
+	}
+
+	for _, pair := range encs {
+		enc, oracle := pair.enc, pair.oracle
+		for _, n := range sizes {
+			src := makeDeterministicBytes(n, 7)
+			encoded := []byte(enc.EncodeToString(src))
+
+			// Inject newlines at various positions: valid base64 must ignore \r and \n.
+			var wrapped []byte
+			for i, b := range encoded {
+				if i == 15 || i == 31 || i == 32 || i == 63 || i == 76 {
+					wrapped = append(wrapped, '\r', '\n')
+				}
+				wrapped = append(wrapped, b)
+			}
+			wrapped = append(wrapped, '\n')
+			dst := make([]byte, enc.DecodedLen(len(wrapped)))
+			dn, err := enc.Decode(dst, wrapped)
+			if err != nil || !bytes.Equal(dst[:dn], src) {
+				t.Fatalf("wrapped decode n=%d err=%v mismatch=%v", n, err, !bytes.Equal(dst[:dn], src))
+			}
+
+			// Streaming NewDecoder test across 32-byte boundaries
+			decBytes, err := io.ReadAll(NewDecoder(enc, bytes.NewReader(wrapped)))
+			if err != nil || !bytes.Equal(decBytes, src) {
+				t.Fatalf("NewDecoder wrapped n=%d err=%v", n, err)
+			}
+
+			// Corrupt byte differential checks against scalar NewEncoding oracle
+			for _, pos := range []int{0, 1, 7, 15, 23, 31, 32, len(encoded) - 1} {
+				if pos < 0 || pos >= len(encoded) {
+					continue
+				}
+				for _, bad := range badBytes {
+					corrupt := slices.Clone(encoded)
+					corrupt[pos] = bad
+					out := make([]byte, enc.DecodedLen(len(corrupt)))
+					wantOut := make([]byte, oracle.DecodedLen(len(corrupt)))
+					gotN, gotErr := enc.Decode(out, corrupt)
+					wantN, wantErr := oracle.Decode(wantOut, corrupt)
+					if !errors.Is(gotErr, wantErr) || (gotErr != nil && wantErr != nil && gotErr.Error() != wantErr.Error()) {
+						t.Fatalf("n=%d pos=%d bad=%#x err mismatch: got (%d, %v), want (%d, %v)", n, pos, bad, gotN, gotErr, wantN, wantErr)
+					}
+					if gotN != wantN || !bytes.Equal(out[:gotN], wantOut[:wantN]) {
+						t.Fatalf("n=%d pos=%d bad=%#x partial decoded mismatch: got %d, want %d", n, pos, bad, gotN, wantN)
+					}
+				}
+			}
+		}
+	}
+
+	// Cross-encoding rejection ('+' / '/' invalid in URL, '-' / '_' invalid in Std)
+	urlData := makeDeterministicBytes(192, 42)
+	stdStr := StdEncoding.EncodeToString(urlData)
+	if strings.ContainsAny(stdStr, "+/") {
+		if _, err := URLEncoding.DecodeString(stdStr); err == nil {
+			t.Fatal("URLEncoding accepted '+' or '/'")
+		}
+	}
+	urlStr := URLEncoding.EncodeToString(urlData)
+	if strings.ContainsAny(urlStr, "-_") {
+		if _, err := StdEncoding.DecodeString(urlStr); err == nil {
+			t.Fatal("StdEncoding accepted '-' or '_'")
+		}
+	}
+
+	// Strict non-zero padding bits
+	_, err := StdEncoding.Strict().DecodeString("AB==") // low 4 bits of 'B' (index 1) are non-zero
+	if err == nil {
+		t.Fatal("Strict failed to reject non-zero trailing pad bits")
+	}
+}
+
+func BenchmarkFastSuite(b *testing.B) {
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"16B", 16},
+		{"256B", 256},
+		{"4KB", 4096},
+		{"32KB", 32768},
+	}
+	for _, sz := range sizes {
+		src := makeDeterministicBytes(sz.size, 3)
+		encDst := make([]byte, StdEncoding.EncodedLen(len(src)))
+		StdEncoding.Encode(encDst, src)
+		decDst := make([]byte, StdEncoding.DecodedLen(len(encDst)))
+		encStr := string(encDst)
+
+		b.Run("Encode/"+sz.name, func(b *testing.B) {
+			b.SetBytes(int64(len(src)))
+			b.ReportAllocs()
+			for b.Loop() {
+				StdEncoding.Encode(encDst, src)
+			}
+		})
+		b.Run("EncodeToString/"+sz.name, func(b *testing.B) {
+			b.SetBytes(int64(len(src)))
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = StdEncoding.EncodeToString(src)
+			}
+		})
+		b.Run("AppendEncode/"+sz.name, func(b *testing.B) {
+			buf := make([]byte, 0, len(encDst))
+			b.SetBytes(int64(len(src)))
+			b.ReportAllocs()
+			for b.Loop() {
+				buf = StdEncoding.AppendEncode(buf[:0], src)
+			}
+		})
+		b.Run("Decode/"+sz.name, func(b *testing.B) {
+			b.SetBytes(int64(len(encDst)))
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := StdEncoding.Decode(decDst, encDst); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run("DecodeString/"+sz.name, func(b *testing.B) {
+			b.SetBytes(int64(len(encDst)))
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := StdEncoding.DecodeString(encStr); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run("AppendDecode/"+sz.name, func(b *testing.B) {
+			buf := make([]byte, 0, len(src))
+			b.SetBytes(int64(len(encDst)))
+			b.ReportAllocs()
+			for b.Loop() {
+				var err error
+				buf, err = StdEncoding.AppendDecode(buf[:0], encDst)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -6,16 +6,31 @@
 package base64
 
 import (
+	"internal/bytealg"
 	"internal/byteorder"
 	"io"
 	"math"
 	"slices"
 	"strconv"
+	"unsafe"
 )
 
 /*
  * Encodings
  */
+
+type encodingKind uint8
+
+const (
+	encCustom encodingKind = iota
+	encStd
+	encURL
+)
+
+const (
+	stdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 
 // An Encoding is a radix 64 encoding/decoding scheme, defined by a
 // 64-character alphabet. The most common encoding is the "base64"
@@ -27,6 +42,7 @@ type Encoding struct {
 	decodeMap [256]uint8 // mapping of symbol byte value to symbol index
 	padChar   rune
 	strict    bool
+	kind      encodingKind
 }
 
 const (
@@ -87,6 +103,12 @@ func NewEncoding(encoder string) *Encoding {
 	return e
 }
 
+func newEncodingKind(encoder string, kind encodingKind) *Encoding {
+	e := NewEncoding(encoder)
+	e.kind = kind
+	return e
+}
+
 // WithPadding creates a new encoding identical to enc except
 // with a specified padding character, or [NoPadding] to disable padding.
 // The padding character must not be '\r' or '\n',
@@ -117,11 +139,11 @@ func (enc Encoding) Strict() *Encoding {
 }
 
 // StdEncoding is the standard base64 encoding, as defined in RFC 4648.
-var StdEncoding = NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+var StdEncoding = newEncodingKind(stdAlphabet, encStd)
 
 // URLEncoding is the alternate base64 encoding defined in RFC 4648.
 // It is typically used in URLs and file names.
-var URLEncoding = NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+var URLEncoding = newEncodingKind(urlAlphabet, encURL)
 
 // RawStdEncoding is the standard raw, unpadded base64 encoding,
 // as defined in RFC 4648 section 3.2.
@@ -155,6 +177,28 @@ func (enc *Encoding) Encode(dst, src []byte) {
 	// The following optimization avoids the need to recompute the capacities
 	// when generating code for src[3:] and dst[4:].
 	src, dst = src[:len(src):len(src)], dst[:len(dst):len(dst)]
+
+	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDEncode && len(dst) >= minSIMDEncode {
+		si, di := encodeSIMD(dst, src, enc.kind)
+		src = src[si:]
+		dst = dst[di:]
+	}
+
+	for len(src) >= 8 {
+		v := byteorder.BEUint64(src)
+		_ = dst[7]
+		out := uint64(enc.encode[v>>58]) |
+			uint64(enc.encode[(v>>52)&0x3F])<<8 |
+			uint64(enc.encode[(v>>46)&0x3F])<<16 |
+			uint64(enc.encode[(v>>40)&0x3F])<<24 |
+			uint64(enc.encode[(v>>34)&0x3F])<<32 |
+			uint64(enc.encode[(v>>28)&0x3F])<<40 |
+			uint64(enc.encode[(v>>22)&0x3F])<<48 |
+			uint64(enc.encode[(v>>16)&0x3F])<<56
+		byteorder.LEPutUint64(dst, out)
+		src = src[6:]
+		dst = dst[8:]
+	}
 
 	for len(src) >= 3 {
 		// Convert 3x 8bit source bytes into 4 bytes
@@ -214,7 +258,7 @@ func (enc *Encoding) EncodeToString(src []byte) string {
 func (enc *Encoding) encodeBuf(buf, src []byte) []byte {
 	n := enc.EncodedLen(len(src))
 	if n > len(buf) {
-		buf = make([]byte, n)
+		buf = bytealg.MakeNoZero(n)
 	}
 	enc.Encode(buf[:n], src)
 	return buf[:n]
@@ -447,7 +491,7 @@ func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
 // [CorruptInputError]. New line characters (\r and \n) are ignored.
 func (enc *Encoding) DecodeString(s string) ([]byte, error) {
 	dbuf := make([]byte, enc.DecodedLen(len(s)))
-	n, err := enc.Decode(dbuf, []byte(s))
+	n, err := enc.Decode(dbuf, unsafe.Slice(unsafe.StringData(s), len(s)))
 	return dbuf[:n], err
 }
 
@@ -571,6 +615,13 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 	_ = enc.decodeMap
 
 	si := 0
+	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDDecode && len(dst) >= 24 {
+		si, n, err = enc.decodeSIMDLoop(dst, src)
+		if err != nil || si == len(src) {
+			return n, err
+		}
+	}
+
 	for strconv.IntSize >= 64 && len(src)-si >= 8 && len(dst)-n >= 8 {
 		src2 := src[si : si+8]
 		if dn, ok := assemble64(
@@ -626,6 +677,80 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 		}
 	}
 	return n, err
+}
+
+func (enc *Encoding) decodeSIMDLoop(dst, src []byte) (si, n int, err error) {
+	for len(src)-si >= minSIMDDecode && len(dst)-n >= 24 {
+		si, n = decodeSIMD(dst, src, si, n, enc.kind)
+		if si == len(src) {
+			break
+		}
+		for len(src)-si >= 8 && len(dst)-n >= 6 {
+			src2 := src[si : si+8]
+			if dn, ok := assemble64(
+				enc.decodeMap[src2[0]],
+				enc.decodeMap[src2[1]],
+				enc.decodeMap[src2[2]],
+				enc.decodeMap[src2[3]],
+				enc.decodeMap[src2[4]],
+				enc.decodeMap[src2[5]],
+				enc.decodeMap[src2[6]],
+				enc.decodeMap[src2[7]],
+			); ok {
+				if len(dst)-n >= 8 {
+					byteorder.BEPutUint64(dst[n:], dn)
+				} else {
+					byteorder.BEPutUint32(dst[n:], uint32(dn>>32))
+					byteorder.BEPutUint16(dst[n+4:], uint16(dn>>16))
+				}
+				n += 6
+				si += 8
+			} else {
+				var ninc int
+				si, ninc, err = enc.decodeQuantum(dst[n:], src, si)
+				n += ninc
+				if err != nil {
+					return si, n, err
+				}
+				break
+			}
+		}
+		if len(src)-si >= minSIMDDecode && len(dst)-n >= 24 {
+			continue
+		}
+		for len(src)-si >= 4 && len(dst)-n >= 3 {
+			src2 := src[si : si+4]
+			if dn, ok := assemble32(
+				enc.decodeMap[src2[0]],
+				enc.decodeMap[src2[1]],
+				enc.decodeMap[src2[2]],
+				enc.decodeMap[src2[3]],
+			); ok {
+				if len(dst)-n >= 4 {
+					byteorder.BEPutUint32(dst[n:], dn)
+				} else {
+					dst[n] = byte(dn >> 24)
+					dst[n+1] = byte(dn >> 16)
+					dst[n+2] = byte(dn >> 8)
+				}
+				n += 3
+				si += 4
+			} else {
+				var ninc int
+				si, ninc, err = enc.decodeQuantum(dst[n:], src, si)
+				n += ninc
+				if err != nil {
+					return si, n, err
+				}
+				break
+			}
+		}
+		if len(src)-si >= minSIMDDecode && len(dst)-n >= 24 {
+			continue
+		}
+		break
+	}
+	return si, n, nil
 }
 
 // assemble32 assembles 4 base64 digits into 3 bytes.
@@ -684,8 +809,14 @@ func (r *newlineFilteringReader) Read(p []byte) (int, error) {
 // stripNewlines removes newline characters from p in place
 // and returns the number of bytes that remain.
 func stripNewlines(p []byte) int {
-	n := 0 // bytes kept
 	i := 0
+	for ; len(p)-i >= 8; i += 8 {
+		x := byteorder.LEUint64(p[i:])
+		if mayHaveNewline(x) {
+			break
+		}
+	}
+	n := i
 	for ; len(p)-i >= 8; i += 8 {
 		x := byteorder.LEUint64(p[i:])
 		if mayHaveNewline(x) {
@@ -694,6 +825,16 @@ func stripNewlines(p []byte) int {
 		}
 		byteorder.LEPutUint64(p[n:], x)
 		n += 8
+	}
+	if n == i {
+		for ; i < len(p); i++ {
+			b := p[i]
+			if b == '\r' || b == '\n' {
+				return n + dropNewlines(p[n:], p[i:])
+			}
+			n++
+		}
+		return n
 	}
 	return n + dropNewlines(p[n:], p[i:])
 }
