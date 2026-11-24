@@ -155,6 +155,31 @@ var RawStdEncoding = StdEncoding.WithPadding(NoPadding)
 // This is the same as [URLEncoding] but omits padding characters.
 var RawURLEncoding = URLEncoding.WithPadding(NoPadding)
 
+const decLUT4Invalid = uint32(0x80000000)
+
+var (
+	stdDecLUT4 = buildDecLUT4(stdAlphabet)
+	urlDecLUT4 = buildDecLUT4(urlAlphabet)
+)
+
+func buildDecLUT4(alphabet string) [4][256]uint32 {
+	var lut [4][256]uint32
+	for j := range 4 {
+		for i := range 256 {
+			lut[j][i] = decLUT4Invalid
+		}
+	}
+	for i := range 64 {
+		d := uint32(i)
+		c := alphabet[i]
+		lut[0][c] = d << 2
+		lut[1][c] = (d >> 4) | ((d & 0xF) << 12)
+		lut[2][c] = ((d >> 2) << 8) | ((d & 0x3) << 22)
+		lut[3][c] = d << 16
+	}
+	return lut
+}
+
 /*
  * Encoder
  */
@@ -658,11 +683,88 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 	_ = enc.decodeMap
 
 	si := 0
-	if len(src) >= minSIMDDecode && haveSIMD && enc.kind != encCustom && len(dst) >= minSIMDDecodeOut {
-		si, n, err = enc.decodeSIMDLoop(dst, src)
-		if err != nil || si == len(src) {
-			return n, err
+	if enc.kind != encCustom {
+		if len(src) >= minSIMDDecode && haveSIMD && len(dst) >= minSIMDDecodeOut {
+			si, n, err = enc.decodeSIMDLoop(dst, src)
+			if err != nil || si == len(src) {
+				return n, err
+			}
 		}
+		lut := &stdDecLUT4
+		if enc.kind == encURL {
+			lut = &urlDecLUT4
+		}
+		t0, t1, t2, t3 := &lut[0], &lut[1], &lut[2], &lut[3]
+		for strconv.IntSize >= 64 && len(src)-si >= 8 && len(dst)-n >= 8 {
+			s2 := src[si : si+8]
+			_ = s2[7]
+			v0 := t0[s2[0]] | t1[s2[1]] | t2[s2[2]] | t3[s2[3]]
+			v1 := t0[s2[4]] | t1[s2[5]] | t2[s2[6]] | t3[s2[7]]
+			if (v0|v1)&decLUT4Invalid == 0 {
+				byteorder.LEPutUint64(dst[n:], uint64(v0)|uint64(v1)<<24)
+				n += 6
+				si += 8
+			} else {
+				var ninc int
+				si, ninc, err = enc.decodeQuantum(dst[n:], src, si)
+				n += ninc
+				if err != nil {
+					return n, err
+				}
+			}
+		}
+		if strconv.IntSize >= 64 && len(src)-si >= 8 && len(dst)-n >= 6 {
+			s2 := src[si : si+8]
+			_ = s2[7]
+			v0 := t0[s2[0]] | t1[s2[1]] | t2[s2[2]] | t3[s2[3]]
+			v1 := t0[s2[4]] | t1[s2[5]] | t2[s2[6]] | t3[s2[7]]
+			if (v0|v1)&decLUT4Invalid == 0 {
+				w := uint64(v0) | uint64(v1)<<24
+				byteorder.LEPutUint32(dst[n:], uint32(w))
+				byteorder.LEPutUint16(dst[n+4:], uint16(w>>32))
+				n += 6
+				si += 8
+			}
+		}
+		for len(src)-si >= 4 && len(dst)-n >= 4 {
+			s2 := src[si : si+4]
+			_ = s2[3]
+			v := t0[s2[0]] | t1[s2[1]] | t2[s2[2]] | t3[s2[3]]
+			if v&decLUT4Invalid == 0 {
+				byteorder.LEPutUint32(dst[n:], v)
+				n += 3
+				si += 4
+			} else {
+				var ninc int
+				si, ninc, err = enc.decodeQuantum(dst[n:], src, si)
+				n += ninc
+				if err != nil {
+					return n, err
+				}
+			}
+		}
+		if len(src)-si >= 4 && len(dst)-n >= 3 {
+			s2 := src[si : si+4]
+			_ = s2[3]
+			v := t0[s2[0]] | t1[s2[1]] | t2[s2[2]] | t3[s2[3]]
+			if v&decLUT4Invalid == 0 {
+				_ = dst[n+2]
+				dst[n] = byte(v)
+				dst[n+1] = byte(v >> 8)
+				dst[n+2] = byte(v >> 16)
+				n += 3
+				si += 4
+			}
+		}
+		for si < len(src) {
+			var ninc int
+			si, ninc, err = enc.decodeQuantum(dst[n:], src, si)
+			n += ninc
+			if err != nil {
+				return n, err
+			}
+		}
+		return n, err
 	}
 
 	for strconv.IntSize >= 64 && len(src)-si >= 8 && len(dst)-n >= 8 {
@@ -742,28 +844,28 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 }
 
 func (enc *Encoding) decodeSIMDLoop(dst, src []byte) (si, n int, err error) {
+	lut := &stdDecLUT4
+	if enc.kind == encURL {
+		lut = &urlDecLUT4
+	}
+	t0, t1, t2, t3 := &lut[0], &lut[1], &lut[2], &lut[3]
 	for len(src)-si >= minSIMDDecode && len(dst)-n >= minSIMDDecodeOut {
 		si, n = decodeSIMD(dst, src, si, n, enc.kind)
 		if si == len(src) {
 			break
 		}
 		for len(src)-si >= 8 && len(dst)-n >= 6 {
-			src2 := src[si : si+8]
-			if dn, ok := assemble64(
-				enc.decodeMap[src2[0]],
-				enc.decodeMap[src2[1]],
-				enc.decodeMap[src2[2]],
-				enc.decodeMap[src2[3]],
-				enc.decodeMap[src2[4]],
-				enc.decodeMap[src2[5]],
-				enc.decodeMap[src2[6]],
-				enc.decodeMap[src2[7]],
-			); ok {
+			s2 := src[si : si+8]
+			_ = s2[7]
+			v0 := t0[s2[0]] | t1[s2[1]] | t2[s2[2]] | t3[s2[3]]
+			v1 := t0[s2[4]] | t1[s2[5]] | t2[s2[6]] | t3[s2[7]]
+			if (v0|v1)&decLUT4Invalid == 0 {
+				w := uint64(v0) | uint64(v1)<<24
 				if len(dst)-n >= 8 {
-					byteorder.BEPutUint64(dst[n:], dn)
+					byteorder.LEPutUint64(dst[n:], w)
 				} else {
-					byteorder.BEPutUint32(dst[n:], uint32(dn>>32))
-					byteorder.BEPutUint16(dst[n+4:], uint16(dn>>16))
+					byteorder.LEPutUint32(dst[n:], uint32(w))
+					byteorder.LEPutUint16(dst[n+4:], uint16(w>>32))
 				}
 				n += 6
 				si += 8
@@ -784,19 +886,17 @@ func (enc *Encoding) decodeSIMDLoop(dst, src []byte) (si, n int, err error) {
 			continue
 		}
 		for len(src)-si >= 4 && len(dst)-n >= 3 {
-			src2 := src[si : si+4]
-			if dn, ok := assemble32(
-				enc.decodeMap[src2[0]],
-				enc.decodeMap[src2[1]],
-				enc.decodeMap[src2[2]],
-				enc.decodeMap[src2[3]],
-			); ok {
+			s2 := src[si : si+4]
+			_ = s2[3]
+			v := t0[s2[0]] | t1[s2[1]] | t2[s2[2]] | t3[s2[3]]
+			if v&decLUT4Invalid == 0 {
 				if len(dst)-n >= 4 {
-					byteorder.BEPutUint32(dst[n:], dn)
+					byteorder.LEPutUint32(dst[n:], v)
 				} else {
-					dst[n] = byte(dn >> 24)
-					dst[n+1] = byte(dn >> 16)
-					dst[n+2] = byte(dn >> 8)
+					_ = dst[n+2]
+					dst[n] = byte(v)
+					dst[n+1] = byte(v >> 8)
+					dst[n+2] = byte(v >> 16)
 				}
 				n += 3
 				si += 4

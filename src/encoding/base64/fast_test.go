@@ -559,3 +559,135 @@ func TestFastDecoderLargeAndSmallReads(t *testing.T) {
 		}
 	}
 }
+
+func TestFastBoundaryAndLUT4(t *testing.T) {
+	// Custom Encodings fall back to generic scalar assemble32/assemble64/decodeQuantum,
+	// serving as an oracle for standard/URL SIMD and LUT4 paths across boundary sizes.
+	stdOracle := NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+	rawStdOracle := stdOracle.WithPadding(NoPadding)
+	urlOracle := NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+	rawURLOracle := urlOracle.WithPadding(NoPadding)
+
+	cases := []struct {
+		name   string
+		enc    *Encoding
+		oracle *Encoding
+	}{
+		{"Std", StdEncoding, stdOracle},
+		{"RawStd", RawStdEncoding, rawStdOracle},
+		{"URL", URLEncoding, urlOracle},
+		{"RawURL", RawURLEncoding, rawURLOracle},
+	}
+
+	for _, tc := range cases {
+		for size := 0; size <= 100; size++ {
+			raw := make([]byte, size)
+			for i := range raw {
+				raw[i] = byte(i*41 + 17)
+			}
+			encoded := tc.enc.EncodeToString(raw)
+			wantEncoded := tc.oracle.EncodeToString(raw)
+			if encoded != wantEncoded {
+				t.Fatalf("%s EncodeToString size=%d mismatch", tc.name, size)
+			}
+
+			// Exact-sized dst buffer (len(dst) == len(raw), which can be smaller than DecodedLen).
+			exactDst := make([]byte, len(raw))
+			n, err := tc.enc.Decode(exactDst, []byte(encoded))
+			if err != nil || n != len(raw) || !bytes.Equal(exactDst[:n], raw) {
+				t.Fatalf("%s Decode(exact dst) size=%d got (%d, %v)", tc.name, size, n, err)
+			}
+
+			// AppendEncode / AppendDecode roundtrip.
+			appEnc := tc.enc.AppendEncode([]byte("prefix:"), raw)
+			if string(appEnc) != "prefix:"+wantEncoded {
+				t.Fatalf("%s AppendEncode size=%d mismatch", tc.name, size)
+			}
+			appDec, err := tc.enc.AppendDecode([]byte("p:"), []byte(encoded))
+			if err != nil || !bytes.Equal(appDec[2:], raw) {
+				t.Fatalf("%s AppendDecode size=%d got err=%v", tc.name, size, err)
+			}
+		}
+
+		// Verify exact CorruptInputError offset for every position across boundary sizes (12..72).
+		for _, size := range []int{12, 16, 24, 28, 32, 48, 64, 72} {
+			raw := make([]byte, size)
+			for i := range raw {
+				raw[i] = byte(i*13 + 5)
+			}
+			encBytes := []byte(tc.enc.EncodeToString(raw))
+			for pos := range encBytes {
+				if encBytes[pos] == '=' {
+					continue
+				}
+				bad := slices.Clone(encBytes)
+				bad[pos] = '@'
+				gotDst := make([]byte, tc.enc.DecodedLen(len(bad)))
+				wantDst := make([]byte, tc.oracle.DecodedLen(len(bad)))
+				_, gotErr := tc.enc.Decode(gotDst, bad)
+				_, wantErr := tc.oracle.Decode(wantDst, bad)
+				if !errors.Is(gotErr, wantErr) || (gotErr == nil) != (wantErr == nil) ||
+					(gotErr != nil && gotErr.Error() != wantErr.Error()) {
+					t.Fatalf("%s size=%d pos=%d err mismatch: got %v, want %v", tc.name, size, pos, gotErr, wantErr)
+				}
+			}
+		}
+	}
+}
+
+func TestFastDecoderCorruptOffsetWrapped(t *testing.T) {
+	oracle := NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+	raw := make([]byte, 12000)
+	for i := range raw {
+		raw[i] = byte(i*73 + 9)
+	}
+	clean := StdEncoding.EncodeToString(raw)
+	var b strings.Builder
+	for i := 0; i < len(clean); i += 64 {
+		end := min(i+64, len(clean))
+		b.WriteString(clean[i:end])
+		b.WriteString("\r\n")
+	}
+	wrapped := []byte(b.String())
+
+	for _, corruptPos := range []int{5, 19, 100, 1025, 8200, len(wrapped) - 10} {
+		if wrapped[corruptPos] == '\r' || wrapped[corruptPos] == '\n' || wrapped[corruptPos] == '=' {
+			continue
+		}
+		bad := slices.Clone(wrapped)
+		bad[corruptPos] = '!'
+		got, gotErr := io.ReadAll(NewDecoder(StdEncoding, bytes.NewReader(bad)))
+		want, wantErr := io.ReadAll(NewDecoder(oracle, bytes.NewReader(bad)))
+		if gotErr == nil || wantErr == nil || gotErr.Error() != wantErr.Error() {
+			t.Fatalf("pos=%d err mismatch: got (%v), want (%v)", corruptPos, gotErr, wantErr)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("pos=%d partial decoded mismatch: got len %d, want len %d", corruptPos, len(got), len(want))
+		}
+	}
+}
+
+func TestFastStripNewlinesRuns(t *testing.T) {
+	raw := make([]byte, 300)
+	for i := range raw {
+		raw[i] = byte(i ^ 0x5a)
+	}
+	clean := StdEncoding.EncodeToString(raw)
+	for _, nl := range []string{"\n", "\r", "\r\n", "\n\n\r\r\n", strings.Repeat("\r\n", 20)} {
+		var sb strings.Builder
+		for i := 0; i < len(clean); i += 13 {
+			end := min(i+13, len(clean))
+			sb.WriteString(clean[i:end])
+			sb.WriteString(nl)
+		}
+		s := sb.String()
+		got, err := StdEncoding.DecodeString(s)
+		if err != nil {
+			t.Fatalf("DecodeString with nl len=%d failed: %v", len(nl), err)
+		}
+		if !bytes.Equal(got, raw) {
+			t.Fatalf("DecodeString with nl len=%d mismatch", len(nl))
+		}
+	}
+}
+
