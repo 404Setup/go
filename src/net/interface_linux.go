@@ -36,7 +36,7 @@ loop:
 				if err != nil {
 					return nil, os.NewSyscallError("parsenetlinkrouteattr", err)
 				}
-				ift = append(ift, *newLink(ifim, attrs))
+				ift = append(ift, newLink(ifim, attrs))
 				if ifindex == int(ifim.Index) {
 					break loop
 				}
@@ -56,8 +56,8 @@ const (
 	sysARPHardwareGREIPv6  = 823 // any over GRE over IPv6 tunneling
 )
 
-func newLink(ifim *syscall.IfInfomsg, attrs []syscall.NetlinkRouteAttr) *Interface {
-	ifi := &Interface{Index: int(ifim.Index), Flags: linkFlags(ifim.Flags)}
+func newLink(ifim *syscall.IfInfomsg, attrs []syscall.NetlinkRouteAttr) Interface {
+	ifi := Interface{Index: int(ifim.Index), Flags: linkFlags(ifim.Flags)}
 	for _, a := range attrs {
 		switch a.Attr.Type {
 		case syscall.IFLA_ADDRESS:

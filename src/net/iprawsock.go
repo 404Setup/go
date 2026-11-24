@@ -51,6 +51,16 @@ func (a *IPAddr) String() string {
 	if a == nil {
 		return "<nil>"
 	}
+	if a.Zone != "" && len(a.Zone) <= 48 && (len(a.IP) == 0 || len(a.IP) == IPv4len || len(a.IP) == IPv6len) {
+		var buf [96]byte
+		b := buf[:0]
+		if len(a.IP) != 0 {
+			b = a.IP.appendTo(b)
+		}
+		b = append(b, '%')
+		b = append(b, a.Zone...)
+		return string(b)
+	}
 	ip := ipEmptyString(a.IP)
 	if a.Zone != "" {
 		return ip + "%" + a.Zone
@@ -227,7 +237,7 @@ func dialIP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *I
 	if raddr == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
-	sd := &sysDialer{network: network, address: raddr.String()}
+	sd := &sysDialer{network: network}
 	if dialer != nil {
 		sd.Dialer = *dialer
 	}
@@ -249,7 +259,7 @@ func ListenIP(network string, laddr *IPAddr) (*IPConn, error) {
 	if laddr == nil {
 		laddr = &IPAddr{}
 	}
-	sl := &sysListener{network: network, address: laddr.String()}
+	sl := &sysListener{network: network}
 	c, err := sl.listenIP(context.Background(), laddr)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: err}

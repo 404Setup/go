@@ -56,11 +56,17 @@ type dnsCacheKey struct {
 	qtype dnsmessage.Type
 }
 
+type cachedAddr struct {
+	addr netip.Addr
+	str  string
+}
+
 type dnsCacheEntry struct {
 	p          dnsmessage.Parser
 	server     string
 	cfg        *dnsConfig
-	ips        []IP
+	addrs      []cachedAddr
+	txts       []string
 	cname      dnsmessage.Name
 	expireAt   int64
 	isNotFound bool
@@ -82,9 +88,18 @@ type srcAddrCacheEntry struct {
 }
 
 var (
-	srcAddrCache     syncv2.Map[netip.Addr, srcAddrCacheEntry]
-	srcAddrCacheSize atomic.Int64
+	srcAddrCache         syncv2.Map[netip.Addr, srcAddrCacheEntry]
+	srcAddrCacheSize     atomic.Int64
+	srcAddrCacheClearing atomic.Bool
 )
+
+func clearSrcAddrCache() {
+	if srcAddrCacheClearing.CompareAndSwap(false, true) {
+		srcAddrCache.Clear()
+		srcAddrCacheSize.Store(0)
+		srcAddrCacheClearing.Store(false)
+	}
+}
 
 func lookupSrcAddrCache(dst netip.Addr, now int64) (netip.Addr, bool) {
 	entry, ok := srcAddrCache.Load(dst)
@@ -107,8 +122,7 @@ func storeSrcAddrCache(dst, src netip.Addr, now int64) {
 	}
 	if _, loaded := srcAddrCache.Swap(dst, entry); !loaded {
 		if srcAddrCacheSize.Add(1) > maxDNSCacheEntries {
-			srcAddrCache.Clear()
-			srcAddrCacheSize.Store(0)
+			clearSrcAddrCache()
 		}
 	}
 }
@@ -138,16 +152,22 @@ func (c *dnsCache) checkConfig(cfg *dnsConfig) {
 func (c *dnsCache) clear() {
 	c.entries.Clear()
 	c.size.Store(0)
-	srcAddrCache.Clear()
-	srcAddrCacheSize.Store(0)
+	clearSrcAddrCache()
 }
 
 func (c *dnsCache) getEntry(cfg *dnsConfig, name string, qtype dnsmessage.Type) (*dnsCacheEntry, error, bool) {
 	if !dnsCacheEnabled() {
 		return nil, nil, false
 	}
+	return c.getEntryLower(cfg, name, lowerASCIIName(name), qtype)
+}
+
+func (c *dnsCache) getEntryLower(cfg *dnsConfig, name, lname string, qtype dnsmessage.Type) (*dnsCacheEntry, error, bool) {
+	if !dnsCacheEnabled() {
+		return nil, nil, false
+	}
 	c.checkConfig(cfg)
-	key := dnsCacheKey{name: lowerASCIIName(name), qtype: qtype}
+	key := dnsCacheKey{name: lname, qtype: qtype}
 	entry, ok := c.entries.Load(key)
 	if !ok {
 		return nil, nil, false
@@ -186,10 +206,17 @@ func (c *dnsCache) putPositive(cfg *dnsConfig, name string, qtype dnsmessage.Typ
 	if !ok || ttl <= 0 {
 		return
 	}
-	var ips []IP
+	var addrs []cachedAddr
+	var txts []string
 	var cname dnsmessage.Name
-	if qtype == dnsmessage.TypeA || qtype == dnsmessage.TypeAAAA || qtype == dnsmessage.TypeCNAME {
-		ips, cname, ok = extractCachedAddrs(answerParser)
+	switch qtype {
+	case dnsmessage.TypeA, dnsmessage.TypeAAAA, dnsmessage.TypeCNAME:
+		addrs, cname, ok = extractCachedAddrs(answerParser)
+		if !ok {
+			return
+		}
+	case dnsmessage.TypeTXT:
+		txts, ok = extractCachedTXTs(answerParser)
 		if !ok {
 			return
 		}
@@ -200,7 +227,8 @@ func (c *dnsCache) putPositive(cfg *dnsConfig, name string, qtype dnsmessage.Typ
 		p:        answerParser,
 		server:   server,
 		cfg:      cfg,
-		ips:      ips,
+		addrs:    addrs,
+		txts:     txts,
 		cname:    cname,
 		expireAt: now + int64(ttl),
 	}
@@ -236,7 +264,7 @@ func (c *dnsCache) putNegativeExpireAt(cfg *dnsConfig, name string, qtype dnsmes
 	}
 	c.checkConfig(cfg)
 	key := dnsCacheKey{name: lowerASCIIName(name), qtype: qtype}
-	if existing, ok := c.entries.Load(key); ok && now < existing.expireAt {
+	if existing, ok := c.entries.Load(key); ok && now < existing.expireAt && (cfg == nil || existing.cfg == nil || existing.cfg == cfg) {
 		return
 	}
 	entry := &dnsCacheEntry{
@@ -294,6 +322,9 @@ func (c *dnsCache) positiveEntryExpireAt(cfg *dnsConfig, name string, qtype dnsm
 }
 
 func (c *dnsCache) store(key dnsCacheKey, entry *dnsCacheEntry, now int64) {
+	if c.lastSweep.Load() == 0 {
+		c.lastSweep.CompareAndSwap(0, now)
+	}
 	_, loaded := c.entries.Swap(key, entry)
 	var count int64
 	if !loaded {
@@ -336,9 +367,11 @@ func (c *dnsCache) maybeSweep(now int64) {
 		}
 	}
 
-	c.size.Store(live)
 	if evicted > 0 {
-		c.entries.Shrink()
+		c.size.Add(-evicted)
+		if live == 0 || evicted >= maxDNSCacheEntries/4 {
+			c.entries.Shrink()
+		}
 	}
 }
 
@@ -382,12 +415,12 @@ func extractAnswerMinTTL(p dnsmessage.Parser, qtype dnsmessage.Type) (time.Durat
 
 // extractCachedAddrs pre-parses A, AAAA, and CNAME records from p so that
 // cache hits in goLookupIPCNAME avoid repeating wire-format unmarshaling and
-// per-IP slice allocations.
-func extractCachedAddrs(p dnsmessage.Parser) (ips []IP, cname dnsmessage.Name, ok bool) {
+// caller-visible slice aliasing.
+func extractCachedAddrs(p dnsmessage.Parser) (addrs []cachedAddr, cname dnsmessage.Name, ok bool) {
 	for {
 		h, err := p.AnswerHeader()
 		if err == dnsmessage.ErrSectionDone {
-			return ips, cname, true
+			return addrs, cname, true
 		}
 		if err != nil {
 			return nil, dnsmessage.Name{}, false
@@ -398,7 +431,8 @@ func extractCachedAddrs(p dnsmessage.Parser) (ips []IP, cname dnsmessage.Name, o
 			if err != nil {
 				return nil, dnsmessage.Name{}, false
 			}
-			ips = append(ips, IP(a.A[:]))
+			addr := netip.AddrFrom4(a.A)
+			addrs = append(addrs, cachedAddr{addr: addr, str: addr.String()})
 			if cname.Length == 0 && h.Name.Length != 0 {
 				cname = h.Name
 			}
@@ -407,7 +441,8 @@ func extractCachedAddrs(p dnsmessage.Parser) (ips []IP, cname dnsmessage.Name, o
 			if err != nil {
 				return nil, dnsmessage.Name{}, false
 			}
-			ips = append(ips, IP(aaaa.AAAA[:]))
+			addr := netip.AddrFrom16(aaaa.AAAA)
+			addrs = append(addrs, cachedAddr{addr: addr, str: IP(aaaa.AAAA[:]).String()})
 			if cname.Length == 0 && h.Name.Length != 0 {
 				cname = h.Name
 			}
@@ -424,6 +459,42 @@ func extractCachedAddrs(p dnsmessage.Parser) (ips []IP, cname dnsmessage.Name, o
 				return nil, dnsmessage.Name{}, false
 			}
 		}
+	}
+}
+
+// extractCachedTXTs pre-parses TXT records from p so cache hits in goLookupTXT
+// avoid re-parsing wire bytes and per-record slice allocations.
+func extractCachedTXTs(p dnsmessage.Parser) (txts []string, ok bool) {
+	for {
+		h, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			return txts, true
+		}
+		if err != nil {
+			return nil, false
+		}
+		if h.Type != dnsmessage.TypeTXT {
+			if err := p.SkipAnswer(); err != nil {
+				return nil, false
+			}
+			continue
+		}
+		txt, err := p.TXTResource()
+		if err != nil {
+			return nil, false
+		}
+		n := 0
+		for _, s := range txt.TXT {
+			n += len(s)
+		}
+		txtJoin := make([]byte, 0, n)
+		for _, s := range txt.TXT {
+			txtJoin = append(txtJoin, s...)
+		}
+		if len(txts) == 0 {
+			txts = make([]string, 0, 1)
+		}
+		txts = append(txts, string(txtJoin))
 	}
 }
 

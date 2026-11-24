@@ -7,6 +7,7 @@ package net
 import (
 	"context"
 	"errors"
+	"internal/bytealg"
 	"internal/nettrace"
 	"internal/singleflight"
 	"internal/stringslite"
@@ -191,6 +192,25 @@ func LookupHost(host string) (addrs []string, err error) {
 	return DefaultResolver.LookupHost(context.Background(), host)
 }
 
+func mightBeLiteralIP(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	if bytealg.IndexByteString(s, ':') >= 0 {
+		return true
+	}
+	if len(s) > 15 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 // LookupHost looks up the given host using the local resolver.
 // It returns a slice of that host's addresses.
 func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string, err error) {
@@ -198,8 +218,10 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 	if host == "" {
 		return nil, newDNSError(errNoSuchHost, host, "")
 	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return []string{host}, nil
+	if mightBeLiteralIP(host) {
+		if _, err := netip.ParseAddr(host); err == nil {
+			return []string{host}, nil
+		}
 	}
 	return r.lookupHost(ctx, host)
 }
@@ -316,8 +338,11 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 	if host == "" {
 		return nil, newDNSError(errNoSuchHost, host, "")
 	}
-	if ip, err := netip.ParseAddr(host); err == nil {
-		return []IPAddr{{IP: IP(ip.AsSlice()).To16(), Zone: ip.Zone()}}, nil
+	if mightBeLiteralIP(host) {
+		if ip, err := netip.ParseAddr(host); err == nil {
+			a16 := ip.As16()
+			return []IPAddr{{IP: a16[:], Zone: ip.Zone()}}, nil
+		}
 	}
 	trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace)
 	if trace != nil && trace.DNSStart != nil {
@@ -326,8 +351,21 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 	// The underlying resolver func is lookupIP by default but it
 	// can be overridden by tests. This is needed by net/http, so it
 	// uses a context key instead of unexported variables.
+	alt, _ := ctx.Value(nettrace.LookupIPAltResolverKey{}).(func(context.Context, string, string) ([]IPAddr, error))
+	if testHookLookupIP == nil && alt == nil {
+		if addrs, ok := r.tryCachedLookupIPAddr(ctx, network, host); ok {
+			if trace != nil && trace.DNSDone != nil {
+				trace.DNSDone(ipAddrsEface(addrs), false, nil)
+			}
+			testHookShuffleRand(len(addrs), func(i, j int) {
+				addrs[i], addrs[j] = addrs[j], addrs[i]
+			})
+			sortByRFC6724(addrs)
+			return addrs, nil
+		}
+	}
 	resolverFunc := r.lookupIP
-	if alt, _ := ctx.Value(nettrace.LookupIPAltResolverKey{}).(func(context.Context, string, string) ([]IPAddr, error)); alt != nil {
+	if alt != nil {
 		resolverFunc = alt
 	}
 
@@ -341,7 +379,10 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 	lookupKey := network + "\000" + host
 	dnsWaitGroup.Add(1)
 	ch := r.getLookupGroup().DoChan(lookupKey, func() (any, error) {
-		return testHookLookupIP(lookupGroupCtx, resolverFunc, network, host)
+		if testHookLookupIP != nil {
+			return testHookLookupIP(lookupGroupCtx, resolverFunc, network, host)
+		}
+		return resolverFunc(lookupGroupCtx, network, host)
 	})
 
 	dnsWaitGroupDone := func(ch <-chan singleflight.Result, cancelFn context.CancelFunc) {
@@ -878,9 +919,17 @@ func (r *Resolver) goLookupNS(ctx context.Context, name string) ([]*NS, error) {
 
 // goLookupTXT returns the TXT records from name.
 func (r *Resolver) goLookupTXT(ctx context.Context, name string) ([]string, error) {
-	p, server, err := r.lookup(ctx, name, dnsmessage.TypeTXT, nil)
+	entry, p, server, err := r.lookupEntry(ctx, name, dnsmessage.TypeTXT, nil)
 	if err != nil {
 		return nil, err
+	}
+	if entry != nil {
+		if len(entry.txts) == 0 {
+			return nil, nil
+		}
+		txts := make([]string, len(entry.txts))
+		copy(txts, entry.txts)
+		return txts, nil
 	}
 	var txts []string
 	for {

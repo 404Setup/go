@@ -12,14 +12,12 @@ var (
 	// if non-nil, overrides dialTCP.
 	testHookDialTCP func(ctx context.Context, net string, laddr, raddr *TCPAddr) (*TCPConn, error)
 
-	testHookLookupIP = func(
+	testHookLookupIP func(
 		ctx context.Context,
 		fn func(context.Context, string, string) ([]IPAddr, error),
 		network string,
 		host string,
-	) ([]IPAddr, error) {
-		return fn(ctx, network, host)
-	}
+	) ([]IPAddr, error)
 	testPreHookSetKeepAlive = func(*netFD) {}
 	testHookSetKeepAlive    = func(KeepAliveConfig) {}
 

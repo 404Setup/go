@@ -8,6 +8,7 @@ import (
 	"errors"
 	"internal/strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	_ "unsafe"
 )
@@ -196,45 +197,52 @@ func InterfaceByName(name string) (*Interface, error) {
 //
 // Multiple names sharing the index are managed by first-come
 // first-served basis for consistency.
-type ipv6ZoneCache struct {
-	sync.RWMutex                // guard the following
-	lastFetched  time.Time      // last time routing information was fetched
-	toIndex      map[string]int // interface name to its index
-	toName       map[int]string // interface index to its name
+type zoneCacheSnapshot struct {
+	lastFetched int64 // runtimeNano()
+	toIndex     map[string]int
+	toName      map[int]string
 }
 
-var zoneCache = ipv6ZoneCache{
-	toIndex: make(map[string]int),
-	toName:  make(map[int]string),
+type ipv6ZoneCache struct {
+	mu   sync.Mutex
+	snap atomic.Pointer[zoneCacheSnapshot]
 }
+
+var zoneCache ipv6ZoneCache
+
+const zoneCacheTTL = int64(60 * time.Second)
 
 // update refreshes the network interface information if the cache was last
 // updated more than 1 minute ago, or if force is set. It reports whether the
 // cache was updated.
 func (zc *ipv6ZoneCache) update(ift []Interface, force bool) (updated bool) {
-	zc.Lock()
-	defer zc.Unlock()
-	now := time.Now()
-	if !force && zc.lastFetched.After(now.Add(-60*time.Second)) {
+	zc.mu.Lock()
+	defer zc.mu.Unlock()
+	now := runtimeNano()
+	if snap := zc.snap.Load(); !force && snap != nil && now-snap.lastFetched < zoneCacheTTL {
 		return false
 	}
-	zc.lastFetched = now
 	if len(ift) == 0 {
 		var err error
 		if ift, err = interfaceTable(0); err != nil {
 			return false
 		}
 	}
-	zc.toIndex = make(map[string]int, len(ift))
-	zc.toName = make(map[int]string, len(ift))
+	toIndex := make(map[string]int, len(ift))
+	toName := make(map[int]string, len(ift))
 	for _, ifi := range ift {
 		if ifi.Name != "" {
-			zc.toIndex[ifi.Name] = ifi.Index
-			if _, ok := zc.toName[ifi.Index]; !ok {
-				zc.toName[ifi.Index] = ifi.Name
+			toIndex[ifi.Name] = ifi.Index
+			if _, ok := toName[ifi.Index]; !ok {
+				toName[ifi.Index] = ifi.Name
 			}
 		}
 	}
+	zc.snap.Store(&zoneCacheSnapshot{
+		lastFetched: now,
+		toIndex:     toIndex,
+		toName:      toName,
+	})
 	return true
 }
 
@@ -242,38 +250,51 @@ func (zc *ipv6ZoneCache) name(index int) string {
 	if index == 0 {
 		return ""
 	}
-	updated := zoneCache.update(nil, false)
-	zoneCache.RLock()
-	name, ok := zoneCache.toName[index]
-	zoneCache.RUnlock()
-	if !ok && !updated {
-		zoneCache.update(nil, true)
-		zoneCache.RLock()
-		name, ok = zoneCache.toName[index]
-		zoneCache.RUnlock()
+	snap := zc.snap.Load()
+	updated := false
+	if snap == nil || runtimeNano()-snap.lastFetched >= zoneCacheTTL {
+		updated = zc.update(nil, false)
+		snap = zc.snap.Load()
 	}
-	if !ok { // last resort
-		name = strconv.Itoa(index)
+	if snap != nil {
+		if name, ok := snap.toName[index]; ok {
+			return name
+		}
 	}
-	return name
+	if !updated {
+		zc.update(nil, true)
+		if snap = zc.snap.Load(); snap != nil {
+			if name, ok := snap.toName[index]; ok {
+				return name
+			}
+		}
+	}
+	return strconv.Itoa(index)
 }
 
 func (zc *ipv6ZoneCache) index(name string) int {
 	if name == "" {
 		return 0
 	}
-	updated := zoneCache.update(nil, false)
-	zoneCache.RLock()
-	index, ok := zoneCache.toIndex[name]
-	zoneCache.RUnlock()
-	if !ok && !updated {
-		zoneCache.update(nil, true)
-		zoneCache.RLock()
-		index, ok = zoneCache.toIndex[name]
-		zoneCache.RUnlock()
+	snap := zc.snap.Load()
+	updated := false
+	if snap == nil || runtimeNano()-snap.lastFetched >= zoneCacheTTL {
+		updated = zc.update(nil, false)
+		snap = zc.snap.Load()
 	}
-	if !ok { // last resort
-		index, _, _ = dtoi(name)
+	if snap != nil {
+		if index, ok := snap.toIndex[name]; ok {
+			return index
+		}
 	}
+	if !updated {
+		zc.update(nil, true)
+		if snap = zc.snap.Load(); snap != nil {
+			if index, ok := snap.toIndex[name]; ok {
+				return index
+			}
+		}
+	}
+	index, _, _ := dtoi(name)
 	return index
 }

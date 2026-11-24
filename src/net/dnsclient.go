@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"internal/bytealg"
 	"internal/strconv"
+	"net/netip"
 	"slices"
 	_ "unsafe" // for go:linkname
 
@@ -43,26 +44,39 @@ func shuffle(n int, swap func(i, j int)) {
 // address addr suitable for rDNS (PTR) record lookup or an error if it fails
 // to parse the IP address.
 func reverseaddr(addr string) (arpa string, err error) {
-	ip := ParseIP(addr)
-	if ip == nil {
+	ip, parseErr := netip.ParseAddr(addr)
+	if parseErr != nil || ip.Zone() != "" {
 		return "", &DNSError{Err: "unrecognized address", Name: addr}
 	}
-	if ip.To4() != nil {
-		return strconv.Itoa(int(ip[15])) + "." + strconv.Itoa(int(ip[14])) + "." + strconv.Itoa(int(ip[13])) + "." + strconv.Itoa(int(ip[12])) + ".in-addr.arpa.", nil
+	if ip.Is4() || ip.Is4In6() {
+		a4 := ip.Unmap().As4()
+		var buf [len("255.255.255.255.in-addr.arpa.")]byte
+		b := buf[:0]
+		b = strconv.AppendInt(b, int64(a4[3]), 10)
+		b = append(b, '.')
+		b = strconv.AppendInt(b, int64(a4[2]), 10)
+		b = append(b, '.')
+		b = strconv.AppendInt(b, int64(a4[1]), 10)
+		b = append(b, '.')
+		b = strconv.AppendInt(b, int64(a4[0]), 10)
+		b = append(b, ".in-addr.arpa."...)
+		return string(b), nil
 	}
 	// Must be IPv6
-	buf := make([]byte, 0, len(ip)*4+len("ip6.arpa."))
+	a16 := ip.As16()
+	var buf [len(a16)*4 + len("ip6.arpa.")]byte
+	b := buf[:0]
 	// Add it, in reverse, to the buffer
-	for i := len(ip) - 1; i >= 0; i-- {
-		v := ip[i]
-		buf = append(buf, hexDigit[v&0xF],
+	for i := len(a16) - 1; i >= 0; i-- {
+		v := a16[i]
+		b = append(b, hexDigit[v&0xF],
 			'.',
 			hexDigit[v>>4],
 			'.')
 	}
-	// Append "ip6.arpa." and return (buf already has the final .)
-	buf = append(buf, "ip6.arpa."...)
-	return string(buf), nil
+	// Append "ip6.arpa." and return (b already has the final .)
+	b = append(b, "ip6.arpa."...)
+	return string(b), nil
 }
 
 func equalASCIIName(x, y dnsmessage.Name) bool {

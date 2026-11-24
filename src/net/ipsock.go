@@ -7,6 +7,7 @@ package net
 import (
 	"context"
 	"internal/bytealg"
+	"net/netip"
 	"runtime"
 	"sync"
 	_ "unsafe" // for linkname
@@ -286,6 +287,20 @@ func (r *Resolver) internetAddrList(ctx context.Context, net, addr string) (addr
 	}
 
 	// Try as a literal IP address, then as a DNS name.
+	if mightBeLiteralIP(host) {
+		if ip, err := netip.ParseAddr(host); err == nil {
+			var last byte
+			if net != "" {
+				last = net[len(net)-1]
+			}
+			if (last != '4' && last != '6' && ip != netip.IPv6Unspecified()) ||
+				(last == '4' && (ip.Is4() || ip.Is4In6())) ||
+				(last == '6' && ip.Is6() && !ip.Is4In6()) {
+				a16 := ip.As16()
+				return addrList{inetaddr(IPAddr{IP: a16[:], Zone: ip.Zone()})}, nil
+			}
+		}
+	}
 	ips, err := r.lookupIPAddr(ctx, net, host)
 	if err != nil {
 		return nil, err

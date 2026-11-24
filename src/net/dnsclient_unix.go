@@ -295,21 +295,32 @@ func extractExtendedRCode(p dnsmessage.Parser, hdr dnsmessage.Header) (dnsmessag
 // Do a lookup for a single name, which must be rooted
 // (otherwise answer will not find the answers).
 func (r *Resolver) tryOneName(ctx context.Context, cfg *dnsConfig, name string, qtype dnsmessage.Type) (dnsmessage.Parser, string, error) {
+	return r.tryOneNameQuery(ctx, cfg, name, qtype, true)
+}
+
+func (r *Resolver) tryOneNameQuery(ctx context.Context, cfg *dnsConfig, name string, qtype dnsmessage.Type, checkCache bool) (dnsmessage.Parser, string, error) {
+	_, p, server, err := r.tryOneNameEntry(ctx, cfg, name, qtype, checkCache)
+	return p, server, err
+}
+
+func (r *Resolver) tryOneNameEntry(ctx context.Context, cfg *dnsConfig, name string, qtype dnsmessage.Type, checkCache bool) (*dnsCacheEntry, dnsmessage.Parser, string, error) {
 	var lastErr error
 	serverOffset := cfg.serverOffset()
 	sLen := uint32(len(cfg.servers))
 
 	n, err := dnsmessage.NewName(name)
 	if err != nil {
-		return dnsmessage.Parser{}, "", &DNSError{Err: errCannotMarshalDNSMessage.Error(), Name: name}
+		return nil, dnsmessage.Parser{}, "", &DNSError{Err: errCannotMarshalDNSMessage.Error(), Name: name}
 	}
 
 	if sLen > 0 {
 		if err := ctx.Err(); err != nil {
-			return dnsmessage.Parser{}, "", newDNSError(mapErr(err), name, cfg.servers[serverOffset%sLen])
+			return nil, dnsmessage.Parser{}, "", newDNSError(mapErr(err), name, cfg.servers[serverOffset%sLen])
 		}
-		if p, server, err, ok := r.getDNSCache().get(cfg, name, qtype); ok {
-			return p, server, err
+		if checkCache {
+			if entry, err, ok := r.getDNSCache().getEntry(cfg, name, qtype); ok {
+				return entry, entry.p, entry.server, err
+			}
 		}
 	}
 
@@ -341,7 +352,7 @@ func (r *Resolver) tryOneName(ctx context.Context, cfg *dnsConfig, name string, 
 					// The name does not exist, so trying
 					// another server won't help.
 					cache.putNegative(cfg, name, qtype, p, server)
-					return p, server, newDNSError(errNoSuchHost, name, server)
+					return nil, p, server, newDNSError(errNoSuchHost, name, server)
 				}
 				lastErr = newDNSError(err, name, server)
 				continue
@@ -353,17 +364,17 @@ func (r *Resolver) tryOneName(ctx context.Context, cfg *dnsConfig, name string, 
 					// The name does not exist, so trying
 					// another server won't help.
 					cache.putNegative(cfg, name, qtype, p, server)
-					return p, server, newDNSError(errNoSuchHost, name, server)
+					return nil, p, server, newDNSError(errNoSuchHost, name, server)
 				}
 				lastErr = newDNSError(err, name, server)
 				continue
 			}
 
 			cache.putPositive(cfg, name, qtype, beforeAnswers, p, server)
-			return p, server, nil
+			return nil, p, server, nil
 		}
 	}
-	return dnsmessage.Parser{}, "", lastErr
+	return nil, dnsmessage.Parser{}, "", lastErr
 }
 
 // A resolverConfig represents a DNS stub resolver configuration.
@@ -485,13 +496,18 @@ func (conf *resolverConfig) releaseSema() {
 }
 
 func (r *Resolver) lookup(ctx context.Context, name string, qtype dnsmessage.Type, conf *dnsConfig) (dnsmessage.Parser, string, error) {
+	_, p, server, err := r.lookupEntry(ctx, name, qtype, conf)
+	return p, server, err
+}
+
+func (r *Resolver) lookupEntry(ctx context.Context, name string, qtype dnsmessage.Type, conf *dnsConfig) (*dnsCacheEntry, dnsmessage.Parser, string, error) {
 	if !isDomainName(name) {
 		// We used to use "invalid domain name" as the error,
 		// but that is a detail of the specific lookup mechanism.
 		// Other lookups might allow broader name syntax
 		// (for example Multicast DNS allows UTF-8; see RFC 6762).
 		// For consistency with libc resolvers, report no such host.
-		return dnsmessage.Parser{}, "", newDNSError(errNoSuchHost, name, "")
+		return nil, dnsmessage.Parser{}, "", newDNSError(errNoSuchHost, name, "")
 	}
 
 	if isLocalhostName(name) {
@@ -499,7 +515,7 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype dnsmessage.Typ
 		// localhost names should get negative responses without the
 		// query being sent to DNS servers. Address queries never
 		// reach here; goLookupIPCNAMEOrder answers them itself.
-		return dnsmessage.Parser{}, "", newDNSError(errNoSuchHost, name, "")
+		return nil, dnsmessage.Parser{}, "", newDNSError(errNoSuchHost, name, "")
 	}
 
 	if conf == nil {
@@ -507,14 +523,16 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype dnsmessage.Typ
 	}
 
 	var (
+		entry  *dnsCacheEntry
 		p      dnsmessage.Parser
 		server string
 		err    error
 	)
-	fqdns := conf.nameList(name)
+	var fqdnBuf [8]string
+	fqdns := conf.appendNameList(fqdnBuf[:0], name)
 	var prevNotFound [8]bool
 	for i, fqdn := range fqdns {
-		p, server, err = r.tryOneName(ctx, conf, fqdn, qtype)
+		entry, p, server, err = r.tryOneNameEntry(ctx, conf, fqdn, qtype, true)
 		if err == nil {
 			if i > 0 {
 				cache := r.getDNSCache()
@@ -540,7 +558,7 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype dnsmessage.Typ
 		}
 	}
 	if err == nil {
-		return p, server, nil
+		return entry, p, server, nil
 	}
 	if err, ok := err.(*DNSError); ok {
 		// Show original name passed to lookup, not suffixed one.
@@ -548,7 +566,7 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype dnsmessage.Typ
 		// just one is misleading. See also golang.org/issue/6324.
 		err.Name = name
 	}
-	return dnsmessage.Parser{}, "", err
+	return nil, dnsmessage.Parser{}, "", err
 }
 
 // avoidDNS reports whether this is a hostname for which we should not
@@ -573,6 +591,10 @@ func isLocalhostName(name string) bool {
 
 // nameList returns a list of names for sequential DNS queries.
 func (conf *dnsConfig) nameList(name string) []string {
+	return conf.appendNameList(nil, name)
+}
+
+func (conf *dnsConfig) appendNameList(dst []string, name string) []string {
 	// Check name length (see isDomainName).
 	rooted := len(name) > 0 && name[len(name)-1] == '.'
 	if len(name) > 254 || len(name) == 254 && !rooted {
@@ -584,30 +606,31 @@ func (conf *dnsConfig) nameList(name string) []string {
 		if avoidDNS(name) {
 			return nil
 		}
-		return []string{name}
+		return append(dst, name)
 	}
 
 	hasNdots := bytealg.CountString(name, '.') >= conf.ndots
 	name += "."
 
-	// Build list of search choices.
-	names := make([]string, 0, 1+len(conf.search))
+	if dst == nil {
+		dst = make([]string, 0, 1+len(conf.search))
+	}
 	// If name has enough dots, try unsuffixed first.
 	if hasNdots && !avoidDNS(name) {
-		names = append(names, name)
+		dst = append(dst, name)
 	}
 	// Try suffixes that are not too long (see isDomainName).
 	for _, suffix := range conf.search {
 		fqdn := name + suffix
 		if !avoidDNS(fqdn) && len(fqdn) <= 254 {
-			names = append(names, fqdn)
+			dst = append(dst, fqdn)
 		}
 	}
 	// Try unsuffixed, if not tried first above.
 	if !hasNdots && !avoidDNS(name) {
-		names = append(names, name)
+		dst = append(dst, name)
 	}
-	return names
+	return dst
 }
 
 // hostLookupOrder specifies the order of LookupHost lookup strategies.
@@ -639,6 +662,141 @@ func (o hostLookupOrder) String() string {
 	return "hostLookupOrder=" + strconv.Itoa(int(o)) + "??"
 }
 
+func (r *Resolver) tryCachedLookupHost(ctx context.Context, name string, conf *dnsConfig) ([]string, bool) {
+	if !dnsCacheEnabled() || !isDomainName(name) || isLocalhostName(name) {
+		return nil, false
+	}
+	if conf == nil {
+		conf = getSystemDNSConfig()
+	}
+	if len(conf.servers) == 0 || ctx.Err() != nil {
+		return nil, false
+	}
+	cache := r.getDNSCache()
+	var fqdnBuf [8]string
+	fqdns := conf.appendNameList(fqdnBuf[:0], name)
+	for _, fqdn := range fqdns {
+		lname := lowerASCIIName(fqdn)
+		eA, errA, okA := cache.getEntryLower(conf, fqdn, lname, dnsmessage.TypeA)
+		eAAAA, errAAAA, okAAAA := cache.getEntryLower(conf, fqdn, lname, dnsmessage.TypeAAAA)
+		if !okA || !okAAAA {
+			return nil, false
+		}
+		var cachedBuf [8]cachedAddr
+		cached := cachedBuf[:0]
+		if errA == nil && eA != nil {
+			cached = append(cached, eA.addrs...)
+		}
+		if errAAAA == nil && eAAAA != nil {
+			cached = append(cached, eAAAA.addrs...)
+		}
+		if len(cached) == 0 {
+			return nil, false
+		}
+		if len(cached) == 1 {
+			return []string{cached[0].str}, true
+		}
+		sortCachedByRFC6724(cached)
+		out := make([]string, len(cached))
+		for i, ca := range cached {
+			out[i] = ca.str
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func (r *Resolver) tryCachedLookupIPAddr(ctx context.Context, network, host string) ([]IPAddr, bool) {
+	if !dnsCacheEnabled() || ctx.Err() != nil {
+		return nil, false
+	}
+	order, conf := systemConf().hostLookupOrder(r, host)
+	if order == hostLookupCgo {
+		return nil, false
+	}
+	if order == hostLookupFilesDNS || order == hostLookupFiles {
+		if addrs, _ := goLookupIPFiles(host); len(addrs) > 0 {
+			return addrs, true
+		}
+		if order == hostLookupFiles {
+			return nil, false
+		}
+	}
+	if !isDomainName(host) || isLocalhostName(host) || network == "CNAME" {
+		return nil, false
+	}
+	if conf == nil {
+		conf = getSystemDNSConfig()
+	}
+	if len(conf.servers) == 0 {
+		return nil, false
+	}
+	var qtypesBuf [2]dnsmessage.Type
+	qtypesBuf[0] = dnsmessage.TypeA
+	qtypesBuf[1] = dnsmessage.TypeAAAA
+	qtypes := qtypesBuf[:2]
+	switch ipVersion(network) {
+	case '4':
+		qtypes = qtypesBuf[:1]
+	case '6':
+		qtypes = qtypesBuf[1:2]
+	}
+
+	cache := r.getDNSCache()
+	var fqdnBuf [8]string
+	fqdns := conf.appendNameList(fqdnBuf[:0], host)
+	for _, fqdn := range fqdns {
+		lname := lowerASCIIName(fqdn)
+		var entries [2]*dnsCacheEntry
+		addrCount := 0
+		totalBytes := 0
+		for i, qtype := range qtypes {
+			entry, err, ok := cache.getEntryLower(conf, fqdn, lname, qtype)
+			if !ok {
+				return nil, false
+			}
+			if err == nil && entry != nil {
+				entries[i] = entry
+				addrCount += len(entry.addrs)
+				for _, ca := range entry.addrs {
+					if ca.addr.Is4() {
+						totalBytes += 4
+					} else {
+						totalBytes += 16
+					}
+				}
+			}
+		}
+		if addrCount == 0 {
+			return nil, false
+		}
+		slab := make([]byte, totalBytes)
+		addrs := make([]IPAddr, 0, addrCount)
+		slabOff := 0
+		for i := range qtypes {
+			entry := entries[i]
+			if entry == nil {
+				continue
+			}
+			for _, ca := range entry.addrs {
+				if ca.addr.Is4() {
+					a4 := ca.addr.As4()
+					copy(slab[slabOff:slabOff+4], a4[:])
+					addrs = append(addrs, IPAddr{IP: slab[slabOff : slabOff+4 : slabOff+4]})
+					slabOff += 4
+				} else {
+					a16 := ca.addr.As16()
+					copy(slab[slabOff:slabOff+16], a16[:])
+					addrs = append(addrs, IPAddr{IP: slab[slabOff : slabOff+16 : slabOff+16]})
+					slabOff += 16
+				}
+			}
+		}
+		return addrs, true
+	}
+	return nil, false
+}
+
 func (r *Resolver) goLookupHostOrder(ctx context.Context, name string, order hostLookupOrder, conf *dnsConfig) (addrs []string, err error) {
 	if order == hostLookupFilesDNS || order == hostLookupFiles {
 		// Use entries from /etc/hosts if they match.
@@ -655,6 +813,11 @@ func (r *Resolver) goLookupHostOrder(ctx context.Context, name string, order hos
 		}
 		if order == hostLookupFilesDNS {
 			order = hostLookupDNS
+		}
+	}
+	if order != hostLookupFiles {
+		if addrs, ok := r.tryCachedLookupHost(ctx, name, conf); ok {
+			return addrs, nil
 		}
 	}
 	ips, _, err := r.goLookupIPCNAMEOrder(ctx, "ip", name, order, conf)
@@ -771,15 +934,17 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 	canUseCache := len(conf.servers) > 0 && ctx.Err() == nil
 	var lane chan indexedResult
 	var lastErr error
-	fqdns := conf.nameList(name)
+	var fqdnBuf [8]string
+	fqdns := conf.appendNameList(fqdnBuf[:0], name)
 	var prevAllNotFound [8]bool
 	for fqdnIdx, fqdn := range fqdns {
 		var results [3]result
 		var hit [3]bool
 		misses := len(qtypes)
 		if canUseCache {
+			lname := lowerASCIIName(fqdn)
 			for i, qtype := range qtypes {
-				if entry, err, ok := cache.getEntry(conf, fqdn, qtype); ok {
+				if entry, err, ok := cache.getEntryLower(conf, fqdn, lname, qtype); ok {
 					results[i] = result{entry.p, entry.server, err, entry}
 					hit[i] = true
 					misses--
@@ -791,7 +956,7 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 				for i, qtype := range qtypes {
 					if !hit[i] {
 						dnsWaitGroup.Add(1)
-						p, server, err := r.tryOneName(ctx, conf, fqdn, qtype)
+						p, server, err := r.tryOneNameQuery(ctx, conf, fqdn, qtype, false)
 						dnsWaitGroup.Done()
 						results[i] = result{p: p, server: server, error: err}
 					}
@@ -804,7 +969,7 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 					if !hit[i] {
 						dnsWaitGroup.Add(1)
 						go func(idx int, qtype dnsmessage.Type) {
-							p, server, err := r.tryOneName(ctx, conf, fqdn, qtype)
+							p, server, err := r.tryOneNameQuery(ctx, conf, fqdn, qtype, false)
 							lane <- indexedResult{idx: idx, res: result{p: p, server: server, error: err}}
 							dnsWaitGroup.Done()
 						}(i, qtype)
@@ -820,6 +985,8 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 		hitStrictError := false
 		fqdnAllNotFound := true
 		var hasError [3]bool
+		var slab []byte
+		slabOff := 0
 		for i := range qtypes {
 			result := results[i]
 			if result.error != nil {
@@ -839,17 +1006,40 @@ func (r *Resolver) goLookupIPCNAME(ctx context.Context, network, name string, or
 			}
 			fqdnAllNotFound = false
 			if result.entry != nil {
-				if len(result.entry.ips) > 0 && addrs == nil {
-					n := 0
+				if len(result.entry.addrs) > 0 && slab == nil {
+					addrCount := 0
+					totalBytes := 0
 					for j := i; j < len(qtypes); j++ {
 						if results[j].error == nil && results[j].entry != nil {
-							n += len(results[j].entry.ips)
+							addrCount += len(results[j].entry.addrs)
+							for _, ca := range results[j].entry.addrs {
+								if ca.addr.Is4() {
+									totalBytes += 4
+								} else {
+									totalBytes += 16
+								}
+							}
 						}
 					}
-					addrs = make([]IPAddr, 0, n)
+					if totalBytes > 0 {
+						slab = make([]byte, totalBytes)
+					}
+					if addrs == nil && addrCount > 0 {
+						addrs = make([]IPAddr, 0, addrCount)
+					}
 				}
-				for _, ip := range result.entry.ips {
-					addrs = append(addrs, IPAddr{IP: ip})
+				for _, ca := range result.entry.addrs {
+					if ca.addr.Is4() {
+						a4 := ca.addr.As4()
+						copy(slab[slabOff:slabOff+4], a4[:])
+						addrs = append(addrs, IPAddr{IP: slab[slabOff : slabOff+4 : slabOff+4]})
+						slabOff += 4
+					} else {
+						a16 := ca.addr.As16()
+						copy(slab[slabOff:slabOff+16], a16[:])
+						addrs = append(addrs, IPAddr{IP: slab[slabOff : slabOff+16 : slabOff+16]})
+						slabOff += 16
+					}
 				}
 				if cname.Length == 0 && result.entry.cname.Length != 0 {
 					cname = result.entry.cname

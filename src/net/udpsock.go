@@ -45,6 +45,52 @@ func (a *UDPAddr) String() string {
 	if a == nil {
 		return "<nil>"
 	}
+	if a.Zone == "" || (len(a.Zone) <= 32 && !hasZoneColon(a.Zone)) {
+		switch len(a.IP) {
+		case 0:
+			var buf [64]byte
+			b := buf[:0]
+			if a.Zone != "" {
+				b = append(b, '%')
+				b = append(b, a.Zone...)
+			}
+			b = append(b, ':')
+			b = strconv.AppendInt(b, int64(a.Port), 10)
+			return string(b)
+		case IPv4len:
+			var buf [72]byte
+			b := netip.AddrFrom4([4]byte(a.IP)).AppendTo(buf[:0])
+			if a.Zone != "" {
+				b = append(b, '%')
+				b = append(b, a.Zone...)
+			}
+			b = append(b, ':')
+			b = strconv.AppendInt(b, int64(a.Port), 10)
+			return string(b)
+		case IPv6len:
+			if p4 := a.IP.To4(); len(p4) == IPv4len {
+				var buf [72]byte
+				b := netip.AddrFrom4([4]byte(p4)).AppendTo(buf[:0])
+				if a.Zone != "" {
+					b = append(b, '%')
+					b = append(b, a.Zone...)
+				}
+				b = append(b, ':')
+				b = strconv.AppendInt(b, int64(a.Port), 10)
+				return string(b)
+			}
+			var buf [96]byte
+			b := append(buf[:0], '[')
+			b = netip.AddrFrom16([16]byte(a.IP)).AppendTo(b)
+			if a.Zone != "" {
+				b = append(b, '%')
+				b = append(b, a.Zone...)
+			}
+			b = append(b, "]:"...)
+			b = strconv.AppendInt(b, int64(a.Port), 10)
+			return string(b)
+		}
+	}
 	ip := ipEmptyString(a.IP)
 	if a.Zone != "" {
 		return JoinHostPort(ip+"%"+a.Zone, strconv.Itoa(a.Port))
@@ -297,7 +343,7 @@ func dialUDP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *
 	if raddr == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
-	sd := &sysDialer{network: network, address: raddr.String()}
+	sd := &sysDialer{network: network}
 	if dialer != nil {
 		sd.Dialer = *dialer
 	}
@@ -326,7 +372,7 @@ func ListenUDP(network string, laddr *UDPAddr) (*UDPConn, error) {
 	if laddr == nil {
 		laddr = &UDPAddr{}
 	}
-	sl := &sysListener{network: network, address: laddr.String()}
+	sl := &sysListener{network: network}
 	c, err := sl.listenUDP(context.Background(), laddr)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: err}
@@ -363,7 +409,7 @@ func ListenMulticastUDP(network string, ifi *Interface, gaddr *UDPAddr) (*UDPCon
 	if gaddr == nil || gaddr.IP == nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: gaddr.opAddr(), Err: errMissingAddress}
 	}
-	sl := &sysListener{network: network, address: gaddr.String()}
+	sl := &sysListener{network: network}
 	c, err := sl.listenMulticastUDP(context.Background(), ifi, gaddr)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: gaddr.opAddr(), Err: err}

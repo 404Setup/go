@@ -13,7 +13,14 @@ func (a HardwareAddr) String() string {
 	if len(a) == 0 {
 		return ""
 	}
-	buf := make([]byte, 0, len(a)*3-1)
+	n := len(a)*3 - 1
+	var stack [64]byte
+	var buf []byte
+	if n <= len(stack) {
+		buf = stack[:0]
+	} else {
+		buf = make([]byte, 0, n)
+	}
 	for i, b := range a {
 		if i > 0 {
 			buf = append(buf, ':')

@@ -146,12 +146,33 @@ func lookupStaticHost(host string) ([]string, string) {
 	defer hosts.Unlock()
 	readHosts()
 	if len(hosts.byName) != 0 {
-		if hasUpperCase(host) {
-			lowerHost := []byte(host)
-			lowerASCIIBytes(lowerHost)
-			host = string(lowerHost)
+		var byName byName
+		var ok bool
+		var keyBuf [256]byte
+		if len(host) < len(keyBuf) {
+			n := len(host)
+			hasDot := false
+			for i := 0; i < n; i++ {
+				c := host[i]
+				if c == '.' {
+					hasDot = true
+				}
+				keyBuf[i] = lowerASCII(c)
+			}
+			if hasDot && keyBuf[n-1] != '.' {
+				keyBuf[n] = '.'
+				n++
+			}
+			byName, ok = hosts.byName[string(keyBuf[:n])]
+		} else {
+			if hasUpperCase(host) {
+				lowerHost := []byte(host)
+				lowerASCIIBytes(lowerHost)
+				host = string(lowerHost)
+			}
+			byName, ok = hosts.byName[absDomainName(host)]
 		}
-		if byName, ok := hosts.byName[absDomainName(host)]; ok {
+		if ok {
 			ipsCp := make([]string, len(byName.addrs))
 			copy(ipsCp, byName.addrs)
 			return ipsCp, byName.canonicalName

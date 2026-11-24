@@ -14,6 +14,7 @@ package net
 
 import (
 	"internal/bytealg"
+	"internal/byteorder"
 	"internal/godebug"
 	"internal/goversion"
 	"internal/strconv"
@@ -221,9 +222,8 @@ func (ip IP) To4() IP {
 		return ip
 	}
 	if len(ip) == IPv6len &&
-		isZeros(ip[0:10]) &&
-		ip[10] == 0xff &&
-		ip[11] == 0xff {
+		byteorder.BEUint64(ip[:8]) == 0 &&
+		byteorder.BEUint32(ip[8:12]) == 0xffff {
 		return ip[12:16]
 	}
 	return nil
@@ -304,21 +304,22 @@ func (ip IP) String() string {
 		return "<nil>"
 	}
 
-	if len(ip) != IPv4len && len(ip) != IPv6len {
-		return "?" + hexString(ip)
+	if p4 := ip.To4(); len(p4) == IPv4len {
+		return netip.AddrFrom4([4]byte(p4)).String()
 	}
+	if len(ip) == IPv6len {
+		return netip.AddrFrom16([16]byte(ip)).String()
+	}
+	return "?" + hexString(ip)
+}
 
-	var buf []byte
-	switch len(ip) {
-	case IPv4len:
-		const maxCap = len("255.255.255.255")
-		buf = make([]byte, 0, maxCap)
-	case IPv6len:
-		const maxCap = len("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
-		buf = make([]byte, 0, maxCap)
+func hasZoneColon(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == ':' {
+			return true
+		}
 	}
-	buf = ip.appendTo(buf)
-	return string(buf)
+	return false
 }
 
 func hexString(b []byte) string {
@@ -327,6 +328,13 @@ func hexString(b []byte) string {
 		s[i*2], s[i*2+1] = hexDigit[tn>>4], hexDigit[tn&0xf]
 	}
 	return string(s)
+}
+
+func appendHex(dst []byte, b []byte) []byte {
+	for _, tn := range b {
+		dst = append(dst, hexDigit[tn>>4], hexDigit[tn&0xf])
+	}
+	return dst
 }
 
 // ipEmptyString is like ip.String except that it returns
@@ -396,13 +404,25 @@ func (ip *IP) UnmarshalText(text []byte) error {
 // considered to be equal.
 func (ip IP) Equal(x IP) bool {
 	if len(ip) == len(x) {
-		return bytealg.Equal(ip, x)
+		switch len(ip) {
+		case IPv4len:
+			return byteorder.BEUint32(ip) == byteorder.BEUint32(x)
+		case IPv6len:
+			return byteorder.BEUint64(ip[:8]) == byteorder.BEUint64(x[:8]) &&
+				byteorder.BEUint64(ip[8:]) == byteorder.BEUint64(x[8:])
+		default:
+			return bytealg.Equal(ip, x)
+		}
 	}
 	if len(ip) == IPv4len && len(x) == IPv6len {
-		return bytealg.Equal(x[0:12], v4InV6Prefix) && bytealg.Equal(ip, x[12:])
+		return byteorder.BEUint64(x[:8]) == 0 &&
+			byteorder.BEUint32(x[8:12]) == 0xffff &&
+			byteorder.BEUint32(ip) == byteorder.BEUint32(x[12:])
 	}
 	if len(ip) == IPv6len && len(x) == IPv4len {
-		return bytealg.Equal(ip[0:12], v4InV6Prefix) && bytealg.Equal(ip[12:], x)
+		return byteorder.BEUint64(ip[:8]) == 0 &&
+			byteorder.BEUint32(ip[8:12]) == 0xffff &&
+			byteorder.BEUint32(ip[12:]) == byteorder.BEUint32(x)
 	}
 	return false
 }
@@ -588,6 +608,17 @@ func (n *IPNet) String() string {
 		return "<nil>"
 	}
 	l := simpleMaskLength(m)
+	if len(nn) <= IPv6len && (l != -1 || len(m) <= IPv6len) {
+		var buf [72]byte
+		b := nn.appendTo(buf[:0])
+		b = append(b, '/')
+		if l == -1 {
+			b = appendHex(b, m)
+		} else {
+			b = strconv.AppendInt(b, int64(l), 10)
+		}
+		return string(b)
+	}
 	if l == -1 {
 		return nn.String() + "/" + m.String()
 	}

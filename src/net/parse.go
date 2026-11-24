@@ -12,15 +12,30 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sync"
 )
+
+var fileBufPool = sync.Pool{
+	New: func() any {
+		return new([64 * 1024]byte)
+	},
+}
 
 type file struct {
 	file  *os.File
 	data  []byte
+	buf   *[64 * 1024]byte
 	atEOF bool
 }
 
-func (f *file) close() { f.file.Close() }
+func (f *file) close() {
+	f.file.Close()
+	if f.buf != nil {
+		f.data = nil
+		fileBufPool.Put(f.buf)
+		f.buf = nil
+	}
+}
 
 func (f *file) getLineFromData() (s string, ok bool) {
 	data := f.data
@@ -73,7 +88,8 @@ func open(name string) (*file, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &file{fd, make([]byte, 0, 64*1024), false}, nil
+	buf := fileBufPool.Get().(*[64 * 1024]byte)
+	return &file{file: fd, data: buf[:0], buf: buf}, nil
 }
 
 func stat(name string) (fs.FileInfo, error) {
