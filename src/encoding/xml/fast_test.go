@@ -845,3 +845,142 @@ func TestFastMixedPathsAndNilTextAttr(t *testing.T) {
 		t.Fatalf("Marshal vs Encoder.Encode mismatch:\n%s\nvs\n%s", bMarshal, encBuf.Bytes())
 	}
 }
+
+func TestFastAttrPrefixScoping(t *testing.T) {
+	type ptrAttrChild struct {
+		A    *Attr  `xml:",attr"`
+		Any  any    `xml:",attr"`
+		Val  string `xml:",chardata"`
+	}
+	type doc struct {
+		XMLName Name           `xml:"root"`
+		First   ptrAttrChild   `xml:"first"`
+		Second  string         `xml:"urn:example:ns second"`
+	}
+	a1 := Attr{Name: Name{Space: "urn:example:ns", Local: "k"}, Value: "v1"}
+	a2 := Attr{Name: Name{Space: "urn:example:other", Local: "m"}, Value: "v2"}
+	d := doc{
+		First:  ptrAttrChild{A: &a1, Any: a2, Val: "ok"},
+		Second: "s",
+	}
+	out, err := Marshal(&d)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	var got doc
+	if err := Unmarshal(out, &got); err != nil {
+		t.Fatalf("Unmarshal failed (%s): %v", out, err)
+	}
+	if got.Second != "s" {
+		t.Fatalf("got Second=%q, want %q; marshaled=%s", got.Second, "s", out)
+	}
+	// Prefix bound on <first> must not leak onto sibling <second>.
+	if bytes.Contains(out, []byte(`<ns:`)) {
+		t.Fatalf("namespace prefix leaked outside <first>: %s", out)
+	}
+}
+
+type smallChunkReader struct {
+	data []byte
+	step int
+}
+
+func (r *smallChunkReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.step)
+	n = min(n, len(r.data))
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestFastSimpleLeafEdgeCases(t *testing.T) {
+	type leafDoc struct {
+		XMLName Name   `xml:"root"`
+		Empty   string `xml:"a"`
+		Multi   string `xml:"b"`
+		Esc     string `xml:"c"`
+		Comment string `xml:"d"`
+		Space   string `xml:"e"`
+		NS      string `xml:"f"`
+	}
+	input := "<root><a/><b>line1\n\tline2</b><c>x&amp;y&#34;z</c><d>pre<!--skip-->post</d><e>ok</e ><f xmlns=\"urn:u\">ns</f></root>"
+	for _, step := range []int{len(input), 1, 5, 17} {
+		dec := NewDecoder(&smallChunkReader{data: []byte(input), step: step})
+		var got leafDoc
+		if err := dec.Decode(&got); err != nil {
+			t.Fatalf("step=%d Decode failed: %v", step, err)
+		}
+		if got.Empty != "" || got.Multi != "line1\n\tline2" || got.Esc != `x&y"z` ||
+			got.Comment != "prepost" || got.Space != "ok" || got.NS != "ns" {
+			t.Fatalf("step=%d decoded mismatch: %+v", step, got)
+		}
+		line, col := dec.InputPos()
+		if line != 2 || col < 10 {
+			t.Fatalf("step=%d InputPos() = (%d, %d), want line=2, col>=10", step, line, col)
+		}
+	}
+
+	// Nested element inside scalar string leaf must fall back and skip child cleanly.
+	var withChild leafDoc
+	if err := Unmarshal([]byte(`<root><b>abc<nested/>def</b></root>`), &withChild); err != nil {
+		t.Fatalf("unexpected error for child element in scalar leaf: %v", err)
+	}
+	if withChild.Multi != "abcdef" {
+		t.Fatalf("got Multi=%q, want %q", withChild.Multi, "abcdef")
+	}
+
+	// Mismatched close tag and unescaped ]]> inside leaf must error.
+	for _, bad := range []string{
+		`<root><b>abc</x></root>`,
+		`<root><b>abc]]>def</b></root>`,
+	} {
+		var got leafDoc
+		if err := Unmarshal([]byte(bad), &got); err == nil {
+			t.Fatalf("expected error for malformed leaf XML %q", bad)
+		}
+	}
+}
+
+func TestFastMarshalIndentParentPaths(t *testing.T) {
+	type nested struct {
+		XMLName Name   `xml:"root"`
+		Leaf1   string `xml:"a>b>c"`
+		Leaf2   int    `xml:"a>b>d"`
+		Leaf3   string `xml:"a>e"`
+	}
+	in := nested{Leaf1: "hello", Leaf2: 42, Leaf3: "world"}
+	got, err := MarshalIndent(&in, ">", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent failed: %v", err)
+	}
+	want := "><root>\n>  <a>\n>    <b>\n>      <c>hello</c>\n>      <d>42</d>\n>    </b>\n>    <e>world</e>\n>  </a>\n></root>"
+	if string(got) != want {
+		t.Fatalf("MarshalIndent parent paths:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestFastEscapeTextQuotesAndControl(t *testing.T) {
+	in := []byte("plain\"single'amp&lt<gt>tab\tnl\ncr\rnul\x00bad\xffend")
+	want := "plain&#34;single&#39;amp&amp;lt&lt;gt&gt;tab&#x9;nl&#xA;cr&#xD;nul\uFFFDbad\uFFFDend"
+
+	var bb bytes.Buffer
+	if err := EscapeText(&bb, in); err != nil {
+		t.Fatal(err)
+	}
+	var sb strings.Builder
+	if err := EscapeText(&sb, in); err != nil {
+		t.Fatal(err)
+	}
+	var cw customEscapeWriter
+	if err := EscapeText(&cw, in); err != nil {
+		t.Fatal(err)
+	}
+	if bb.String() != want || sb.String() != want || cw.buf.String() != want {
+		t.Fatalf("EscapeText mismatch:\nwant=%q\nbb  =%q\nsb  =%q\ncw  =%q",
+			want, bb.String(), sb.String(), cw.buf.String())
+	}
+}
+

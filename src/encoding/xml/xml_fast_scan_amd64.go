@@ -14,13 +14,48 @@ import (
 
 var haveXMLSIMD = archsimd.X86.AVX2()
 
+var (
+	xmlVec32 = [32]int8{
+		32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+		32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+	}
+	xmlVecQuot = [32]uint8{
+		'"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"',
+		'"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"',
+	}
+	xmlVecApos = [32]uint8{
+		'\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'',
+		'\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'', '\'',
+	}
+	xmlVecAmp = [32]uint8{
+		'&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&',
+		'&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&', '&',
+	}
+	xmlVecLt = [32]uint8{
+		'<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<',
+		'<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<', '<',
+	}
+	xmlVecGt = [32]uint8{
+		'>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>',
+		'>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>', '>',
+	}
+	xmlVecTab = [32]uint8{
+		'\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t',
+		'\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t', '\t',
+	}
+	xmlVecRb = [32]uint8{
+		']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']',
+		']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']', ']',
+	}
+)
+
 func xmlEscapeIndexSIMD(s []byte, i int) (int, bool) {
-	c32 := archsimd.BroadcastInt8x32(32)
-	cQuot := archsimd.BroadcastUint8x32('"')
-	cApos := archsimd.BroadcastUint8x32('\'')
-	cAmp := archsimd.BroadcastUint8x32('&')
-	cLt := archsimd.BroadcastUint8x32('<')
-	cGt := archsimd.BroadcastUint8x32('>')
+	c32 := archsimd.LoadInt8x32Array(&xmlVec32)
+	cQuot := archsimd.LoadUint8x32Array(&xmlVecQuot)
+	cApos := archsimd.LoadUint8x32Array(&xmlVecApos)
+	cAmp := archsimd.LoadUint8x32Array(&xmlVecAmp)
+	cLt := archsimd.LoadUint8x32Array(&xmlVecLt)
+	cGt := archsimd.LoadUint8x32Array(&xmlVecGt)
 	ptr := unsafe.Pointer(unsafe.SliceData(s))
 	for len(s)-i >= 32 {
 		v := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(ptr, i)))
@@ -39,11 +74,11 @@ func xmlEscapeIndexSIMD(s []byte, i int) (int, bool) {
 }
 
 func xmlCharDataIndexSIMD(s []byte, i int) (int, bool) {
-	c32 := archsimd.BroadcastInt8x32(32)
-	cTab := archsimd.BroadcastUint8x32('\t')
-	cAmp := archsimd.BroadcastUint8x32('&')
-	cLt := archsimd.BroadcastUint8x32('<')
-	cRb := archsimd.BroadcastUint8x32(']')
+	c32 := archsimd.LoadInt8x32Array(&xmlVec32)
+	cTab := archsimd.LoadUint8x32Array(&xmlVecTab)
+	cAmp := archsimd.LoadUint8x32Array(&xmlVecAmp)
+	cLt := archsimd.LoadUint8x32Array(&xmlVecLt)
+	cRb := archsimd.LoadUint8x32Array(&xmlVecRb)
 	ptr := unsafe.Pointer(unsafe.SliceData(s))
 	for len(s)-i >= 32 {
 		v := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(ptr, i)))
@@ -60,10 +95,10 @@ func xmlCharDataIndexSIMD(s []byte, i int) (int, bool) {
 }
 
 func xmlAttrValIndexSIMD(s []byte, i int, qb byte) (int, bool) {
-	c32 := archsimd.BroadcastInt8x32(32)
-	cTab := archsimd.BroadcastUint8x32('\t')
-	cAmp := archsimd.BroadcastUint8x32('&')
-	cLt := archsimd.BroadcastUint8x32('<')
+	c32 := archsimd.LoadInt8x32Array(&xmlVec32)
+	cTab := archsimd.LoadUint8x32Array(&xmlVecTab)
+	cAmp := archsimd.LoadUint8x32Array(&xmlVecAmp)
+	cLt := archsimd.LoadUint8x32Array(&xmlVecLt)
 	cQ := archsimd.BroadcastUint8x32(qb)
 	ptr := unsafe.Pointer(unsafe.SliceData(s))
 	for len(s)-i >= 32 {

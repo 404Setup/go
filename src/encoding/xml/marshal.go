@@ -12,6 +12,7 @@ import (
 	"internal/bytealg"
 	"io"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -89,6 +90,7 @@ func Marshal(v any) ([]byte, error) {
 	plan := lookupXmlMarshalPlan(at)
 	if plan.canFast {
 		err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
+		runtime.KeepAlive(v)
 		if err == nil {
 			err = eb.enc.p.Close()
 		}
@@ -174,6 +176,7 @@ func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
 	plan := lookupXmlMarshalPlan(at)
 	if plan.canFast {
 		err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
+		runtime.KeepAlive(v)
 		if err == nil {
 			err = eb.enc.p.Close()
 		}
@@ -249,6 +252,7 @@ func (enc *Encoder) Encode(v any) error {
 			eb.enc.p.indent = enc.p.indent
 			eb.enc.p.putNewline = enc.p.putNewline
 			err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
+			runtime.KeepAlive(v)
 			if err != nil {
 				putXmlMarshalEncoder(eb)
 				return err
@@ -1196,6 +1200,26 @@ func (p *printer) writeIndent(depthDelta int) {
 			return
 		}
 		p.indentedIn = false
+	}
+	if p.w == nil && p.err == nil && !p.closed {
+		if p.putNewline {
+			p.out = append(p.out, '\n')
+		} else {
+			p.putNewline = true
+		}
+		if len(p.prefix) > 0 {
+			p.out = append(p.out, p.prefix...)
+		}
+		if len(p.indent) > 0 {
+			for i := 0; i < p.depth; i++ {
+				p.out = append(p.out, p.indent...)
+			}
+		}
+		if depthDelta > 0 {
+			p.depth++
+			p.indentedIn = true
+		}
+		return
 	}
 	if p.putNewline {
 		p.WriteByte('\n')

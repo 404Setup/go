@@ -116,7 +116,14 @@ func appendEscapeXMLSlow(dst, s []byte, i int, escapeNewline bool) []byte {
 		if c < utf8.RuneSelf {
 			if !xmlEscapeASCII[c] {
 				i++
-				if i-last >= 16 {
+				for i < len(s) && i-last < 16 {
+					b := s[i]
+					if b >= utf8.RuneSelf || xmlEscapeASCII[b] {
+						break
+					}
+					i++
+				}
+				if i-last >= 16 && i < len(s) && s[i] < utf8.RuneSelf && !xmlEscapeASCII[s[i]] {
 					if haveXMLSIMD && len(s)-i >= 32 {
 						var found bool
 						i, found = xmlEscapeIndexSIMD(s, i)
@@ -131,36 +138,49 @@ func appendEscapeXMLSlow(dst, s []byte, i int, escapeNewline bool) []byte {
 						}
 						i += 8
 					}
+					for i < len(s) {
+						b := s[i]
+						if b >= utf8.RuneSelf || xmlEscapeASCII[b] {
+							break
+						}
+						i++
+					}
 				}
 				continue
 			}
-			var esc []byte
+			if c == '\n' && !escapeNewline {
+				i++
+				continue
+			}
+			if n := i - last; n > 0 {
+				if n <= 8 {
+					for j := last; j < i; j++ {
+						dst = append(dst, s[j])
+					}
+				} else {
+					dst = append(dst, s[last:i]...)
+				}
+			}
 			switch c {
 			case '"':
-				esc = escQuot
+				dst = append(dst, "&#34;"...)
 			case '\'':
-				esc = escApos
+				dst = append(dst, "&#39;"...)
 			case '&':
-				esc = escAmp
+				dst = append(dst, "&amp;"...)
 			case '<':
-				esc = escLT
+				dst = append(dst, "&lt;"...)
 			case '>':
-				esc = escGT
+				dst = append(dst, "&gt;"...)
 			case '\t':
-				esc = escTab
+				dst = append(dst, "&#x9;"...)
 			case '\n':
-				if !escapeNewline {
-					i++
-					continue
-				}
-				esc = escNL
+				dst = append(dst, "&#xA;"...)
 			case '\r':
-				esc = escCR
+				dst = append(dst, "&#xD;"...)
 			default:
-				esc = escFFFD
+				dst = append(dst, "\uFFFD"...)
 			}
-			dst = append(dst, s[last:i]...)
-			dst = append(dst, esc...)
 			i++
 			last = i
 			continue

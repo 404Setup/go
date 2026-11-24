@@ -243,7 +243,9 @@ func (d *Decoder) DecodeElement(v any, start *StartElement) error {
 	}
 	plan := lookupXmlDecodePlan(at.Elem())
 	if plan.canFast {
-		return d.fastUnmarshal(plan, elemPtr, start)
+		err := d.fastUnmarshal(plan, elemPtr, start)
+		runtime.KeepAlive(v)
+		return err
 	}
 	return d.unmarshal(reflect.ValueOf(v).Elem(), start)
 }

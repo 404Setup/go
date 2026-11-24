@@ -546,7 +546,7 @@ func buildXmlMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Type]*
 
 			if fi.flags&fAttr != 0 {
 				fa := buildXmlFastAttr(fi, frt, fat, steps, off)
-				if fa.name.Space != "" || fa.isMarshalerAttr || fa.ptrMarshalerAttr || fa.kind == xkAttr || fa.kind == xkInterface || fa.isSlice {
+				if fa.name.Space != "" || fa.isMarshalerAttr || fa.ptrMarshalerAttr || fa.kind == xkAttr || (fa.isPtr && (fa.elemKind == xkAttr || fa.elemKind == xkInterface)) || fa.kind == xkInterface || fa.isSlice {
 					p.hasAttrSpace = true
 				}
 				if fa.isMarshalerAttr || fa.ptrMarshalerAttr || fa.kind == xkInterface {

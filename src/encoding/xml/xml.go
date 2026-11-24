@@ -562,11 +562,23 @@ func (d *Decoder) autoClose(t Token) (Token, bool) {
 	if d.stk == nil || d.stk.kind != stkStart {
 		return nil, false
 	}
+	local := d.stk.name.Local
+	n := len(local)
+	if n == 0 {
+		return nil, false
+	}
+	c0 := local[0]
 	for _, s := range d.AutoClose {
-		if strings.EqualFold(s, d.stk.name.Local) {
+		if len(s) != n {
+			continue
+		}
+		if c0 < utf8.RuneSelf && s[0] < utf8.RuneSelf && (s[0]^c0)&^0x20 != 0 {
+			continue
+		}
+		if strings.EqualFold(s, local) {
 			// This one should be auto closed if t doesn't close it.
 			et, ok := t.(EndElement)
-			if !ok || !strings.EqualFold(et.Name.Local, d.stk.name.Local) {
+			if !ok || len(et.Name.Local) != n || !strings.EqualFold(et.Name.Local, local) {
 				return EndElement{d.stk.name}, true
 			}
 			break
@@ -1476,34 +1488,53 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 		start := d.pos
 		i := start
 		if quote < 0 {
-			if haveXMLSIMD && len(s)-i >= 32 {
-				for len(s)-i >= 32 {
-					i, _ = xmlCharDataIndexSIMD(s, i)
-					if i < len(s) && s[i] == '\n' {
-						i++
-						d.line++
-						d.linestart = d.offset + int64(i-d.pos)
-						continue
-					}
-					break
-				}
-			}
-			for len(s)-i >= 8 {
+			if len(s)-i >= 8 {
 				if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
+					if s[i] == '<' {
+						goto fastCharDataDone
+					}
 					if s[i] == '\n' {
 						i++
 						d.line++
 						d.linestart = d.offset + int64(i-d.pos)
-						continue
-					}
-					if s[i] == '\t' {
+					} else if s[i] == '\t' {
 						i++
-						continue
+					} else {
+						goto fastCharDataSlow
 					}
-					break
+				} else {
+					i += 8
 				}
-				i += 8
+				if haveXMLSIMD && len(s)-i >= 32 {
+					for len(s)-i >= 32 {
+						i, _ = xmlCharDataIndexSIMD(s, i)
+						if i < len(s) && s[i] == '\n' {
+							i++
+							d.line++
+							d.linestart = d.offset + int64(i-d.pos)
+							continue
+						}
+						break
+					}
+				}
+				for len(s)-i >= 8 {
+					if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
+						i += bits.TrailingZeros64(m) >> 3
+						if s[i] == '\n' {
+							i++
+							d.line++
+							d.linestart = d.offset + int64(i-d.pos)
+							continue
+						}
+						if s[i] == '\t' {
+							i++
+							continue
+						}
+						break
+					}
+					i += 8
+				}
 			}
 			for i < len(s) {
 				c := s[i]
@@ -1516,6 +1547,7 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 					d.linestart = d.offset + int64(i-d.pos)
 				}
 			}
+		fastCharDataDone:
 			if i < len(s) && s[i] == '<' {
 				if d.saved != nil {
 					d.saved.Write(s[start:i])
@@ -1528,37 +1560,57 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 				d.buf.Write(s[start:i])
 				return d.buf.Bytes()
 			}
+		fastCharDataSlow:
 		} else {
 			q8 := uint64(byte(quote)) * xmlSwarLo
 			qb := byte(quote)
-			if haveXMLSIMD && len(s)-i >= 32 {
-				for len(s)-i >= 32 {
-					i, _ = xmlAttrValIndexSIMD(s, i, qb)
-					if i < len(s) && s[i] == '\n' {
-						i++
-						d.line++
-						d.linestart = d.offset + int64(i-d.pos)
-						continue
-					}
-					break
-				}
-			}
-			for len(s)-i >= 8 {
+			if len(s)-i >= 8 {
 				if m := xmlAttrValMask(byteorder.LEUint64(s[i:]), q8); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
+					if s[i] == qb {
+						goto fastAttrValDone
+					}
 					if s[i] == '\n' {
 						i++
 						d.line++
 						d.linestart = d.offset + int64(i-d.pos)
-						continue
-					}
-					if s[i] == '\t' {
+					} else if s[i] == '\t' {
 						i++
-						continue
+					} else {
+						goto fastAttrValSlow
 					}
-					break
+				} else {
+					i += 8
 				}
-				i += 8
+				if haveXMLSIMD && len(s)-i >= 32 {
+					for len(s)-i >= 32 {
+						i, _ = xmlAttrValIndexSIMD(s, i, qb)
+						if i < len(s) && s[i] == '\n' {
+							i++
+							d.line++
+							d.linestart = d.offset + int64(i-d.pos)
+							continue
+						}
+						break
+					}
+				}
+				for len(s)-i >= 8 {
+					if m := xmlAttrValMask(byteorder.LEUint64(s[i:]), q8); m != 0 {
+						i += bits.TrailingZeros64(m) >> 3
+						if s[i] == '\n' {
+							i++
+							d.line++
+							d.linestart = d.offset + int64(i-d.pos)
+							continue
+						}
+						if s[i] == '\t' {
+							i++
+							continue
+						}
+						break
+					}
+					i += 8
+				}
 			}
 			for i < len(s) {
 				c := s[i]
@@ -1571,6 +1623,7 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 					d.linestart = d.offset + int64(i-d.pos)
 				}
 			}
+		fastAttrValDone:
 			if i < len(s) && s[i] == qb {
 				if d.saved != nil {
 					d.saved.Write(s[start : i+1])
@@ -1583,6 +1636,7 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 				d.buf.Write(s[start:i])
 				return d.buf.Bytes()
 			}
+		fastAttrValSlow:
 		}
 		if i > start {
 			if d.saved != nil {
@@ -1923,21 +1977,37 @@ func (d *Decoder) internName(b []byte) string {
 	return string(b)
 }
 
-func (d *Decoder) nameBytesFast() ([]byte, bool) {
+func (d *Decoder) nameBytesFast() ([]byte, int, bool) {
 	if d.err != nil || d.nextByte >= 0 || d.pos >= len(d.src) {
-		return nil, false
+		return nil, -1, false
 	}
 	s := d.src
 	i := d.pos
-	if nameCharTable[s[i]]&1 == 0 {
-		return nil, false
+	b0 := s[i]
+	if nameCharTable[b0]&1 == 0 {
+		return nil, -1, false
+	}
+	colon := -1
+	if b0 == ':' {
+		colon = 0
 	}
 	i++
-	for i < len(s) && nameCharTable[s[i]]&2 != 0 {
+	for i < len(s) {
+		c := s[i]
+		if nameCharTable[c]&2 == 0 {
+			break
+		}
+		if c == ':' {
+			if colon < 0 {
+				colon = i - d.pos
+			} else {
+				colon = -2
+			}
+		}
 		i++
 	}
 	if i == len(s) || s[i] >= utf8.RuneSelf {
-		return nil, false
+		return nil, -1, false
 	}
 	b := s[d.pos:i]
 	if d.saved != nil {
@@ -1945,26 +2015,23 @@ func (d *Decoder) nameBytesFast() ([]byte, bool) {
 	}
 	d.offset += int64(i - d.pos)
 	d.pos = i
-	return b, true
+	return b, colon, true
 }
 
 // Get name space name: name with a : stuck in the middle.
 // The part before the : is the name space identifier.
 func (d *Decoder) nsname() (name Name, ok bool) {
-	if b, fast := d.nameBytesFast(); fast {
-		if colon := bytes.IndexByte(b, ':'); colon < 0 {
-			name.Local = d.internName(b)
-			return name, true
-		} else if bytes.IndexByte(b[colon+1:], ':') >= 0 {
+	if b, colon, fast := d.nameBytesFast(); fast {
+		if colon == -2 {
 			return name, false
-		} else if colon == 0 || colon+1 == len(b) {
+		}
+		if colon <= 0 || colon+1 == len(b) {
 			name.Local = d.internName(b)
-			return name, true
-		} else {
-			name.Space = d.internName(b[:colon])
-			name.Local = d.internName(b[colon+1:])
 			return name, true
 		}
+		name.Space = d.internName(b[:colon])
+		name.Local = d.internName(b[colon+1:])
+		return name, true
 	}
 	s, ok := d.name()
 	if !ok {
@@ -1985,7 +2052,7 @@ func (d *Decoder) nsname() (name Name, ok bool) {
 // Do not set d.err if the name is missing (unless unexpected EOF is received):
 // let the caller provide better context.
 func (d *Decoder) name() (s string, ok bool) {
-	if b, fast := d.nameBytesFast(); fast {
+	if b, _, fast := d.nameBytesFast(); fast {
 		return d.internName(b), true
 	}
 	d.buf.Reset()

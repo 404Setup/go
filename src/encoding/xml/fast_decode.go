@@ -9,6 +9,8 @@ import (
 	"encoding"
 	"errors"
 	"internal/abi"
+	"internal/byteorder"
+	"math/bits"
 	"reflect"
 	"runtime"
 	syncv2 "sync/v2"
@@ -574,7 +576,105 @@ func (d *Decoder) fastUnmarshalTextElem(plan *xmlDecodePlan, ptr unsafe.Pointer)
 	return errors.New("xml: internal error: expected TextUnmarshaler")
 }
 
+func (d *Decoder) fastReadSimpleLeafBytes() ([]byte, bool) {
+	if d.t != nil || !d.Strict || d.err != nil || d.nextByte >= 0 || d.needClose || d.nextToken != nil || d.saved != nil {
+		return nil, false
+	}
+	stk := d.stk
+	if stk == nil || stk.kind != stkStart || stk.name.Space != "" || (stk.next != nil && stk.next.kind == stkNs) {
+		return nil, false
+	}
+	s := d.src
+	start := d.pos
+	if start >= len(s) {
+		return nil, false
+	}
+	i := start
+	line := d.line
+	linestart := d.linestart
+	if len(s)-i >= 8 {
+		if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
+			i += bits.TrailingZeros64(m) >> 3
+			c := s[i]
+			if c == '<' {
+				goto checkClose
+			}
+			if c == '\n' {
+				i++
+				line++
+				linestart = d.offset + int64(i-d.pos)
+			} else if c == '\t' {
+				i++
+			} else {
+				return nil, false
+			}
+		} else {
+			i += 8
+		}
+		if haveXMLSIMD && len(s)-i >= 32 {
+			for len(s)-i >= 32 {
+				i, _ = xmlCharDataIndexSIMD(s, i)
+				if i < len(s) && s[i] == '\n' {
+					i++
+					line++
+					linestart = d.offset + int64(i-d.pos)
+					continue
+				}
+				break
+			}
+		}
+		for len(s)-i >= 8 {
+			if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				c := s[i]
+				if c == '\n' {
+					i++
+					line++
+					linestart = d.offset + int64(i-d.pos)
+					continue
+				}
+				if c == '\t' {
+					i++
+					continue
+				}
+				break
+			}
+			i += 8
+		}
+	}
+	for i < len(s) {
+		c := s[i]
+		if c == '<' || c == '&' || c == ']' || c == '\r' || c >= 0x80 || (c < ' ' && c != '\t' && c != '\n') {
+			break
+		}
+		i++
+		if c == '\n' {
+			line++
+			linestart = d.offset + int64(i-d.pos)
+		}
+	}
+checkClose:
+	tag := stk.name.Local
+	end := i + 2 + len(tag) + 1
+	if end > len(s) || s[i] != '<' || s[i+1] != '/' || s[end-1] != '>' || string(s[i+2:i+2+len(tag)]) != tag {
+		return nil, false
+	}
+	d.stk = stk.next
+	d.stkDepth--
+	stk.name = Name{}
+	stk.next = d.free
+	d.free = stk
+	d.line = line
+	d.linestart = linestart
+	d.offset += int64(end - d.pos)
+	d.pos = end
+	return s[start:i], true
+}
+
 func (d *Decoder) readLeafText(dst []byte) ([]byte, error) {
+	if raw, ok := d.fastReadSimpleLeafBytes(); ok {
+		return append(dst, raw...), nil
+	}
 	depth := 1
 	oldNoCopy := d.noCopyText
 	d.noCopyText = true
@@ -600,6 +700,9 @@ func (d *Decoder) readLeafText(dst []byte) ([]byte, error) {
 }
 
 func (d *Decoder) fastUnmarshalLeaf(kind xmlFastKind, ptr unsafe.Pointer) error {
+	if raw, ok := d.fastReadSimpleLeafBytes(); ok {
+		return assignScalarBytes(kind, ptr, raw)
+	}
 	var stackBuf [256]byte
 	data := stackBuf[:0]
 	oldNoCopy := d.noCopyText
