@@ -924,11 +924,11 @@ func (p *printer) fastMarshalValue(plan *xmlMarshalPlan, ptr unsafe.Pointer, can
 	}
 
 	// Struct marshaling.
-	if err := p.writeStructStartFast(plan, ptr, startName); err != nil {
+	if err := p.writeStructStartFast(plan, ptr, canAddr, startName); err != nil {
 		return err
 	}
 
-	if err := p.fastMarshalStructBody(plan, ptr, depth); err != nil {
+	if err := p.fastMarshalStructBody(plan, ptr, canAddr, depth); err != nil {
 		return err
 	}
 
@@ -1034,7 +1034,7 @@ func (p *printer) writeEndFast(name Name, withPrefixes bool) error {
 	return nil
 }
 
-func (p *printer) writeStructStartFast(plan *xmlMarshalPlan, ptr unsafe.Pointer, startName Name) error {
+func (p *printer) writeStructStartFast(plan *xmlMarshalPlan, ptr unsafe.Pointer, canAddr bool, startName Name) error {
 	if startName.Local == "" {
 		return fmt.Errorf("xml: start tag with no name")
 	}
@@ -1061,7 +1061,7 @@ func (p *printer) writeStructStartFast(plan *xmlMarshalPlan, ptr unsafe.Pointer,
 
 	for i := range plan.attrs {
 		fa := &plan.attrs[i]
-		fptr := resolveFieldPtr(ptr, fa.steps, fa.offset)
+		fptr, fAddr := resolveFieldPtrWithAddr(ptr, fa.steps, fa.offset, canAddr)
 		if fptr == nil {
 			continue
 		}
@@ -1071,7 +1071,7 @@ func (p *printer) writeStructStartFast(plan *xmlMarshalPlan, ptr unsafe.Pointer,
 		if fa.kind == xkInterface && (*xmlEface)(fptr).typ == nil {
 			continue
 		}
-		if err := p.fastWriteAttr(fa, fptr, true); err != nil {
+		if err := p.fastWriteAttr(fa, fptr, fAddr); err != nil {
 			return err
 		}
 	}
@@ -1115,7 +1115,7 @@ func (p *printer) fastWriteAttr(fa *xmlFastAttr, fptr unsafe.Pointer, canAddr bo
 		p.appendAttrBytes(fa, tb)
 		return nil
 	}
-	if fa.isTextMarshaler {
+	if fa.isTextMarshaler && !(fa.isPtr && fa.elemIsTime) {
 		v := reflect.NewAt(fa.rt, fptr).Elem().Interface().(encoding.TextMarshaler)
 		tb, err := v.MarshalText()
 		if err != nil {
@@ -1143,7 +1143,7 @@ func (p *printer) fastWriteAttr(fa *xmlFastAttr, fptr unsafe.Pointer, canAddr bo
 		}
 		k = fa.elemKind
 		rt = fa.elemRT
-		if fa.isTime {
+		if fa.elemIsTime {
 			var scratch [64]byte
 			tb, err := (*time.Time)(fptr).AppendText(scratch[:0])
 			if err != nil {
@@ -1225,6 +1225,15 @@ func (p *printer) fastWriteSliceAttrElem(fa *xmlFastAttr, ep unsafe.Pointer) err
 		if attr.Name.Local != "" {
 			p.appendAttr(attr)
 		}
+		return nil
+	}
+	if fa.elemIsTime {
+		var scratch [64]byte
+		tb, err := (*time.Time)(ep).AppendText(scratch[:0])
+		if err != nil {
+			return err
+		}
+		p.appendAttrBytes(fa, tb)
 		return nil
 	}
 	if fa.elemTextMarsh {
@@ -1317,8 +1326,43 @@ func (p *printer) appendAttrBytes(fa *xmlFastAttr, b []byte) {
 	p.out = append(p.out, '"')
 }
 
-func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer, depth int) error {
-	var s parentStack
+type fastParentStack struct {
+	p      *printer
+	inline [8]string
+	stack  []string
+}
+
+func (s *fastParentStack) trim(parents []string) error {
+	split := 0
+	for ; split < len(parents) && split < len(s.stack); split++ {
+		if parents[split] != s.stack[split] {
+			break
+		}
+	}
+	for i := len(s.stack) - 1; i >= split; i-- {
+		if err := s.p.writeEndFast(Name{Local: s.stack[i]}, false); err != nil {
+			return err
+		}
+	}
+	s.stack = s.stack[:split]
+	return nil
+}
+
+func (s *fastParentStack) push(parents []string) error {
+	for i := 0; i < len(parents); i++ {
+		if err := s.p.writeStartNameFast(Name{Local: parents[i]}, false); err != nil {
+			return err
+		}
+	}
+	if s.stack == nil {
+		s.stack = s.inline[:0]
+	}
+	s.stack = append(s.stack, parents...)
+	return nil
+}
+
+func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer, canAddr bool, depth int) error {
+	var s fastParentStack
 	if plan.hasParents {
 		s.p = p
 	}
@@ -1326,7 +1370,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 
 	for i := range plan.elems {
 		fe := &plan.elems[i]
-		fptr := resolveFieldPtr(ptr, fe.steps, fe.offset)
+		fptr, fAddr := resolveFieldPtrWithAddr(ptr, fe.steps, fe.offset, canAddr)
 		if fptr == nil {
 			continue
 		}
@@ -1365,7 +1409,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 				}
 				continue
 			}
-			if fe.ptrTextMarshaler {
+			if fAddr && fe.ptrTextMarshaler {
 				v := reflect.NewAt(fe.rt, fptr).Interface().(encoding.TextMarshaler)
 				tb, err := v.MarshalText()
 				if err != nil {
@@ -1522,11 +1566,11 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 			continue
 
 		case fInnerXML:
-			if fe.kind == xkString {
+			if fe.rt == xmlStringType {
 				p.out = append(p.out, *(*string)(fptr)...)
 				continue
 			}
-			if fe.kind == xkBytes {
+			if fe.rt == xmlBytesType {
 				p.out = append(p.out, *(*[]byte)(fptr)...)
 				continue
 			}
@@ -1559,6 +1603,26 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 			continue
 		}
 
+		if fe.kind == xkTime && fe.mode == fElement && !fe.isMarshaler && !fe.ptrMarshaler {
+			var scratch [64]byte
+			tb, err := (*time.Time)(fptr).AppendText(scratch[:0])
+			if err != nil {
+				return err
+			}
+			if !hasIndent {
+				p.out = append(p.out, fe.openTag...)
+				p.out = appendEscapeXMLBytes(p.out, tb, true)
+				p.out = append(p.out, fe.closeTag...)
+				continue
+			}
+			p.writeIndent(1)
+			p.out = append(p.out, fe.openTag...)
+			p.out = appendEscapeXMLBytes(p.out, tb, true)
+			p.writeIndent(-1)
+			p.out = append(p.out, fe.closeTag...)
+			continue
+		}
+
 		if fe.isScalarLeaf && fe.mode == fElement {
 			if !hasIndent {
 				p.out = append(p.out, fe.openTag...)
@@ -1582,7 +1646,7 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 			continue
 		}
 
-		if err := p.fastMarshalValue(fe.plan, fptr, true, fe, depth+1); err != nil {
+		if err := p.fastMarshalValue(fe.plan, fptr, fAddr, fe, depth+1); err != nil {
 			return err
 		}
 	}

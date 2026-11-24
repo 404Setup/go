@@ -2,14 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !goexperiment.simdstable || !amd64
+//go:build !arm64 && !(goexperiment.simdstable && amd64)
 
 package base64
 
 const (
-	haveSIMD      = false
-	minSIMDEncode = 0
-	minSIMDDecode = 0
+	haveSIMD         = false
+	minSIMDEncode    = 0
+	minSIMDEncodeOut = 0
+	minSIMDDecode    = 0
+	minSIMDDecodeOut = 0
 )
 
 func encodeSIMD(dst, src []byte, kind encodingKind) (si, di int) {

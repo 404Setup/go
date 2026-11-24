@@ -178,7 +178,7 @@ func (enc *Encoding) Encode(dst, src []byte) {
 	// when generating code for src[3:] and dst[4:].
 	src, dst = src[:len(src):len(src)], dst[:len(dst):len(dst)]
 
-	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDEncode && len(dst) >= minSIMDEncode {
+	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDEncode && len(dst) >= minSIMDEncodeOut {
 		si, di := encodeSIMD(dst, src, enc.kind)
 		src = src[si:]
 		dst = dst[di:]
@@ -246,22 +246,32 @@ func (enc *Encoding) AppendEncode(dst, src []byte) []byte {
 	return dst[:len(dst)+n]
 }
 
+type encodeToStringState struct {
+	buf [64]byte
+	s   string
+}
+
 // EncodeToString returns the base64 encoding of src.
 func (enc *Encoding) EncodeToString(src []byte) string {
 	// Kept small so that it is inlined and a short
 	// result can stay on the caller's stack.
-	var buf [64]byte
-	return string(enc.encodeBuf(buf[:], src))
+	var st encodeToStringState
+	if b := enc.encodeBuf(&st, src); b != nil {
+		return string(b)
+	}
+	return st.s
 }
 
-// encodeBuf returns the encoding of src, using buf if it fits.
-func (enc *Encoding) encodeBuf(buf, src []byte) []byte {
+func (enc *Encoding) encodeBuf(st *encodeToStringState, src []byte) []byte {
 	n := enc.EncodedLen(len(src))
-	if n > len(buf) {
-		buf = bytealg.MakeNoZero(n)
+	if n <= len(st.buf) {
+		enc.Encode(st.buf[:n], src)
+		return st.buf[:n]
 	}
-	enc.Encode(buf[:n], src)
-	return buf[:n]
+	b := bytealg.MakeNoZero(n)
+	enc.Encode(b, src)
+	st.s = unsafe.String(unsafe.SliceData(b), n)
+	return nil
 }
 
 type encoder struct {
@@ -615,7 +625,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 	_ = enc.decodeMap
 
 	si := 0
-	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDDecode && len(dst) >= 24 {
+	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDDecode && len(dst) >= minSIMDDecodeOut {
 		si, n, err = enc.decodeSIMDLoop(dst, src)
 		if err != nil || si == len(src) {
 			return n, err
@@ -644,6 +654,25 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 			if err != nil {
 				return n, err
 			}
+		}
+	}
+
+	if strconv.IntSize >= 64 && len(src)-si >= 8 && len(dst)-n >= 6 {
+		src2 := src[si : si+8]
+		if dn, ok := assemble64(
+			enc.decodeMap[src2[0]],
+			enc.decodeMap[src2[1]],
+			enc.decodeMap[src2[2]],
+			enc.decodeMap[src2[3]],
+			enc.decodeMap[src2[4]],
+			enc.decodeMap[src2[5]],
+			enc.decodeMap[src2[6]],
+			enc.decodeMap[src2[7]],
+		); ok {
+			byteorder.BEPutUint32(dst[n:], uint32(dn>>32))
+			byteorder.BEPutUint16(dst[n+4:], uint16(dn>>16))
+			n += 6
+			si += 8
 		}
 	}
 
@@ -680,7 +709,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 }
 
 func (enc *Encoding) decodeSIMDLoop(dst, src []byte) (si, n int, err error) {
-	for len(src)-si >= minSIMDDecode && len(dst)-n >= 24 {
+	for len(src)-si >= minSIMDDecode && len(dst)-n >= minSIMDDecodeOut {
 		si, n = decodeSIMD(dst, src, si, n, enc.kind)
 		if si == len(src) {
 			break
@@ -715,7 +744,7 @@ func (enc *Encoding) decodeSIMDLoop(dst, src []byte) (si, n int, err error) {
 				break
 			}
 		}
-		if len(src)-si >= minSIMDDecode && len(dst)-n >= 24 {
+		if len(src)-si >= minSIMDDecode && len(dst)-n >= minSIMDDecodeOut {
 			continue
 		}
 		for len(src)-si >= 4 && len(dst)-n >= 3 {
@@ -745,7 +774,7 @@ func (enc *Encoding) decodeSIMDLoop(dst, src []byte) (si, n int, err error) {
 				break
 			}
 		}
-		if len(src)-si >= minSIMDDecode && len(dst)-n >= 24 {
+		if len(src)-si >= minSIMDDecode && len(dst)-n >= minSIMDDecodeOut {
 			continue
 		}
 		break

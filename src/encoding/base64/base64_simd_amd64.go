@@ -14,8 +14,10 @@ import (
 var haveSIMD = archsimd.X86.AVX2()
 
 const (
-	minSIMDEncode = 32
-	minSIMDDecode = 32
+	minSIMDEncode    = 32
+	minSIMDEncodeOut = 32
+	minSIMDDecode    = 32
+	minSIMDDecodeOut = 24
 )
 
 var (
