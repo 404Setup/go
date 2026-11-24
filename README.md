@@ -12,10 +12,10 @@ This fork is a personal Go branch maintained by 404Setup.
 ### Standard Library & Runtime
 - **`encoding/json`, `encoding/json/v2`**: Compiled marshal/unmarshal fast paths, SWAR scanning and validation, pooled buffers, exact float paths, and generic `*Of` / `Append*` APIs for both `jsonv2` and `GOEXPERIMENT=nojsonv2`.
 - **`io`**: Pooled overflow buffers and exact-sized final allocations in `ReadAll`.
-- **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with `Shrink()`).
-- **`sync/v2/container`**: Generic ordered/sorted maps: `OrderedMap`, `ConcurrentSkipListMap`, `LinkedHashMap`, and `TreeMap`.
+- **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with `Shrink()` and single-load `Load` fast path).
+- **`sync/v2/container`**: Generic ordered/sorted maps (`OrderedMap`, `ConcurrentSkipListMap`, `LinkedHashMap`, `TreeMap`) with zero-alloc `internal/abi` CAS/CAD equality, capped node freelists, and lock-free `ConcurrentSkipListMap.First`.
 - **`sync/atomic/v2`**: Generic `Value[T]` without interface boxing.
-- **`net`**: TTL-aware DNS cache (`GODEBUG=netdnscache=0`), address shuffling before RFC 6724 sorting, and stack-buffered `(*TCPAddr).String`.
+- **`net`**: TTL-aware DNS cache (`GODEBUG=netdnscache=0`) with immutable address/TXT caching and `singleflight`-free cache hits, lock-free `ipv6ZoneCache` snapshots, pooled net-file buffers, O(1) RFC 6724 policy classification, and stack-buffered formatting.
 - **`net/http`, `net/textproto`, `net/url`**: Allocation and throughput optimizations across HTTP/1.1, HTTP/2, and HTTP/3.
 - **`net/http/server`**: HTTP router with path parameters, route groups, pooled contexts, and middleware.
 - **`reflect`**: Fast paths for `Equal`, `DeepEqual`, `Comparable`, `Call`, `Select`, `MapKeys`, and struct fields.
@@ -69,6 +69,17 @@ xychart-beta
     bar [66.99, 252.73, 281.83, 319.97]
 ```
 > *Bars per container (left to right): **Load**, **Store**, and **Delete+Store Churn** across 1,024 entries (`OrderedMap` parallel hit load: **9.04 ns/op**, 0 allocs/op).*
+
+#### `sync/v2` & `sync/v2/container` (`2a4868c0` → Current, `-cpu=2`)
+
+| Benchmark | Baseline (`2a4868c0`) | Current | Latency Delta | Allocs |
+| :--- | ---: | ---: | ---: | :---: |
+| `OrderedMap` (`Load` / `Churn` / `All`) | 37.50 / 434.1 / 6,679 ns/op | **33.46 / 408.7 / 6,379 ns/op** | **-10.8% / -5.9% / -4.5%** | 0 / 2 / 3 |
+| `LinkedHashMap.Churn` | 114.2 ns/op | **107.7 ns/op** | **-5.7%** | 0 (0 B) |
+| `TreeMap.Churn` | 435.4 ns/op | **401.6 ns/op** | **-7.8%** | 0 (0 B) |
+| `ConcurrentSkipListMap.Churn` | 481.4 ns/op | **477.7 ns/op** | **-0.8%** | 1 (65 B) |
+
+> *New zero-alloc container fast paths (`-cpu=2`): `CompareAndSwapMiss` (`ordered` / `linked` / `tree` / `skip`, 16B struct) **40.26 / 13.86 / 15.75 / 37.55 ns/op** (0 allocs); `ConcurrentSkipListMap.First` parallel **2.01 ns/op** (0 allocs); `Map.CompareAndSwap` (32B struct) **25.26 ns/op** (0 allocs).*
 
 ---
 
@@ -170,7 +181,7 @@ xychart-beta
 
 ---
 
-### 3. `net` DNS Resolver Cache
+### 3. `net` DNS Resolver Cache & Fast Paths
 
 ```mermaid
 xychart-beta
@@ -186,6 +197,21 @@ xychart-beta
 | `DNSLookupHost` (A + AAAA + RFC 6724) | 44,548 ns/op | **1,436 ns/op** | **-96.8%** (31.02×) | 74 (10,136 B) → **10 (288 B)** |
 | `DNSLookupHostParallel` | 44,548 ns/op | **1,279 ns/op** | **-97.1%** (34.83×) | 74 (10,136 B) → **10 (288 B)** |
 | `DNSLookupTXT` | 3,612 ns/op | **467.6 ns/op** | **-87.1%** (7.72×) | 22 (4,216 B) → **5 (112 B)** |
+
+#### `net` Hardening & Fast Paths (`2a4868c0` → Current, `-cpu=2`)
+
+| Benchmark | Baseline (`2a4868c0`) | Current | Latency Delta | Allocs (`Baseline` → `Current`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `DNSLookupHostCached` | 2,243 ns/op | **1,241 ns/op** | **-44.7%** (1.81×) | 10 (288 B) → **1 (32 B)** |
+| `DNSLookupHostCachedParallel` | 1,506 ns/op | **892.4 ns/op** | **-40.7%** (1.69×) | 10 (288 B) → **1 (32 B)** |
+| `DNSLookupTXTCached` | 746.5 ns/op | **441.8 ns/op** | **-40.8%** (1.69×) | 5 (112 B) → **1 (16 B)** |
+| `InterfacesAndMulticastAddrs` | 142.4 µs/op | **72.50 µs/op** | **-49.1%** (1.96×) | 40 (136,163 B) → **38 (5,130 B)** |
+| `ParseIPValidIPv4` / `ParseIP` | 44.75 / 3,006 ns/op | **34.33 / 2,536 ns/op** | **-23.3% / -15.6%** | 0 / 16 → 0 / 16 |
+| `IP.String` (`IPv4` / `IPv6`) | 116.1 / 1,640 ns/op | **100.2 / 1,438 ns/op** | **-13.7% / -12.3%** | 2 / 11 → 2 / 11 |
+| `IP.Equal` (`IPv4`) | 8.04 ns/op | **5.94 ns/op** | **-26.1%** (1.35×) | 0 → 0 |
+| `TCP6OneShot` | 100.9 µs/op | **89.82 µs/op** | **-11.0%** (1.12×) | 26 (2,344 B) → **25 (2,296 B)** |
+
+> *New `net` fast paths (`-cpu=2`): `ZoneCacheName` **19.65 ns/op** (0 allocs); `IPNet.String` (`IPv4` / `IPv6`) **71.39 / 179.4 ns/op** (1 alloc, 16 B); `AddrStrings` (`UDPv4` / `TCPZone` / `UDPZone`) **69.32 / 180.3 / 184.4 ns/op** (1 alloc); `ReverseAddr` (`IPv4` / `IPv6`) **117.3 / 153.4 ns/op** (1 alloc); `DNSLookupIPAddrCached` **1,403 ns/op** (3 allocs, 136 B, isolated slab without `singleflight`).*
 
 ---
 
