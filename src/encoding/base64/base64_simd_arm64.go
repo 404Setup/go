@@ -7,12 +7,15 @@
 package base64
 
 const (
-	haveSIMD         = true
-	minSIMDEncode    = 48
-	minSIMDEncodeOut = 64
-	minSIMDDecode    = 64
-	minSIMDDecodeOut = 48
+	haveSIMD              = true
+	haveStripNewlinesSIMD = false
+	minSIMDEncode         = 48
+	minSIMDEncodeOut      = 64
+	minSIMDDecode         = 64
+	minSIMDDecodeOut      = 48
 )
+
+func stripNewlinesSIMD(p []byte) int { return 0 }
 
 var (
 	neonEncStd = [64]byte{

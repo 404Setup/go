@@ -178,7 +178,7 @@ func (enc *Encoding) Encode(dst, src []byte) {
 	// when generating code for src[3:] and dst[4:].
 	src, dst = src[:len(src):len(src)], dst[:len(dst):len(dst)]
 
-	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDEncode && len(dst) >= minSIMDEncodeOut {
+	if len(src) >= minSIMDEncode && haveSIMD && enc.kind != encCustom && len(dst) >= minSIMDEncodeOut {
 		si, di := encodeSIMD(dst, src, enc.kind)
 		src = src[si:]
 		dst = dst[di:]
@@ -541,6 +541,39 @@ func (d *decoder) Read(p []byte) (n int, err error) {
 
 	// This code assumes that d.r strips supported whitespace ('\r' and '\n').
 
+	// Fast path for large reads: read directly into p and decode in place.
+	if len(p) >= len(d.buf) && d.nbuf < 4 && d.readErr == nil && !d.end {
+		if d.nbuf > 0 {
+			copy(p, d.buf[:d.nbuf])
+		}
+		total := d.nbuf
+		d.nbuf = 0
+		for total < 4 && d.readErr == nil {
+			var nr int
+			nr, d.readErr = d.r.Read(p[total:])
+			total += nr
+		}
+		if total >= 4 {
+			nr := total / 4 * 4
+			rem := total - nr
+			if rem > 0 {
+				copy(d.buf[:rem], p[nr:total])
+				d.nbuf = rem
+			}
+			padded := d.enc.padChar != NoPadding && p[nr-1] == byte(d.enc.padChar)
+			n, d.err = d.enc.Decode(p, p[:nr])
+			if d.err != nil {
+				d.err = d.rebaseError(d.err)
+			} else if padded {
+				d.end = true
+			}
+			d.total += int64(nr)
+			return n, d.err
+		}
+		copy(d.buf[:total], p[:total])
+		d.nbuf = total
+	}
+
 	// Refill buffer.
 	for d.nbuf < 4 && d.readErr == nil {
 		nn := len(p) / 3 * 4
@@ -625,7 +658,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 	_ = enc.decodeMap
 
 	si := 0
-	if haveSIMD && enc.kind != encCustom && len(src) >= minSIMDDecode && len(dst) >= minSIMDDecodeOut {
+	if len(src) >= minSIMDDecode && haveSIMD && enc.kind != encCustom && len(dst) >= minSIMDDecodeOut {
 		si, n, err = enc.decodeSIMDLoop(dst, src)
 		if err != nil || si == len(src) {
 			return n, err
@@ -741,6 +774,9 @@ func (enc *Encoding) decodeSIMDLoop(dst, src []byte) (si, n int, err error) {
 				if err != nil {
 					return si, n, err
 				}
+				for si < len(src) && (src[si] == '\r' || src[si] == '\n') {
+					si++
+				}
 				break
 			}
 		}
@@ -838,6 +874,9 @@ func (r *newlineFilteringReader) Read(p []byte) (int, error) {
 // stripNewlines removes newline characters from p in place
 // and returns the number of bytes that remain.
 func stripNewlines(p []byte) int {
+	if haveStripNewlinesSIMD && len(p) >= 32 {
+		return stripNewlinesSIMD(p)
+	}
 	i := 0
 	for ; len(p)-i >= 8; i += 8 {
 		x := byteorder.LEUint64(p[i:])

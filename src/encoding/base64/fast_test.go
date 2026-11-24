@@ -354,6 +354,43 @@ func TestFastLargeSIMDCorruptAndNewlinePositions(t *testing.T) {
 	}
 }
 
+func TestFastExhaustive256ByteValidation(t *testing.T) {
+	stdAlpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	urlAlpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	encs := []struct {
+		enc    *Encoding
+		oracle *Encoding
+	}{
+		{StdEncoding, NewEncoding(stdAlpha)},
+		{URLEncoding, NewEncoding(urlAlpha)},
+		{StdEncoding.Strict(), NewEncoding(stdAlpha).Strict()},
+		{URLEncoding.Strict(), NewEncoding(urlAlpha).Strict()},
+		{RawStdEncoding, NewEncoding(stdAlpha).WithPadding(NoPadding)},
+		{RawURLEncoding, NewEncoding(urlAlpha).WithPadding(NoPadding)},
+	}
+
+	base := bytes.Repeat([]byte("QUJD"), 32) // 128 bytes valid base64
+	positions := []int{0, 1, 15, 16, 31, 32, 47, 63, 64, 95, 96, 127}
+	for _, pair := range encs {
+		for _, pos := range positions {
+			buf := slices.Clone(base)
+			out := make([]byte, pair.enc.DecodedLen(len(buf)))
+			wantOut := make([]byte, pair.oracle.DecodedLen(len(buf)))
+			for b := 0; b < 256; b++ {
+				buf[pos] = byte(b)
+				gotN, gotErr := pair.enc.Decode(out, buf)
+				wantN, wantErr := pair.oracle.Decode(wantOut, buf)
+				if !errors.Is(gotErr, wantErr) || (gotErr != nil && wantErr != nil && gotErr.Error() != wantErr.Error()) {
+					t.Fatalf("pos=%d byte=%#02x err mismatch: got (%d, %v), want (%d, %v)", pos, b, gotN, gotErr, wantN, wantErr)
+				}
+				if gotN != wantN || !bytes.Equal(out[:gotN], wantOut[:wantN]) {
+					t.Fatalf("pos=%d byte=%#02x partial decode mismatch: got %d, want %d", pos, b, gotN, wantN)
+				}
+			}
+		}
+	}
+}
+
 func BenchmarkFastSuite(b *testing.B) {
 	sizes := []struct {
 		name string
@@ -423,5 +460,102 @@ func BenchmarkFastSuite(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestFastStripNewlinesAndWrappedSIMD(t *testing.T) {
+	for _, size := range []int{0, 1, 15, 31, 32, 33, 64, 95, 192, 4096} {
+		raw := make([]byte, size)
+		for i := range raw {
+			raw[i] = byte(i*13 + 7)
+		}
+		clean := StdEncoding.EncodeToString(raw)
+		for _, interval := range []int{1, 7, 31, 32, 33, 64, 76} {
+			for _, sep := range []string{"\n", "\r", "\r\n"} {
+				var wrapped strings.Builder
+				for i := 0; i < len(clean); i += interval {
+					end := min(i+interval, len(clean))
+					wrapped.WriteString(clean[i:end])
+					wrapped.WriteString(sep)
+				}
+				wStr := wrapped.String()
+				gotStr, err := StdEncoding.DecodeString(wStr)
+				if err != nil {
+					t.Fatalf("DecodeString size=%d interval=%d sep=%q error: %v", size, interval, sep, err)
+				}
+				if !bytes.Equal(gotStr, raw) {
+					t.Fatalf("DecodeString size=%d mismatch", size)
+				}
+
+				dst := make([]byte, StdEncoding.DecodedLen(len(wStr)))
+				n, err := StdEncoding.Decode(dst, []byte(wStr))
+				if err != nil {
+					t.Fatalf("Decode size=%d interval=%d sep=%q error: %v", size, interval, sep, err)
+				}
+				if !bytes.Equal(dst[:n], raw) {
+					t.Fatalf("Decode size=%d mismatch", size)
+				}
+			}
+		}
+
+		// Non-CR/LF whitespace must still be rejected even inside large payloads.
+		if len(clean) > 40 {
+			for _, badByte := range []byte{' ', '\t', 0x00, 0x7f, 0xff} {
+				bad := []byte(clean)
+				bad[35] = badByte
+				if _, err := StdEncoding.Decode(make([]byte, len(bad)), bad); err == nil {
+					t.Fatalf("expected CorruptInputError for byte 0x%02x at pos 35", badByte)
+				}
+			}
+		}
+	}
+}
+
+func TestFastDecoderLargeAndSmallReads(t *testing.T) {
+	encs := []struct {
+		name string
+		enc  *Encoding
+	}{
+		{"Std", StdEncoding},
+		{"RawStd", RawStdEncoding},
+		{"URL", URLEncoding},
+		{"RawURL", RawURLEncoding},
+	}
+	for _, tc := range encs {
+		for _, size := range []int{0, 1, 2, 3, 63, 128, 1536, 16384, 65535} {
+			raw := make([]byte, size)
+			for i := range raw {
+				raw[i] = byte(i*29 + 3)
+			}
+			encStr := tc.enc.EncodeToString(raw)
+			// Also test wrapped CR/LF input for large reads.
+			var wrapped strings.Builder
+			for i := 0; i < len(encStr); i += 76 {
+				end := min(i+76, len(encStr))
+				wrapped.WriteString(encStr[i:end])
+				wrapped.WriteString("\r\n")
+			}
+
+			for _, input := range []string{encStr, wrapped.String()} {
+				for _, readSize := range []int{1, 7, 1024, 4096, 65536} {
+					dec := NewDecoder(tc.enc, strings.NewReader(input))
+					buf := make([]byte, readSize)
+					var out []byte
+					for {
+						n, err := dec.Read(buf)
+						out = append(out, buf[:n]...)
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							t.Fatalf("%s size=%d readSize=%d Read error: %v", tc.name, size, readSize, err)
+						}
+					}
+					if !bytes.Equal(out, raw) {
+						t.Fatalf("%s size=%d readSize=%d decoded len=%d want %d", tc.name, size, readSize, len(out), len(raw))
+					}
+				}
+			}
+		}
 	}
 }

@@ -7,11 +7,12 @@
 package base64
 
 const (
-	haveSIMD         = false
-	minSIMDEncode    = 0
-	minSIMDEncodeOut = 0
-	minSIMDDecode    = 0
-	minSIMDDecodeOut = 0
+	haveSIMD              = false
+	haveStripNewlinesSIMD = false
+	minSIMDEncode         = 0
+	minSIMDEncodeOut      = 0
+	minSIMDDecode         = 0
+	minSIMDDecodeOut      = 0
 )
 
 func encodeSIMD(dst, src []byte, kind encodingKind) (si, di int) {
@@ -20,4 +21,8 @@ func encodeSIMD(dst, src []byte, kind encodingKind) (si, di int) {
 
 func decodeSIMD(dst, src []byte, si, di int, kind encodingKind) (int, int) {
 	return si, di
+}
+
+func stripNewlinesSIMD(p []byte) int {
+	return 0
 }

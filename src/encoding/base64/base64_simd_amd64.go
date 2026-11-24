@@ -8,10 +8,13 @@ package base64
 
 import (
 	"internal/byteorder"
+	"math/bits"
 	"simd/archsimd"
+	"unsafe"
 )
 
 var haveSIMD = archsimd.X86.AVX2()
+var haveStripNewlinesSIMD = haveSIMD
 
 const (
 	minSIMDEncode    = 32
@@ -98,8 +101,43 @@ func encodeSIMD(dst, src []byte, kind encodingKind) (si, di int) {
 		lut = archsimd.LoadInt8x32Array(&encLUTStd).ToBits()
 	}
 
+	srcPtr := unsafe.Pointer(unsafe.SliceData(src))
+	dstPtr := unsafe.Pointer(unsafe.SliceData(dst))
+
+	for len(src)-si >= 56 && len(dst)-di >= 64 {
+		v0 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(srcPtr, si))).ReshapeToUint32s().LookupMod(permIdx)
+		v1 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(srcPtr, si+24))).ReshapeToUint32s().LookupMod(permIdx)
+		shuf0 := v0.ReshapeToUint8s().LookupModOrZeroGrouped(shufMask).ReshapeToUint32s()
+		shuf1 := v1.ReshapeToUint8s().LookupModOrZeroGrouped(shufMask).ReshapeToUint32s()
+
+		t0Lo0 := shuf0.ShiftAllRight(10).And(mask3F)
+		t0Hi0 := shuf0.ShiftAllRight(6).And(mask3F0000)
+		t10 := shuf0.And(maskT1).ReshapeToUint16s().Mul(mul16).ReshapeToUint32s()
+		indices0 := t0Lo0.Or(t0Hi0).Or(t10).ReshapeToUint8s()
+
+		t0Lo1 := shuf1.ShiftAllRight(10).And(mask3F)
+		t0Hi1 := shuf1.ShiftAllRight(6).And(mask3F0000)
+		t11 := shuf1.And(maskT1).ReshapeToUint16s().Mul(mul16).ReshapeToUint32s()
+		indices1 := t0Lo1.Or(t0Hi1).Or(t11).ReshapeToUint8s()
+
+		res0 := indices0.SubSaturated(c51)
+		less0 := c26.Greater(indices0.BitsToInt8())
+		res0 = res0.Add(less0.ToInt8x32().ToBits().And(c13))
+		ascii0 := indices0.Add(lut.LookupModOrZeroGrouped(res0.BitsToInt8()))
+
+		res1 := indices1.SubSaturated(c51)
+		less1 := c26.Greater(indices1.BitsToInt8())
+		res1 = res1.Add(less1.ToInt8x32().ToBits().And(c13))
+		ascii1 := indices1.Add(lut.LookupModOrZeroGrouped(res1.BitsToInt8()))
+
+		ascii0.StoreArray((*[32]uint8)(unsafe.Add(dstPtr, di)))
+		ascii1.StoreArray((*[32]uint8)(unsafe.Add(dstPtr, di+32)))
+		si += 48
+		di += 64
+	}
+
 	for len(src)-si >= 32 && len(dst)-di >= 32 {
-		v := archsimd.LoadUint8x32(src[si:]).ReshapeToUint32s().LookupMod(permIdx)
+		v := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(srcPtr, si))).ReshapeToUint32s().LookupMod(permIdx)
 		shuf := v.ReshapeToUint8s().LookupModOrZeroGrouped(shufMask).ReshapeToUint32s()
 
 		t0Lo := shuf.ShiftAllRight(10).And(mask3F)
@@ -113,7 +151,7 @@ func encodeSIMD(dst, src []byte, kind encodingKind) (si, di int) {
 		offset := lut.LookupModOrZeroGrouped(result.BitsToInt8())
 		ascii := indices.Add(offset)
 
-		ascii.Store(dst[di:])
+		ascii.StoreArray((*[32]uint8)(unsafe.Add(dstPtr, di)))
 		si += 24
 		di += 32
 	}
@@ -141,15 +179,58 @@ func decodeSIMD(dst, src []byte, si, di int, kind encodingKind) (int, int) {
 	}
 
 	c0F := archsimd.BroadcastUint8x32(0x0f)
-	c0F32 := archsimd.BroadcastUint32x8(0x0f0f0f0f)
+	c0F32 := c0F.ReshapeToUint32s()
 	var zero archsimd.Uint8x32
 	mul1 := archsimd.BroadcastUint32x8(0x01400140).ReshapeToUint8s().BitsToInt8()
 	mul2 := archsimd.BroadcastUint32x8(0x00011000).ReshapeToUint16s().BitsToInt16()
 	packShuf := archsimd.LoadInt8x32Array(&decPackShuf)
 	packPerm := archsimd.LoadUint32x8Array(&decPackPerm)
 
+	srcPtr := unsafe.Pointer(unsafe.SliceData(src))
+	dstPtr := unsafe.Pointer(unsafe.SliceData(dst))
+
+	for len(src)-si >= 64 && len(dst)-di >= 56 {
+		in0 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(srcPtr, si)))
+		in1 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(srcPtr, si+32)))
+		hiNib0 := in0.ReshapeToUint32s().ShiftAllRight(4).And(c0F32).ReshapeToUint8s()
+		loNib0 := in0.And(c0F)
+		hiNib1 := in1.ReshapeToUint32s().ShiftAllRight(4).And(c0F32).ReshapeToUint8s()
+		loNib1 := in1.And(c0F)
+
+		lo0 := loLUT.LookupModOrZeroGrouped(loNib0.BitsToInt8())
+		hi0 := hiLUT.LookupModOrZeroGrouped(hiNib0.BitsToInt8())
+		lo1 := loLUT.LookupModOrZeroGrouped(loNib1.BitsToInt8())
+		hi1 := hiLUT.LookupModOrZeroGrouped(hiNib1.BitsToInt8())
+		if lo0.And(hi0).Equal(zero).Or(lo1.And(hi1).Equal(zero)).Any() {
+			break
+		}
+
+		roll0 := rollLUT.LookupModOrZeroGrouped(hiNib0.BitsToInt8())
+		eq0 := in0.Equal(specialChar).ToInt8x32().And(specialDelta)
+		sextets0 := in0.BitsToInt8().Add(roll0).Add(eq0).ToBits()
+
+		roll1 := rollLUT.LookupModOrZeroGrouped(hiNib1.BitsToInt8())
+		eq1 := in1.Equal(specialChar).ToInt8x32().And(specialDelta)
+		sextets1 := in1.BitsToInt8().Add(roll1).Add(eq1).ToBits()
+
+		merged0 := sextets0.DotProductPairsSaturated(mul1)
+		packed0 := merged0.DotProductPairs(mul2)
+		packedBytes0 := packed0.ToBits().ReshapeToUint8s().LookupModOrZeroGrouped(packShuf)
+		out0 := packedBytes0.ReshapeToUint32s().LookupMod(packPerm).ReshapeToUint8s()
+
+		merged1 := sextets1.DotProductPairsSaturated(mul1)
+		packed1 := merged1.DotProductPairs(mul2)
+		packedBytes1 := packed1.ToBits().ReshapeToUint8s().LookupModOrZeroGrouped(packShuf)
+		out1 := packedBytes1.ReshapeToUint32s().LookupMod(packPerm).ReshapeToUint8s()
+
+		out0.StoreArray((*[32]uint8)(unsafe.Add(dstPtr, di)))
+		out1.StoreArray((*[32]uint8)(unsafe.Add(dstPtr, di+24)))
+		si += 64
+		di += 48
+	}
+
 	for len(src)-si >= 32 && len(dst)-di >= 32 {
-		in := archsimd.LoadUint8x32(src[si:])
+		in := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(srcPtr, si)))
 		hiNibbles := in.ReshapeToUint32s().ShiftAllRight(4).And(c0F32).ReshapeToUint8s()
 		loNibbles := in.And(c0F)
 
@@ -168,13 +249,13 @@ func decodeSIMD(dst, src []byte, si, di int, kind encodingKind) (int, int) {
 		packedBytes := packed.ToBits().ReshapeToUint8s().LookupModOrZeroGrouped(packShuf)
 		out := packedBytes.ReshapeToUint32s().LookupMod(packPerm).ReshapeToUint8s()
 
-		out.Store(dst[di:])
+		out.StoreArray((*[32]uint8)(unsafe.Add(dstPtr, di)))
 		si += 32
 		di += 24
 	}
 
 	if len(src)-si >= 32 && len(dst)-di >= 24 {
-		in := archsimd.LoadUint8x32(src[si:])
+		in := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(srcPtr, si)))
 		hiNibbles := in.ReshapeToUint32s().ShiftAllRight(4).And(c0F32).ReshapeToUint8s()
 		loNibbles := in.And(c0F)
 
@@ -190,7 +271,7 @@ func decodeSIMD(dst, src []byte, si, di int, kind encodingKind) (int, int) {
 			packedBytes := packed.ToBits().ReshapeToUint8s().LookupModOrZeroGrouped(packShuf)
 			out := packedBytes.ReshapeToUint32s().LookupMod(packPerm).ReshapeToUint8s()
 
-			out.Lo().Store(dst[di:])
+			out.Lo().StoreArray((*[16]uint8)(unsafe.Add(dstPtr, di)))
 			byteorder.LEPutUint64(dst[di+16:], out.Hi().ReshapeToUint64s().Elem(0))
 			si += 32
 			di += 24
@@ -198,4 +279,68 @@ func decodeSIMD(dst, src []byte, si, di int, kind encodingKind) (int, int) {
 	}
 
 	return si, di
+}
+
+func stripNewlinesSIMD(p []byte) int {
+	cr := archsimd.BroadcastUint8x32('\r')
+	lf := archsimd.BroadcastUint8x32('\n')
+	ptr := unsafe.Pointer(unsafe.SliceData(p))
+	i := 0
+	for len(p)-i >= 32 {
+		in := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(ptr, i)))
+		if m := in.Equal(cr).Or(in.Equal(lf)).ToBits(); m != 0 {
+			i += bits.TrailingZeros32(m)
+			break
+		}
+		i += 32
+	}
+	n := i
+	if i < len(p) && (p[i] == '\r' || p[i] == '\n') {
+		for i < len(p) && (p[i] == '\r' || p[i] == '\n') {
+			i++
+		}
+	}
+	for len(p)-i >= 32 {
+		in := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(ptr, i)))
+		m := in.Equal(cr).Or(in.Equal(lf)).ToBits()
+		if m == 0 {
+			in.StoreArray((*[32]uint8)(unsafe.Add(ptr, n)))
+			n += 32
+			i += 32
+			continue
+		}
+		k := bits.TrailingZeros32(m)
+		if k > 0 {
+			if n < i {
+				copy(p[n:], p[i:i+k])
+			}
+			n += k
+			i += k
+		}
+		for i < len(p) && (p[i] == '\r' || p[i] == '\n') {
+			i++
+		}
+	}
+	for ; len(p)-i >= 8; i += 8 {
+		x := byteorder.LEUint64(p[i:])
+		if mayHaveNewline(x) {
+			n += dropNewlines(p[n:], p[i:i+8])
+			continue
+		}
+		if n < i {
+			byteorder.LEPutUint64(p[n:], x)
+		}
+		n += 8
+	}
+	if n == i {
+		for ; i < len(p); i++ {
+			b := p[i]
+			if b == '\r' || b == '\n' {
+				return n + dropNewlines(p[n:], p[i:])
+			}
+			n++
+		}
+		return n
+	}
+	return n + dropNewlines(p[n:], p[i:])
 }
