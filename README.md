@@ -7,26 +7,26 @@ This fork is a personal Go branch maintained by 404Setup.
 
 ## Features
 
-This fork preserves Go syntax and standard library API compatibility.
+Preserves Go syntax and standard library API compatibility.
 
 ### Compiler & Runtime
-- **`cmd/compile`**: `-ldflags="-o2"` (loop unrolling, post-prove DCE), `-ldflags="-o3"` (cost-based inlining, loop interchange/tiling, cross-loop BCE, reflection/interface DCE), `-ldflags="-fmth"` (fast-math SSA), stack SBO for non-escaping slices/strings, and `//go:immutable` checks. Prefix with `all=` to apply across dependencies.
-- **`runtime`, `slices`, `maps`**: span/stack/GC sweep optimizations, write-barrier deduplication, and compile-time/runtime immutable collections (`//go:immutable`, `slices.ToImmutable`, `maps.ToImmutable`).
+- **`cmd/compile`**: `-ldflags="-o2"` (loop unrolling, post-prove DCE), `-ldflags="-o3"` (cost-based inlining, loop interchange/tiling, cross-loop BCE, reflection/interface DCE), `-ldflags="-fmth"` (fast-math SSA), stack SBO for non-escaping slices/strings, and `//go:immutable` checks (`all=` applies across dependencies).
+- **`runtime`, `slices`, `maps`**: span/stack/GC sweep optimizations, write-barrier deduplication, and `//go:immutable`, `slices.ToImmutable`, `maps.ToImmutable`.
 
 ### Standard Library
 - **`sync/v2`, `sync/v2/container`, `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, `LinkedHashMap`, `OrderedMap`, `TreeMap`, and `ConcurrentSkipListMap`.
 - **`encoding/base64`**: AVX2/SSSE3 (`amd64`), NEON/SVE2 (`arm64`) vector codecs, LUT4 scalar decode, and single-alloc `EncodeToString`.
-- **`encoding/hex`**: AVX2/SSSE3 (`amd64`) and NEON (`arm64`) vector encode/decode, LUT16/coalesced scalar paths, zero-copy `DecodeString`, single-alloc `Dump`, and large-buffer `Decoder.Read`.
+- **`encoding/hex`**: AVX2/SSSE3 (`amd64`) and NEON (`arm64`) vector encode/decode, LUT16 scalar encode, AVX2/packed `Dump`, zero-copy `DecodeString`, single-alloc `EncodeToString`, and large-buffer `Decoder.Read`.
 - **`encoding/json`, `encoding/json/v2`, `encoding/xml`**: compiled marshal/unmarshal plans, SWAR/SIMD scanning, pooled codecs, and generic `Append*`/`*Of` fast paths (`jsonv2` and `nojsonv2`).
 - **`fmt`, `internal/fmtsort`, `io`**: stack-buffered formatting/append fast paths, specialized `[]T` and map/slice comparators, direct string scanning, and exact-sized `io.ReadAll`.
-- **`net`, `net/http`, `net/http/server`, `net/url`**: TTL DNS cache (`GODEBUG=netdnscache=0`), HTTP/1.1/2/3 allocation/header optimizations, `net/http/server` zero-alloc router, and fast `url.ParseQuery`.
+- **`net`, `net/http`, `net/http/server`, `net/url`**: TTL DNS cache (`GODEBUG=netdnscache=0`), HTTP/1.1/2/3 header/allocation optimizations, zero-alloc `net/http/server` router, and fast `url.ParseQuery`.
 - **`reflect`**: fast paths for `Equal`, `DeepEqual`, `Comparable`, `Call`, and `VisibleFields`.
 
 ---
 
 ## Benchmarks
 
-Measured on `linux/amd64` (Intel Xeon) comparing upstream Go / pre-optimization baselines against Illium (`-cpu=2` where applicable).
+Measured on `linux/amd64` (Intel Xeon, `-cpu=2`) against upstream Go / pre-optimization baselines.
 
 ### Compiler, Runtime & `reflect`
 
@@ -36,9 +36,7 @@ Measured on `linux/amd64` (Intel Xeon) comparing upstream Go / pre-optimization 
 | Compiler (`-o2`/`-fmth`) | `LoopUnrollFull` / `math.Pow` | 6.31 / 43.17 ns | **1.59 / 17.04 ns** | **3.97× / 2.53×** |
 | Binary Size (`-o3`) | Service + Reflect + Crypto | 8.59 MB | **5.29 MB** | **-38.4%** |
 | Stack SBO | `make([]byte, 128)` / `[]byte(s)` (48 B) | 37.86 / 22.53 ns | **3.71 / 1.88 ns** | **1 → 0 allocs** |
-| Runtime | `GCSpanSetResetEmpty` / `PageCacheFlush64` | 3,424 / 1,536 ns | **468.7 / 263.7 ns** | **7.31× / 5.82×** |
-| `reflect` | `Comparable` / `VisibleFields/Flat` | 170.8 / 727.3 ns | **16.36 / 223.2 ns** | **10.44× / 3.26×** |
-| `//go:immutable` | `ToImmutableSliceIdempotent` / `ToImmutableMapIdempotent` | — | **10.41 / 4.13 ns** | **0 allocs** |
+| Runtime / `reflect` | `GCSpanSetResetEmpty` / `reflect.Comparable` | 3,424 / 170.8 ns | **468.7 / 16.36 ns** | **7.31× / 10.44×** |
 
 ### Concurrency (`sync/v2`, `sync/atomic/v2`)
 
@@ -47,7 +45,6 @@ Measured on `linux/amd64` (Intel Xeon) comparing upstream Go / pre-optimization 
 | `MapLoadMostlyHits` / `MapMixed` | 12.14 / 52.23 ns | **7.11 / 38.81 ns** | **-41.4% / -25.7%** | 0/6 B → 0/**4 B** |
 | `PoolValue` (32 B struct) | 25.90 ns | **6.23 ns** | **4.16×** | 1 (32 B) → **0 (0 B)** |
 | `atomic.Value` `Load` / `Store` / `CAS Mismatch` (128 B) | 1.03 / 17.18 / 69.03 ns | **0.35 / 5.77 / 9.79 ns** | **2.94× / 2.98× / 7.05×** | 0/1/1 → **0 allocs** |
-| Ordered Maps (1,024 entries `Load`) | — | **10.79 / 21.00 / 53.28 / 85.54 ns** | `LinkedHash`/`Ordered`/`Tree`/`SkipList` | — |
 
 ### Networking & HTTP (`net`, `net/http`, `net/http/server`)
 
@@ -56,8 +53,7 @@ Measured on `linux/amd64` (Intel Xeon) comparing upstream Go / pre-optimization 
 | `ClientServer/h1` (`1×` / `64×`) | 24.03 / 50.46 µs | **10.02 / 13.63 µs** | **-58.3% / -73.0%** | 65/105 → **20/39** |
 | `ClientServerParallel/64` (`https1`) | 818.8 µs | **29.45 µs** | **27.80×** | 795 → **58** |
 | `ServerFakeConn` (`KeepAlive` / `Lite`) | 7,414 / 4,031 ns | **2,374 / 759.4 ns** | **-68.0% / -81.2%** | 22/12 → **6/2** |
-| `ReverseProxy.ServeHTTP` / `ReadRequest` (`Wrk`) | 6,124 / 984.1 ns | **602.4 / 246.9 ns** | **10.17× / 3.99×** | 12/7 → **7/2** |
-| `net` `DNSLookupHost` / `DNSLookupTXT` | 44,548 / 3,612 ns | **1,241 / 441.8 ns** | **35.9× / 8.18×** | 74/22 → **1/1** |
+| `ReverseProxy.ServeHTTP` / `DNSLookupHost` | 6,124 / 44,548 ns | **602.4 / 1,241 ns** | **10.17× / 35.9×** | 12/74 → **7/1** |
 | `net/http/server` `Param1Route` / `ParallelParamRoute` | 227.0 / 117.0 ns | **83.05 / 41.55 ns** | **2.73× / 2.82×** | 1 → **0 allocs** |
 
 ### Encoding & Formatting
@@ -78,16 +74,13 @@ Measured on `linux/amd64` (Intel Xeon) comparing upstream Go / pre-optimization 
 
 | Package | Benchmark | Baseline | Illium | Speedup / Notes |
 | :--- | :--- | ---: | ---: | :--- |
-| `encoding/base64` | `Encode` / `Decode` (32 KB) | 42.42 / 49.04 µs | **3.31 / 4.35 µs** | **12.83× / 11.27×** (9,910 / 10,044 MB/s, 0 allocs) |
-| `encoding/hex` | `Encode` (4 KB / 16 KB) | 6,832 / 61,986 ns | **326.9 / 1,292 ns** | **20.90× / 47.98×** (12.7 GB/s, 0 allocs) |
-| `encoding/hex` | `Decode` (4 KB / 16 KB) | 11,437 / 54,980 ns | **285.4 / 1,092 ns** | **40.07× / 50.35×** (15.0 GB/s, 0 allocs) |
-| `encoding/hex` | `DecodeString` (256 B / 4 KB) | 1,453 / 25,113 ns | **38.38 / 1,448 ns** | **37.86× / 17.34×** (0 / 1 alloc) |
-| `encoding/hex` | `Dump` (16 B / 1 KB) | 3,410 / 61,712 ns | **101.8 / 4,467 ns** | **33.50× / 13.82×** (1 alloc) |
-| `encoding/xml` | `Marshal` / `Unmarshal` | 7.80 / 21.11 µs | **1.19 / 4.54 µs** | **6.58× / 4.65×** (23/184 → **1/33 allocs**) |
-| `encoding/xml` | `EscapeTextPlain` | 12.31 µs | **250.6 ns** | **49.12×** (0 allocs) |
-| `fmt` | `SprintfEmpty` / `SprintfString` / `SprintfInt` | 66.35 / 112.8 / 41.91 ns | **3.27 / 27.95 / 16.59 ns** | **20.29× / 4.04× / 2.53×** |
-| `fmt` | `SprintfSliceInt` / `SprintfBytes` | 530.6 / 483.7 ns | **116.9 / 111.7 ns** | **4.54× / 4.33×** |
-| `fmt` | `SprintMixed` / `SscanIntFloat` | 163.6 / 1,198 ns | **79.94 / 590.3 ns** | **2.05× / 2.03×** |
+| `encoding/base64` | `Encode` / `Decode` (32 KB) | 42.42 / 49.04 µs | **3.31 / 4.35 µs** | **12.83× / 11.27×** (9.9 / 10.0 GB/s, 0 allocs) |
+| `encoding/hex` | `Encode` / `Decode` (4 KB) | 5,413 / 3,014 ns | **327.4 / 275.5 ns** | **16.5× / 10.9×** (12.5 / 14.9 GB/s, 0 allocs) |
+| `encoding/hex` | `Encode` / `Decode` (16 KB) | 21,599 / 11,701 ns | **1,283 / 1,091 ns** | **16.8× / 10.7×** (12.8 / 15.0 GB/s, 0 allocs) |
+| `encoding/hex` | `EncodeToString` (8 KB) / `DecodeString` (4 KB) | 24,355 / 4,122 ns | **6,328 / 1,196 ns** | **3.85× / 3.45×** (1 alloc) |
+| `encoding/hex` | `Dump` (1 KB / 16 KB) | 21,879 / 387,694 ns | **2,532 / 33,310 ns** | **8.64× / 11.6×** (3 → **1 alloc**) |
+| `encoding/xml` | `Marshal` / `Unmarshal` / `EscapeTextPlain` | 7.80 / 21.11 / 12.31 µs | **1.19 / 4.54 / 0.25 µs** | **6.58× / 4.65× / 49.1×** |
+| `fmt` | `SprintfEmpty` / `SprintfInt` / `SprintfSliceInt` | 66.35 / 41.91 / 530.6 ns | **3.27 / 16.59 / 116.9 ns** | **20.3× / 2.53× / 4.54×** |
 
 ---
 
