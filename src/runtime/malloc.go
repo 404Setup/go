@@ -1094,7 +1094,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				}
 			}
 		} else {
-			x, elemsize = mallocgcLarge(size, typ, needzero)
+			x, elemsize = mallocgcLarge(size, typ, needzero, false)
 		}
 	} else {
 		if size <= maxSmallSize-gc.MallocHeaderSize {
@@ -1119,7 +1119,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				}
 			}
 		} else {
-			x, elemsize = mallocgcLarge(size, typ, needzero)
+			x, elemsize = mallocgcLarge(size, typ, needzero, false)
 		}
 	}
 
@@ -1646,10 +1646,6 @@ func mallocgcSmallScanHeader(size uintptr, typ *_type) (unsafe.Pointer, uintptr)
 	return x, size
 }
 
-func mallocgcLarge(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uintptr) {
-	return mallocgcLargeWithAlign(size, typ, needzero, false)
-}
-
 func mallocgcLargeImmutable(size uintptr, typ *_type) unsafe.Pointer {
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1672,7 +1668,7 @@ func mallocgcLargeImmutable(size uintptr, typ *_type) unsafe.Pointer {
 		deductAssistCredit(size)
 	}
 
-	x, elemsize := mallocgcLargeWithAlign(size, typ, true, hasImmutablePageProtect)
+	x, elemsize := mallocgcLarge(size, typ, true, hasImmutablePageProtect)
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -1705,7 +1701,9 @@ func mallocgcLargeImmutable(size uintptr, typ *_type) unsafe.Pointer {
 	return x
 }
 
-func mallocgcLargeWithAlign(size uintptr, typ *_type, needzero, physPageAlign bool) (unsafe.Pointer, uintptr) {
+// mallocgcLarge allocates a large object. It deliberately does not go through
+// a wrapper function: an extra frame would show up in memory profile stacks.
+func mallocgcLarge(size uintptr, typ *_type, needzero, physPageAlign bool) (unsafe.Pointer, uintptr) {
 	// Set mp.mallocing to keep from being preempted by GC.
 	mp := acquirem()
 	if doubleCheckMalloc {
