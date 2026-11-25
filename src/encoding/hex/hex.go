@@ -180,7 +180,10 @@ func Decode(dst, src []byte) (int, error) {
 	}
 
 	t0, t1, t2, t3 := &hexDecLUT4[0], &hexDecLUT4[1], &hexDecLUT4[2], &hexDecLUT4[3]
-	for len(src) >= 8 {
+	// The len(dst) >= 4 condition ensures that a too-short dst falls through
+	// to the scalar loop below, which validates src before touching dst, so
+	// malformed input is reported as an error rather than a bounds panic.
+	for len(src) >= 8 && len(dst) >= 4 {
 		_ = dst[3] // Eliminate bounds checks.
 		v0 := t0[src[0]] | t1[src[1]] | t2[src[2]] | t3[src[3]]
 		v1 := t0[src[4]] | t1[src[5]] | t2[src[6]] | t3[src[7]]

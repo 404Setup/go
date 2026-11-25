@@ -498,6 +498,25 @@ func TestFastForwardOverlapAndShortDst(t *testing.T) {
 		t.Fatalf("short dst early error: got (%d, %v, %x)", n, err, dst[0])
 	}
 
+	// Short dst with a long malformed src must also report the error, not
+	// panic on the batched-loop bounds check.
+	for _, n := range []int{8, 9, 16, 17, 32, 64} {
+		for dl := 0; dl < 4; dl++ {
+			for pos := 0; pos < n; pos++ {
+				src := bytes.Repeat([]byte("a"), n)
+				src[pos] = 'z'
+				wantN := pos / 2
+				if wantN > dl {
+					continue // upstream also panics once valid output outgrows dst
+				}
+				n2, err := Decode(make([]byte, dl), src)
+				if n2 != wantN || !errors.Is(err, InvalidByteError('z')) {
+					t.Fatalf("short dst n=%d dl=%d pos=%d: got (%d, %v), want (%d, InvalidByteError('z'))", n, dl, pos, n2, err, wantN)
+				}
+			}
+		}
+	}
+
 	// Empty DecodeString must return a non-nil empty slice (matching upstream).
 	empty, err := DecodeString("")
 	if err != nil || empty == nil || len(empty) != 0 {
