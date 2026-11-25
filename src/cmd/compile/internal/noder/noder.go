@@ -174,6 +174,7 @@ type pragmas struct {
 	Embeds     []pragmaEmbed
 	WasmImport *WasmImport
 	WasmExport *WasmExport
+	Immutable  *pragmaImmutable
 }
 
 func (p *pragmas) Nointerface() bool {
@@ -191,6 +192,11 @@ type WasmImport struct {
 type WasmExport struct {
 	Pos  syntax.Pos
 	Name string
+}
+
+type pragmaImmutable struct {
+	Pos  syntax.Pos
+	Args []string
 }
 
 type pragmaPos struct {
@@ -230,6 +236,10 @@ func (pragma *pragmas) CheckDefPragma() syntax.Pragma {
 	if pragma.WasmExport != nil {
 		pragma.noder.error(syntax.Error{Pos: pragma.WasmExport.Pos, Msg: "misplaced go:wasmexport directive"})
 		pragma.WasmExport = nil
+	}
+	if pragma.Immutable != nil && len(pragma.Immutable.Args) > 0 {
+		pragma.noder.error(syntax.Error{Pos: pragma.Immutable.Pos, Msg: "//go:immutable arguments are only allowed on function declarations"})
+		pragma.Immutable.Args = nil
 	}
 	pragma.Pos = kept
 	pragma.Flag &= ir.Immutable
@@ -348,6 +358,19 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 			break
 		}
 		pragma.Embeds = append(pragma.Embeds, pragmaEmbed{pos, args})
+
+	case text == "go:immutable" || strings.HasPrefix(text, "go:immutable ") || strings.HasPrefix(text, "go:immutable\t"):
+		if pragma.Immutable != nil {
+			p.error(syntax.Error{Pos: pos, Msg: "duplicate //go:immutable directive"})
+			break
+		}
+		fields := strings.Fields(text)
+		pragma.Flag |= ir.Immutable
+		pragma.Pos = append(pragma.Pos, pragmaPos{ir.Immutable, pos})
+		pragma.Immutable = &pragmaImmutable{
+			Pos:  pos,
+			Args: fields[1:],
+		}
 
 	case strings.HasPrefix(text, "go:cgo_import_dynamic "):
 		// This is permitted for general use because Solaris

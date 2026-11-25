@@ -28,11 +28,12 @@ import (
 // must not be copied after first use. Unlike Java's ConcurrentSkipListMap,
 // it permits nil keys and values when the comparator and Go types permit them.
 type ConcurrentSkipListMap[K, V any] struct {
-	_       noCopy
-	compare func(K, K) int
-	mu      sync.Mutex
-	state   atomic.Pointer[skipListState[K, V]]
-	length  int // guarded by mu
+	_         noCopy
+	compare   func(K, K) int
+	mu        sync.Mutex
+	state     atomic.Pointer[skipListState[K, V]]
+	immutable atomic.Bool
+	length    int // guarded by mu unless immutable
 }
 
 const skipListLevels = 32
@@ -67,6 +68,9 @@ func NewConcurrentSkipListMap[K, V any](compare func(K, K) int) *ConcurrentSkipL
 
 // Len returns the number of entries. It waits for an in-progress write.
 func (m *ConcurrentSkipListMap[K, V]) Len() int {
+	if m.immutable.Load() {
+		return m.length
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.length
@@ -146,6 +150,9 @@ func (m *ConcurrentSkipListMap[K, V]) Swap(key K, value V) (previous V, loaded b
 // LoadOrStore returns the existing value, or stores and returns value if absent.
 // The loaded result reports whether the key was already present.
 func (m *ConcurrentSkipListMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
+	if m.immutable.Load() {
+		panic(errImmutableContainer)
+	}
 	if actual, loaded = m.Load(key); loaded {
 		return actual, true
 	}
@@ -156,6 +163,9 @@ func (m *ConcurrentSkipListMap[K, V]) LoadOrStore(key K, value V) (actual V, loa
 }
 
 func (m *ConcurrentSkipListMap[K, V]) store(key K, value V, overwrite bool) (previous V, loaded bool) {
+	if m.immutable.Load() {
+		panic(errImmutableContainer)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.compare == nil {
@@ -221,6 +231,9 @@ func (m *ConcurrentSkipListMap[K, V]) store(key K, value V, overwrite bool) (pre
 
 // LoadAndDelete removes key and returns its previous value, if any.
 func (m *ConcurrentSkipListMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
+	if m.immutable.Load() {
+		panic(errImmutableContainer)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.remove(key)
@@ -259,6 +272,9 @@ func (m *ConcurrentSkipListMap[K, V]) Delete(key K) { m.LoadAndDelete(key) }
 // panics if V is not comparable, or if the comparison involves an uncomparable
 // dynamic value.
 func (m *ConcurrentSkipListMap[K, V]) CompareAndSwap(key K, old, new V) bool {
+	if m.immutable.Load() {
+		panic(errImmutableContainer)
+	}
 	eq := mapValueEqualFunc[V]("CompareAndSwap")
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -277,6 +293,9 @@ func (m *ConcurrentSkipListMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 // CompareAndDelete atomically removes key if its value equals old. It has the
 // same comparability requirements as CompareAndSwap.
 func (m *ConcurrentSkipListMap[K, V]) CompareAndDelete(key K, old V) bool {
+	if m.immutable.Load() {
+		panic(errImmutableContainer)
+	}
 	eq := mapValueEqualFunc[V]("CompareAndDelete")
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -309,13 +328,16 @@ func (m *ConcurrentSkipListMap[K, V]) CompareAndDelete(key K, old V) bool {
 // Clear atomically removes all entries. Readers already using the old list may
 // finish on it; its storage is reclaimed when they finish.
 func (m *ConcurrentSkipListMap[K, V]) Clear() {
+	if m.immutable.Load() {
+		panic(errImmutableContainer)
+	}
 	m.mu.Lock()
 	m.state.Store(nil)
 	m.length = 0
 	m.mu.Unlock()
 }
 
-// skipListPair is called with mu held, so n is either nil or live.
+// skipListPair is called with mu held or on an immutable map, so n is either nil or live.
 func skipListPair[K, V any](n *skipListNode[K, V]) (key K, value V, ok bool) {
 	if n == nil {
 		return key, value, false
@@ -324,8 +346,13 @@ func skipListPair[K, V any](n *skipListNode[K, V]) (key K, value V, ok bool) {
 }
 
 func (m *ConcurrentSkipListMap[K, V]) edge(last, remove bool) (key K, value V, ok bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if remove && m.immutable.Load() {
+		panic(errImmutableContainer)
+	}
+	if !m.immutable.Load() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+	}
 	s := m.state.Load()
 	if s == nil {
 		return key, value, false
@@ -404,8 +431,10 @@ func (m *ConcurrentSkipListMap[K, V]) Ceiling(key K) (K, V, bool) { return m.bou
 func (m *ConcurrentSkipListMap[K, V]) Higher(key K) (K, V, bool) { return m.bound(key, true, false) }
 
 func (m *ConcurrentSkipListMap[K, V]) bound(key K, upper, inclusive bool) (k K, value V, ok bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !m.immutable.Load() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+	}
 	s := m.state.Load()
 	if s == nil {
 		return k, value, false
@@ -484,3 +513,68 @@ func (m *ConcurrentSkipListMap[K, V]) Backward() iter.Seq2[K, V] {
 // Range calls f in ascending key order, stopping when f returns false.
 // It has the same concurrency guarantees as All.
 func (m *ConcurrentSkipListMap[K, V]) Range(f func(K, V) bool) { m.All()(f) }
+
+// IsImmutable reports whether m is immutable.
+// It returns false if m is nil.
+func (m *ConcurrentSkipListMap[K, V]) IsImmutable() bool {
+	return m != nil && m.immutable.Load()
+}
+
+// ToImmutable returns an immutable snapshot of m retaining its comparator and
+// entries. Any subsequent mutating method call on the returned map panics at
+// runtime.
+// If m is already immutable or nil, ToImmutable returns m without allocating.
+func (m *ConcurrentSkipListMap[K, V]) ToImmutable() *ConcurrentSkipListMap[K, V] {
+	if m == nil || m.immutable.Load() {
+		return m
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	c := &ConcurrentSkipListMap[K, V]{
+		compare: m.compare,
+	}
+	s := m.state.Load()
+	if s != nil && m.length > 0 {
+		ns := new(skipListState[K, V])
+		ns.head.next = ns.headNext[:]
+		nodes := make([]skipListNode[K, V], m.length)
+		var preds [skipListLevels]*skipListNode[K, V]
+		for l := range preds {
+			preds[l] = &ns.head
+		}
+		maxH := 1
+		used := 0
+		for cur := s.head.next[0].Load(); cur != nil && used < len(nodes); cur = cur.next[0].Load() {
+			val := cur.value.Load()
+			if val == nil {
+				continue
+			}
+			dst := &nodes[used]
+			used++
+			dst.key = cur.key
+			dst.initVal = skipListValue[V]{value: val.value}
+			dst.value.Store(&dst.initVal)
+			h := min(1+bits.TrailingZeros64(uint64(used)), skipListLevels)
+			if h > maxH {
+				maxH = h
+			}
+			if h <= len(dst.tower) {
+				dst.next = dst.tower[:h]
+			} else {
+				dst.next = make([]atomic.Pointer[skipListNode[K, V]], h)
+			}
+			for l := range h {
+				preds[l].next[l].Store(dst)
+				preds[l] = dst
+			}
+		}
+		c.length = used
+		if used > 0 {
+			ns.height.Store(int32(maxH))
+			c.state.Store(ns)
+		}
+	}
+	c.immutable.Store(true)
+	return c
+}

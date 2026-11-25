@@ -101,9 +101,14 @@ type pkgWriter struct {
 	cgoPragmas [][]string
 
 	// //go:immutable tracking
-	immutableVars     map[*types2.Var]bool
-	immutableDefStmts map[*syntax.AssignStmt]bool
-	importedImmutable map[*types2.Var]bool
+	immutableVars             map[*types2.Var]bool
+	immutableParamVars        map[*types2.Var]bool
+	immutableResultVars       map[*types2.Var]bool
+	immutableDefStmts         map[*syntax.AssignStmt]bool
+	importedImmutable         map[*types2.Var]bool
+	immutableFuncs            map[*types2.Func]*ir.ImmutableFuncInfo
+	importedImmutableFuncs    map[*types2.Func]*ir.ImmutableFuncInfo
+	immutableContainerGlobals []*types2.Var
 }
 
 // newPkgWriter returns an initialized pkgWriter for the specified
@@ -132,8 +137,11 @@ func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo ma
 			std    bool
 		}),
 
-		immutableVars:     make(map[*types2.Var]bool),
-		immutableDefStmts: make(map[*syntax.AssignStmt]bool),
+		immutableVars:       make(map[*types2.Var]bool),
+		immutableParamVars:  make(map[*types2.Var]bool),
+		immutableResultVars: make(map[*types2.Var]bool),
+		immutableDefStmts:   make(map[*syntax.AssignStmt]bool),
+		immutableFuncs:      make(map[*types2.Func]*ir.ImmutableFuncInfo),
 	}
 }
 
@@ -1210,6 +1218,12 @@ func (w *writer) funcExt(obj *types2.Func) {
 	}
 
 	sig, block := obj.Type().(*types2.Signature), decl.Body
+	immInfo := w.p.immutableFuncs[obj]
+	if immInfo == nil {
+		pragma &^= ir.Immutable
+	} else if sig.Recv() != nil && len(immInfo.Params) > 0 {
+		pragma |= ir.Nointerface
+	}
 	body, closureVars := w.p.bodyIdx(sig, block, w.dict)
 	if len(closureVars) > 0 {
 		fmt.Fprintln(os.Stderr, "CLOSURE", closureVars)
@@ -1218,6 +1232,16 @@ func (w *writer) funcExt(obj *types2.Func) {
 
 	w.Sync(pkgbits.SyncFuncExt)
 	w.pragmaFlag(pragma)
+	if pragma&ir.Immutable != 0 {
+		w.Len(len(immInfo.Params))
+		for _, idx := range immInfo.Params {
+			w.Len(idx)
+		}
+		w.Len(len(immInfo.Results))
+		for _, idx := range immInfo.Results {
+			w.Len(idx)
+		}
+	}
 	w.linkname(obj)
 
 	if buildcfg.GOARCH == "wasm" || buildcfg.GOARCH == "wasm32" {
@@ -1549,7 +1573,7 @@ func (w *writer) assign(expr syntax.Expr) {
 
 			if w.p.immutableVars[obj] {
 				w.Bool(true)
-				switch u := types2.Unalias(obj.Type()).Underlying().(type) {
+				switch u := types2.CommonUnderlying(obj.Type()).(type) {
 				case *types2.Slice:
 					w.Len(1)
 					w.rtype(u.Elem())
@@ -1557,7 +1581,12 @@ func (w *writer) assign(expr syntax.Expr) {
 					w.Len(2)
 					w.rtype(obj.Type())
 				default:
-					w.Len(0)
+					if isImmutableContainerType(obj.Type()) {
+						w.Len(3)
+						w.containerFreezeMethod(obj, obj.Type())
+					} else {
+						w.Len(0)
+					}
 				}
 			} else {
 				w.Bool(false)
@@ -2365,6 +2394,14 @@ func (w *writer) funcInst(obj *types2.Func, targs []types2.Type) {
 	w.objInfo(info)
 }
 
+func (w *writer) containerFreezeMethod(pos poser, recv types2.Type) {
+	methodObj, _, _ := types2.LookupFieldOrMethod(recv, false, nil, "ToImmutable")
+	if methodObj == nil {
+		w.p.fatalf(pos, "missing ToImmutable method on %v", recv)
+	}
+	w.methodExprFunc(pos, nil, recv, methodObj.(*types2.Func))
+}
+
 // methodExpr writes out a reference to the method selected by
 // expr. sel should be the corresponding types2.Selection, and recv
 // the type produced after any implicit addressing, dereferencing, and
@@ -2372,7 +2409,10 @@ func (w *writer) funcInst(obj *types2.Func, targs []types2.Type) {
 // parameter in the case of interface types, and is needed for
 // handling type parameter methods.)
 func (w *writer) methodExpr(expr *syntax.SelectorExpr, recv types2.Type, sel *types2.Selection) {
-	fun := sel.Obj().(*types2.Func)
+	w.methodExprFunc(expr, expr.Sel, recv, sel.Obj().(*types2.Func))
+}
+
+func (w *writer) methodExprFunc(pos poser, selName *syntax.Name, recv types2.Type, fun *types2.Func) {
 	sig := fun.Type().(*types2.Signature)
 
 	w.typ(recv)
@@ -2388,7 +2428,7 @@ func (w *writer) methodExpr(expr *syntax.SelectorExpr, recv types2.Type, sel *ty
 		w.typ(sig)
 	}
 
-	w.pos(expr)
+	w.pos(pos)
 	w.selector(fun)
 
 	// Method on a type parameter. These require an indirect call
@@ -2402,7 +2442,7 @@ func (w *writer) methodExpr(expr *syntax.SelectorExpr, recv types2.Type, sel *ty
 	}
 
 	if isInterface(recv) != isInterface(sig.Recv().Type()) {
-		w.p.fatalf(expr, "isInterface inconsistency: %v and %v", recv, sig.Recv().Type())
+		w.p.fatalf(pos, "isInterface inconsistency: %v and %v", recv, sig.Recv().Type())
 	}
 
 	if isConcreteMethod(sig) {
@@ -2410,7 +2450,7 @@ func (w *writer) methodExpr(expr *syntax.SelectorExpr, recv types2.Type, sel *ty
 		var info objInfo
 		if isGenericMethod(sig) {
 			// For generic methods, the shaped object is the method itself.
-			mExplicits := asTypeSlice(w.p.info.Instances[expr.Sel].TypeArgs)
+			mExplicits := asTypeSlice(w.p.info.Instances[selName].TypeArgs)
 			info = w.p.objInstIdx(fun.Origin(), slices.Concat(tExplicits, mExplicits), w.dict)
 		} else {
 			// For non-generic concrete methods on generic types, the shaped object
@@ -2890,6 +2930,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 
 		obj := pw.info.Defs[n.Name].(*types2.Func)
 		pw.funDecls[obj] = n
+		pw.collectImmutableFunc(n, obj)
 
 		return c.withTParams(obj)
 
@@ -2927,6 +2968,9 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		}
 
 		if asPragmaFlag(n.Pragma)&ir.Immutable != 0 {
+			if p, ok := n.Pragma.(*pragmas); ok && p.Immutable != nil && len(p.Immutable.Args) > 0 {
+				pw.errorf(p.Immutable.Pos, "//go:immutable arguments are only allowed on function declarations")
+			}
 			if c.withinFunc && n.Values == nil {
 				pw.errorf(n, "//go:immutable local variable must have an initializer")
 			}
@@ -2937,10 +2981,13 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 				}
 				if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
 					if !isImmutableSupportedType(obj.Type()) {
-						pw.errorf(name, "//go:immutable only applies to slice, array, or map variables")
+						pw.errorf(name, "//go:immutable only applies to slice, array, map, or container variables")
 						continue
 					}
 					pw.immutableVars[obj] = true
+					if !c.withinFunc && isImmutableContainerType(obj.Type()) {
+						pw.immutableContainerGlobals = append(pw.immutableContainerGlobals, obj)
+					}
 				}
 			}
 		}
@@ -2949,6 +2996,9 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		if n.Op == syntax.Def {
 			pw.checkPragmas(n.Pragma, ir.Immutable, false)
 			if asPragmaFlag(n.Pragma)&ir.Immutable != 0 {
+				if p, ok := n.Pragma.(*pragmas); ok && p.Immutable != nil && len(p.Immutable.Args) > 0 {
+					pw.errorf(p.Immutable.Pos, "//go:immutable arguments are only allowed on function declarations")
+				}
 				pw.immutableDefStmts[n] = true
 				for _, lhsExpr := range syntax.UnpackListExpr(n.Lhs) {
 					name, ok := syntax.Unparen(lhsExpr).(*syntax.Name)
@@ -2958,7 +3008,7 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 					}
 					if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
 						if !isImmutableSupportedType(obj.Type()) {
-							pw.errorf(name, "//go:immutable only applies to slice, array, or map variables")
+							pw.errorf(name, "//go:immutable only applies to slice, array, map, or container variables")
 							continue
 						}
 						pw.immutableVars[obj] = true
@@ -3067,6 +3117,12 @@ func (w *writer) pkgInit(noders []*noder) {
 		}
 	}
 	w.Code(declEnd)
+
+	w.Len(len(w.p.immutableContainerGlobals))
+	for _, v := range w.p.immutableContainerGlobals {
+		w.obj(v, nil)
+		w.containerFreezeMethod(v, v.Type())
+	}
 
 	w.Sync(pkgbits.SyncEOF)
 }

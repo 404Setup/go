@@ -5,6 +5,8 @@
 // Package ring implements operations on circular lists.
 package ring
 
+const errImmutableRing = "container/ring: modification of immutable Ring"
+
 // A Ring is an element of a circular list, or ring.
 // Rings do not have a beginning or end; a pointer to any ring element
 // serves as reference to the entire ring. Empty rings are represented
@@ -13,9 +15,13 @@ package ring
 type Ring struct {
 	next, prev *Ring
 	Value      any // for use by client; untouched by this library
+	immutable  bool
 }
 
 func (r *Ring) init() *Ring {
+	if r.immutable {
+		panic(errImmutableRing)
+	}
 	r.next = r
 	r.prev = r
 	return r
@@ -88,6 +94,9 @@ func New(n int) *Ring {
 // after r. The result points to the element following the
 // last element of s after insertion.
 func (r *Ring) Link(s *Ring) *Ring {
+	if r.immutable || (s != nil && s.immutable) {
+		panic(errImmutableRing)
+	}
 	n := r.Next()
 	if s != nil {
 		p := s.Prev()
@@ -105,6 +114,9 @@ func (r *Ring) Link(s *Ring) *Ring {
 // at r.Next(). If n % r.Len() == 0, r remains unchanged.
 // The result is the removed subring. r must not be empty.
 func (r *Ring) Unlink(n int) *Ring {
+	if r.immutable {
+		panic(errImmutableRing)
+	}
 	if n <= 0 {
 		return nil
 	}
@@ -133,4 +145,57 @@ func (r *Ring) Do(f func(any)) {
 			f(p.Value)
 		}
 	}
+}
+
+// IsImmutable reports whether r is immutable.
+// It returns false if r is nil.
+func (r *Ring) IsImmutable() bool {
+	return r != nil && r.immutable
+}
+
+// ToImmutable returns an immutable copy of r with every ring element marked
+// immutable. Any subsequent Link or Unlink involving the returned ring panics
+// at runtime.
+// If r is already immutable or nil, ToImmutable returns r without allocating.
+func (r *Ring) ToImmutable() *Ring {
+	if r == nil || r.immutable {
+		return r
+	}
+	if r.next == nil {
+		c := &Ring{
+			Value:     r.Value,
+			immutable: true,
+		}
+		c.next = c
+		c.prev = c
+		return c
+	}
+	n := 1
+	for p := r.next; p != r; p = p.next {
+		n++
+	}
+	nodes := make([]Ring, n)
+	src := r
+	for i := range nodes {
+		nodes[i].Value = src.Value
+		nodes[i].immutable = true
+		nodes[i].prev = &nodes[(i+n-1)%n]
+		nodes[i].next = &nodes[(i+1)%n]
+		src = src.next
+	}
+	return &nodes[0]
+}
+
+// ToImmutable returns an immutable copy of r with every ring element marked
+// immutable. Any subsequent Link or Unlink involving the returned ring panics
+// at runtime.
+// If r is already immutable or nil, ToImmutable returns r without allocating.
+func ToImmutable(r *Ring) *Ring {
+	return r.ToImmutable()
+}
+
+// IsImmutable reports whether r is immutable.
+// It returns false if r is nil.
+func IsImmutable(r *Ring) bool {
+	return r.IsImmutable()
 }

@@ -243,3 +243,47 @@ func BenchmarkImmutableSliceRead(b *testing.B) {
 		}
 	})
 }
+
+//go:noinline
+func sumPlainFunc(s []int64) []int64 {
+	if len(s) > 2 {
+		return s[:2]
+	}
+	return s
+}
+
+//go:noinline
+//go:immutable args0 r
+func sumImmutableFunc(s []int64) []int64 {
+	if len(s) > 2 {
+		return s[:2]
+	}
+	return s
+}
+
+func BenchmarkImmutableFuncCall(b *testing.B) {
+	//go:immutable
+	imm := []int64{1, 2, 3, 4, 5, 6, 7, 8}
+	b.Run("Plain", func(b *testing.B) {
+		b.ReportAllocs()
+		var acc int64
+		for b.Loop() {
+			r := sumPlainFunc(imm)
+			acc += r[0]
+		}
+		if acc == -1 {
+			b.Fatal(acc)
+		}
+	})
+	b.Run("ImmutableDirective", func(b *testing.B) {
+		b.ReportAllocs()
+		var acc int64
+		for b.Loop() {
+			r := sumImmutableFunc(imm)
+			acc += r[0]
+		}
+		if acc == -1 {
+			b.Fatal(acc)
+		}
+	})
+}

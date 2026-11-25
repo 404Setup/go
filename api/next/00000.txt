@@ -1,3 +1,11 @@
+pkg container/list, func IsImmutable(*List) bool #80000
+pkg container/list, func ToImmutable(*List) *List #80000
+pkg container/list, method (*List) IsImmutable() bool #80000
+pkg container/list, method (*List) ToImmutable() *List #80000
+pkg container/ring, func IsImmutable(*Ring) bool #80000
+pkg container/ring, func ToImmutable(*Ring) *Ring #80000
+pkg container/ring, method (*Ring) IsImmutable() bool #80000
+pkg container/ring, method (*Ring) ToImmutable() *Ring #80000
 pkg encoding/json, func AppendMarshal([]uint8, interface{}) ([]uint8, error) #80000
 pkg encoding/json, func AppendMarshalIndent([]uint8, interface{}, string, string) ([]uint8, error) #80000
 pkg encoding/json, func AppendMarshalIndentOf[$0 interface{}]([]uint8, $0, string, string) ([]uint8, error) #80000
@@ -252,9 +260,11 @@ pkg sync/v2, type Pool[$0 interface{}] struct #80000
 pkg sync/v2, type Pool[$0 interface{}] struct, New func() $0 #80000
 pkg sync/v2, type RWMutex = sync.RWMutex #80000
 pkg sync/v2, type WaitGroup = sync.WaitGroup #80000
+pkg sync/v2/container, func IsImmutable[$0 interface{ IsImmutable, ToImmutable }]($0) bool #80000
 pkg sync/v2/container, func NewConcurrentSkipListMap[$0 interface{}, $1 interface{}](func($0, $0) int) *ConcurrentSkipListMap[$0, $1] #80000
 pkg sync/v2/container, func NewLinkedHashMap[$0 comparable, $1 interface{}](bool) *LinkedHashMap[$0, $1] #80000
 pkg sync/v2/container, func NewTreeMap[$0 interface{}, $1 interface{}](func($0, $0) int) *TreeMap[$0, $1] #80000
+pkg sync/v2/container, func ToImmutable[$0 interface{ IsImmutable, ToImmutable }]($0) $0 #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) All() iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Backward() iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Ceiling($0) ($0, $1, bool) #80000
@@ -265,6 +275,7 @@ pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Delete($0) #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) First() ($0, $1, bool) #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Floor($0) ($0, $1, bool) #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Higher($0) ($0, $1, bool) #80000
+pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) IsImmutable() bool #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Last() ($0, $1, bool) #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Len() int #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Load($0) ($1, bool) #80000
@@ -277,6 +288,7 @@ pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Range(func($0, $1
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) RangeBetween($0, $0) iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Store($0, $1) #80000
 pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) Swap($0, $1) ($1, bool) #80000
+pkg sync/v2/container, method (*ConcurrentSkipListMap[$0, $1]) ToImmutable() *ConcurrentSkipListMap[$0, $1] #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) All() iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Backward() iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Clear() #80000
@@ -284,6 +296,7 @@ pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) CompareAndDelete($0, $1) 
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) CompareAndSwap($0, $1, $1) bool #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Delete($0) #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) First() ($0, $1, bool) #80000
+pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) IsImmutable() bool #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Last() ($0, $1, bool) #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Len() int #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Load($0) ($1, bool) #80000
@@ -296,11 +309,13 @@ pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Range(func($0, $1) bool) 
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Shrink() #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Store($0, $1) #80000
 pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) Swap($0, $1) ($1, bool) #80000
+pkg sync/v2/container, method (*LinkedHashMap[$0, $1]) ToImmutable() *LinkedHashMap[$0, $1] #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) All() iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) Clear() #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) CompareAndDelete($0, $1) bool #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) CompareAndSwap($0, $1, $1) bool #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) Delete($0) #80000
+pkg sync/v2/container, method (*OrderedMap[$0, $1]) IsImmutable() bool #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) Load($0) ($1, bool) #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) LoadAndDelete($0) ($1, bool) #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) LoadOrStore($0, $1) ($1, bool) #80000
@@ -308,6 +323,7 @@ pkg sync/v2/container, method (*OrderedMap[$0, $1]) Range(func($0, $1) bool) #80
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) Shrink() #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) Store($0, $1) #80000
 pkg sync/v2/container, method (*OrderedMap[$0, $1]) Swap($0, $1) ($1, bool) #80000
+pkg sync/v2/container, method (*OrderedMap[$0, $1]) ToImmutable() *OrderedMap[$0, $1] #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) All() iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Backward() iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Ceiling($0) ($0, $1, bool) #80000
@@ -318,6 +334,7 @@ pkg sync/v2/container, method (*TreeMap[$0, $1]) Delete($0) #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) First() ($0, $1, bool) #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Floor($0) ($0, $1, bool) #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Higher($0) ($0, $1, bool) #80000
+pkg sync/v2/container, method (*TreeMap[$0, $1]) IsImmutable() bool #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Last() ($0, $1, bool) #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Len() int #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Load($0) ($1, bool) #80000
@@ -330,6 +347,7 @@ pkg sync/v2/container, method (*TreeMap[$0, $1]) Range(func($0, $1) bool) #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) RangeBetween($0, $0) iter.Seq2[$0, $1] #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Store($0, $1) #80000
 pkg sync/v2/container, method (*TreeMap[$0, $1]) Swap($0, $1) ($1, bool) #80000
+pkg sync/v2/container, method (*TreeMap[$0, $1]) ToImmutable() *TreeMap[$0, $1] #80000
 pkg sync/v2/container, type ConcurrentSkipListMap[$0 interface{}, $1 interface{}] struct #80000
 pkg sync/v2/container, type LinkedHashMap[$0 comparable, $1 interface{}] struct #80000
 pkg sync/v2/container, type OrderedMap[$0 comparable, $1 interface{}] struct #80000

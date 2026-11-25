@@ -10,11 +10,12 @@ This fork is a personal Go branch maintained by 404Setup.
 Preserves Go syntax and standard library API compatibility.
 
 ### Compiler & Runtime
-- **`cmd/compile`**: `-ldflags="-o2"` (loop unrolling, post-prove DCE), `-ldflags="-o3"` (cost-based inlining, loop interchange/tiling, cross-loop BCE, reflection/interface DCE), `-ldflags="-fmth"` (fast-math SSA), stack SBO for non-escaping slices/strings, and `//go:immutable` checks (`all=` applies across dependencies).
-- **`runtime`, `slices`, `maps`**: span/stack/GC sweep optimizations, write-barrier deduplication, and `//go:immutable`, `slices.ToImmutable`, `maps.ToImmutable`.
+- **`cmd/compile`**: `-ldflags="-o2"` (loop unrolling, post-prove DCE), `-ldflags="-o3"` (cost-based inlining, loop interchange/tiling, cross-loop BCE, reflection/interface DCE), `-ldflags="-fmth"` (fast-math SSA), and stack SBO for non-escaping slices/strings (`all=` applies flags across dependencies).
+- **`//go:immutable`**: compile-time and runtime immutability for slices, arrays, maps, `*list.List`, `*ring.Ring`, and `sync/v2/container` maps. Applies to variable declarations (`var`, `:=`) and named functions/methods (`//go:immutable [args<N>...] [r|r<N>...]`; bare `//go:immutable` constrains all supported non-variadic parameters, `r` aliases `r0` for single-result functions, verified at compile time across call and return sites).
+- **`runtime`, `slices`, `maps`, `container/list`, `container/ring`**: span/stack/GC sweep optimizations, write-barrier deduplication, and `ToImmutable` / `IsImmutable`.
 
 ### Standard Library
-- **`sync/v2`, `sync/v2/container`, `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, `LinkedHashMap`, `OrderedMap`, `TreeMap`, and `ConcurrentSkipListMap`.
+- **`sync/v2`, `sync/v2/container`, `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, and `LinkedHashMap`, `OrderedMap`, `TreeMap`, `ConcurrentSkipListMap` (`ToImmutable`, `IsImmutable`).
 - **`encoding/base64`**: AVX2/SSSE3 (`amd64`), NEON/SVE2 (`arm64`) vector codecs, LUT4 scalar decode, and single-alloc `EncodeToString`.
 - **`encoding/hex`**: AVX2/SSSE3 (`amd64`) and NEON (`arm64`) vector encode/decode, LUT16 scalar encode, AVX2/packed `Dump`, zero-copy `DecodeString`, single-alloc `EncodeToString`, and large-buffer `Decoder.Read`.
 - **`encoding/json`, `encoding/json/v2`, `encoding/xml`**: compiled marshal/unmarshal plans, SWAR/SIMD scanning, pooled codecs, and generic `Append*`/`*Of` fast paths (`jsonv2` and `nojsonv2`).

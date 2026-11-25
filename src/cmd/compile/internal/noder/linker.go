@@ -267,6 +267,21 @@ func (l *linker) relocFuncExt(w *pkgbits.Encoder, name *ir.Name) {
 	w.Sync(pkgbits.SyncFuncExt)
 
 	l.pragmaFlag(w, name.Func.Pragma)
+	if name.Func.Pragma&ir.Immutable != 0 {
+		var params, results []int
+		if info := name.Func.ImmutableInfo(); info != nil {
+			params = info.Params
+			results = info.Results
+		}
+		w.Len(len(params))
+		for _, idx := range params {
+			w.Len(idx)
+		}
+		w.Len(len(results))
+		for _, idx := range results {
+			w.Len(idx)
+		}
+	}
 	l.linkname(w, name)
 
 	if buildcfg.GOARCH == "wasm" || buildcfg.GOARCH == "wasm32" {

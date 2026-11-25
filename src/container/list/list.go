@@ -43,15 +43,21 @@ func (e *Element) Prev() *Element {
 	return nil
 }
 
+const errImmutableList = "container/list: modification of immutable List"
+
 // List represents a doubly linked list.
 // The zero value for List is an empty list ready to use.
 type List struct {
-	root Element // sentinel list element, only &root, root.prev, and root.next are used
-	len  int     // current list length excluding (this) sentinel element
+	root      Element // sentinel list element, only &root, root.prev, and root.next are used
+	len       int     // current list length excluding (this) sentinel element
+	immutable bool
 }
 
 // Init initializes or clears list l.
 func (l *List) Init() *List {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	l.root.next = &l.root
 	l.root.prev = &l.root
 	l.len = 0
@@ -132,6 +138,9 @@ func (l *List) move(e, at *Element) {
 // It returns the element value e.Value.
 // The element must not be nil.
 func (l *List) Remove(e *Element) any {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	if e.list == l {
 		// if e.list == l, l must have been initialized when e was inserted
 		// in l or l == nil (e is a zero Element) and l.remove will crash
@@ -142,12 +151,18 @@ func (l *List) Remove(e *Element) any {
 
 // PushFront inserts a new element e with value v at the front of list l and returns e.
 func (l *List) PushFront(v any) *Element {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	l.lazyInit()
 	return l.insertValue(v, &l.root)
 }
 
 // PushBack inserts a new element e with value v at the back of list l and returns e.
 func (l *List) PushBack(v any) *Element {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	l.lazyInit()
 	return l.insertValue(v, l.root.prev)
 }
@@ -156,6 +171,9 @@ func (l *List) PushBack(v any) *Element {
 // If mark is not an element of l, the list is not modified.
 // The mark must not be nil.
 func (l *List) InsertBefore(v any, mark *Element) *Element {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	if mark.list != l {
 		return nil
 	}
@@ -167,6 +185,9 @@ func (l *List) InsertBefore(v any, mark *Element) *Element {
 // If mark is not an element of l, the list is not modified.
 // The mark must not be nil.
 func (l *List) InsertAfter(v any, mark *Element) *Element {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	if mark.list != l {
 		return nil
 	}
@@ -178,6 +199,9 @@ func (l *List) InsertAfter(v any, mark *Element) *Element {
 // If e is not an element of l, the list is not modified.
 // The element must not be nil.
 func (l *List) MoveToFront(e *Element) {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	if e.list != l || l.root.next == e {
 		return
 	}
@@ -189,6 +213,9 @@ func (l *List) MoveToFront(e *Element) {
 // If e is not an element of l, the list is not modified.
 // The element must not be nil.
 func (l *List) MoveToBack(e *Element) {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	if e.list != l || l.root.prev == e {
 		return
 	}
@@ -200,6 +227,9 @@ func (l *List) MoveToBack(e *Element) {
 // If e or mark is not an element of l, or e == mark, the list is not modified.
 // The element and mark must not be nil.
 func (l *List) MoveBefore(e, mark *Element) {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	if e.list != l || e == mark || mark.list != l {
 		return
 	}
@@ -210,6 +240,9 @@ func (l *List) MoveBefore(e, mark *Element) {
 // If e or mark is not an element of l, or e == mark, the list is not modified.
 // The element and mark must not be nil.
 func (l *List) MoveAfter(e, mark *Element) {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	if e.list != l || e == mark || mark.list != l {
 		return
 	}
@@ -219,6 +252,9 @@ func (l *List) MoveAfter(e, mark *Element) {
 // PushBackList inserts a copy of another list at the back of list l.
 // The lists l and other may be the same. They must not be nil.
 func (l *List) PushBackList(other *List) {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	l.lazyInit()
 	for i, e := other.Len(), other.Front(); i > 0; i, e = i-1, e.Next() {
 		l.insertValue(e.Value, l.root.prev)
@@ -228,8 +264,68 @@ func (l *List) PushBackList(other *List) {
 // PushFrontList inserts a copy of another list at the front of list l.
 // The lists l and other may be the same. They must not be nil.
 func (l *List) PushFrontList(other *List) {
+	if l.immutable {
+		panic(errImmutableList)
+	}
 	l.lazyInit()
 	for i, e := other.Len(), other.Back(); i > 0; i, e = i-1, e.Prev() {
 		l.insertValue(e.Value, &l.root)
 	}
+}
+
+// IsImmutable reports whether l is immutable.
+// It returns false if l is nil.
+func (l *List) IsImmutable() bool {
+	return l != nil && l.immutable
+}
+
+// ToImmutable returns an immutable copy of l. Any subsequent mutating method
+// call on the returned list panics at runtime.
+// If l is already immutable or nil, ToImmutable returns l without allocating.
+func (l *List) ToImmutable() *List {
+	if l == nil || l.immutable {
+		return l
+	}
+	c := &List{
+		len:       l.len,
+		immutable: true,
+	}
+	c.root.next = &c.root
+	c.root.prev = &c.root
+	if l.len == 0 {
+		return c
+	}
+	elems := make([]Element, l.len)
+	src := l.root.next
+	for i := range elems {
+		elems[i].Value = src.Value
+		elems[i].list = c
+		if i == 0 {
+			elems[i].prev = &c.root
+		} else {
+			elems[i].prev = &elems[i-1]
+		}
+		if i == l.len-1 {
+			elems[i].next = &c.root
+		} else {
+			elems[i].next = &elems[i+1]
+		}
+		src = src.next
+	}
+	c.root.next = &elems[0]
+	c.root.prev = &elems[l.len-1]
+	return c
+}
+
+// ToImmutable returns an immutable copy of l. Any subsequent mutating method
+// call on the returned list panics at runtime.
+// If l is already immutable or nil, ToImmutable returns l without allocating.
+func ToImmutable(l *List) *List {
+	return l.ToImmutable()
+}
+
+// IsImmutable reports whether l is immutable.
+// It returns false if l is nil.
+func IsImmutable(l *List) bool {
+	return l.IsImmutable()
 }
