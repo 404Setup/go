@@ -2616,6 +2616,9 @@ func (p *parser) stmtOrNil() Stmt {
 		s := p.simpleStmt(lhs, 0)
 		if prag != nil {
 			if as, ok := s.(*AssignStmt); ok && as.Op == Def {
+				if checker, ok := prag.(interface{ CheckDefPragma() Pragma }); ok {
+					prag = checker.CheckDefPragma()
+				}
 				as.Pragma = prag
 			} else {
 				p.pragh(p.pos(), p.scanner.blank, "", prag)

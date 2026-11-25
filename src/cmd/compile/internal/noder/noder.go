@@ -168,6 +168,7 @@ var allowedStdPragmas = map[string]bool{
 
 // *pragmas is the value stored in a syntax.pragmas during parsing.
 type pragmas struct {
+	noder      *noder
 	Flag       ir.PragmaFlag // collected bits
 	Pos        []pragmaPos   // position of each individual flag
 	Embeds     []pragmaEmbed
@@ -202,6 +203,42 @@ type pragmaEmbed struct {
 	Patterns []string
 }
 
+// CheckDefPragma reports any directive other than //go:immutable on a short
+// variable declaration during parsing so misplaced directives are diagnosed
+// even if later compiler phases are skipped due to earlier syntax errors.
+func (pragma *pragmas) CheckDefPragma() syntax.Pragma {
+	var kept []pragmaPos
+	for _, pos := range pragma.Pos {
+		if pos.Flag&^ir.Immutable != 0 {
+			if pos.Flag&pragma.Flag != 0 {
+				pragma.noder.error(syntax.Error{Pos: pos.Pos, Msg: "misplaced compiler directive"})
+			}
+		} else {
+			kept = append(kept, pos)
+		}
+	}
+	if len(pragma.Embeds) > 0 {
+		for _, e := range pragma.Embeds {
+			pragma.noder.error(syntax.Error{Pos: e.Pos, Msg: "misplaced go:embed directive"})
+		}
+		pragma.Embeds = nil
+	}
+	if pragma.WasmImport != nil {
+		pragma.noder.error(syntax.Error{Pos: pragma.WasmImport.Pos, Msg: "misplaced go:wasmimport directive"})
+		pragma.WasmImport = nil
+	}
+	if pragma.WasmExport != nil {
+		pragma.noder.error(syntax.Error{Pos: pragma.WasmExport.Pos, Msg: "misplaced go:wasmexport directive"})
+		pragma.WasmExport = nil
+	}
+	pragma.Pos = kept
+	pragma.Flag &= ir.Immutable
+	if pragma.Flag == 0 {
+		return nil
+	}
+	return pragma
+}
+
 func (p *noder) checkUnusedDuringParse(pragma *pragmas) {
 	for _, pos := range pragma.Pos {
 		if pos.Flag&pragma.Flag != 0 {
@@ -225,7 +262,7 @@ func (p *noder) checkUnusedDuringParse(pragma *pragmas) {
 func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.Pragma) syntax.Pragma {
 	pragma, _ := old.(*pragmas)
 	if pragma == nil {
-		pragma = new(pragmas)
+		pragma = &pragmas{noder: p}
 	}
 
 	if text == "" {
