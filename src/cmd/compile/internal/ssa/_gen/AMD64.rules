@@ -40,6 +40,16 @@
 (SBBQ x y (FlagEQ)) => (SUBQborrow x y)
 (SBBQconst x [c] (FlagEQ)) => (SUBQconstborrow x [c])
 (SUBQborrow x (MOVQconst [c])) && ssa.Is32Bit(c) => (SUBQconstborrow x [int32(c)])
+// Constant carry/borrow in. With the carry clear, use the carry-less ops.
+// With the carry set, materialize it: NEGL of a nonzero value sets CF.
+(ADCQ x y (Flag(LT_UGT|GT_UGT))) => (ADDQcarry x y)
+(ADCQconst x [c] (Flag(LT_UGT|GT_UGT))) => (ADDQconstcarry x [c])
+(SBBQ x y (Flag(LT_UGT|GT_UGT))) => (SUBQborrow x y)
+(SBBQconst x [c] (Flag(LT_UGT|GT_UGT))) => (SUBQconstborrow x [c])
+(ADCQ x y (Flag(LT_ULT|GT_ULT))) => (ADCQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+(ADCQconst x [c] (Flag(LT_ULT|GT_ULT))) => (ADCQconst x [c] (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+(SBBQ x y (Flag(LT_ULT|GT_ULT))) => (SBBQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+(SBBQconst x [c] (Flag(LT_ULT|GT_ULT))) => (SBBQconst x [c] (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
 (Select1 (NEGLflags (MOVQconst [0]))) => (FlagEQ)
 (Select1 (NEGLflags (MOVBQZX (SETB x)))) => x
 // Absorb InvertFlags into ADCQ/SBBQ: CF(InvertFlags(f)) = SETA(f), so
@@ -1817,6 +1827,14 @@
 (IfElseFloat(32|64) <t> x mask y) && t.Size() == 16 => (VBLENDVP(S|D)128 y x mask)
 (IfElseFloat(32|64) <t> x mask y) && t.Size() == 32 => (VBLENDVP(S|D)256 y x mask)
 (IfElseFloat(32|64) <t> x mask y) && t.Size() == 64 => (VPBLENDM(D|Q)Masked512 y x (VPMOVVec(32x16|64x8)ToM <types.TypeMask> mask))
+
+// 512-bit mask logic uses the same instructions as integer vector logic. The
+// mask rules below turn it into logic on K registers.
+// (VPANDND x y) computes ^x & y.
+(AndMask512 ...) => (VPANDD512 ...)
+(OrMask512 ...) => (VPORD512 ...)
+(XorMask512 ...) => (VPXORD512 ...)
+(AndNotMask512 x y) => (VPANDND512 y x)
 
 // 256-bit mask logic. If AVX2 is available, use the integer instructions, which
 // the mask rules below can optimize further. Otherwise, use the floating-point

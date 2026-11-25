@@ -3559,6 +3559,9 @@ func RewriteValue(v *ssa.Value) bool {
 		return true
 	case ssaop.OpAndMask256:
 		return rewriteValue_OpAndMask256(v)
+	case ssaop.OpAndMask512:
+		v.Op = ssaop.OpAMD64VPANDD512
+		return true
 	case ssaop.OpAndNotInt16x16:
 		return rewriteValue_OpAndNotInt16x16(v)
 	case ssaop.OpAndNotInt16x32:
@@ -3585,6 +3588,8 @@ func RewriteValue(v *ssa.Value) bool {
 		return rewriteValue_OpAndNotInt8x64(v)
 	case ssaop.OpAndNotMask256:
 		return rewriteValue_OpAndNotMask256(v)
+	case ssaop.OpAndNotMask512:
+		return rewriteValue_OpAndNotMask512(v)
 	case ssaop.OpAndNotUint16x16:
 		return rewriteValue_OpAndNotUint16x16(v)
 	case ssaop.OpAndNotUint16x32:
@@ -5997,6 +6002,9 @@ func RewriteValue(v *ssa.Value) bool {
 		return true
 	case ssaop.OpOrMask256:
 		return rewriteValue_OpOrMask256(v)
+	case ssaop.OpOrMask512:
+		v.Op = ssaop.OpAMD64VPORD512
+		return true
 	case ssaop.OpOrUint16x16:
 		v.Op = ssaop.OpAMD64VPOR256
 		return true
@@ -7193,6 +7201,9 @@ func RewriteValue(v *ssa.Value) bool {
 		return true
 	case ssaop.OpXorMask256:
 		return rewriteValue_OpXorMask256(v)
+	case ssaop.OpXorMask512:
+		v.Op = ssaop.OpAMD64VPXORD512
+		return true
 	case ssaop.OpXorUint16x16:
 		v.Op = ssaop.OpAMD64VPXOR256
 		return true
@@ -7845,6 +7856,66 @@ func rewriteValue_OpAMD64ADCQ(v *ssa.Value) bool {
 		v.AddArg2(x, y)
 		return true
 	}
+	// match: (ADCQ x y (FlagLT_UGT))
+	// result: (ADDQcarry x y)
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagLT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADDQcarry)
+		v.AddArg2(x, y)
+		return true
+	}
+	// match: (ADCQ x y (FlagGT_UGT))
+	// result: (ADDQcarry x y)
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagGT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADDQcarry)
+		v.AddArg2(x, y)
+		return true
+	}
+	// match: (ADCQ x y (FlagLT_ULT))
+	// result: (ADCQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagLT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADCQ)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg3(x, y, v0)
+		return true
+	}
+	// match: (ADCQ x y (FlagGT_ULT))
+	// result: (ADCQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagGT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADCQ)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg3(x, y, v0)
+		return true
+	}
 	// match: (ADCQ x y (InvertFlags f))
 	// result: (ADCQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVBQZX <types.Types[types.TUINT32]> (SETA <types.Types[types.TUINT8]> f)))))
 	for {
@@ -7884,6 +7955,70 @@ func rewriteValue_OpAMD64ADCQconst(v *ssa.Value) bool {
 		v.Reset(ssaop.OpAMD64ADDQconstcarry)
 		v.AuxInt = ssa.Int32ToAuxInt(c)
 		v.AddArg(x)
+		return true
+	}
+	// match: (ADCQconst x [c] (FlagLT_UGT))
+	// result: (ADDQconstcarry x [c])
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagLT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADDQconstcarry)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v.AddArg(x)
+		return true
+	}
+	// match: (ADCQconst x [c] (FlagGT_UGT))
+	// result: (ADDQconstcarry x [c])
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagGT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADDQconstcarry)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v.AddArg(x)
+		return true
+	}
+	// match: (ADCQconst x [c] (FlagLT_ULT))
+	// result: (ADCQconst x [c] (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagLT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADCQconst)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg2(x, v0)
+		return true
+	}
+	// match: (ADCQconst x [c] (FlagGT_ULT))
+	// result: (ADCQconst x [c] (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagGT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64ADCQconst)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg2(x, v0)
 		return true
 	}
 	// match: (ADCQconst x [c] (InvertFlags f))
@@ -32736,6 +32871,66 @@ func rewriteValue_OpAMD64SBBQ(v *ssa.Value) bool {
 		v.AddArg2(x, y)
 		return true
 	}
+	// match: (SBBQ x y (FlagLT_UGT))
+	// result: (SUBQborrow x y)
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagLT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SUBQborrow)
+		v.AddArg2(x, y)
+		return true
+	}
+	// match: (SBBQ x y (FlagGT_UGT))
+	// result: (SUBQborrow x y)
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagGT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SUBQborrow)
+		v.AddArg2(x, y)
+		return true
+	}
+	// match: (SBBQ x y (FlagLT_ULT))
+	// result: (SBBQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagLT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SBBQ)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg3(x, y, v0)
+		return true
+	}
+	// match: (SBBQ x y (FlagGT_ULT))
+	// result: (SBBQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		x := v_0
+		y := v_1
+		if v_2.Op != ssaop.OpAMD64FlagGT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SBBQ)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg3(x, y, v0)
+		return true
+	}
 	// match: (SBBQ x y (InvertFlags f))
 	// result: (SBBQ x y (Select1 <types.TypeFlags> (NEGLflags (MOVBQZX <types.Types[types.TUINT32]> (SETA <types.Types[types.TUINT8]> f)))))
 	for {
@@ -32829,6 +33024,70 @@ func rewriteValue_OpAMD64SBBQconst(v *ssa.Value) bool {
 		v.Reset(ssaop.OpAMD64SUBQconstborrow)
 		v.AuxInt = ssa.Int32ToAuxInt(c)
 		v.AddArg(x)
+		return true
+	}
+	// match: (SBBQconst x [c] (FlagLT_UGT))
+	// result: (SUBQconstborrow x [c])
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagLT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SUBQconstborrow)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v.AddArg(x)
+		return true
+	}
+	// match: (SBBQconst x [c] (FlagGT_UGT))
+	// result: (SUBQconstborrow x [c])
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagGT_UGT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SUBQconstborrow)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v.AddArg(x)
+		return true
+	}
+	// match: (SBBQconst x [c] (FlagLT_ULT))
+	// result: (SBBQconst x [c] (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagLT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SBBQconst)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg2(x, v0)
+		return true
+	}
+	// match: (SBBQconst x [c] (FlagGT_ULT))
+	// result: (SBBQconst x [c] (Select1 <types.TypeFlags> (NEGLflags (MOVLconst [1]))))
+	for {
+		c := ssa.AuxIntToInt32(v.AuxInt)
+		x := v_0
+		if v_1.Op != ssaop.OpAMD64FlagGT_ULT {
+			break
+		}
+		v.Reset(ssaop.OpAMD64SBBQconst)
+		v.AuxInt = ssa.Int32ToAuxInt(c)
+		v0 := b.NewValue0(v.Pos, ssaop.OpSelect1, types.TypeFlags)
+		v1 := b.NewValue0(v.Pos, ssaop.OpAMD64NEGLflags, types.NewTuple(typ.UInt32, types.TypeFlags))
+		v2 := b.NewValue0(v.Pos, ssaop.OpAMD64MOVLconst, typ.UInt32)
+		v2.AuxInt = ssa.Int32ToAuxInt(1)
+		v1.AddArg(v2)
+		v0.AddArg(v1)
+		v.AddArg2(x, v0)
 		return true
 	}
 	// match: (SBBQconst x [c] (InvertFlags f))
@@ -99266,6 +99525,19 @@ func rewriteValue_OpAndNotMask256(v *ssa.Value) bool {
 		x := v_0
 		y := v_1
 		v.Reset(ssaop.OpAMD64VANDNPS256)
+		v.AddArg2(y, x)
+		return true
+	}
+}
+func rewriteValue_OpAndNotMask512(v *ssa.Value) bool {
+	v_1 := v.Args[1]
+	v_0 := v.Args[0]
+	// match: (AndNotMask512 x y)
+	// result: (VPANDND512 y x)
+	for {
+		x := v_0
+		y := v_1
+		v.Reset(ssaop.OpAMD64VPANDND512)
 		v.AddArg2(y, x)
 		return true
 	}

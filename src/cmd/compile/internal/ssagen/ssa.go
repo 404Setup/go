@@ -186,6 +186,7 @@ func InitConfig(config *ssa.Config) {
 	ir.Syms.Loong64HasLAM_BH = typecheck.LookupRuntimeVar("loong64HasLAM_BH")         // bool
 	ir.Syms.Loong64HasDBAR_HINTS = typecheck.LookupRuntimeVar("loong64HasDBAR_HINTS") // bool
 	ir.Syms.Loong64HasLSX = typecheck.LookupRuntimeVar("loong64HasLSX")               // bool
+	ir.Syms.Loong64HasLASX = typecheck.LookupRuntimeVar("loong64HasLASX")             // bool
 	ir.Syms.RISCV64HasV = typecheck.LookupRuntimeVar("riscv64HasV")                   // bool
 	ir.Syms.RISCV64HasZbb = typecheck.LookupRuntimeVar("riscv64HasZbb")               // bool
 	ir.Syms.Staticuint64s = typecheck.LookupRuntimeVar("staticuint64s")
@@ -7394,6 +7395,9 @@ func genssa(htmlWriter ssa.HTMLWriter, f *ssa.Func, pp *objw.Progs) {
 		// Any unmatched inline marks now need to be added to the inlining tree (and will generate a nop instruction).
 		for _, p := range inlMarkList {
 			if p.As != obj.ANOP {
+				// As with a reused instruction above, the call-site anchor
+				// must be a statement boundary, not just a line-table row.
+				p.Pos = p.Pos.WithIsStmt()
 				s.pp.CurFunc.LSym.Func().AddInlMark(p, inlMarks[p])
 			}
 		}
