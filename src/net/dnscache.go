@@ -262,6 +262,9 @@ func (c *dnsCache) putNegativeExpireAt(cfg *dnsConfig, name string, qtype dnsmes
 	if now >= expireAt {
 		return
 	}
+	if maxExp := now + int64(maxDNSNegativeCacheTTL); expireAt > maxExp {
+		expireAt = maxExp
+	}
 	c.checkConfig(cfg)
 	key := dnsCacheKey{name: lowerASCIIName(name), qtype: qtype}
 	if existing, ok := c.entries.Load(key); ok && now < existing.expireAt && (cfg == nil || existing.cfg == nil || existing.cfg == cfg) {

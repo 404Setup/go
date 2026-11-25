@@ -691,7 +691,7 @@ func (r *Resolver) tryCachedLookupHost(ctx context.Context, name string, conf *d
 			cached = append(cached, eAAAA.addrs...)
 		}
 		if len(cached) == 0 {
-			return nil, false
+			continue
 		}
 		if len(cached) == 1 {
 			return []string{cached[0].str}, true
@@ -768,7 +768,7 @@ func (r *Resolver) tryCachedLookupIPAddr(ctx context.Context, network, host stri
 			}
 		}
 		if addrCount == 0 {
-			return nil, false
+			continue
 		}
 		slab := make([]byte, totalBytes)
 		addrs := make([]IPAddr, 0, addrCount)

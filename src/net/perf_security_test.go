@@ -228,6 +228,112 @@ func TestDNSCachePutNegativeExpireAtConfigIsolationAndSweepSize(t *testing.T) {
 	}
 }
 
+func TestDNSCachePutNegativeExpireAtCapped(t *testing.T) {
+	origNow := dnsCacheNow
+	defer func() { dnsCacheNow = origNow }()
+
+	now := int64(1_000_000_000_000)
+	dnsCacheNow = func() int64 { return now }
+
+	var c dnsCache
+	cfg := &dnsConfig{servers: []string{"192.0.2.1:53"}}
+	c.putNegativeExpireAt(cfg, "neg-cap.example.", dnsmessage.TypeA, "192.0.2.1:53", now+int64(maxDNSCacheTTL))
+
+	if _, _, ok := c.getEntry(cfg, "neg-cap.example.", dnsmessage.TypeA); !ok {
+		t.Fatalf("expected negative entry right after insert")
+	}
+	now += int64(maxDNSNegativeCacheTTL) + 1
+	if _, _, ok := c.getEntry(cfg, "neg-cap.example.", dnsmessage.TypeA); ok {
+		t.Fatalf("negative entry exceeded maxDNSNegativeCacheTTL cap")
+	}
+}
+
+func TestDNSCacheSearchDomainAndDNSDoneOrder(t *testing.T) {
+	fake := fakeDNSServer{
+		rh: func(_, _ string, q dnsmessage.Message, _ time.Time) (dnsmessage.Message, error) {
+			resp := dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID:                 q.Header.ID,
+					Response:           true,
+					RecursionAvailable: true,
+				},
+				Questions: q.Questions,
+			}
+			switch q.Questions[0].Type {
+			case dnsmessage.TypeA:
+				resp.Answers = []dnsmessage.Resource{{
+					Header: dnsmessage.ResourceHeader{
+						Name:  q.Questions[0].Name,
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+						TTL:   3600,
+					},
+					Body: &dnsmessage.AResource{A: [4]byte{192, 0, 2, 20}},
+				}}
+			case dnsmessage.TypeAAAA:
+				resp.Answers = []dnsmessage.Resource{{
+					Header: dnsmessage.ResourceHeader{
+						Name:  q.Questions[0].Name,
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
+						TTL:   3600,
+					},
+					Body: &dnsmessage.AAAAResource{AAAA: [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+				}}
+			}
+			return resp, nil
+		},
+	}
+
+	r := &Resolver{PreferGo: true, Dial: fake.DialContext}
+	conf := &dnsConfig{
+		servers: []string{"192.0.2.53:53"},
+		search:  []string{"miss.example.", "hit.example."},
+		ndots:   1,
+	}
+
+	// Verify tryCachedLookupHost continues past a negatively cached prefix.
+	cache := r.getDNSCache()
+	now := dnsCacheNow()
+	cache.putNegativeExpireAt(conf, "svc.miss.example.", dnsmessage.TypeA, "192.0.2.53:53", now+int64(time.Minute))
+	cache.putNegativeExpireAt(conf, "svc.miss.example.", dnsmessage.TypeAAAA, "192.0.2.53:53", now+int64(time.Minute))
+
+	cache.store(dnsCacheKey{name: "svc.hit.example.", qtype: dnsmessage.TypeA}, &dnsCacheEntry{
+		server:   "192.0.2.53:53",
+		cfg:      conf,
+		expireAt: now + int64(time.Minute),
+		addrs:    []cachedAddr{{addr: netip.MustParseAddr("192.0.2.20"), str: "192.0.2.20"}},
+	}, now)
+	cache.putNegativeExpireAt(conf, "svc.hit.example.", dnsmessage.TypeAAAA, "192.0.2.53:53", now+int64(time.Minute))
+
+	hosts, ok := r.tryCachedLookupHost(context.Background(), "svc", conf)
+	if !ok || !slices.Equal(hosts, []string{"192.0.2.20"}) {
+		t.Fatalf("tryCachedLookupHost = (%v, %v), want ([192.0.2.20], true)", hosts, ok)
+	}
+
+	// Verify nettrace.Trace.DNSDone observes RFC 6724-sorted addresses on both miss and cache hit.
+	for _, pass := range []string{"miss", "hit"} {
+		var traced []IPAddr
+		tctx := context.WithValue(context.Background(), nettrace.TraceKey{}, &nettrace.Trace{
+			DNSDone: func(addrs []any, _ bool, err error) {
+				if err != nil {
+					return
+				}
+				for _, a := range addrs {
+					traced = append(traced, a.(IPAddr))
+				}
+			},
+		})
+		got, err := r.lookupIPAddr(tctx, "ip", "rfc6724.example.")
+		if err != nil {
+			t.Fatalf("%s lookupIPAddr failed: %v", pass, err)
+		}
+		if len(got) != 2 || len(traced) != 2 || !got[0].IP.Equal(traced[0].IP) || !got[1].IP.Equal(traced[1].IP) {
+			t.Fatalf("%s DNSDone order mismatch: traced=%v, returned=%v", pass, traced, got)
+		}
+	}
+}
+
 func TestSrcAddrCacheConcurrentEviction(t *testing.T) {
 	defer clearSrcAddrCache()
 	var wg sync.WaitGroup

@@ -354,13 +354,13 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 	alt, _ := ctx.Value(nettrace.LookupIPAltResolverKey{}).(func(context.Context, string, string) ([]IPAddr, error))
 	if testHookLookupIP == nil && alt == nil {
 		if addrs, ok := r.tryCachedLookupIPAddr(ctx, network, host); ok {
-			if trace != nil && trace.DNSDone != nil {
-				trace.DNSDone(ipAddrsEface(addrs), false, nil)
-			}
 			testHookShuffleRand(len(addrs), func(i, j int) {
 				addrs[i], addrs[j] = addrs[j], addrs[i]
 			})
 			sortByRFC6724(addrs)
+			if trace != nil && trace.DNSDone != nil {
+				trace.DNSDone(ipAddrsEface(addrs), false, nil)
+			}
 			return addrs, nil
 		}
 	}
@@ -419,10 +419,6 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 				err = newDNSError(mapErr(err), host, "")
 			}
 		}
-		if trace != nil && trace.DNSDone != nil {
-			addrs, _ := r.Val.([]IPAddr)
-			trace.DNSDone(ipAddrsEface(addrs), r.Shared, err)
-		}
 		// shuffle resolved addrs before sort by RFC6724 for connection load-balancing.
 		// See https://go.dev/issue/34511.
 		// See https://go.dev/issue/31698.
@@ -431,6 +427,9 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 			addrs[i], addrs[j] = addrs[j], addrs[i]
 		})
 		sortByRFC6724(addrs)
+		if trace != nil && trace.DNSDone != nil {
+			trace.DNSDone(ipAddrsEface(addrs), r.Shared, err)
+		}
 		return addrs, err
 	}
 }
