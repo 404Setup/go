@@ -1394,19 +1394,31 @@ func (v Value) FieldByIndexErr(index []int) (Value, error) {
 // It panics if v's Kind is not [Struct].
 func (v Value) FieldByName(name string) Value {
 	v.mustBe(Struct)
+	if name == "" {
+		return Value{}
+	}
 	t := (*structType)(unsafe.Pointer(v.typ()))
 	// Quick check for top-level name, or struct without embedded fields.
 	hasEmbeds := false
-	if name != "" {
-		for i := range t.Fields {
-			tf := &t.Fields[i]
-			if tf.Name.Name() == name {
+	matchIdx := -1
+	for i := range t.Fields {
+		tf := &t.Fields[i]
+		if tf.Name.Name() == name {
+			if name != "_" {
 				return v.Field(i)
 			}
-			if tf.Embedded() {
-				hasEmbeds = true
+			if matchIdx >= 0 {
+				return Value{}
 			}
+			matchIdx = i
+			continue
 		}
+		if tf.Embedded() {
+			hasEmbeds = true
+		}
+	}
+	if matchIdx >= 0 {
+		return v.Field(matchIdx)
 	}
 	if !hasEmbeds {
 		return Value{}
@@ -3395,6 +3407,15 @@ func (v Value) Comparable() bool {
 
 	case Array:
 		typ := (*abi.ArrayType)(unsafe.Pointer(v.typ()))
+		if typ.Len == 0 {
+			return typ.Elem.Equal != nil
+		}
+		if typ.Equal == nil {
+			return false
+		}
+		if !typ.Pointers() {
+			return true
+		}
 		switch Kind(typ.Elem.Kind()) {
 		case Interface, Array, Struct:
 			for i := 0; i < int(typ.Len); i++ {
@@ -3404,13 +3425,20 @@ func (v Value) Comparable() bool {
 			}
 			return true
 		}
-		return typ.Equal != nil
+		return true
 
 	case Interface:
 		return v.IsNil() || v.Elem().Comparable()
 
 	case Struct:
-		for i := range (*structType)(unsafe.Pointer(v.typ())).Fields {
+		typ := (*structType)(unsafe.Pointer(v.typ()))
+		if typ.Equal == nil {
+			return false
+		}
+		if !typ.Pointers() {
+			return true
+		}
+		for i := range typ.Fields {
 			if !v.Field(i).Comparable() {
 				return false
 			}
@@ -3482,7 +3510,7 @@ func (v Value) Equal(u Value) bool {
 			}
 			return true
 		}
-		if typ.TFlag&abi.TFlagRegularMemory != 0 {
+		if typ.TFlag&abi.TFlagRegularMemory != 0 && !typ.IsDirectIface() {
 			return bytealg.Equal(unsafe.Slice((*byte)(v.ptr), typ.Size()), unsafe.Slice((*byte)(u.ptr), typ.Size()))
 		}
 		for i := uintptr(0); i < typ.Len; i++ {
@@ -3493,7 +3521,7 @@ func (v Value) Equal(u Value) bool {
 		return true
 	case Struct:
 		typ := (*abi.StructType)(unsafe.Pointer(v.typ()))
-		if typ.TFlag&abi.TFlagRegularMemory != 0 {
+		if typ.TFlag&abi.TFlagRegularMemory != 0 && !typ.IsDirectIface() {
 			return bytealg.Equal(unsafe.Slice((*byte)(v.ptr), typ.Size()), unsafe.Slice((*byte)(u.ptr), typ.Size()))
 		}
 		for i := range typ.Fields {

@@ -773,3 +773,199 @@ func BenchmarkEqual(b *testing.B) {
 		}
 	})
 }
+
+func mustPanic(t *testing.T, name string, fn func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("%s: expected panic, got none", name)
+		}
+	}()
+	fn()
+}
+
+func TestEqualDirectIfacePointerWrappers(t *testing.T) {
+	a, b := 42, 42
+	pa, pa2, pb := &a, &a, &b
+
+	assertEqualAllModes := func(name string, v1, v2 any, want bool) {
+		t.Helper()
+		val1 := ValueOf(v1)
+		val2 := ValueOf(v2)
+		ptr1 := New(val1.Type())
+		ptr1.Elem().Set(val1)
+		ptr2 := New(val2.Type())
+		ptr2.Elem().Set(val2)
+		indir1 := ptr1.Elem()
+		indir2 := ptr2.Elem()
+
+		if got := val1.Equal(val2); got != want {
+			t.Fatalf("%s (val, val): Equal = %v, want %v", name, got, want)
+		}
+		if got := val1.Equal(indir2); got != want {
+			t.Fatalf("%s (val, indir): Equal = %v, want %v", name, got, want)
+		}
+		if got := indir1.Equal(val2); got != want {
+			t.Fatalf("%s (indir, val): Equal = %v, want %v", name, got, want)
+		}
+		if got := indir1.Equal(indir2); got != want {
+			t.Fatalf("%s (indir, indir): Equal = %v, want %v", name, got, want)
+		}
+	}
+
+	assertEqualAllModes("[1]*int same ptr", [1]*int{pa}, [1]*int{pa2}, true)
+	assertEqualAllModes("[1]*int diff ptr equal pointee", [1]*int{pa}, [1]*int{pb}, false)
+	assertEqualAllModes("[1]*int nil vs non-nil", [1]*int{nil}, [1]*int{pa}, false)
+	assertEqualAllModes("[1]*int nil vs nil", [1]*int{nil}, [1]*int{nil}, true)
+
+	type ptrStruct struct{ P *int }
+	assertEqualAllModes("ptrStruct same", ptrStruct{pa}, ptrStruct{pa2}, true)
+	assertEqualAllModes("ptrStruct diff ptr", ptrStruct{pa}, ptrStruct{pb}, false)
+	assertEqualAllModes("ptrStruct nil", ptrStruct{nil}, ptrStruct{pa}, false)
+	assertEqualAllModes("ptrStruct both nil", ptrStruct{nil}, ptrStruct{nil}, true)
+
+	type zeroPadPtrStruct struct {
+		_ [0]int
+		P *int
+	}
+	assertEqualAllModes("zeroPadPtrStruct diff ptr", zeroPadPtrStruct{P: pa}, zeroPadPtrStruct{P: pb}, false)
+	assertEqualAllModes("zeroPadPtrStruct nil", zeroPadPtrStruct{P: nil}, zeroPadPtrStruct{P: pa}, false)
+
+	assertEqualAllModes("[1]unsafe.Pointer diff", [1]unsafe.Pointer{unsafe.Pointer(pa)}, [1]unsafe.Pointer{unsafe.Pointer(pb)}, false)
+	assertEqualAllModes("[1]unsafe.Pointer nil", [1]unsafe.Pointer{nil}, [1]unsafe.Pointer{nil}, true)
+
+	ch1 := make(chan int)
+	ch2 := make(chan int)
+	type chanStruct struct{ C chan int }
+	assertEqualAllModes("chanStruct same", chanStruct{ch1}, chanStruct{ch1}, true)
+	assertEqualAllModes("chanStruct diff", chanStruct{ch1}, chanStruct{ch2}, false)
+	assertEqualAllModes("chanStruct nil", chanStruct{nil}, chanStruct{ch1}, false)
+
+	// StructOf and ArrayOf wrapping a single pointer.
+	st := StructOf([]StructField{{Name: "P", Type: TypeFor[*int]()}})
+	s1 := New(st).Elem()
+	s2 := New(st).Elem()
+	s1.Field(0).Set(ValueOf(pa))
+	s2.Field(0).Set(ValueOf(pb))
+	if s1.Equal(s2) {
+		t.Fatal("StructOf ptr diff: Equal = true, want false")
+	}
+	s3 := New(st).Elem()
+	if s3.Equal(s1) {
+		t.Fatal("StructOf nil vs non-nil: Equal = true, want false")
+	}
+	at := ArrayOf(1, TypeFor[*int]())
+	a1 := New(at).Elem()
+	a2 := New(at).Elem()
+	a1.Index(0).Set(ValueOf(pa))
+	a2.Index(0).Set(ValueOf(pb))
+	if a1.Equal(a2) {
+		t.Fatal("ArrayOf ptr diff: Equal = true, want false")
+	}
+}
+
+func TestComparableZeroLenAndNonPtr(t *testing.T) {
+	uncomparableVals := []struct {
+		name string
+		val  any
+	}{
+		{"[0]func()", [0]func(){}},
+		{"[0]struct{F func()}", [0]struct{ F func() }{}},
+		{"[0][1]func()", [0][1]func(){}},
+		{"struct{[0]func()}", struct{ A [0]func() }{}},
+		{"struct{[0]struct{F func()}}", struct{ A [0]struct{ F func() } }{}},
+		{"struct{X int; F func()}", struct {
+			X int
+			F func()
+		}{}},
+	}
+	for _, tc := range uncomparableVals {
+		v := ValueOf(tc.val)
+		if v.Comparable() {
+			t.Fatalf("%s: Comparable() = true, want false", tc.name)
+		}
+		mustPanic(t, tc.name+".Equal", func() {
+			_ = v.Equal(v)
+		})
+	}
+
+	comparableVals := []struct {
+		name string
+		val  any
+	}{
+		{"[0]any", [0]any{}},
+		{"[0]int", [0]int{}},
+		{"[0]struct{X int}", [0]struct{ X int }{}},
+		{"struct{A int; B [2]float64}", struct {
+			A int
+			B [2]float64
+		}{1, [2]float64{2, 3}}},
+		{"[4]float64", [4]float64{1, 2, 3, 4}},
+	}
+	for _, tc := range comparableVals {
+		v := ValueOf(tc.val)
+		if !v.Comparable() {
+			t.Fatalf("%s: Comparable() = false, want true", tc.name)
+		}
+		if !v.Equal(v) {
+			t.Fatalf("%s: Equal(self) = false, want true", tc.name)
+		}
+	}
+
+	// Verify NaN still compares false cleanly.
+	nanStruct := ValueOf(struct{ F float64 }{math.NaN()})
+	if !nanStruct.Comparable() {
+		t.Fatal("struct{float64}: Comparable() = false, want true")
+	}
+	if nanStruct.Equal(nanStruct) {
+		t.Fatal("struct{NaN}: Equal(self) = true, want false")
+	}
+}
+
+func TestFieldByNameBlankAndEmpty(t *testing.T) {
+	type oneBlank struct {
+		_ int
+		A string
+	}
+	type twoBlanks struct {
+		_ int
+		_ string
+		A int
+	}
+	type embedBlankA struct{ _ int }
+	type embedBlankB struct{ _ int }
+	type outerOneEmbedBlank struct {
+		embedBlankA
+		A int
+	}
+	type outerDominantBlank struct {
+		_ int
+		embedBlankA
+	}
+	type outerAmbigEmbedBlank struct {
+		embedBlankA
+		embedBlankB
+	}
+
+	check := func(name string, v any, fieldName string, wantOK bool, wantIndex []int) {
+		t.Helper()
+		rv := ValueOf(v)
+		rt := rv.Type()
+		sf, ok := rt.FieldByName(fieldName)
+		fv := rv.FieldByName(fieldName)
+		if ok != wantOK || fv.IsValid() != wantOK {
+			t.Fatalf("%s(%q): type ok=%v val valid=%v, want %v", name, fieldName, ok, fv.IsValid(), wantOK)
+		}
+		if wantOK && !slices.Equal(sf.Index, wantIndex) {
+			t.Fatalf("%s(%q): index=%v, want %v", name, fieldName, sf.Index, wantIndex)
+		}
+	}
+
+	check("oneBlank", oneBlank{}, "", false, nil)
+	check("outerOneEmbedBlank", outerOneEmbedBlank{}, "", false, nil)
+	check("oneBlank", oneBlank{}, "_", true, []int{0})
+	check("twoBlanks", twoBlanks{}, "_", false, nil)
+	check("outerOneEmbedBlank", outerOneEmbedBlank{}, "_", true, []int{0, 0})
+	check("outerDominantBlank", outerDominantBlank{}, "_", true, []int{0})
+	check("outerAmbigEmbedBlank", outerAmbigEmbedBlank{}, "_", false, nil)
+}

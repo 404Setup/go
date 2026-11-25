@@ -1391,18 +1391,30 @@ func (t *structType) FieldByNameFunc(match func(string) bool) (result StructFiel
 // FieldByName returns the struct field with the given name
 // and a boolean to indicate if the field was found.
 func (t *structType) FieldByName(name string) (f StructField, present bool) {
+	if name == "" {
+		return
+	}
 	// Quick check for top-level name, or struct without embedded fields.
 	hasEmbeds := false
-	if name != "" {
-		for i := range t.Fields {
-			tf := &t.Fields[i]
-			if tf.Name.Name() == name {
+	matchIdx := -1
+	for i := range t.Fields {
+		tf := &t.Fields[i]
+		if tf.Name.Name() == name {
+			if name != "_" {
 				return t.Field(i), true
 			}
-			if tf.Embedded() {
-				hasEmbeds = true
+			if matchIdx >= 0 {
+				return
 			}
+			matchIdx = i
+			continue
 		}
+		if tf.Embedded() {
+			hasEmbeds = true
+		}
+	}
+	if matchIdx >= 0 {
+		return t.Field(matchIdx), true
 	}
 	if !hasEmbeds {
 		return
