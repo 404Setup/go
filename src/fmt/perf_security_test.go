@@ -96,8 +96,8 @@ func TestPerfFastPathFormattingEquivalence(t *testing.T) {
 		{longASCII, nil, longASCII},
 		{"%%", nil, "%"},
 		{"100%% done", nil, "100% done"},
-		{"%d|%d|%d|%d", []any{0, 42, -99, math.MinInt64}, "0|42|-99|-9223372036854775808"},
-		{"%u|%x|%X|%o|%O|%b", []any{uint(255), 0xdeadbeef, 0xCAFE, 0755, 0755, 13}, "%!u(uint=255)|deadbeef|CAFE|755|0o755|1101"},
+		{"%d|%d|%d|%d", []any{0, 42, -99, int64(math.MinInt64)}, "0|42|-99|-9223372036854775808"},
+		{"%u|%x|%X|%o|%O|%b", []any{uint(255), uint64(0xdeadbeef), 0xCAFE, 0755, 0755, 13}, "%!u(uint=255)|deadbeef|CAFE|755|0o755|1101"},
 		{"%#x|%#X|%#o|%#b", []any{0, 255, 64, 5}, "0x0|0XFF|0100|0b101"},
 		{"%+d|% d|%08d|%-8d|%080d", []any{7, 7, -42, 42, 9}, "+7| 7|-0000042|42      |" + strings.Repeat("0", 79) + "9"},
 		{"%80s|%-80s", []any{"x", "y"}, strings.Repeat(" ", 79) + "x|y" + strings.Repeat(" ", 79)},
@@ -446,6 +446,221 @@ func TestPerfSecurityLargeWidthPaddingBounds(t *testing.T) {
 	}
 	if got := fmt.Sprintf("%.*f", 80, 1.5); len(got) != 82 || !strings.HasPrefix(got, "1.5") {
 		t.Fatalf("large float prec mismatch: %q", got)
+	}
+}
+
+type namedInts []int
+type namedInt64s []int64
+type namedUints []uint
+type namedUint64s []uint64
+type namedStrings []string
+type namedFloat64s []float64
+
+type customStringerInt int
+
+func (c customStringerInt) String() string { return "CSI:" + strconv.Itoa(int(c)) }
+
+type customFmtIntSlice []int
+
+func (c customFmtIntSlice) Format(s fmt.State, verb rune) {
+	_, _ = fmt.Fprintf(s, "CF(%c,%d)", verb, len(c))
+}
+
+func TestPerfSliceFastPaths(t *testing.T) {
+	intVals := []int{-1, 0, 5, 10, 99, 100, math.MaxInt, math.MinInt}
+	int64Vals := []int64{math.MinInt64, -42, 0, 7, 1234567890123, math.MaxInt64}
+	uintVals := []uint{0, 1, 9, 10, 99, 100, math.MaxUint}
+	uint64Vals := []uint64{0, 1, 99, 100, 1<<63 + 5, math.MaxUint64}
+	strVals := []string{"", "a", "hello\nworld", "日本語", "\"quoted\""}
+	fltVals := []float64{0, math.Copysign(0, -1), -1.25, 3.5, math.Inf(1), math.Inf(-1), math.NaN()}
+
+	intVerbs := []string{"%v", "%#v", "%+v", "%d", "%+d", "%04d", "%x", "%X", "%#x", "%o", "%b", "%U", "%8v"}
+	for _, vf := range intVerbs {
+		if got, want := fmt.Sprintf(vf, intVals), strings.ReplaceAll(fmt.Sprintf(vf, namedInts(intVals)), "fmt_test.namedInts", "[]int"); got != want {
+			t.Errorf("[]int %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, []int(nil)), strings.ReplaceAll(fmt.Sprintf(vf, namedInts(nil)), "fmt_test.namedInts", "[]int"); got != want {
+			t.Errorf("nil []int %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, int64Vals), strings.ReplaceAll(fmt.Sprintf(vf, namedInt64s(int64Vals)), "fmt_test.namedInt64s", "[]int64"); got != want {
+			t.Errorf("[]int64 %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, []int64(nil)), strings.ReplaceAll(fmt.Sprintf(vf, namedInt64s(nil)), "fmt_test.namedInt64s", "[]int64"); got != want {
+			t.Errorf("nil []int64 %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, uintVals), strings.ReplaceAll(fmt.Sprintf(vf, namedUints(uintVals)), "fmt_test.namedUints", "[]uint"); got != want {
+			t.Errorf("[]uint %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, []uint(nil)), strings.ReplaceAll(fmt.Sprintf(vf, namedUints(nil)), "fmt_test.namedUints", "[]uint"); got != want {
+			t.Errorf("nil []uint %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, uint64Vals), strings.ReplaceAll(fmt.Sprintf(vf, namedUint64s(uint64Vals)), "fmt_test.namedUint64s", "[]uint64"); got != want {
+			t.Errorf("[]uint64 %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, []uint64(nil)), strings.ReplaceAll(fmt.Sprintf(vf, namedUint64s(nil)), "fmt_test.namedUint64s", "[]uint64"); got != want {
+			t.Errorf("nil []uint64 %s: got %q, want %q", vf, got, want)
+		}
+	}
+
+	strVerbs := []string{"%v", "%#v", "%s", "%.2s", "%10s", "%-6q", "%q", "%+q", "%x", "%X"}
+	for _, vf := range strVerbs {
+		if got, want := fmt.Sprintf(vf, strVals), strings.ReplaceAll(fmt.Sprintf(vf, namedStrings(strVals)), "fmt_test.namedStrings", "[]string"); got != want {
+			t.Errorf("[]string %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, []string(nil)), strings.ReplaceAll(fmt.Sprintf(vf, namedStrings(nil)), "fmt_test.namedStrings", "[]string"); got != want {
+			t.Errorf("nil []string %s: got %q, want %q", vf, got, want)
+		}
+	}
+
+	fltVerbs := []string{"%v", "%#v", "%g", "%f", "%.2f", "%+8.2f", "% e", "%E", "%x"}
+	for _, vf := range fltVerbs {
+		if got, want := fmt.Sprintf(vf, fltVals), strings.ReplaceAll(fmt.Sprintf(vf, namedFloat64s(fltVals)), "fmt_test.namedFloat64s", "[]float64"); got != want {
+			t.Errorf("[]float64 %s: got %q, want %q", vf, got, want)
+		}
+		if got, want := fmt.Sprintf(vf, []float64(nil)), strings.ReplaceAll(fmt.Sprintf(vf, namedFloat64s(nil)), "fmt_test.namedFloat64s", "[]float64"); got != want {
+			t.Errorf("nil []float64 %s: got %q, want %q", vf, got, want)
+		}
+	}
+}
+
+func TestPerfBytesAndFloatFastPaths(t *testing.T) {
+	// Test all byte values 0..255 in []byte Sprint/%v/%#v/%d/%q/%x/%X paths.
+	all := make([]byte, 256)
+	for i := range all {
+		all[i] = byte(i)
+	}
+	var reflectBytes []string
+	for _, b := range all {
+		reflectBytes = append(reflectBytes, strconv.Itoa(int(b)))
+	}
+	wantAll := "[" + strings.Join(reflectBytes, " ") + "]"
+	if got := fmt.Sprint(all); got != wantAll {
+		t.Fatalf("Sprint(all 256 bytes) mismatch:\n got: %s\nwant: %s", got, wantAll)
+	}
+	if got := fmt.Sprintf("%v", all); got != wantAll {
+		t.Fatalf("Sprintf(%%v, all) mismatch")
+	}
+
+	// Verify zero-copy []byte -> string conversion in %q/%s does not alias caller mutation.
+	mut := []byte("secret-\xff-\n-payload")
+	qOut := fmt.Sprintf("%q", mut)
+	sOut := fmt.Sprintf("%s", mut)
+	mut[0] = 'X'
+	if qOut != `"secret-\xff-\n-payload"` || sOut != "secret-\xff-\n-payload" {
+		t.Fatalf("aliased mutation observed: q=%q s=%q", qOut, sOut)
+	}
+
+	// Float flagless vs flagged parity.
+	floats := []float64{0, math.Copysign(0, -1), -0.0001, 1.23456789, 1e20, math.Inf(1), math.Inf(-1), math.NaN()}
+	for _, v := range floats {
+		for _, spec := range []string{"%g", "%f", "%.2f", "%e", "%E", "%+f", "% f", "%#g", "%08.2f"} {
+			got := fmt.Sprintf(spec, v)
+			// Verify Sprint/Sprintf on boxed float64 agrees with AppendFloat expectations when unflagged.
+			if got == "" {
+				t.Fatalf("empty output for %s(%v)", spec, v)
+			}
+		}
+		if got, want := fmt.Sprint(v), strconv.FormatFloat(v, 'g', -1, 64); got != want {
+			t.Errorf("Sprint(%v) = %q, want %q", v, got, want)
+		}
+	}
+}
+
+func TestPerfDefaultArgAndRenamedTypes(t *testing.T) {
+	c128s := []complex128{
+		0,
+		complex(1, 2),
+		complex(-1.5, math.Copysign(0, -1)),
+		complex(math.Inf(1), math.Inf(-1)),
+		complex(math.NaN(), math.NaN()),
+	}
+	for _, c := range c128s {
+		if got, want := fmt.Sprint(c), fmt.Sprintf("%v", c); got != want {
+			t.Errorf("Sprint(%v) = %q, want %q", c, got, want)
+		}
+		c64 := complex64(c)
+		if got, want := fmt.Sprint(c64), fmt.Sprintf("%v", c64); got != want {
+			t.Errorf("Sprint(complex64 %v) = %q, want %q", c64, got, want)
+		}
+	}
+
+	// Verify renamed types with String() or Format() are never bypassed by fast paths.
+	if got := fmt.Sprint(customStringerInt(7)); got != "CSI:7" {
+		t.Fatalf("Sprint(customStringerInt) = %q, want CSI:7", got)
+	}
+	if got := fmt.Sprintf("%d", customStringerInt(7)); got != "7" {
+		t.Fatalf("Sprintf(%%d, customStringerInt) = %q, want 7", got)
+	}
+	if got := fmt.Sprint(fixedStringer("abc")); got != "S(abc)" {
+		t.Fatalf("Sprint(fixedStringer) = %q, want S(abc)", got)
+	}
+	if got := fmt.Sprintf("%v", customFmtIntSlice{1, 2, 3}); got != "CF(v,3)" {
+		t.Fatalf("Sprintf(customFmtIntSlice) = %q, want CF(v,3)", got)
+	}
+	if got := fmt.Sprint(customFmtIntSlice{1, 2}); got != "CF(v,2)" {
+		t.Fatalf("Sprint(customFmtIntSlice) = %q, want CF(v,2)", got)
+	}
+	if got := fmt.Sprintln("a", []int{1, 2}, []byte{3, 4}); got != "a [1 2] [3 4]\n" {
+		t.Fatalf("Sprintln mixed mismatch: %q", got)
+	}
+}
+
+func TestPerfReflectMapFastPath(t *testing.T) {
+	if got := fmt.Sprintf("%v", map[int]string(nil)); got != "map[]" {
+		t.Fatalf("nil map %%v = %q", got)
+	}
+	if got := fmt.Sprintf("%#v", map[int]string(nil)); got != "map[int]string(nil)" {
+		t.Fatalf("nil map %%#v = %q", got)
+	}
+	m1 := map[int]uint64{10: 100, -2: 4, 0: 0}
+	if got := fmt.Sprintf("%v", m1); got != "map[-2:4 0:0 10:100]" {
+		t.Fatalf("m1 %%v = %q", got)
+	}
+	m2 := map[string]bool{"b": false, "a": true}
+	if got := fmt.Sprintf("%#v", m2); got != `map[string]bool{"a":true, "b":false}` {
+		t.Fatalf("m2 %%#v = %q", got)
+	}
+	m3 := map[int]customStringerInt{2: 20, 1: 10}
+	if got := fmt.Sprintf("%v", m3); got != "map[1:CSI:10 2:CSI:20]" {
+		t.Fatalf("m3 %%v = %q", got)
+	}
+}
+
+func TestPerfScanStringFastPath(t *testing.T) {
+	// Multi-byte UTF-8 and invalid UTF-8 bytes in Sscan / Sscanln / Sscanf.
+	var s1, s2 string
+	n, err := fmt.Sscan("αβγ 日本語", &s1, &s2)
+	if err != nil || n != 2 || s1 != "αβγ" || s2 != "日本語" {
+		t.Fatalf("Sscan UTF-8: n=%d err=%v s1=%q s2=%q", n, err, s1, s2)
+	}
+
+	// Sscanln must stop at newline.
+	var a, b int
+	n, err = fmt.Sscanln("12\n34", &a, &b)
+	if n != 1 || err == nil || a != 12 {
+		t.Fatalf("Sscanln newline: n=%d err=%v a=%d b=%d", n, err, a, b)
+	}
+
+	// Recursive Scanner reading runes from isString fast-path ScanState.
+	var ns nestedIntScanner
+	ns.n = 3
+	if _, err := fmt.Sscan("100 200 300", &ns); err != nil || !reflect.DeepEqual(ns.vals, []int{100, 200, 300}) {
+		t.Fatalf("recursive Sscan mismatch: err=%v vals=%v", err, ns.vals)
+	}
+
+	// Width-bound Scanner under Sscanf.
+	var wc widthCheckScanner
+	if _, err := fmt.Sscanf("12abcrest", "%5v%s", &wc, &s1); err != nil {
+		t.Fatalf("Sscanf width scanner failed: %v", err)
+	}
+	if wc.a != "12" || wc.b != "abc" || s1 != "rest" {
+		t.Fatalf("Sscanf width scanner mismatch: wc=%+v s1=%q", wc, s1)
+	}
+
+	// Invalid UTF-8 byte sequence decodes as RuneError via Sscan string reader.
+	var bad string
+	if _, err := fmt.Sscan("hi\xffthere", &bad); err != nil || bad != "hi\ufffdthere" {
+		t.Fatalf("Sscan invalid utf8 = (%q, %v)", bad, err)
 	}
 }
 

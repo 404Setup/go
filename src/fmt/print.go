@@ -8,12 +8,14 @@ import (
 	"internal/abi"
 	"internal/bytealg"
 	"internal/fmtsort"
+	internalstrconv "internal/strconv"
 	"io"
 	"os"
 	"reflect"
 	"strconv"
 	"sync/v2"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // Strings for use with buffer.WriteString.
@@ -237,14 +239,14 @@ func Sprintf(format string, a ...any) string {
 	if len(a) == 0 && bytealg.IndexByteString(format, '%') == -1 {
 		return format
 	}
-	var stackBuf [256]byte
+	var stackBuf [128]byte
 	out, nextI, nextArg, ok := appendPrintfFast(stackBuf[:0], format, a)
 	if ok {
 		return string(out)
 	}
 	p := newPrinter()
 	p.buf = append(p.buf, out...)
-	p.doPrintfFrom(format, a, nextI, nextArg)
+	p.doPrintfFrom(format, a, nextI, nextArg, true)
 	s := string(p.buf)
 	p.free()
 	return s
@@ -263,7 +265,7 @@ func Appendf(b []byte, format string, a ...any) []byte {
 	}
 	p := newPrinter()
 	p.buf = append(p.buf, out[origLen:]...)
-	p.doPrintfFrom(format, a, nextI, nextArg)
+	p.doPrintfFrom(format, a, nextI, nextArg, true)
 	b = append(out[:origLen], p.buf...)
 	p.free()
 	return b
@@ -300,7 +302,7 @@ func Sprint(a ...any) string {
 			return s
 		}
 	}
-	var stackBuf [256]byte
+	var stackBuf [128]byte
 	out, nextArg, prevString, ok := appendPrintFast(stackBuf[:0], a, false)
 	if ok {
 		return string(out)
@@ -361,7 +363,7 @@ func Sprintln(a ...any) string {
 	if len(a) == 0 {
 		return "\n"
 	}
-	var stackBuf [256]byte
+	var stackBuf [128]byte
 	out, nextArg, _, ok := appendPrintFast(stackBuf[:0], a, true)
 	if ok {
 		out = append(out, '\n')
@@ -1053,6 +1055,29 @@ func (p *pp) printArg(arg any, verb rune) {
 	}
 }
 
+func (p *pp) printPrimitiveReflect(value reflect.Value, kind reflect.Kind, verb rune, depth int) {
+	switch kind {
+	case reflect.Bool:
+		p.fmtBool(nil, value, value.Bool(), verb)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		p.fmtInteger(nil, value, uint64(value.Int()), signed, verb)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		p.fmtInteger(nil, value, value.Uint(), unsigned, verb)
+	case reflect.Float32:
+		p.fmtFloat(nil, value, value.Float(), 32, verb)
+	case reflect.Float64:
+		p.fmtFloat(nil, value, value.Float(), 64, verb)
+	case reflect.Complex64:
+		p.fmtComplex(nil, value, value.Complex(), 64, verb)
+	case reflect.Complex128:
+		p.fmtComplex(nil, value, value.Complex(), 128, verb)
+	case reflect.String:
+		p.fmtString(nil, value, value.String(), verb)
+	default:
+		p.printValue(value, verb, depth)
+	}
+}
+
 // printValue is similar to printArg but starts with a reflect value, not an interface{} value.
 // It does not handle 'p' and 'T' verbs because these should have been already handled by printArg.
 func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
@@ -1097,8 +1122,10 @@ func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
 	case reflect.String:
 		p.fmtString(nil, value, f.String(), verb)
 	case reflect.Map:
-		if p.fmt.flags&flagSharpV != 0 {
-			p.buf.writeString(f.Type().String())
+		mapType := f.Type()
+		sharpV := p.fmt.flags&flagSharpV != 0
+		if sharpV {
+			p.buf.writeString(mapType.String())
 			if f.IsNil() {
 				p.buf.writeString(nilParenString)
 				return
@@ -1109,20 +1136,34 @@ func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
 		}
 		if f.Len() > 0 {
 			sorted := fmtsort.Sort(f)
+			keyType := mapType.Key()
+			elemType := mapType.Elem()
+			keyKind := keyType.Kind()
+			elemKind := elemType.Kind()
+			keyDirect := verb != 'w' && keyKind != reflect.Interface && keyType.NumMethod() == 0
+			elemDirect := verb != 'w' && elemKind != reflect.Interface && elemType.NumMethod() == 0
 			for i, m := range sorted {
 				if i > 0 {
-					if p.fmt.flags&flagSharpV != 0 {
+					if sharpV {
 						p.buf.writeString(commaSpaceString)
 					} else {
 						p.buf.writeByte(' ')
 					}
 				}
-				p.printValue(m.Key, verb, depth+1)
+				if keyDirect {
+					p.printPrimitiveReflect(m.Key, keyKind, verb, depth+1)
+				} else {
+					p.printValue(m.Key, verb, depth+1)
+				}
 				p.buf.writeByte(':')
-				p.printValue(m.Value, verb, depth+1)
+				if elemDirect {
+					p.printPrimitiveReflect(m.Value, elemKind, verb, depth+1)
+				} else {
+					p.printValue(m.Value, verb, depth+1)
+				}
 			}
 		}
-		if p.fmt.flags&flagSharpV != 0 {
+		if sharpV {
 			p.buf.writeByte('}')
 		} else {
 			p.buf.writeByte(']')
@@ -1410,10 +1451,10 @@ func (p *pp) missingArg(verb rune) {
 }
 
 func (p *pp) doPrintf(format string, a []any) {
-	p.doPrintfFrom(format, a, 0, 0)
+	p.doPrintfFrom(format, a, 0, 0, false)
 }
 
-func (p *pp) doPrintfFrom(format string, a []any, startI, startArg int) {
+func (p *pp) doPrintfFrom(format string, a []any, startI, startArg int, skipFirstFast bool) {
 	end := len(format)
 	argNum := startArg  // we process one argument per non-trivial format
 	afterIndex := false // previous item in format was an index like [3].
@@ -1480,8 +1521,10 @@ formatLoop:
 							flags = (flags &^ flagPlus) | flagPlusV
 						}
 					}
-					if c != 'w' && c != 'p' {
-						if out, ok := appendArgFast(p.buf, a[argNum], rune(c), flags, 0, 0, &p.fmt.intbuf); ok {
+					if skipFirstFast {
+						skipFirstFast = false
+					} else if c != 'w' && c != 'p' {
+						if out, ok := appendArgFast(p.buf, &p.fmt.intbuf, a[argNum], rune(c), flags, 0, 0); ok {
 							p.buf = out
 							argNum++
 							i++
@@ -1600,8 +1643,10 @@ formatLoop:
 			}
 			fallthrough
 		default:
-			if verb != 'w' && verb != 'p' && verb != 'T' {
-				if out, ok := appendArgFast(p.buf, a[argNum], verb, flags, p.fmt.wid, p.fmt.prec, &p.fmt.intbuf); ok {
+			if skipFirstFast {
+				skipFirstFast = false
+			} else if verb != 'w' && verb != 'p' && verb != 'T' {
+				if out, ok := appendArgFast(p.buf, &p.fmt.intbuf, a[argNum], verb, flags, p.fmt.wid, p.fmt.prec); ok {
 					p.buf = out
 					argNum++
 					continue formatLoop
@@ -1636,6 +1681,14 @@ formatLoop:
 }
 
 func (p *pp) doPrint(a []any) {
+	if len(a) == 1 {
+		if out, ok := appendDefaultArg(p.buf, a[0]); ok {
+			p.buf = out
+			return
+		}
+		p.printArg(a[0], 'v')
+		return
+	}
 	p.doPrintFrom(a, 0, false)
 }
 
@@ -1647,7 +1700,7 @@ func (p *pp) doPrintFrom(a []any, startArg int, prevString bool) {
 		if argNum > 0 && !isString && !prevString {
 			p.buf.writeByte(' ')
 		}
-		if out, ok := appendArgFast(p.buf, arg, 'v', 0, 0, 0, &p.fmt.intbuf); ok {
+		if out, ok := appendDefaultArg(p.buf, arg); ok {
 			p.buf = out
 		} else {
 			p.printArg(arg, 'v')
@@ -1659,6 +1712,15 @@ func (p *pp) doPrintFrom(a []any, startArg int, prevString bool) {
 // doPrintln is like doPrint but always adds a space between arguments
 // and a newline after the last argument.
 func (p *pp) doPrintln(a []any) {
+	if len(a) == 1 {
+		if out, ok := appendDefaultArg(p.buf, a[0]); ok {
+			p.buf = append(out, '\n')
+			return
+		}
+		p.printArg(a[0], 'v')
+		p.buf.writeByte('\n')
+		return
+	}
 	p.doPrintlnFrom(a, 0)
 }
 
@@ -1668,7 +1730,7 @@ func (p *pp) doPrintlnFrom(a []any, startArg int) {
 			p.buf.writeByte(' ')
 		}
 		arg := a[argNum]
-		if out, ok := appendArgFast(p.buf, arg, 'v', 0, 0, 0, &p.fmt.intbuf); ok {
+		if out, ok := appendDefaultArg(p.buf, arg); ok {
 			p.buf = out
 		} else {
 			p.printArg(arg, 'v')
@@ -1678,9 +1740,9 @@ func (p *pp) doPrintlnFrom(a []any, startArg int) {
 }
 
 func appendPrintfFast(dst []byte, format string, a []any) (out []byte, nextI, nextArg int, ok bool) {
+	var intbuf [68]byte
 	end := len(format)
 	argNum := 0
-	var intbuf [68]byte
 fastFormatLoop:
 	for i := 0; i < end; {
 		if format[i] != '%' {
@@ -1734,7 +1796,7 @@ fastFormatLoop:
 							flags = (flags &^ flagPlus) | flagPlusV
 						}
 					}
-					nextDst, handled := appendArgFast(dst, a[argNum], rune(c), flags, 0, 0, &intbuf)
+					nextDst, handled := appendArgFast(dst, &intbuf, a[argNum], rune(c), flags, 0, 0)
 					if !handled {
 						return dst, verbStart, argNum, false
 					}
@@ -1792,7 +1854,7 @@ fastFormatLoop:
 				flags = (flags &^ flagPlus) | flagPlusV
 			}
 		}
-		nextDst, handled := appendArgFast(dst, a[argNum], rune(c), flags, wid, prec, &intbuf)
+		nextDst, handled := appendArgFast(dst, &intbuf, a[argNum], rune(c), flags, wid, prec)
 		if !handled {
 			return dst, verbStart, argNum, false
 		}
@@ -1807,7 +1869,6 @@ fastFormatLoop:
 }
 
 func appendPrintFast(dst []byte, a []any, addSpaces bool) (out []byte, nextArg int, prevString bool, ok bool) {
-	var intbuf [68]byte
 	for argNum, arg := range a {
 		_, isString := arg.(string)
 		if !isString && arg != nil && abi.TypeOf(arg).Kind() == abi.String {
@@ -1819,7 +1880,7 @@ func appendPrintFast(dst []byte, a []any, addSpaces bool) (out []byte, nextArg i
 		if needSpace {
 			dst = append(dst, ' ')
 		}
-		nextDst, handled := appendArgFast(dst, arg, 'v', 0, 0, 0, &intbuf)
+		nextDst, handled := appendDefaultArg(dst, arg)
 		if !handled {
 			return dst[:startLen], argNum, prevString, false
 		}
@@ -1829,7 +1890,133 @@ func appendPrintFast(dst []byte, a []any, addSpaces bool) (out []byte, nextArg i
 	return dst, len(a), prevString, true
 }
 
-func appendArgFast(dst []byte, arg any, verb rune, flags fmtFlags, wid, prec int, intbuf *[68]byte) ([]byte, bool) {
+func appendDefaultBytes(dst, f []byte) []byte {
+	if len(f) == 0 {
+		return append(dst, "[]"...)
+	}
+	maxLen := 2 + len(f)*4
+	if cap(dst)-len(dst) >= maxLen {
+		oldLen := len(dst)
+		out := dst[oldLen:cap(dst)]
+		out[0] = '['
+		pos := 1
+		for i, c := range f {
+			if i > 0 {
+				out[pos] = ' '
+				pos++
+			}
+			if c >= 200 {
+				r := uint(c-200) * 2
+				out[pos] = '2'
+				out[pos+1] = smalls[r]
+				out[pos+2] = smalls[r+1]
+				pos += 3
+			} else if c >= 100 {
+				r := uint(c-100) * 2
+				out[pos] = '1'
+				out[pos+1] = smalls[r]
+				out[pos+2] = smalls[r+1]
+				pos += 3
+			} else if c >= 10 {
+				r := uint(c) * 2
+				out[pos] = smalls[r]
+				out[pos+1] = smalls[r+1]
+				pos += 2
+			} else {
+				out[pos] = '0' + c
+				pos++
+			}
+		}
+		out[pos] = ']'
+		return dst[:oldLen+pos+1]
+	}
+	dst = append(dst, '[')
+	for i, c := range f {
+		if i > 0 {
+			dst = append(dst, ' ')
+		}
+		if c >= 200 {
+			r := uint(c-200) * 2
+			dst = append(dst, '2', smalls[r], smalls[r+1])
+		} else if c >= 100 {
+			r := uint(c-100) * 2
+			dst = append(dst, '1', smalls[r], smalls[r+1])
+		} else if c >= 10 {
+			r := uint(c) * 2
+			dst = append(dst, smalls[r], smalls[r+1])
+		} else {
+			dst = append(dst, '0'+c)
+		}
+	}
+	return append(dst, ']')
+}
+
+func appendDefaultArg(dst []byte, arg any) ([]byte, bool) {
+	if arg == nil {
+		return append(dst, nilAngleString...), true
+	}
+	switch f := arg.(type) {
+	case string:
+		return append(dst, f...), true
+	case int:
+		if 0 <= f && f < 100 {
+			if f < 10 {
+				return append(dst, byte('0'+f)), true
+			}
+			r := uint(f) * 2
+			return append(dst, smalls[r], smalls[r+1]), true
+		}
+		return internalstrconv.AppendInt10(dst, int64(f)), true
+	case int64:
+		return internalstrconv.AppendInt10(dst, f), true
+	case int32:
+		return internalstrconv.AppendInt10(dst, int64(f)), true
+	case int16:
+		return internalstrconv.AppendInt10(dst, int64(f)), true
+	case int8:
+		return internalstrconv.AppendInt10(dst, int64(f)), true
+	case uint:
+		if f < 100 {
+			if f < 10 {
+				return append(dst, byte('0'+f)), true
+			}
+			r := uint(f) * 2
+			return append(dst, smalls[r], smalls[r+1]), true
+		}
+		return internalstrconv.AppendUint10(dst, uint64(f)), true
+	case uint64:
+		return internalstrconv.AppendUint10(dst, f), true
+	case uint32:
+		return internalstrconv.AppendUint10(dst, uint64(f)), true
+	case uint16:
+		return internalstrconv.AppendUint10(dst, uint64(f)), true
+	case uint8:
+		return internalstrconv.AppendUint10(dst, uint64(f)), true
+	case uintptr:
+		return internalstrconv.AppendUint10(dst, uint64(f)), true
+	case bool:
+		if f {
+			return append(dst, "true"...), true
+		}
+		return append(dst, "false"...), true
+	case float64:
+		return internalstrconv.AppendFloat(dst, f, 'g', -1, 64), true
+	case float32:
+		return internalstrconv.AppendFloat(dst, float64(f), 'g', -1, 32), true
+	case complex128:
+		var intbuf [68]byte
+		return appendComplexVerb(dst, &intbuf, f, 128, 'v', 0, 0, 0)
+	case complex64:
+		var intbuf [68]byte
+		return appendComplexVerb(dst, &intbuf, complex128(f), 64, 'v', 0, 0, 0)
+	case []byte:
+		return appendDefaultBytes(dst, f), true
+	default:
+		return appendSliceFast(dst, nil, arg, 'v', 0, 0, 0)
+	}
+}
+
+func appendArgFast(dst []byte, intbuf *[68]byte, arg any, verb rune, flags fmtFlags, wid, prec int) ([]byte, bool) {
 	if arg == nil {
 		if verb == 'v' {
 			return appendPadASCIIString(dst, nilAngleString, flags, wid), true
@@ -1908,27 +2095,10 @@ func appendArgFast(dst []byte, arg any, verb rune, flags fmtFlags, wid, prec int
 				}
 				return append(dst, '}'), true
 			}
-			dst = append(dst, '[')
 			if flags == 0 {
-				for i, c := range f {
-					if i > 0 {
-						dst = append(dst, ' ')
-					}
-					if c >= 200 {
-						r := uint(c-200) * 2
-						dst = append(dst, '2', smalls[r], smalls[r+1])
-					} else if c >= 100 {
-						r := uint(c-100) * 2
-						dst = append(dst, '1', smalls[r], smalls[r+1])
-					} else if c >= 10 {
-						r := uint(c) * 2
-						dst = append(dst, smalls[r], smalls[r+1])
-					} else {
-						dst = append(dst, '0'+c)
-					}
-				}
-				return append(dst, ']'), true
+				return appendDefaultBytes(dst, f), true
 			}
+			dst = append(dst, '[')
 			for i, c := range f {
 				if i > 0 {
 					dst = append(dst, ' ')
@@ -1946,10 +2116,242 @@ func appendArgFast(dst []byte, arg any, verb rune, flags fmtFlags, wid, prec int
 		case 'X':
 			return appendSbx(dst, "", f, udigits, flags, wid, prec), true
 		case 'q':
-			return appendQuoted(dst, intbuf, string(f), flags, wid, prec), true
+			return appendQuoted(dst, intbuf, unsafe.String(unsafe.SliceData(f), len(f)), flags, wid, prec), true
 		}
+	default:
+		return appendSliceFast(dst, intbuf, arg, verb, flags, wid, prec)
 	}
 	return dst, false
+}
+
+func appendSliceFast(dst []byte, intbuf *[68]byte, arg any, verb rune, flags fmtFlags, wid, prec int) ([]byte, bool) {
+	sharpV := flags&flagSharpV != 0
+	switch f := arg.(type) {
+	case []int:
+		if !validIntVerb(verb) || verb == 'U' {
+			return dst, false
+		}
+		if sharpV {
+			dst = append(dst, "[]int"...)
+			if f == nil {
+				return append(dst, nilParenString...), true
+			}
+			dst = append(dst, '{')
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, commaSpaceString...)
+				}
+				dst, _ = appendIntVerb(dst, intbuf, uint64(v), signed, verb, flags, wid, prec)
+			}
+			return append(dst, '}'), true
+		}
+		dst = append(dst, '[')
+		if flags == 0 && (verb == 'v' || verb == 'd') {
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, ' ')
+				}
+				if 0 <= v && v < 100 {
+					if v < 10 {
+						dst = append(dst, byte('0'+v))
+					} else {
+						r := uint(v) * 2
+						dst = append(dst, smalls[r], smalls[r+1])
+					}
+				} else {
+					dst = internalstrconv.AppendInt10(dst, int64(v))
+				}
+			}
+			return append(dst, ']'), true
+		}
+		for i, v := range f {
+			if i > 0 {
+				dst = append(dst, ' ')
+			}
+			dst, _ = appendIntVerb(dst, intbuf, uint64(v), signed, verb, flags, wid, prec)
+		}
+		return append(dst, ']'), true
+	case []int64:
+		if !validIntVerb(verb) || verb == 'U' {
+			return dst, false
+		}
+		if sharpV {
+			dst = append(dst, "[]int64"...)
+			if f == nil {
+				return append(dst, nilParenString...), true
+			}
+			dst = append(dst, '{')
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, commaSpaceString...)
+				}
+				dst, _ = appendIntVerb(dst, intbuf, uint64(v), signed, verb, flags, wid, prec)
+			}
+			return append(dst, '}'), true
+		}
+		dst = append(dst, '[')
+		if flags == 0 && (verb == 'v' || verb == 'd') {
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, ' ')
+				}
+				dst = internalstrconv.AppendInt10(dst, v)
+			}
+			return append(dst, ']'), true
+		}
+		for i, v := range f {
+			if i > 0 {
+				dst = append(dst, ' ')
+			}
+			dst, _ = appendIntVerb(dst, intbuf, uint64(v), signed, verb, flags, wid, prec)
+		}
+		return append(dst, ']'), true
+	case []uint:
+		if !validIntVerb(verb) || verb == 'U' {
+			return dst, false
+		}
+		if sharpV {
+			dst = append(dst, "[]uint"...)
+			if f == nil {
+				return append(dst, nilParenString...), true
+			}
+			dst = append(dst, '{')
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, commaSpaceString...)
+				}
+				dst, _ = appendIntVerb(dst, intbuf, uint64(v), unsigned, verb, flags, wid, prec)
+			}
+			return append(dst, '}'), true
+		}
+		dst = append(dst, '[')
+		if flags == 0 && (verb == 'v' || verb == 'd') {
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, ' ')
+				}
+				dst = internalstrconv.AppendUint10(dst, uint64(v))
+			}
+			return append(dst, ']'), true
+		}
+		for i, v := range f {
+			if i > 0 {
+				dst = append(dst, ' ')
+			}
+			dst, _ = appendIntVerb(dst, intbuf, uint64(v), unsigned, verb, flags, wid, prec)
+		}
+		return append(dst, ']'), true
+	case []uint64:
+		if !validIntVerb(verb) || verb == 'U' {
+			return dst, false
+		}
+		if sharpV {
+			dst = append(dst, "[]uint64"...)
+			if f == nil {
+				return append(dst, nilParenString...), true
+			}
+			dst = append(dst, '{')
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, commaSpaceString...)
+				}
+				dst, _ = appendIntVerb(dst, intbuf, v, unsigned, verb, flags, wid, prec)
+			}
+			return append(dst, '}'), true
+		}
+		dst = append(dst, '[')
+		if flags == 0 && (verb == 'v' || verb == 'd') {
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, ' ')
+				}
+				dst = internalstrconv.AppendUint10(dst, v)
+			}
+			return append(dst, ']'), true
+		}
+		for i, v := range f {
+			if i > 0 {
+				dst = append(dst, ' ')
+			}
+			dst, _ = appendIntVerb(dst, intbuf, v, unsigned, verb, flags, wid, prec)
+		}
+		return append(dst, ']'), true
+	case []string:
+		if !validStringVerb(verb) {
+			return dst, false
+		}
+		if sharpV {
+			dst = append(dst, "[]string"...)
+			if f == nil {
+				return append(dst, nilParenString...), true
+			}
+			dst = append(dst, '{')
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, commaSpaceString...)
+				}
+				dst = appendStringVerb(dst, intbuf, v, verb, flags, wid, prec)
+			}
+			return append(dst, '}'), true
+		}
+		dst = append(dst, '[')
+		for i, v := range f {
+			if i > 0 {
+				dst = append(dst, ' ')
+			}
+			dst = appendStringVerb(dst, intbuf, v, verb, flags, wid, prec)
+		}
+		return append(dst, ']'), true
+	case []float64:
+		if !validFloatVerb(verb) {
+			return dst, false
+		}
+		if sharpV {
+			dst = append(dst, "[]float64"...)
+			if f == nil {
+				return append(dst, nilParenString...), true
+			}
+			dst = append(dst, '{')
+			for i, v := range f {
+				if i > 0 {
+					dst = append(dst, commaSpaceString...)
+				}
+				dst, _ = appendFloatVerb(dst, intbuf, v, 64, verb, flags, wid, prec)
+			}
+			return append(dst, '}'), true
+		}
+		dst = append(dst, '[')
+		for i, v := range f {
+			if i > 0 {
+				dst = append(dst, ' ')
+			}
+			dst, _ = appendFloatVerb(dst, intbuf, v, 64, verb, flags, wid, prec)
+		}
+		return append(dst, ']'), true
+	}
+	return dst, false
+}
+
+func appendStringVerb(dst []byte, intbuf *[68]byte, s string, verb rune, flags fmtFlags, wid, prec int) []byte {
+	switch verb {
+	case 'v':
+		if flags&flagSharpV != 0 {
+			return appendQuoted(dst, intbuf, s, flags, wid, prec)
+		}
+		fallthrough
+	case 's':
+		if flags&flagPrecPresent != 0 {
+			s = truncateString(s, flags, prec)
+		}
+		return appendPadString(dst, s, flags, wid)
+	case 'x':
+		return appendSbx(dst, s, nil, ldigits, flags, wid, prec)
+	case 'X':
+		return appendSbx(dst, s, nil, udigits, flags, wid, prec)
+	case 'q':
+		return appendQuoted(dst, intbuf, s, flags, wid, prec)
+	}
+	return dst
 }
 
 func appendIntVerb(dst []byte, intbuf *[68]byte, v uint64, isSigned bool, verb rune, flags fmtFlags, wid, prec int) ([]byte, bool) {

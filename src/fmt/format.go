@@ -5,6 +5,7 @@
 package fmt
 
 import (
+	"internal/byteorder"
 	"internal/strconv"
 	stdstrconv "strconv"
 	"unicode/utf8"
@@ -25,6 +26,22 @@ const (
 	spaces64 = "                                                                "
 	zeros64  = "0000000000000000000000000000000000000000000000000000000000000000"
 	smalls   = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+)
+
+var (
+	hexLowerLUT16 = func() (lut [256]uint16) {
+		for i := range 256 {
+			lut[i] = uint16(ldigits[i>>4]) | uint16(ldigits[i&0xf])<<8
+		}
+		return lut
+	}()
+
+	hexUpperLUT16 = func() (lut [256]uint16) {
+		for i := range 256 {
+			lut[i] = uint16(udigits[i>>4]) | uint16(udigits[i&0xf])<<8
+		}
+		return lut
+	}()
 )
 
 // fmtFlags stores formatting flags as a compact bitmask.
@@ -320,7 +337,10 @@ func appendInteger(dst []byte, intbuf *[68]byte, u uint64, base int, isSigned bo
 					r := u * 2
 					return append(dst, smalls[r], smalls[r+1])
 				}
+				return strconv.AppendUint10(dst, u)
 			}
+			dst = append(dst, '-')
+			return strconv.AppendUint10(dst, u)
 		case 16:
 			if u < 16 {
 				return append(dst, digits[u])
@@ -328,6 +348,10 @@ func appendInteger(dst []byte, intbuf *[68]byte, u uint64, base int, isSigned bo
 		}
 	}
 
+	return appendIntegerSlow(dst, intbuf, u, negative, base, verb, digits, flags, wid, prec)
+}
+
+func appendIntegerSlow(dst []byte, intbuf *[68]byte, u uint64, negative bool, base int, verb rune, digits string, flags fmtFlags, wid, prec int) []byte {
 	// Two ways to ask for extra leading zero digits: %.3d or %03d.
 	// If both are specified the zero flag is ignored and
 	// padding with spaces is used instead.
@@ -636,6 +660,10 @@ func appendSbx(dst []byte, s string, b []byte, digits string, flags fmtFlags, wi
 	}
 	dst = dst[:oldLen+width]
 	out := dst[oldLen:]
+	lut := &hexLowerLUT16
+	if digits[10] == 'A' {
+		lut = &hexUpperLUT16
+	}
 	pos := 0
 	if !space {
 		if sharp {
@@ -644,11 +672,21 @@ func appendSbx(dst []byte, s string, b []byte, digits string, flags fmtFlags, wi
 			pos = 2
 		}
 		s = s[:length]
-		for i := 0; i < len(s); i++ {
-			c := s[i]
-			out[pos] = digits[c>>4]
-			out[pos+1] = digits[c&0xF]
-			pos += 2
+		outHex := out[pos:]
+		i := 0
+		for i+4 <= len(s) {
+			v := uint64(lut[s[i]]) |
+				uint64(lut[s[i+1]])<<16 |
+				uint64(lut[s[i+2]])<<32 |
+				uint64(lut[s[i+3]])<<48
+			byteorder.LEPutUint64(outHex, v)
+			outHex = outHex[8:]
+			i += 4
+		}
+		for i < len(s) {
+			byteorder.LEPutUint16(outHex, lut[s[i]])
+			outHex = outHex[2:]
+			i++
 		}
 	} else {
 		prefix := digits[16]
@@ -663,9 +701,7 @@ func appendSbx(dst []byte, s string, b []byte, digits string, flags fmtFlags, wi
 				out[pos+1] = prefix
 				pos += 2
 			}
-			c := s[i]
-			out[pos] = digits[c>>4]
-			out[pos+1] = digits[c&0xF]
+			byteorder.LEPutUint16(out[pos:pos+2], lut[s[i]])
 			pos += 2
 		}
 	}
@@ -727,20 +763,18 @@ func appendQuoted(dst []byte, intbuf *[68]byte, s string, flags fmtFlags, wid, p
 		if len(s) == 0 {
 			return append(dst, `""`...)
 		}
-		if s[0] < utf8.RuneSelf {
-			simple := true
-			for i := 0; i < len(s); i++ {
-				c := s[i]
-				if c < ' ' || c >= 0x7f || c == '"' || c == '\\' {
-					simple = false
-					break
-				}
+		simple := true
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c < ' ' || c >= 0x7f || c == '"' || c == '\\' {
+				simple = false
+				break
 			}
-			if simple {
-				dst = append(dst, '"')
-				dst = append(dst, s...)
-				return append(dst, '"')
-			}
+		}
+		if simple {
+			dst = append(dst, '"')
+			dst = append(dst, s...)
+			return append(dst, '"')
 		}
 		return stdstrconv.AppendQuote(dst, s)
 	}
@@ -813,6 +847,9 @@ func (f *fmt) fmtQc(c uint64) {
 }
 
 func appendFloat(dst []byte, intbuf *[68]byte, v float64, size int, verb rune, prec int, flags fmtFlags, wid int) []byte {
+	if flags&^flagPrecPresent == 0 {
+		return strconv.AppendFloat(dst, v, byte(verb), prec, size)
+	}
 	// Format number, reserving space for leading + sign if needed.
 	num := strconv.AppendFloat(intbuf[:1], v, byte(verb), prec, size)
 	if num[1] == '-' || num[1] == '+' {

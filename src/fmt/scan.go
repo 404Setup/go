@@ -198,10 +198,11 @@ const eof = -1
 
 // ss is the internal implementation of ScanState.
 type ss struct {
-	rs    io.RuneScanner // where to read input
-	buf   buffer         // token accumulator
-	count int            // runes consumed so far.
-	atEOF bool           // already read EOF
+	rs       io.RuneScanner // where to read input
+	buf      buffer         // token accumulator
+	count    int            // runes consumed so far.
+	atEOF    bool           // already read EOF
+	isString bool           // true when rs is &sr
 	ssave
 	sr stringReader
 	rr readRune
@@ -232,7 +233,11 @@ func (s *ss) ReadRune() (r rune, size int, err error) {
 		return
 	}
 
-	r, size, err = s.rs.ReadRune()
+	if s.isString {
+		r, size, err = s.sr.ReadRune()
+	} else {
+		r, size, err = s.rs.ReadRune()
+	}
 	if err == nil {
 		s.count++
 		if s.nlIsEnd && r == '\n' {
@@ -276,7 +281,11 @@ func (s *ss) mustReadRune() (r rune) {
 }
 
 func (s *ss) UnreadRune() error {
-	s.rs.UnreadRune()
+	if s.isString {
+		s.sr.UnreadRune()
+	} else {
+		s.rs.UnreadRune()
+	}
 	s.atEOF = false
 	s.count--
 	return nil
@@ -436,6 +445,7 @@ func newScanStateString(str string, nlIsSpace, nlIsEnd bool) (s *ss, old ssave) 
 	s = ssFree.Get()
 	s.sr = stringReader{s: str, prevRune: -1}
 	s.rs = &s.sr
+	s.isString = true
 	s.nlIsSpace = nlIsSpace
 	s.nlIsEnd = nlIsEnd
 	s.atEOF = false
@@ -466,6 +476,7 @@ func newScanState(r io.Reader, nlIsSpace, nlIsEnd bool) (s *ss, old ssave) {
 		return outer, old
 	}
 	s = ssFree.Get()
+	s.isString = false
 	if rs, ok := r.(io.RuneScanner); ok {
 		s.rs = rs
 	} else {
