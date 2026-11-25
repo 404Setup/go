@@ -6,6 +6,7 @@ package fmt
 
 import (
 	"errors"
+	internalstrconv "internal/strconv"
 	"io"
 	"math"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"sync/v2"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // ScanState represents the scanner state passed to custom scanners.
@@ -81,15 +83,47 @@ func Scanf(format string, a ...any) (n int, err error) {
 	return Fscanf(os.Stdin, format, a...)
 }
 
-type stringReader string
+type stringReader struct {
+	s        string
+	i        int
+	prevRune int
+}
 
 func (r *stringReader) Read(b []byte) (n int, err error) {
-	n = copy(b, *r)
-	*r = (*r)[n:]
-	if n == 0 {
-		err = io.EOF
+	if r.i >= len(r.s) {
+		return 0, io.EOF
 	}
+	r.prevRune = -1
+	n = copy(b, r.s[r.i:])
+	r.i += n
 	return
+}
+
+func (r *stringReader) ReadRune() (ch rune, size int, err error) {
+	if r.i >= len(r.s) {
+		r.prevRune = -1
+		return 0, 0, io.EOF
+	}
+	r.prevRune = r.i
+	if c := r.s[r.i]; c < utf8.RuneSelf {
+		r.i++
+		return rune(c), 1, nil
+	}
+	ch, size = utf8.DecodeRuneInString(r.s[r.i:])
+	r.i += size
+	return
+}
+
+func (r *stringReader) UnreadRune() error {
+	if r.i <= 0 {
+		return errors.New("fmt: stringReader.UnreadRune: at beginning of string")
+	}
+	if r.prevRune < 0 {
+		return errors.New("fmt: stringReader.UnreadRune: previous operation was not ReadRune")
+	}
+	r.i = r.prevRune
+	r.prevRune = -1
+	return nil
 }
 
 // Sscan scans the argument string, storing successive space-separated
@@ -97,13 +131,19 @@ func (r *stringReader) Read(b []byte) (n int, err error) {
 // returns the number of items successfully scanned. If that is less
 // than the number of arguments, err will report why.
 func Sscan(str string, a ...any) (n int, err error) {
-	return Fscan((*stringReader)(&str), a...)
+	s, old := newScanStateString(str, true, false)
+	n, err = s.doScan(a)
+	s.free(old)
+	return
 }
 
 // Sscanln is similar to [Sscan], but stops scanning at a newline and
 // after the final item there must be a newline or EOF.
 func Sscanln(str string, a ...any) (n int, err error) {
-	return Fscanln((*stringReader)(&str), a...)
+	s, old := newScanStateString(str, false, true)
+	n, err = s.doScan(a)
+	s.free(old)
+	return
 }
 
 // Sscanf scans the argument string, storing successive space-separated
@@ -111,7 +151,10 @@ func Sscanln(str string, a ...any) (n int, err error) {
 // returns the number of items successfully parsed.
 // Newlines in the input must match newlines in the format.
 func Sscanf(str string, format string, a ...any) (n int, err error) {
-	return Fscanf((*stringReader)(&str), format, a...)
+	s, old := newScanStateString(str, false, false)
+	n, err = s.doScanf(format, a)
+	s.free(old)
+	return
 }
 
 // Fscan scans text read from r, storing successive space-separated
@@ -160,17 +203,20 @@ type ss struct {
 	count int            // runes consumed so far.
 	atEOF bool           // already read EOF
 	ssave
+	sr stringReader
+	rr readRune
 }
 
 // ssave holds the parts of ss that need to be
 // saved and restored on recursive scans.
 type ssave struct {
-	validSave bool // is or was a part of an actual ss.
-	nlIsEnd   bool // whether newline terminates scan
-	nlIsSpace bool // whether newline counts as white space
-	argLimit  int  // max value of ss.count for this arg; argLimit <= limit
-	limit     int  // max value of ss.count.
-	maxWid    int  // width of this arg.
+	validSave  bool // is or was a part of an actual ss.
+	nlIsEnd    bool // whether newline terminates scan
+	nlIsSpace  bool // whether newline counts as white space
+	argLimit   int  // max value of ss.count for this arg; argLimit <= limit
+	limit      int  // max value of ss.count.
+	maxWid     int  // width of this arg.
+	savedCount int  // outer ss.count saved during recursive scan.
 }
 
 // The Read method is only in ScanState so that ScanState
@@ -278,7 +324,10 @@ var space = [][2]uint16{
 }
 
 func isSpace(r rune) bool {
-	if r >= 1<<16 {
+	if uint32(r) <= ' ' {
+		return r == ' ' || ('\t' <= r && r <= '\r')
+	}
+	if r < 0x85 || r >= 1<<16 {
 		return false
 	}
 	rx := uint16(r)
@@ -318,11 +367,15 @@ func (r *readRune) readByte() (b byte, err error) {
 		r.pending--
 		return
 	}
-	n, err := io.ReadFull(r.reader, r.pendBuf[:1])
-	if n != 1 {
-		return 0, err
+	for {
+		n, err := r.reader.Read(r.pendBuf[:1])
+		if n == 1 {
+			return r.pendBuf[0], nil
+		}
+		if err != nil {
+			return 0, err
+		}
 	}
-	return r.pendBuf[0], err
 }
 
 // ReadRune returns the next UTF-8 encoded code point from the
@@ -379,13 +432,45 @@ var ssFree = sync.Pool[*ss]{
 	New: func() *ss { return new(ss) },
 }
 
+func newScanStateString(str string, nlIsSpace, nlIsEnd bool) (s *ss, old ssave) {
+	s = ssFree.Get()
+	s.sr = stringReader{s: str, prevRune: -1}
+	s.rs = &s.sr
+	s.nlIsSpace = nlIsSpace
+	s.nlIsEnd = nlIsEnd
+	s.atEOF = false
+	s.limit = hugeWid
+	s.argLimit = hugeWid
+	s.maxWid = hugeWid
+	s.validSave = true
+	s.savedCount = 0
+	s.count = 0
+	return
+}
+
 // newScanState allocates a new ss struct or grab a cached one.
 func newScanState(r io.Reader, nlIsSpace, nlIsEnd bool) (s *ss, old ssave) {
+	if outer, ok := r.(*ss); ok && !outer.nlIsEnd && !nlIsEnd && !outer.atEOF {
+		old = outer.ssave
+		outer.validSave = true
+		outer.nlIsSpace = nlIsSpace
+		rem := outer.argLimit - outer.count
+		if rem < 0 {
+			rem = 0
+		}
+		outer.limit = rem
+		outer.argLimit = rem
+		outer.maxWid = hugeWid
+		outer.savedCount = outer.count
+		outer.count = 0
+		return outer, old
+	}
 	s = ssFree.Get()
 	if rs, ok := r.(io.RuneScanner); ok {
 		s.rs = rs
 	} else {
-		s.rs = &readRune{reader: r, peekRune: -1}
+		s.rr = readRune{reader: r, peekRune: -1}
+		s.rs = &s.rr
 	}
 	s.nlIsSpace = nlIsSpace
 	s.nlIsEnd = nlIsEnd
@@ -394,6 +479,7 @@ func newScanState(r io.Reader, nlIsSpace, nlIsEnd bool) (s *ss, old ssave) {
 	s.argLimit = hugeWid
 	s.maxWid = hugeWid
 	s.validSave = true
+	s.savedCount = 0
 	s.count = 0
 	return
 }
@@ -402,7 +488,9 @@ func newScanState(r io.Reader, nlIsSpace, nlIsEnd bool) (s *ss, old ssave) {
 func (s *ss) free(old ssave) {
 	// If it was used recursively, just restore the old state.
 	if old.validSave {
+		newCount := s.savedCount + s.count
 		s.ssave = old
+		s.count = newCount
 		return
 	}
 	// Don't hold on to ss structs with large buffers.
@@ -411,6 +499,8 @@ func (s *ss) free(old ssave) {
 	}
 	s.buf = s.buf[:0]
 	s.rs = nil
+	s.sr.s = ""
+	s.rr.reader = nil
 	ssFree.Put(s)
 }
 
@@ -516,10 +606,23 @@ func (s *ss) accept(ok string) bool {
 	return s.consume(ok, true)
 }
 
+func (s *ss) acceptByteFold(lower byte) bool {
+	r := s.getRune()
+	if r == eof {
+		return false
+	}
+	if uint32(r) < utf8.RuneSelf && (byte(r)|0x20) == lower {
+		s.buf = append(s.buf, byte(r))
+		return true
+	}
+	s.UnreadRune()
+	return false
+}
+
 // okVerb verifies that the verb is present in the list, setting s.err appropriately if not.
 func (s *ss) okVerb(verb rune, okVerbs, typ string) bool {
-	for _, v := range okVerbs {
-		if v == verb {
+	for i := 0; i < len(okVerbs); i++ {
+		if rune(okVerbs[i]) == verb {
 			return true
 		}
 	}
@@ -541,12 +644,12 @@ func (s *ss) scanBool(verb rune) bool {
 	case '1':
 		return true
 	case 't', 'T':
-		if s.accept("rR") && (!s.accept("uU") || !s.accept("eE")) {
+		if s.acceptByteFold('r') && (!s.acceptByteFold('u') || !s.acceptByteFold('e')) {
 			s.error(errBool)
 		}
 		return true
 	case 'f', 'F':
-		if s.accept("aA") && (!s.accept("lL") || !s.accept("sS") || !s.accept("eE")) {
+		if s.acceptByteFold('a') && (!s.acceptByteFold('l') || !s.acceptByteFold('s') || !s.acceptByteFold('e')) {
 			s.error(errBool)
 		}
 		return false
@@ -584,17 +687,46 @@ func (s *ss) getBase(verb rune) (base int, digits string) {
 	return
 }
 
-// scanNumber returns the numerical string with specified digits starting here.
-func (s *ss) scanNumber(digits string, haveDigits bool) string {
+func isDigitForBase(r rune, digitBase int, allowUnderscore bool) bool {
+	if r == '_' {
+		return allowUnderscore
+	}
+	switch digitBase {
+	case 10:
+		return '0' <= r && r <= '9'
+	case 16:
+		return ('0' <= r && r <= '9') || ('a' <= r && r <= 'f') || ('A' <= r && r <= 'F')
+	case 8:
+		return '0' <= r && r <= '7'
+	case 2:
+		return r == '0' || r == '1'
+	}
+	return false
+}
+
+func (s *ss) scanDigits(digitBase int, allowUnderscore, haveDigits bool) {
 	if !haveDigits {
 		s.notEOF()
-		if !s.accept(digits) {
+		r := s.getRune()
+		if !isDigitForBase(r, digitBase, allowUnderscore) {
+			if r != eof {
+				s.UnreadRune()
+			}
 			s.errorString("expected integer")
 		}
+		s.buf = append(s.buf, byte(r))
 	}
-	for s.accept(digits) {
+	for {
+		r := s.getRune()
+		if r == eof {
+			break
+		}
+		if !isDigitForBase(r, digitBase, allowUnderscore) {
+			s.UnreadRune()
+			break
+		}
+		s.buf = append(s.buf, byte(r))
 	}
-	return string(s.buf)
 }
 
 // scanRune returns the next rune value in the input.
@@ -609,27 +741,34 @@ func (s *ss) scanRune(bitSize int) int64 {
 	return int64(r)
 }
 
-// scanBasePrefix reports whether the integer begins with a base prefix
-// and returns the base, digit string, and whether a zero was found.
+// scanBasePrefixFast reports whether the integer begins with a base prefix
+// and returns the digit base for scanning and whether a zero was found.
 // It is called only if the verb is %v.
-func (s *ss) scanBasePrefix() (base int, digits string, zeroFound bool) {
-	if !s.peek("0") {
-		return 0, decimalDigits + "_", false
+func (s *ss) scanBasePrefixFast() (digitBase int, zeroFound bool) {
+	r := s.getRune()
+	if r != '0' {
+		if r != eof {
+			s.UnreadRune()
+		}
+		return 10, false
 	}
-	s.accept("0")
-	// Special cases for 0, 0b, 0o, 0x.
-	switch {
-	case s.peek("bB"):
-		s.consume("bB", true)
-		return 0, binaryDigits + "_", true
-	case s.peek("oO"):
-		s.consume("oO", true)
-		return 0, octalDigits + "_", true
-	case s.peek("xX"):
-		s.consume("xX", true)
-		return 0, hexadecimalDigits + "_", true
+	s.buf = append(s.buf, '0')
+	r2 := s.getRune()
+	switch r2 {
+	case 'b', 'B':
+		s.buf = append(s.buf, byte(r2))
+		return 2, true
+	case 'o', 'O':
+		s.buf = append(s.buf, byte(r2))
+		return 8, true
+	case 'x', 'X':
+		s.buf = append(s.buf, byte(r2))
+		return 16, true
 	default:
-		return 0, octalDigits + "_", true
+		if r2 != eof {
+			s.UnreadRune()
+		}
+		return 8, true
 	}
 }
 
@@ -641,27 +780,36 @@ func (s *ss) scanInt(verb rune, bitSize int) int64 {
 	}
 	s.SkipSpace()
 	s.notEOF()
-	base, digits := s.getBase(verb)
+	base, _ := s.getBase(verb)
+	digitBase := base
+	allowUnderscore := false
 	haveDigits := false
 	if verb == 'U' {
 		if !s.consume("U", false) || !s.consume("+", false) {
 			s.errorString("bad unicode format ")
 		}
 	} else {
-		s.accept(sign) // If there's a sign, it will be left in the token buffer.
+		if r := s.getRune(); r == '+' || r == '-' {
+			s.buf = append(s.buf, byte(r))
+		} else if r != eof {
+			s.UnreadRune()
+		}
 		if verb == 'v' {
-			base, digits, haveDigits = s.scanBasePrefix()
+			base = 0
+			allowUnderscore = true
+			digitBase, haveDigits = s.scanBasePrefixFast()
 		}
 	}
-	tok := s.scanNumber(digits, haveDigits)
-	i, err := strconv.ParseInt(tok, base, 64)
-	if err != nil {
+	s.scanDigits(digitBase, allowUnderscore, haveDigits)
+	i, ierr := internalstrconv.ParseInt(unsafe.String(unsafe.SliceData(s.buf), len(s.buf)), base, 64)
+	if ierr != nil {
+		_, err := strconv.ParseInt(string(s.buf), base, 64)
 		s.error(err)
 	}
 	n := uint(bitSize)
 	x := (i << (64 - n)) >> (64 - n)
 	if x != i {
-		s.errorString("integer overflow on token " + tok)
+		s.errorString("integer overflow on token " + string(s.buf))
 	}
 	return i
 }
@@ -674,67 +822,113 @@ func (s *ss) scanUint(verb rune, bitSize int) uint64 {
 	}
 	s.SkipSpace()
 	s.notEOF()
-	base, digits := s.getBase(verb)
+	base, _ := s.getBase(verb)
+	digitBase := base
+	allowUnderscore := false
 	haveDigits := false
 	if verb == 'U' {
 		if !s.consume("U", false) || !s.consume("+", false) {
 			s.errorString("bad unicode format ")
 		}
 	} else if verb == 'v' {
-		base, digits, haveDigits = s.scanBasePrefix()
+		base = 0
+		allowUnderscore = true
+		digitBase, haveDigits = s.scanBasePrefixFast()
 	}
-	tok := s.scanNumber(digits, haveDigits)
-	i, err := strconv.ParseUint(tok, base, 64)
-	if err != nil {
+	s.scanDigits(digitBase, allowUnderscore, haveDigits)
+	i, ierr := internalstrconv.ParseUint(unsafe.String(unsafe.SliceData(s.buf), len(s.buf)), base, 64)
+	if ierr != nil {
+		_, err := strconv.ParseUint(string(s.buf), base, 64)
 		s.error(err)
 	}
 	n := uint(bitSize)
 	x := (i << (64 - n)) >> (64 - n)
 	if x != i {
-		s.errorString("unsigned integer overflow on token " + tok)
+		s.errorString("unsigned integer overflow on token " + string(s.buf))
 	}
 	return i
+}
+
+func (s *ss) acceptByte(b byte) bool {
+	r := s.getRune()
+	if r == eof {
+		return false
+	}
+	if r == rune(b) {
+		s.buf = append(s.buf, b)
+		return true
+	}
+	s.UnreadRune()
+	return false
+}
+
+func (s *ss) acceptSign() bool {
+	r := s.getRune()
+	if r == eof {
+		return false
+	}
+	if r == '+' || r == '-' {
+		s.buf = append(s.buf, byte(r))
+		return true
+	}
+	s.UnreadRune()
+	return false
+}
+
+// floatTokenBytes returns the floating-point number starting here in s.buf,
+// no longer than swid if the width is specified.
+func (s *ss) floatTokenBytes() []byte {
+	s.buf = s.buf[:0]
+	// NaN?
+	if s.acceptByteFold('n') && s.acceptByteFold('a') && s.acceptByteFold('n') {
+		return s.buf
+	}
+	// leading sign?
+	s.acceptSign()
+	// Inf?
+	if s.acceptByteFold('i') && s.acceptByteFold('n') && s.acceptByteFold('f') {
+		return s.buf
+	}
+	digitBase := 10
+	expChar := byte('e')
+	if s.acceptByte('0') && s.acceptByteFold('x') {
+		digitBase = 16
+		expChar = 'p'
+	}
+	// digits?
+	s.scanDigits(digitBase, true, true)
+	// decimal point?
+	if s.acceptByte('.') {
+		// fraction?
+		s.scanDigits(digitBase, true, true)
+	}
+	// exponent?
+	expMatched := false
+	if expChar == 'e' {
+		r := s.getRune()
+		if r == 'e' || r == 'E' || r == 'p' || r == 'P' {
+			s.buf = append(s.buf, byte(r))
+			expMatched = true
+		} else if r != eof {
+			s.UnreadRune()
+		}
+	} else {
+		expMatched = s.acceptByteFold('p')
+	}
+	if expMatched {
+		// leading sign?
+		s.acceptSign()
+		// digits?
+		s.scanDigits(10, true, true)
+	}
+	return s.buf
 }
 
 // floatToken returns the floating-point number starting here, no longer than swid
 // if the width is specified. It's not rigorous about syntax because it doesn't check that
 // we have at least some digits, but Atof will do that.
 func (s *ss) floatToken() string {
-	s.buf = s.buf[:0]
-	// NaN?
-	if s.accept("nN") && s.accept("aA") && s.accept("nN") {
-		return string(s.buf)
-	}
-	// leading sign?
-	s.accept(sign)
-	// Inf?
-	if s.accept("iI") && s.accept("nN") && s.accept("fF") {
-		return string(s.buf)
-	}
-	digits := decimalDigits + "_"
-	exp := exponent
-	if s.accept("0") && s.accept("xX") {
-		digits = hexadecimalDigits + "_"
-		exp = "pP"
-	}
-	// digits?
-	for s.accept(digits) {
-	}
-	// decimal point?
-	if s.accept(period) {
-		// fraction?
-		for s.accept(digits) {
-		}
-	}
-	// exponent?
-	if s.accept(exp) {
-		// leading sign?
-		s.accept(sign)
-		// digits?
-		for s.accept(decimalDigits + "_") {
-		}
-	}
-	return string(s.buf)
+	return string(s.floatTokenBytes())
 }
 
 // complexTokens returns the real and imaginary parts of the complex number starting here.
@@ -742,20 +936,20 @@ func (s *ss) floatToken() string {
 // number and there are no spaces within.
 func (s *ss) complexTokens() (real, imag string) {
 	// TODO: accept N and Ni independently?
-	parens := s.accept("(")
+	parens := s.acceptByte('(')
 	real = s.floatToken()
 	s.buf = s.buf[:0]
 	// Must now have a sign.
-	if !s.accept("+-") {
+	if !s.acceptSign() {
 		s.error(errComplex)
 	}
 	// Sign is now in buffer
 	imagSign := string(s.buf)
 	imag = s.floatToken()
-	if !s.accept("i") {
+	if !s.acceptByte('i') {
 		s.error(errComplex)
 	}
-	if parens && !s.accept(")") {
+	if parens && !s.acceptByte(')') {
 		s.error(errComplex)
 	}
 	return real, imagSign + imag
@@ -770,12 +964,42 @@ func hasX(s string) bool {
 	return false
 }
 
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// convertFloatBytes converts tok (which points to s.buf) to a float64 value without allocating on success.
+func (s *ss) convertFloatBytes(tok []byte, n int) float64 {
+	str := unsafe.String(unsafe.SliceData(tok), len(tok))
+	if p := indexByte(str, 'p'); p >= 0 && !hasX(str) {
+		f, ierr := internalstrconv.ParseFloat(str[:p], n)
+		if ierr != nil {
+			return s.convertFloat(string(tok), n)
+		}
+		m, ierr := internalstrconv.Atoi(str[p+1:])
+		if ierr != nil {
+			return s.convertFloat(string(tok), n)
+		}
+		return math.Ldexp(f, m)
+	}
+	f, ierr := internalstrconv.ParseFloat(str, n)
+	if ierr != nil {
+		return s.convertFloat(string(tok), n)
+	}
+	return f
+}
+
 // convertFloat converts the string to a float64value.
 func (s *ss) convertFloat(str string, n int) float64 {
 	// strconv.ParseFloat will handle "+0x1.fp+2",
 	// but we have to implement our non-standard
 	// decimal+binary exponent mix (1.2p4) ourselves.
-	if p := indexRune(str, 'p'); p >= 0 && !hasX(str) {
+	if p := indexByte(str, 'p'); p >= 0 && !hasX(str) {
 		// Atof doesn't handle power-of-2 exponents,
 		// but they're easy to evaluate.
 		f, err := strconv.ParseFloat(str[:p], n)
@@ -944,7 +1168,7 @@ const (
 func (s *ss) scanPercent() {
 	s.SkipSpace()
 	s.notEOF()
-	if !s.accept("%") {
+	if !s.acceptByte('%') {
 		s.errorString("missing literal %")
 	}
 }
@@ -1000,13 +1224,13 @@ func (s *ss) scanOne(verb rune, arg any) {
 		if s.okVerb(verb, floatVerbs, "float32") {
 			s.SkipSpace()
 			s.notEOF()
-			*v = float32(s.convertFloat(s.floatToken(), 32))
+			*v = float32(s.convertFloatBytes(s.floatTokenBytes(), 32))
 		}
 	case *float64:
 		if s.okVerb(verb, floatVerbs, "float64") {
 			s.SkipSpace()
 			s.notEOF()
-			*v = s.convertFloat(s.floatToken(), 64)
+			*v = s.convertFloatBytes(s.floatTokenBytes(), 64)
 		}
 	case *string:
 		*v = s.convertString(verb)
@@ -1044,7 +1268,7 @@ func (s *ss) scanOne(verb rune, arg any) {
 		case reflect.Float32, reflect.Float64:
 			s.SkipSpace()
 			s.notEOF()
-			v.SetFloat(s.convertFloat(s.floatToken(), v.Type().Bits()))
+			v.SetFloat(s.convertFloatBytes(s.floatTokenBytes(), v.Type().Bits()))
 		case reflect.Complex64, reflect.Complex128:
 			v.SetComplex(s.scanComplex(verb, v.Type().Bits()))
 		default:
@@ -1099,7 +1323,14 @@ func (s *ss) doScan(a []any) (numProcessed int, err error) {
 // is empty. If it is negative, the input did not match the string.
 func (s *ss) advance(format string) (i int) {
 	for i < len(format) {
-		fmtc, w := utf8.DecodeRuneInString(format[i:])
+		var fmtc rune
+		var w int
+		if c := format[i]; c < utf8.RuneSelf {
+			fmtc = rune(c)
+			w = 1
+		} else {
+			fmtc, w = utf8.DecodeRuneInString(format[i:])
+		}
 
 		// Space processing.
 		// In the rest of this comment "space" means spaces other than newline.
@@ -1118,7 +1349,15 @@ func (s *ss) advance(format string) (i int) {
 					trailingSpace = true
 				}
 				i += w
-				fmtc, w = utf8.DecodeRuneInString(format[i:])
+				if i >= len(format) {
+					break
+				}
+				if c := format[i]; c < utf8.RuneSelf {
+					fmtc = rune(c)
+					w = 1
+				} else {
+					fmtc, w = utf8.DecodeRuneInString(format[i:])
+				}
 			}
 			for j := 0; j < newlines; j++ {
 				inputc := s.getRune()
@@ -1158,7 +1397,12 @@ func (s *ss) advance(format string) (i int) {
 				s.errorString("missing verb: % at end of format string")
 			}
 			// %% acts like a real percent
-			nextc, _ := utf8.DecodeRuneInString(format[i+w:]) // will not match % if string is empty
+			var nextc rune
+			if c := format[i+w]; c < utf8.RuneSelf {
+				nextc = rune(c)
+			} else {
+				nextc, _ = utf8.DecodeRuneInString(format[i+w:]) // will not match % if string is empty
+			}
 			if nextc != '%' {
 				return
 			}
@@ -1206,7 +1450,15 @@ func (s *ss) doScanf(format string, a []any) (numProcessed int, err error) {
 			s.maxWid = hugeWid
 		}
 
-		c, w := utf8.DecodeRuneInString(format[i:])
+		var c rune
+		var wVerb int
+		if b := format[i]; b < utf8.RuneSelf {
+			c = rune(b)
+			wVerb = 1
+		} else {
+			c, wVerb = utf8.DecodeRuneInString(format[i:])
+		}
+		w = wVerb
 		i += w
 
 		if c != 'c' {

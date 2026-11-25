@@ -54,14 +54,39 @@ func Sort(mapValue reflect.Value) SortedMap {
 	// of a concurrent map update. The runtime is responsible for
 	// yelling loudly if that happens. See issue 33275.
 	n := mapValue.Len()
+	if n == 0 {
+		return nil
+	}
 	sorted := make(SortedMap, 0, n)
 	iter := mapValue.MapRange()
 	for iter.Next() {
 		sorted = append(sorted, KeyValue{iter.Key(), iter.Value()})
 	}
-	slices.SortStableFunc(sorted, func(a, b KeyValue) int {
-		return compare(a.Key, b.Key)
-	})
+	if len(sorted) <= 1 {
+		return sorted
+	}
+	switch mapValue.Type().Key().Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		slices.SortStableFunc(sorted, func(a, b KeyValue) int {
+			return cmp.Compare(a.Key.Int(), b.Key.Int())
+		})
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		slices.SortStableFunc(sorted, func(a, b KeyValue) int {
+			return cmp.Compare(a.Key.Uint(), b.Key.Uint())
+		})
+	case reflect.String:
+		slices.SortStableFunc(sorted, func(a, b KeyValue) int {
+			return cmp.Compare(a.Key.String(), b.Key.String())
+		})
+	case reflect.Float32, reflect.Float64:
+		slices.SortStableFunc(sorted, func(a, b KeyValue) int {
+			return cmp.Compare(a.Key.Float(), b.Key.Float())
+		})
+	default:
+		slices.SortStableFunc(sorted, func(a, b KeyValue) int {
+			return compare(a.Key, b.Key)
+		})
+	}
 	return sorted
 }
 

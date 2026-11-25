@@ -36,9 +36,15 @@ func errorf(format string, a ...any) error {
 	if len(a) == 0 && stringslite.IndexByte(format, '%') == -1 {
 		return nil
 	}
+	var stackBuf [256]byte
+	out, nextI, nextArg, ok := appendPrintfFast(stackBuf[:0], format, a)
+	if ok {
+		return errors.New(string(out))
+	}
 	p := newPrinter()
 	p.wrapErrs = true
-	p.doPrintf(format, a)
+	p.buf = append(p.buf, out...)
+	p.doPrintfFrom(format, a, nextI, nextArg)
 	s := string(p.buf)
 	var err error
 	switch len(p.wrappedErrs) {

@@ -1502,10 +1502,10 @@ var mallocTest = []struct {
 	fn    func()
 }{
 	{0, `Sprintf("")`, func() { _ = Sprintf("") }},
-	{1, `Sprintf("xxx")`, func() { _ = Sprintf("xxx") }},
+	{0, `Sprintf("xxx")`, func() { _ = Sprintf("xxx") }},
 	{0, `Sprintf("%x")`, func() { _ = Sprintf("%x", 7) }},
 	{1, `Sprintf("%x")`, func() { _ = Sprintf("%x", 1<<16) }},
-	{3, `Sprintf("%80000s")`, func() { _ = Sprintf("%80000s", "hello") }}, // large buffer (>64KB)
+	{2, `Sprintf("%80000s")`, func() { _ = Sprintf("%80000s", "hello") }}, // large buffer (>64KB)
 	{1, `Sprintf("%s")`, func() { _ = Sprintf("%s", "hello") }},
 	{1, `Sprintf("%x %x")`, func() { _ = Sprintf("%x %x", 7, 112) }},
 	{1, `Sprintf("%g")`, func() { _ = Sprintf("%g", float32(3.14159)) }},

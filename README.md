@@ -13,6 +13,7 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`encoding/base64`**: 2× unrolled AVX2 and SSSE3 assembly (`amd64`), ARM64 NEON, and runtime-detected ARM64 SVE2 vector codecs for standard and URL alphabets, AVX2 CR/LF newline stripping, in-place large-buffer `Decoder.Read`, `4×256` `uint32` little-endian scalar decode LUTs with 6→8 byte chunking, and single-allocation `EncodeToString`.
 - **`encoding/json`, `encoding/json/v2`**: Compiled marshal/unmarshal fast paths, SWAR scanning and validation, pooled buffers, exact float paths, and generic `*Of` / `Append*` APIs for both `jsonv2` and `GOEXPERIMENT=nojsonv2`.
 - **`encoding/xml`**: Compiled marshal/unmarshal struct plans (`sync/v2.Map`) with O(1) element lookup, pooled encoders and decoders, AVX2/SWAR XML scanning and `EscapeText` (`*bytes.Buffer` / `*strings.Builder`), direct `fastReadSimpleLeafBytes` leaf text decoding, pre-filtered `autoClose` matching, 2-way per-decoder name interning cache, deferred attribute materialization, and `internal/strconv` / inline base-10 numeric parsing.
+- **`fmt`, `internal/fmtsort`**: Stack-buffered formatting fast paths (`Sprintf`, `Appendf`, `Sprint`, `Sprintln`, `Append`, `Appendln`, `Errorf`), packed `fmtFlags` bitmask with bulk ASCII/zero padding and division-free base-10/byte formatting, `internal/abi` interface-skip guards, typed primitive slice and struct reflection hoisting, specialized `fmtsort` comparators, embedded string/reader scan states, zero-allocation numeric token parsing, and $O(N)$ recursive `Scanner` reuse.
 - **`io`**: Pooled overflow buffers and exact-sized final allocations in `ReadAll`.
 - **`sync/v2`**: Generic `Pool[T]` and `Map[K, V]` (`HashTrieMap` with `Shrink()` and single-load `Load` fast path).
 - **`sync/v2/container`**: Generic ordered/sorted maps (`OrderedMap`, `ConcurrentSkipListMap`, `LinkedHashMap`, `TreeMap`) with zero-alloc `internal/abi` CAS/CAD equality, capped node freelists, and lock-free `ConcurrentSkipListMap.First`.
@@ -608,6 +609,45 @@ xychart-beta
 | `FastSuite/UnmarshalFeed100` | 1,728 µs/op | **255.5 µs/op** | **-85.2%** (6.76×) | 8,055 (317 KB) → **423 (47.6 KB)** |
 | `FastSuite/EscapeTextPlain` | 12.31 µs/op | **250.6 ns/op** | **-98.0%** (49.12×) | 0 → 0 |
 | `FastSuite/EscapeTextMixed` | 14.28 µs/op | **7.82 µs/op** | **-45.2%** (1.83×) | 0 → 0 |
+
+---
+
+### 9. `fmt`
+
+Benchmarked on `linux/amd64` (`Intel Xeon @ 2.30 GHz`, `-cpu=2`, 3 runs median).
+
+```mermaid
+xychart-beta
+    title "fmt: Baseline 7511f438 (left) vs Current (right) — Latency (ns/op, lower is better)"
+    x-axis ["Empty", "Int", "Boolean", "TruncateStr", "PrefixedInt", "Bytes", "ManyArgs", "SliceInt"]
+    y-axis "Latency (ns/op)" 0 --> 560
+    bar [17.54, 33.08, 104.5, 148.7, 129.7, 545.3, 423.5, 527.9]
+    bar [3.19, 16.68, 29.72, 54.64, 62.92, 96.82, 217.8, 272.9]
+```
+
+#### `fmt` Formatting & Scanning (`7511f438` → Current, `-cpu=2`)
+
+| Benchmark | Baseline (`7511f438`) | Current | Latency Delta | Allocs (`Baseline` → `Current`) |
+| :--- | ---: | ---: | ---: | :---: |
+| `BenchmarkSprintfEmpty` | 17.54 ns/op | **3.19 ns/op** | **-81.8%** (5.50×) | 0 → 0 |
+| `BenchmarkSprintfBytes` | 545.3 ns/op | **96.82 ns/op** | **-82.2%** (5.63×) | 2 (88 B) → 2 (88 B) |
+| `BenchmarkSprintfBoolean` | 104.5 ns/op | **29.72 ns/op** | **-71.6%** (3.52×) | 1 (4 B) → 1 (4 B) |
+| `BenchmarkSprintfTruncateString` | 148.7 ns/op | **54.64 ns/op** | **-63.3%** (2.72×) | 1 (16 B) → 1 (16 B) |
+| `BenchmarkSprintfSlowParsingPath` | 79.64 ns/op | **32.82 ns/op** | **-58.8%** (2.43×) | 1 (5 B) → 1 (5 B) |
+| `BenchmarkSprintfPadding` | 172.0 ns/op | **80.98 ns/op** | **-52.9%** (2.12×) | 1 (16 B) → 1 (16 B) |
+| `BenchmarkSprintfPrefixedInt` | 129.7 ns/op | **62.92 ns/op** | **-51.5%** (2.06×) | 1 (64 B) → 1 (64 B) |
+| `BenchmarkSprintfInt` | 33.08 ns/op | **16.68 ns/op** | **-49.6%** (1.98×) | 0 → 0 |
+| `BenchmarkManyArgs` | 423.5 ns/op | **217.8 ns/op** | **-48.6%** (1.94×) | 0 → 0 |
+| `BenchmarkSprintfSliceInt` | 527.9 ns/op | **272.9 ns/op** | **-48.3%** (1.93×) | 2 (48 B) → 2 (48 B) |
+| `BenchmarkSprintfHexString` | 174.4 ns/op | **95.60 ns/op** | **-45.2%** (1.82×) | 1 (80 B) → 1 (80 B) |
+| `BenchmarkSprintfComplex` | 201.0 ns/op | **138.9 ns/op** | **-30.9%** (1.45×) | 1 (24 B) → 1 (24 B) |
+| `BenchmarkSprintfFloat` | 108.0 ns/op | **78.46 ns/op** | **-27.4%** (1.38×) | 1 (8 B) → 1 (8 B) |
+| `BenchmarkSprintfStringer` | 270.0 ns/op | **199.3 ns/op** | **-26.2%** (1.35×) | 3 (24 B) → 3 (24 B) |
+| `BenchmarkScanInts` | 378.4 µs/op | **250.5 µs/op** | **-33.8%** (1.51×) | 1,590 (15.2 KB) → **799 (12.8 KB)** |
+| `BenchmarkScanRecursiveInt` | 83,971 µs/op | **361.4 µs/op** | **-99.6%** (232.33×) | 1,596 (26.0 KB) → **801 (12.8 KB)** |
+| `BenchmarkScanRecursiveIntReaderWrapper` | 84,117 µs/op | **432.9 µs/op** | **-99.5%** (194.32×) | 1,599 (27.9 KB) → **802 (12.8 KB)** |
+
+> *Zero-alloc fast paths (`-cpu=2`): `BenchmarkFprintfLiteral` **16.36 ns/op** (0 allocs), `BenchmarkAppendfIntString` **123.6 ns/op** (0 allocs), `BenchmarkSscanIntFloat` **630.7 ns/op** (0 allocs), `BenchmarkSscanfMixed` **1,026 ns/op** (0 allocs). Allocation counts in `TestCountMallocs` dropped for `Sprintf("xxx")` (1 → 0) and `Sprintf("%80000s")` (3 → 2).*
 
 ---
 
