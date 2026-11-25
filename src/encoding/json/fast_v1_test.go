@@ -880,4 +880,33 @@ func TestFastV1SliceStackBufferFloat19AndUTF8(t *testing.T) {
 	}
 }
 
+func TestFastV1TimeInvalidSyntaxRegression(t *testing.T) {
+	type payload struct {
+		T time.Time `json:"t"`
+		X int       `json:"x"`
+	}
 
+	cases := []string{
+		`{"t":"2026-01-01T00:00:00Z","x":1} GARBAGE`,
+		`{"t":"2026-01-01T00:00:00Z","x": [}`,
+	}
+	for _, raw := range cases {
+		var p payload
+		err := json.Unmarshal([]byte(raw), &p)
+		if err == nil {
+			t.Fatalf("Unmarshal(%q) succeeded unexpectedly: %+v", raw, p)
+		}
+		var syn *json.SyntaxError
+		if !errors.As(err, &syn) {
+			t.Fatalf("Unmarshal(%q) err = %T (%v), want *json.SyntaxError", raw, err, err)
+		}
+		if !p.T.IsZero() {
+			t.Fatalf("Unmarshal(%q) mutated T to %v on syntax error", raw, p.T)
+		}
+	}
+
+	var root time.Time
+	if err := json.Unmarshal([]byte(`"2026-01-01T00:00:00Z" GARBAGE`), &root); err == nil {
+		t.Fatalf("Unmarshal root time with trailing garbage succeeded unexpectedly: %v", root)
+	}
+}

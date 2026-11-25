@@ -1334,4 +1334,33 @@ func TestFastSliceStackBufferAndFloat19(t *testing.T) {
 	})
 }
 
+type countUnmarshaler struct {
+	calls int
+	val   int
+}
 
+func (c *countUnmarshaler) UnmarshalJSON(b []byte) error {
+	c.calls++
+	v, err := strconv.Atoi(string(b))
+	if err != nil {
+		return err
+	}
+	c.val = v
+	return nil
+}
+
+func TestFastV2ReplayCustomUnmarshalerOnceRegression(t *testing.T) {
+	type doc struct {
+		P *countUnmarshaler `json:"p"`
+		C countUnmarshaler  `json:"c"`
+		X int               `json:"x"`
+	}
+	var d doc
+	err := Unmarshal([]byte(`{"p":null,"c":42,"x":"not-an-int"}`), &d)
+	if err == nil {
+		t.Fatal("expected error for non-int field X")
+	}
+	if d.C.calls != 1 {
+		t.Fatalf("C.UnmarshalJSON called %d times, want 1", d.C.calls)
+	}
+}

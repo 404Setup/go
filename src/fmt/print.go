@@ -1021,15 +1021,17 @@ func (p *pp) printArg(arg any, verb rune) {
 				p.buf.writeByte(' ')
 			}
 			if elem == nil {
-				if verb == 'v' {
-					p.buf.writeString(nilAngleString)
-				} else {
-					p.badVerb(nil, reflect.Value{}, verb)
-				}
+				p.buf.writeString(nilAngleString)
 				continue
 			}
 			if _, isRV := elem.(reflect.Value); isRV {
 				p.printValue(reflect.ValueOf(elem), verb, 1)
+				continue
+			}
+			if abi.TypeOf(elem).Kind() == abi.Pointer {
+				if !p.handleMethods(elem, reflect.Value{}, verb) {
+					p.fmtPointer(elem, reflect.ValueOf(elem), verb)
+				}
 				continue
 			}
 			p.printArg(elem, verb)

@@ -495,6 +495,7 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 
 	if rt == v1TimeType {
 		p.kind = v1fkTime
+		p.hasCustom = true
 		p.canFast = true
 		return p
 	}

@@ -848,14 +848,14 @@ func TestFastMixedPathsAndNilTextAttr(t *testing.T) {
 
 func TestFastAttrPrefixScoping(t *testing.T) {
 	type ptrAttrChild struct {
-		A    *Attr  `xml:",attr"`
-		Any  any    `xml:",attr"`
-		Val  string `xml:",chardata"`
+		A   *Attr  `xml:",attr"`
+		Any any    `xml:",attr"`
+		Val string `xml:",chardata"`
 	}
 	type doc struct {
-		XMLName Name           `xml:"root"`
-		First   ptrAttrChild   `xml:"first"`
-		Second  string         `xml:"urn:example:ns second"`
+		XMLName Name         `xml:"root"`
+		First   ptrAttrChild `xml:"first"`
+		Second  string       `xml:"urn:example:ns second"`
 	}
 	a1 := Attr{Name: Name{Space: "urn:example:ns", Local: "k"}, Value: "v1"}
 	a2 := Attr{Name: Name{Space: "urn:example:other", Local: "m"}, Value: "v2"}
@@ -984,3 +984,55 @@ func TestFastEscapeTextQuotesAndControl(t *testing.T) {
 	}
 }
 
+func TestFastDecodePointerTextAndSliceAttrRegression(t *testing.T) {
+	// Root *time.Time
+	var tp *time.Time
+	if err := Unmarshal([]byte(`<T>2026-03-04T05:06:07Z</T>`), &tp); err != nil {
+		t.Fatalf("Unmarshal *time.Time: %v", err)
+	}
+	wantT := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	if tp == nil || !tp.Equal(wantT) {
+		t.Fatalf("*time.Time = %v, want %v", tp, wantT)
+	}
+
+	// Struct fields *time.Time and *customTextTag (*TextUnmarshaler)
+	type timedDoc struct {
+		T *time.Time     `xml:"T"`
+		C *customTextTag `xml:"C"`
+	}
+	var td timedDoc
+	if err := Unmarshal([]byte(`<timedDoc><T>2026-03-04T05:06:07Z</T><C>[world]</C></timedDoc>`), &td); err != nil {
+		t.Fatalf("Unmarshal timedDoc: %v", err)
+	}
+	if td.T == nil || !td.T.Equal(wantT) {
+		t.Fatalf("timedDoc.T = %v, want %v", td.T, wantT)
+	}
+	if td.C == nil || *td.C != "world" {
+		t.Fatalf("timedDoc.C = %v, want world", td.C)
+	}
+
+	// Root *customTextTag (*TextUnmarshaler)
+	var ct *customTextTag
+	if err := Unmarshal([]byte(`<C>[hello]</C>`), &ct); err != nil {
+		t.Fatalf("Unmarshal *customTextTag: %v", err)
+	}
+	if ct == nil || *ct != "hello" {
+		t.Fatalf("*customTextTag = %v, want hello", ct)
+	}
+
+	// Struct attribute *[]string and **string
+	type doc struct {
+		Items *[]string `xml:"item,attr"`
+		Note  **string  `xml:"note,attr"`
+	}
+	var d doc
+	if err := Unmarshal([]byte(`<doc item="a" item="b" note="ok"/>`), &d); err != nil {
+		t.Fatalf("Unmarshal doc: %v", err)
+	}
+	if d.Items == nil || !reflect.DeepEqual(*d.Items, []string{"a", "b"}) {
+		t.Fatalf("Items = %v, want [a b]", d.Items)
+	}
+	if d.Note == nil || *d.Note == nil || **d.Note != "ok" {
+		t.Fatalf("Note = %v, want ok", d.Note)
+	}
+}

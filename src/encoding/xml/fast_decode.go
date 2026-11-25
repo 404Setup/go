@@ -25,58 +25,58 @@ type xmlDecodeStep struct {
 }
 
 type xmlDecodeAttr struct {
-	name             Name
-	steps            []xmlDecodeStep
-	offset           uintptr
-	kind             xmlFastKind
-	rt               reflect.Type
-	isUnmarshaler    bool
-	ptrUnmarshaler   bool
-	isTextUnmarshaler bool
+	name               Name
+	steps              []xmlDecodeStep
+	offset             uintptr
+	kind               xmlFastKind
+	rt                 reflect.Type
+	isUnmarshaler      bool
+	ptrUnmarshaler     bool
+	isTextUnmarshaler  bool
 	ptrTextUnmarshaler bool
-	isTime           bool
-	isSlice          bool
-	isPtr            bool
-	elemSize         uintptr
-	elemKind         xmlFastKind
-	elemRT           reflect.Type
-	elemUnmarsh      bool
-	elemPtrUnmarsh   bool
-	elemTextUnmarsh  bool
-	elemPtrTextUnm   bool
+	isTime             bool
+	isSlice            bool
+	isPtr              bool
+	elemSize           uintptr
+	elemKind           xmlFastKind
+	elemRT             reflect.Type
+	elemUnmarsh        bool
+	elemPtrUnmarsh     bool
+	elemTextUnmarsh    bool
+	elemPtrTextUnm     bool
 }
 
 type xmlDecodeElem struct {
-	name             Name
-	mode             fieldFlags
-	parents          []string
-	steps            []xmlDecodeStep
-	offset           uintptr
-	kind             xmlFastKind
-	rt               reflect.Type
-	plan             *xmlDecodePlan
-	isUnmarshaler    bool
-	ptrUnmarshaler   bool
-	isTextUnmarshaler bool
+	name               Name
+	mode               fieldFlags
+	parents            []string
+	steps              []xmlDecodeStep
+	offset             uintptr
+	kind               xmlFastKind
+	rt                 reflect.Type
+	plan               *xmlDecodePlan
+	isUnmarshaler      bool
+	ptrUnmarshaler     bool
+	isTextUnmarshaler  bool
 	ptrTextUnmarshaler bool
-	isTime           bool
-	canFastField     bool
+	isTime             bool
+	canFastField       bool
 }
 
 type xmlDecodePlan struct {
-	typ              *abi.Type
-	rt               reflect.Type
-	ptrRT            reflect.Type
-	kind             xmlFastKind
-	canFast          bool
-	building         bool
-	buildErr         error
-	isUnmarshaler    bool
-	ptrUnmarshaler   bool
-	isTextUnmarshaler bool
+	typ                *abi.Type
+	rt                 reflect.Type
+	ptrRT              reflect.Type
+	kind               xmlFastKind
+	canFast            bool
+	building           bool
+	buildErr           error
+	isUnmarshaler      bool
+	ptrUnmarshaler     bool
+	isTextUnmarshaler  bool
 	ptrTextUnmarshaler bool
-	elemSize         uintptr
-	elemPlan         *xmlDecodePlan
+	elemSize           uintptr
+	elemPlan           *xmlDecodePlan
 
 	// Struct fields
 	hasXMLName   bool
@@ -86,22 +86,22 @@ type xmlDecodePlan struct {
 	xmlNameOff   uintptr
 	xmlNameIsN   bool
 
-	attrs        []xmlDecodeAttr
-	hasAnyAttr   bool
-	anyAttrIdx   int
+	attrs      []xmlDecodeAttr
+	hasAnyAttr bool
+	anyAttrIdx int
 
-	elems        []xmlDecodeElem
-	elemByLocal  map[string]int // -1/-2 = multiple/ambiguous -> linear scan
-	hasParents   bool
+	elems       []xmlDecodeElem
+	elemByLocal map[string]int // -1/-2 = multiple/ambiguous -> linear scan
+	hasParents  bool
 
-	hasCharData  bool
-	charDataIdx  int
-	hasComment   bool
-	commentIdx   int
-	hasInnerXML  bool
-	innerXMLIdx  int
-	hasAnyElem   bool
-	anyElemIdx   int
+	hasCharData bool
+	charDataIdx int
+	hasComment  bool
+	commentIdx  int
+	hasInnerXML bool
+	innerXMLIdx int
+	hasAnyElem  bool
+	anyElemIdx  int
 }
 
 var xmlDecodePlanCache syncv2.Map[*abi.Type, *xmlDecodePlan]
@@ -181,24 +181,24 @@ func buildXmlDecodePlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Type]*x
 
 	ptrRT := reflect.PointerTo(rt)
 	p := &xmlDecodePlan{
-		typ:               at,
-		rt:                rt,
-		ptrRT:             ptrRT,
-		kind:              classifyXmlKind(rt, at),
-		building:          true,
-		isUnmarshaler:     rt.Implements(xmlUnmarshalerType),
-		ptrUnmarshaler:    ptrRT.Implements(xmlUnmarshalerType),
-		isTextUnmarshaler: rt.Implements(xmlTextUnmarshalerType),
+		typ:                at,
+		rt:                 rt,
+		ptrRT:              ptrRT,
+		kind:               classifyXmlKind(rt, at),
+		building:           true,
+		isUnmarshaler:      rt.Implements(xmlUnmarshalerType),
+		ptrUnmarshaler:     ptrRT.Implements(xmlUnmarshalerType),
+		isTextUnmarshaler:  rt.Implements(xmlTextUnmarshalerType),
 		ptrTextUnmarshaler: ptrRT.Implements(xmlTextUnmarshalerType),
-		anyAttrIdx:        -1,
-		charDataIdx:       -1,
-		commentIdx:        -1,
-		innerXMLIdx:       -1,
-		anyElemIdx:        -1,
+		anyAttrIdx:         -1,
+		charDataIdx:        -1,
+		commentIdx:         -1,
+		innerXMLIdx:        -1,
+		anyElemIdx:         -1,
 	}
 	visiting[at] = p
 
-	if p.isUnmarshaler || p.ptrUnmarshaler || p.isTextUnmarshaler || p.ptrTextUnmarshaler {
+	if p.kind != xkPtr && (p.isUnmarshaler || p.ptrUnmarshaler || p.isTextUnmarshaler || p.ptrTextUnmarshaler) {
 		if at == xmlTimeAbiType {
 			p.canFast = true
 			return p
@@ -362,16 +362,16 @@ func buildXmlDecodePlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Type]*x
 func buildXmlDecodeAttr(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xmlDecodeStep, off uintptr) xmlDecodeAttr {
 	ptrFRT := reflect.PointerTo(frt)
 	fa := xmlDecodeAttr{
-		name:              Name{Space: fi.xmlns, Local: fi.name},
-		steps:             steps,
-		offset:            off,
-		kind:              classifyXmlKind(frt, fat),
-		rt:                frt,
-		isUnmarshaler:     frt.Implements(xmlUnmarshalerAttrType),
-		ptrUnmarshaler:    ptrFRT.Implements(xmlUnmarshalerAttrType),
-		isTextUnmarshaler: frt.Implements(xmlTextUnmarshalerType),
+		name:               Name{Space: fi.xmlns, Local: fi.name},
+		steps:              steps,
+		offset:             off,
+		kind:               classifyXmlKind(frt, fat),
+		rt:                 frt,
+		isUnmarshaler:      frt.Implements(xmlUnmarshalerAttrType),
+		ptrUnmarshaler:     ptrFRT.Implements(xmlUnmarshalerAttrType),
+		isTextUnmarshaler:  frt.Implements(xmlTextUnmarshalerType),
 		ptrTextUnmarshaler: ptrFRT.Implements(xmlTextUnmarshalerType),
-		isTime:            fat == xmlTimeAbiType,
+		isTime:             fat == xmlTimeAbiType,
 	}
 	if fa.kind == xkSlice {
 		fa.isSlice = true
@@ -404,18 +404,18 @@ func buildXmlDecodeAttr(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []
 func buildXmlDecodeElem(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xmlDecodeStep, off uintptr, visiting map[*abi.Type]*xmlDecodePlan) xmlDecodeElem {
 	ptrFRT := reflect.PointerTo(frt)
 	fe := xmlDecodeElem{
-		name:              Name{Space: fi.xmlns, Local: fi.name},
-		mode:              fi.flags & fMode,
-		parents:           fi.parents,
-		steps:             steps,
-		offset:            off,
-		kind:              classifyXmlKind(frt, fat),
-		rt:                frt,
-		isUnmarshaler:     frt.Implements(xmlUnmarshalerType),
-		ptrUnmarshaler:    ptrFRT.Implements(xmlUnmarshalerType),
-		isTextUnmarshaler: frt.Implements(xmlTextUnmarshalerType),
+		name:               Name{Space: fi.xmlns, Local: fi.name},
+		mode:               fi.flags & fMode,
+		parents:            fi.parents,
+		steps:              steps,
+		offset:             off,
+		kind:               classifyXmlKind(frt, fat),
+		rt:                 frt,
+		isUnmarshaler:      frt.Implements(xmlUnmarshalerType),
+		ptrUnmarshaler:     ptrFRT.Implements(xmlUnmarshalerType),
+		isTextUnmarshaler:  frt.Implements(xmlTextUnmarshalerType),
 		ptrTextUnmarshaler: ptrFRT.Implements(xmlTextUnmarshalerType),
-		isTime:            fat == xmlTimeAbiType,
+		isTime:             fat == xmlTimeAbiType,
 	}
 	if fe.mode&(fElement|fAny) != 0 {
 		fe.plan = buildXmlDecodePlan(frt, fat, visiting)
@@ -898,7 +898,7 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 		if fa.isTime {
 			return (*time.Time)(fptr).UnmarshalText(valBytes)
 		}
-		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm {
+		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm || fa.elemKind == xkSlice || fa.elemKind == xkPtr {
 			return d.unmarshalAttr(reflect.NewAt(fa.elemRT, fptr).Elem(), materializeAttrVal(a, raw))
 		}
 		if fa.elemKind == xkAttr {

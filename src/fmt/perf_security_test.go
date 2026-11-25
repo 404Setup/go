@@ -753,3 +753,53 @@ func BenchmarkSprintfMapSorted(b *testing.B) {
 		_ = fmt.Sprintf("%v", m)
 	}
 }
+
+type ptrStringer struct{ v int }
+
+func (p *ptrStringer) String() string { return fmt.Sprintf("ps(%d)", p.v) }
+
+func TestAnySliceFormattingRegression(t *testing.T) {
+	// Cyclic slice via pointer must print pointer address without stack overflow.
+	cyc := make([]any, 1)
+	cyc[0] = &cyc
+	gotCyc := fmt.Sprintf("%v", cyc)
+	wantCyc := fmt.Sprintf("[%p]", &cyc)
+	if gotCyc != wantCyc {
+		t.Fatalf("cyclic []any = %q, want %q", gotCyc, wantCyc)
+	}
+
+	// Non-nil pointers in []any must not be dereferenced at depth 1.
+	type pair struct{ A int }
+	pv := &pair{A: 7}
+	if got, want := fmt.Sprintf("%v", []any{pv}), fmt.Sprintf("[%p]", pv); got != want {
+		t.Fatalf("[]any{&pair} %%v = %q, want %q", got, want)
+	}
+	if got, want := fmt.Sprintf("%s", []any{pv}), "[%!s(*fmt_test.pair=&{7})]"; got != want {
+		t.Fatalf("[]any{&pair} %%s = %q, want %q", got, want)
+	}
+	iv := 7
+	if got, want := fmt.Sprintf("%s", []any{&iv}), fmt.Sprintf("[%%!s(*int=%p)]", &iv); got != want {
+		t.Fatalf("[]any{&int} %%s = %q, want %q", got, want)
+	}
+
+	// Typed nil pointer vs Stringer pointer in []any.
+	var nilIntPtr *int
+	if got := fmt.Sprintf("%v", []any{nilIntPtr}); got != "[<nil>]" {
+		t.Fatalf("[]any{(*int)(nil)} = %q, want %q", got, "[<nil>]")
+	}
+	ps := &ptrStringer{v: 9}
+	if got := fmt.Sprintf("%v", []any{ps}); got != "[ps(9)]" {
+		t.Fatalf("[]any{&ptrStringer} = %q, want %q", got, "[ps(9)]")
+	}
+
+	// Nil elements in []any for non-v verbs must match upstream [<nil>], except %w.
+	for _, verb := range []string{"%v", "%d", "%s", "%q", "%x"} {
+		if got := fmt.Sprintf(verb, []any{nil}); got != "[<nil>]" {
+			t.Fatalf("Sprintf(%q, []any{nil}) = %q, want %q", verb, got, "[<nil>]")
+		}
+	}
+	wrapFmt := "%w"
+	if got := fmt.Errorf(wrapFmt, []any{nil}).Error(); got != "[%!w(interface {}=<nil>)]" {
+		t.Fatalf("Errorf(%%w, []any{nil}) = %q, want %q", got, "[%!w(interface {}=<nil>)]")
+	}
+}
