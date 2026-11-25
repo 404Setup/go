@@ -569,16 +569,13 @@ func (d *Decoder) autoClose(t Token) (Token, bool) {
 	}
 	c0 := local[0]
 	for _, s := range d.AutoClose {
-		if len(s) != n {
-			continue
-		}
 		if c0 < utf8.RuneSelf && s[0] < utf8.RuneSelf && (s[0]^c0)&^0x20 != 0 {
 			continue
 		}
 		if strings.EqualFold(s, local) {
 			// This one should be auto closed if t doesn't close it.
 			et, ok := t.(EndElement)
-			if !ok || len(et.Name.Local) != n || !strings.EqualFold(et.Name.Local, local) {
+			if !ok || !strings.EqualFold(et.Name.Local, local) {
 				return EndElement{d.stk.name}, true
 			}
 			break

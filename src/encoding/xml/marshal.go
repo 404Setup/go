@@ -272,7 +272,7 @@ func (enc *Encoder) Encode(v any) error {
 	if err != nil {
 		return err
 	}
-	return enc.p.w.Flush()
+	return enc.Flush()
 }
 
 // EncodeElement writes the XML encoding of v to the stream,
@@ -287,7 +287,7 @@ func (enc *Encoder) EncodeElement(v any, start StartElement) error {
 	if err != nil {
 		return err
 	}
-	return enc.p.w.Flush()
+	return enc.Flush()
 }
 
 var (

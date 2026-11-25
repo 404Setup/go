@@ -1510,3 +1510,32 @@ func TestHTMLAutoClose(t *testing.T) {
 		}
 	}
 }
+
+func TestAutoCloseUnicodeLengthMismatch(t *testing.T) {
+	// U+212A (KELVIN SIGN, 3 UTF-8 bytes) folds to ASCII 'k' (1 byte).
+	d := NewDecoder(strings.NewReader("<a><\u212a><b></b></a>"))
+	d.Strict = false
+	d.AutoClose = []string{"k"}
+	var got []Token
+	for {
+		tok, err := d.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got = append(got, CopyToken(tok))
+	}
+	want := []Token{
+		StartElement{Name{"", "a"}, []Attr{}},
+		StartElement{Name{"", "\u212a"}, []Attr{}},
+		EndElement{Name{"", "\u212a"}},
+		StartElement{Name{"", "b"}, []Attr{}},
+		EndElement{Name{"", "b"}},
+		EndElement{Name{"", "a"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("tokens mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	}
+}

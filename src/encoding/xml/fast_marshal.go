@@ -281,6 +281,7 @@ type xmlMarshalPlan struct {
 	ptrMarshaler     bool
 	isTextMarshaler  bool
 	ptrTextMarshaler bool
+	isNonEmptyIface  bool
 	elemSize         uintptr
 	arrayLen         int
 	elemPlan         *xmlMarshalPlan
@@ -510,6 +511,7 @@ func buildXmlMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Type]*
 		return p
 
 	case xkInterface:
+		p.isNonEmptyIface = rt.NumMethod() > 0
 		p.hasCustom = true
 		p.canFast = true
 		return p
@@ -816,18 +818,31 @@ func (p *printer) fastMarshalValue(plan *xmlMarshalPlan, ptr unsafe.Pointer, can
 			continue
 
 		case xkInterface:
-			e := (*xmlEface)(ptr)
-			if e.typ == nil {
-				return nil
+			var elemTyp *abi.Type
+			var elemData unsafe.Pointer
+			if plan.isNonEmptyIface {
+				ni := (*abi.NonEmptyInterface)(ptr)
+				if ni.ITab == nil {
+					return nil
+				}
+				elemTyp = ni.ITab.Type
+				elemData = ni.Data
+			} else {
+				e := (*xmlEface)(ptr)
+				if e.typ == nil {
+					return nil
+				}
+				elemTyp = e.typ
+				elemData = e.data
 			}
-			if e.typ.IsDirectIface() {
-				ptr = unsafe.Pointer(&e.data)
+			if elemTyp.IsDirectIface() {
+				ptr = unsafe.Pointer(&elemData)
 				canAddr = false
 			} else {
-				ptr = e.data
+				ptr = elemData
 				canAddr = false
 			}
-			plan = lookupXmlMarshalPlan(e.typ)
+			plan = lookupXmlMarshalPlan(elemTyp)
 			depth++
 			if depth > 1000 {
 				return errors.New("xml: nested too deeply")

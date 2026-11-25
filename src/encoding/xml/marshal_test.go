@@ -2600,3 +2600,69 @@ func TestClose(t *testing.T) {
 		})
 	}
 }
+
+type stringerStruct struct {
+	V string
+}
+
+func (s stringerStruct) String() string { return s.V }
+
+type directStringerPtr struct {
+	V string
+}
+
+func (s *directStringerPtr) String() string { return s.V }
+
+type xmlCustomMarshaler struct {
+	V string
+}
+
+func (m xmlCustomMarshaler) MarshalXML(e *Encoder, start StartElement) error {
+	return e.EncodeElement(m.V, start)
+}
+
+type xmlEncodeMarshaler struct {
+	V string
+}
+
+func (m xmlEncodeMarshaler) MarshalXML(e *Encoder, start StartElement) error {
+	type inner struct {
+		XMLName Name `xml:"inner"`
+		Val     string
+	}
+	return e.Encode(inner{Val: m.V})
+}
+
+func TestMarshalNonEmptyInterface(t *testing.T) {
+	type doc struct {
+		XMLName   Name           `xml:"doc"`
+		S1        fmt.Stringer   `xml:"s1"`
+		S2        fmt.Stringer   `xml:"s2"`
+		NilS      fmt.Stringer   `xml:"nils"`
+		TypedNilS fmt.Stringer   `xml:"typednils"`
+		List      []fmt.Stringer `xml:"item"`
+		M         Marshaler      `xml:"m"`
+		M2        Marshaler      `xml:"m2"`
+		NilM      Marshaler      `xml:"nilm"`
+	}
+	var typedNil *directStringerPtr
+	in := doc{
+		S1:        stringerStruct{V: "alpha"},
+		S2:        &directStringerPtr{V: "beta"},
+		TypedNilS: typedNil,
+		List: []fmt.Stringer{
+			stringerStruct{V: "one"},
+			&directStringerPtr{V: "two"},
+		},
+		M:  xmlCustomMarshaler{V: "custom"},
+		M2: xmlEncodeMarshaler{V: "enc"},
+	}
+	got, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	const want = `<doc><s1><V>alpha</V></s1><s2><V>beta</V></s2><item><V>one</V></item><item><V>two</V></item><m>custom</m><inner><Val>enc</Val></inner></doc>`
+	if string(got) != want {
+		t.Fatalf("Marshal got %s, want %s", got, want)
+	}
+}
