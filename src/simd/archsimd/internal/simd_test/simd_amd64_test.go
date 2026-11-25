@@ -259,19 +259,19 @@ func TestBitMaskToBits(t *testing.T) {
 	if v := archsimd.LoadInt32x4(int32s[:4]).ToMask().ToBits(); v != want4 {
 		t.Errorf("want %b, got %b", want4, v)
 	}
-	if v := archsimd.LoadInt32x8(int32s[:8]).ToMask().ToBits(); v != want8 {
-		t.Errorf("want %b, got %b", want8, v)
-	}
 	if v := archsimd.LoadInt64x2(int64s[:2]).ToMask().ToBits(); v != want2 {
 		t.Errorf("want %b, got %b", want2, v)
-	}
-	if v := archsimd.LoadInt64x4(int64s[:4]).ToMask().ToBits(); v != want4 {
-		t.Errorf("want %b, got %b", want4, v)
 	}
 
 	if archsimd.X86.AVX2() {
 		if v := archsimd.LoadInt8x32(int8s[:32]).ToMask().ToBits(); v != want32 {
 			t.Errorf("want %b, got %b", want32, v)
+		}
+		if v := archsimd.LoadInt32x8(int32s[:8]).ToMask().ToBits(); v != want8 {
+			t.Errorf("want %b, got %b", want8, v)
+		}
+		if v := archsimd.LoadInt64x4(int64s[:4]).ToMask().ToBits(); v != want4 {
+			t.Errorf("want %b, got %b", want4, v)
 		}
 	}
 
@@ -448,6 +448,9 @@ func TestRotateAllConst(t *testing.T) {
 }
 
 func TestBroadcastFloat32x8(t *testing.T) {
+	if !archsimd.X86.AVX2() {
+		t.Skip("Test requires X86.AVX2, not available on this hardware")
+	}
 	s := make([]float32, 8, 8)
 	archsimd.BroadcastFloat32x8(123456789).Store(s)
 	checkSlices(t, s, []float32{123456789, 123456789, 123456789, 123456789, 123456789, 123456789, 123456789, 123456789})
@@ -828,6 +831,9 @@ func TestConcatPermuteScalarsConstGroupedUint32x16(t *testing.T) {
 }
 
 func TestConcatPermute128Scalars(t *testing.T) {
+	if !archsimd.X86.AVX2() {
+		t.Skip("Test requires X86.AVX2, not available on this hardware")
+	}
 	x := archsimd.LoadUint64x4([]uint64{0, 1, 2, 3})
 	y := archsimd.LoadUint64x4([]uint64{4, 5, 6, 7})
 
@@ -855,6 +861,9 @@ func TestConcatPermute128Scalars(t *testing.T) {
 }
 
 func TestConcatPermute128ScalarsError(t *testing.T) {
+	if !archsimd.X86.AVX2() {
+		t.Skip("Test requires X86.AVX2, not available on this hardware")
+	}
 	x := archsimd.LoadUint64x4([]uint64{0, 1, 2, 3})
 	y := archsimd.LoadUint64x4([]uint64{4, 5, 6, 7})
 
@@ -874,6 +883,9 @@ func select128FromPair(x archsimd.Uint64x4, lo, hi uint8, y archsimd.Uint64x4) a
 }
 
 func TestConcatPermute128ScalarsVar(t *testing.T) {
+	if !archsimd.X86.AVX2() {
+		t.Skip("Test requires X86.AVX2, not available on this hardware")
+	}
 	x := archsimd.LoadUint64x4([]uint64{0, 1, 2, 3})
 	y := archsimd.LoadUint64x4([]uint64{4, 5, 6, 7})
 
@@ -1054,6 +1066,58 @@ func TestMaskString(t *testing.T) {
 
 	if g := m.String(); g != w {
 		t.Errorf("got=%s wanted %s", g, w)
+	}
+}
+
+// TestMaskString256 checks that String works on 256-bit masks with only AVX,
+// which is all that their types require. Without AVX2, these masks come from
+// floating-point comparisons.
+func TestMaskString256(t *testing.T) {
+	if !archsimd.X86.AVX() {
+		t.Skip("requires AVX")
+	}
+	x := archsimd.LoadFloat32x8Array(&[8]float32{0, 1, 0, 3, 4, 5, 6, 0})
+	y := archsimd.LoadFloat64x4Array(&[4]float64{1, 0, 0, 3})
+
+	if g, w := x.Equal(archsimd.Float32x8{}).String(), "{1,0,1,0,0,0,0,1}"; g != w {
+		t.Errorf("Mask32x8: got=%s wanted %s", g, w)
+	}
+	if g, w := y.Equal(archsimd.Float64x4{}).String(), "{0,1,1,0}"; g != w {
+		t.Errorf("Mask64x4: got=%s wanted %s", g, w)
+	}
+}
+
+// TestMaskLogic256 checks bitwise operations on 256-bit masks with only AVX,
+// which is all that their types require. Without AVX2, these masks come from
+// floating-point comparisons.
+func TestMaskLogic256(t *testing.T) {
+	if !archsimd.X86.AVX() {
+		t.Skip("requires AVX")
+	}
+	x := archsimd.LoadFloat32x8Array(&[8]float32{0, 0, 1, 1, 0, 0, 1, 1})
+	y := archsimd.LoadFloat32x8Array(&[8]float32{0, 1, 0, 1, 0, 1, 0, 1})
+	zero := archsimd.Float32x8{}
+	mx, my := x.NotEqual(zero), y.NotEqual(zero)
+	for _, tc := range []struct {
+		name string
+		got  archsimd.Mask32x8
+		want string
+	}{
+		{"And", mx.And(my), "{0,0,0,1,0,0,0,1}"},
+		{"Or", mx.Or(my), "{0,1,1,1,0,1,1,1}"},
+		{"Xor", mx.Xor(my), "{0,1,1,0,0,1,1,0}"},
+		{"AndNot", mx.AndNot(my), "{0,0,1,0,0,0,1,0}"},
+	} {
+		if g := tc.got.String(); g != tc.want {
+			t.Errorf("Mask32x8.%s: got=%s wanted %s", tc.name, g, tc.want)
+		}
+	}
+
+	u := archsimd.LoadFloat64x4Array(&[4]float64{0, 0, 1, 1})
+	v := archsimd.LoadFloat64x4Array(&[4]float64{0, 1, 0, 1})
+	mu, mv := u.NotEqual(archsimd.Float64x4{}), v.NotEqual(archsimd.Float64x4{})
+	if g, w := mu.AndNot(mv).Or(mu.And(mv).Xor(mv)).String(), "{0,1,1,0}"; g != w {
+		t.Errorf("Mask64x4: got=%s wanted %s", g, w)
 	}
 }
 
@@ -1793,6 +1857,175 @@ func TestReduceSumAmd64AVX512(t *testing.T) {
 
 	testV2S(t, int32s, archsimd.LoadInt32x16, archsimd.Int32x16.ReduceSum, reduceSum)
 	testV2S(t, uint32s, archsimd.LoadUint32x16, archsimd.Uint32x16.ReduceSum, reduceSum)
+}
+
+func TestReduceMinMaxAmd64(t *testing.T) {
+	testV2S(t, int8s, archsimd.LoadInt8x16, archsimd.Int8x16.ReduceMax, func(x []int8) int8 { return reduceSlice(x, max_[int8]) })
+	testV2S(t, int8s, archsimd.LoadInt8x16, archsimd.Int8x16.ReduceMin, func(x []int8) int8 { return reduceSlice(x, min_[int8]) })
+	testV2S(t, uint8s, archsimd.LoadUint8x16, archsimd.Uint8x16.ReduceMax, func(x []uint8) uint8 { return reduceSlice(x, max_[uint8]) })
+	testV2S(t, uint8s, archsimd.LoadUint8x16, archsimd.Uint8x16.ReduceMin, func(x []uint8) uint8 { return reduceSlice(x, min_[uint8]) })
+
+	testV2S(t, int16s, archsimd.LoadInt16x8, archsimd.Int16x8.ReduceMax, func(x []int16) int16 { return reduceSlice(x, max_[int16]) })
+	testV2S(t, int16s, archsimd.LoadInt16x8, archsimd.Int16x8.ReduceMin, func(x []int16) int16 { return reduceSlice(x, min_[int16]) })
+	testV2S(t, uint16s, archsimd.LoadUint16x8, archsimd.Uint16x8.ReduceMax, func(x []uint16) uint16 { return reduceSlice(x, max_[uint16]) })
+	testV2S(t, uint16s, archsimd.LoadUint16x8, archsimd.Uint16x8.ReduceMin, func(x []uint16) uint16 { return reduceSlice(x, min_[uint16]) })
+
+	testV2S(t, int32s, archsimd.LoadInt32x4, archsimd.Int32x4.ReduceMax, func(x []int32) int32 { return reduceSlice(x, max_[int32]) })
+	testV2S(t, int32s, archsimd.LoadInt32x4, archsimd.Int32x4.ReduceMin, func(x []int32) int32 { return reduceSlice(x, min_[int32]) })
+	testV2S(t, uint32s, archsimd.LoadUint32x4, archsimd.Uint32x4.ReduceMax, func(x []uint32) uint32 { return reduceSlice(x, max_[uint32]) })
+	testV2S(t, uint32s, archsimd.LoadUint32x4, archsimd.Uint32x4.ReduceMin, func(x []uint32) uint32 { return reduceSlice(x, min_[uint32]) })
+
+	testV2S(t, int64s, archsimd.LoadInt64x2, archsimd.Int64x2.ReduceMax, func(x []int64) int64 { return reduceSlice(x, max_[int64]) })
+	testV2S(t, int64s, archsimd.LoadInt64x2, archsimd.Int64x2.ReduceMin, func(x []int64) int64 { return reduceSlice(x, min_[int64]) })
+	testV2S(t, uint64s, archsimd.LoadUint64x2, archsimd.Uint64x2.ReduceMax, func(x []uint64) uint64 { return reduceSlice(x, max_[uint64]) })
+	testV2S(t, uint64s, archsimd.LoadUint64x2, archsimd.Uint64x2.ReduceMin, func(x []uint64) uint64 { return reduceSlice(x, min_[uint64]) })
+
+	testV2S(t, float32s, archsimd.LoadFloat32x4, archsimd.Float32x4.ReduceMax, func(x []float32) float32 { return reduceSlice(x, max_[float32]) })
+	testV2S(t, float32s, archsimd.LoadFloat32x4, archsimd.Float32x4.ReduceMin, func(x []float32) float32 { return reduceSlice(x, min_[float32]) })
+	testV2S(t, float32s, archsimd.LoadFloat32x8, archsimd.Float32x8.ReduceMax, func(x []float32) float32 { return reduceSlice(x, max_[float32]) })
+	testV2S(t, float32s, archsimd.LoadFloat32x8, archsimd.Float32x8.ReduceMin, func(x []float32) float32 { return reduceSlice(x, min_[float32]) })
+	testV2S(t, float64s, archsimd.LoadFloat64x2, archsimd.Float64x2.ReduceMax, func(x []float64) float64 { return reduceSlice(x, max_[float64]) })
+	testV2S(t, float64s, archsimd.LoadFloat64x2, archsimd.Float64x2.ReduceMin, func(x []float64) float64 { return reduceSlice(x, min_[float64]) })
+	testV2S(t, float64s, archsimd.LoadFloat64x4, archsimd.Float64x4.ReduceMax, func(x []float64) float64 { return reduceSlice(x, max_[float64]) })
+	testV2S(t, float64s, archsimd.LoadFloat64x4, archsimd.Float64x4.ReduceMin, func(x []float64) float64 { return reduceSlice(x, min_[float64]) })
+}
+
+// TestReduceMinMaxFloatSpecialAmd64 checks float ReduceMin and ReduceMax on
+// combinations of NaNs, signed zeroes, and infinities. These are emulated on
+// AMD64 because VMINP[SD]/VMAXP[SD] don't follow IEEE 754-2019 for NaNs and
+// signed zeroes, so we check them exhaustively for small vectors, and on random
+// combinations for large vectors.
+func TestReduceMinMaxFloatSpecialAmd64(t *testing.T) {
+	all := []float64{math.NaN(), math.Float64frombits(0xfff8000000000001), math.Inf(-1), -1, math.Copysign(0, -1), 0, 1, math.Inf(1)}
+	few := []float64{math.NaN(), -1, math.Copysign(0, -1), 0, 1}
+	all32 := make([]float32, len(all))
+	for i, v := range all {
+		all32[i] = float32(v)
+	}
+	few32 := make([]float32, len(few))
+	for i, v := range few {
+		few32[i] = float32(v)
+	}
+
+	testReduceSpecial(t, "Float32x4", all32, 4, archsimd.LoadFloat32x4, archsimd.Float32x4.ReduceMin, archsimd.Float32x4.ReduceMax)
+	testReduceSpecial(t, "Float32x8", few32, 8, archsimd.LoadFloat32x8, archsimd.Float32x8.ReduceMin, archsimd.Float32x8.ReduceMax)
+	testReduceSpecial(t, "Float64x2", all, 2, archsimd.LoadFloat64x2, archsimd.Float64x2.ReduceMin, archsimd.Float64x2.ReduceMax)
+	testReduceSpecial(t, "Float64x4", all, 4, archsimd.LoadFloat64x4, archsimd.Float64x4.ReduceMin, archsimd.Float64x4.ReduceMax)
+	if archsimd.X86.AVX512() {
+		testReduceSpecial(t, "Float32x16", all32, 16, archsimd.LoadFloat32x16, archsimd.Float32x16.ReduceMin, archsimd.Float32x16.ReduceMax)
+		testReduceSpecial(t, "Float64x8", all, 8, archsimd.LoadFloat64x8, archsimd.Float64x8.ReduceMin, archsimd.Float64x8.ReduceMax)
+	}
+}
+
+// testReduceSpecial checks reduceMin and reduceMax against Go's min and max on
+// n-element vectors drawn from vals. If there are at most 1<<20 such vectors,
+// it checks all of them. Otherwise, it checks a deterministic pseudo-random
+// sample.
+func testReduceSpecial[F float32 | float64, V any](t *testing.T, name string, vals []F, n int, load func([]F) V, reduceMin, reduceMax func(V) F) {
+	t.Helper()
+	same := func(a, b F) bool {
+		if a != a {
+			return b != b
+		}
+		return math.Float64bits(float64(a)) == math.Float64bits(float64(b))
+	}
+	const limit = 1 << 20
+	total := 1
+	for range n {
+		total *= len(vals)
+		if total > limit {
+			total = limit
+			break
+		}
+	}
+	x := make([]F, n)
+	rnd := uint64(1)
+	failures := 0
+	for i := range total {
+		// Choose x from either the i'th combination or a pseudo-random one.
+		k := i
+		for j := range x {
+			if total == limit {
+				rnd = rnd*6364136223846793005 + 1442695040888963407
+				k = int(rnd >> 33)
+			}
+			x[j] = vals[k%len(vals)]
+			k /= len(vals)
+		}
+		v := load(x)
+		wantMin, wantMax := x[0], x[0]
+		for _, xi := range x[1:] {
+			wantMin, wantMax = min(wantMin, xi), max(wantMax, xi)
+		}
+		if got := reduceMin(v); !same(got, wantMin) {
+			t.Errorf("%s.ReduceMin(%v) = %v, want %v", name, x, got, wantMin)
+			failures++
+		}
+		if got := reduceMax(v); !same(got, wantMax) {
+			t.Errorf("%s.ReduceMax(%v) = %v, want %v", name, x, got, wantMax)
+			failures++
+		}
+		if failures >= 10 {
+			t.Fatalf("too many failures")
+		}
+	}
+}
+
+func TestReduceMinMaxAmd64AVX2(t *testing.T) {
+	if !archsimd.X86.AVX2() {
+		t.Skip("Test requires X86.AVX2, not available on this hardware")
+		return
+	}
+	testV2S(t, int8s, archsimd.LoadInt8x32, archsimd.Int8x32.ReduceMax, func(x []int8) int8 { return reduceSlice(x, max_[int8]) })
+	testV2S(t, int8s, archsimd.LoadInt8x32, archsimd.Int8x32.ReduceMin, func(x []int8) int8 { return reduceSlice(x, min_[int8]) })
+	testV2S(t, uint8s, archsimd.LoadUint8x32, archsimd.Uint8x32.ReduceMax, func(x []uint8) uint8 { return reduceSlice(x, max_[uint8]) })
+	testV2S(t, uint8s, archsimd.LoadUint8x32, archsimd.Uint8x32.ReduceMin, func(x []uint8) uint8 { return reduceSlice(x, min_[uint8]) })
+
+	testV2S(t, int16s, archsimd.LoadInt16x16, archsimd.Int16x16.ReduceMax, func(x []int16) int16 { return reduceSlice(x, max_[int16]) })
+	testV2S(t, int16s, archsimd.LoadInt16x16, archsimd.Int16x16.ReduceMin, func(x []int16) int16 { return reduceSlice(x, min_[int16]) })
+	testV2S(t, uint16s, archsimd.LoadUint16x16, archsimd.Uint16x16.ReduceMax, func(x []uint16) uint16 { return reduceSlice(x, max_[uint16]) })
+	testV2S(t, uint16s, archsimd.LoadUint16x16, archsimd.Uint16x16.ReduceMin, func(x []uint16) uint16 { return reduceSlice(x, min_[uint16]) })
+
+	testV2S(t, int32s, archsimd.LoadInt32x8, archsimd.Int32x8.ReduceMax, func(x []int32) int32 { return reduceSlice(x, max_[int32]) })
+	testV2S(t, int32s, archsimd.LoadInt32x8, archsimd.Int32x8.ReduceMin, func(x []int32) int32 { return reduceSlice(x, min_[int32]) })
+	testV2S(t, uint32s, archsimd.LoadUint32x8, archsimd.Uint32x8.ReduceMax, func(x []uint32) uint32 { return reduceSlice(x, max_[uint32]) })
+	testV2S(t, uint32s, archsimd.LoadUint32x8, archsimd.Uint32x8.ReduceMin, func(x []uint32) uint32 { return reduceSlice(x, min_[uint32]) })
+
+	testV2S(t, int64s, archsimd.LoadInt64x4, archsimd.Int64x4.ReduceMax, func(x []int64) int64 { return reduceSlice(x, max_[int64]) })
+	testV2S(t, int64s, archsimd.LoadInt64x4, archsimd.Int64x4.ReduceMin, func(x []int64) int64 { return reduceSlice(x, min_[int64]) })
+	testV2S(t, uint64s, archsimd.LoadUint64x4, archsimd.Uint64x4.ReduceMax, func(x []uint64) uint64 { return reduceSlice(x, max_[uint64]) })
+	testV2S(t, uint64s, archsimd.LoadUint64x4, archsimd.Uint64x4.ReduceMin, func(x []uint64) uint64 { return reduceSlice(x, min_[uint64]) })
+}
+
+func TestReduceMinMaxAmd64AVX512(t *testing.T) {
+	if !archsimd.X86.AVX512() {
+		t.Skip("Test requires X86.AVX512, not available on this hardware")
+		return
+	}
+	testV2S(t, int8s, archsimd.LoadInt8x64, archsimd.Int8x64.ReduceMax, func(x []int8) int8 { return reduceSlice(x, max_[int8]) })
+	testV2S(t, int8s, archsimd.LoadInt8x64, archsimd.Int8x64.ReduceMin, func(x []int8) int8 { return reduceSlice(x, min_[int8]) })
+	testV2S(t, uint8s, archsimd.LoadUint8x64, archsimd.Uint8x64.ReduceMax, func(x []uint8) uint8 { return reduceSlice(x, max_[uint8]) })
+	testV2S(t, uint8s, archsimd.LoadUint8x64, archsimd.Uint8x64.ReduceMin, func(x []uint8) uint8 { return reduceSlice(x, min_[uint8]) })
+
+	testV2S(t, int16s, archsimd.LoadInt16x32, archsimd.Int16x32.ReduceMax, func(x []int16) int16 { return reduceSlice(x, max_[int16]) })
+	testV2S(t, int16s, archsimd.LoadInt16x32, archsimd.Int16x32.ReduceMin, func(x []int16) int16 { return reduceSlice(x, min_[int16]) })
+	testV2S(t, uint16s, archsimd.LoadUint16x32, archsimd.Uint16x32.ReduceMax, func(x []uint16) uint16 { return reduceSlice(x, max_[uint16]) })
+	testV2S(t, uint16s, archsimd.LoadUint16x32, archsimd.Uint16x32.ReduceMin, func(x []uint16) uint16 { return reduceSlice(x, min_[uint16]) })
+
+	testV2S(t, int32s, archsimd.LoadInt32x16, archsimd.Int32x16.ReduceMax, func(x []int32) int32 { return reduceSlice(x, max_[int32]) })
+	testV2S(t, int32s, archsimd.LoadInt32x16, archsimd.Int32x16.ReduceMin, func(x []int32) int32 { return reduceSlice(x, min_[int32]) })
+	testV2S(t, uint32s, archsimd.LoadUint32x16, archsimd.Uint32x16.ReduceMax, func(x []uint32) uint32 { return reduceSlice(x, max_[uint32]) })
+	testV2S(t, uint32s, archsimd.LoadUint32x16, archsimd.Uint32x16.ReduceMin, func(x []uint32) uint32 { return reduceSlice(x, min_[uint32]) })
+
+	testV2S(t, int64s, archsimd.LoadInt64x8, archsimd.Int64x8.ReduceMax, func(x []int64) int64 { return reduceSlice(x, max_[int64]) })
+	testV2S(t, int64s, archsimd.LoadInt64x8, archsimd.Int64x8.ReduceMin, func(x []int64) int64 { return reduceSlice(x, min_[int64]) })
+	testV2S(t, uint64s, archsimd.LoadUint64x8, archsimd.Uint64x8.ReduceMax, func(x []uint64) uint64 { return reduceSlice(x, max_[uint64]) })
+	testV2S(t, uint64s, archsimd.LoadUint64x8, archsimd.Uint64x8.ReduceMin, func(x []uint64) uint64 { return reduceSlice(x, min_[uint64]) })
+
+	testV2S(t, float32s, archsimd.LoadFloat32x16, archsimd.Float32x16.ReduceMax, func(x []float32) float32 { return reduceSlice(x, max_[float32]) })
+	testV2S(t, float32s, archsimd.LoadFloat32x16, archsimd.Float32x16.ReduceMin, func(x []float32) float32 { return reduceSlice(x, min_[float32]) })
+	testV2S(t, float64s, archsimd.LoadFloat64x8, archsimd.Float64x8.ReduceMax, func(x []float64) float64 { return reduceSlice(x, max_[float64]) })
+	testV2S(t, float64s, archsimd.LoadFloat64x8, archsimd.Float64x8.ReduceMin, func(x []float64) float64 { return reduceSlice(x, min_[float64]) })
 }
 
 func TestMaskedZeroingResultSize(t *testing.T) {

@@ -80,9 +80,11 @@ type tester struct {
 	banner       string   // prefix, or "" for none
 	lastHeading  string   // last dir heading printed
 
-	tests        []distTest // use addTest to extend
-	testNames    map[string]bool
-	timeoutScale int // a non-negative integer factor to scale test timeout by; defaults to 1
+	tests               []distTest // use addTest to extend
+	testNames           map[string]bool
+	timeoutScale        int // a non-negative integer factor to scale test timeout by; defaults to 1
+	deferSimdGODEBUGs   bool
+	simdGODEBUGInsertAt int
 
 	worklist []*work
 }
@@ -250,14 +252,21 @@ func (t *tester) run() {
 		}
 	}
 
+	var simdGODEBUGCh chan simdGODEBUGList
+	if t.deferSimdGODEBUGs {
+		simdGODEBUGCh = make(chan simdGODEBUGList, 1)
+		go func() {
+			simdGODEBUGCh <- t.listSimdGODEBUGs(true)
+		}()
+	}
+
 	var anyIncluded, someExcluded bool
-	for _, dt := range t.tests {
+	runDistTest := func(dt distTest) {
 		if !t.shouldRunTest(dt.name) {
 			someExcluded = true
-			continue
+			return
 		}
 		anyIncluded = true
-		dt := dt // dt used in background after this iteration
 		if err := dt.fn(&dt); err != nil {
 			t.runPending(&dt) // in case that hasn't been done yet
 			t.failed = true
@@ -266,6 +275,25 @@ func (t *tester) run() {
 			} else {
 				fatalf("Failed: %v", err)
 			}
+		}
+	}
+	tests := t.tests
+	for i, dt := range tests {
+		if simdGODEBUGCh != nil && i == t.simdGODEBUGInsertAt {
+			start := len(t.tests)
+			t.addSimdGODEBUGTests(<-simdGODEBUGCh)
+			simdGODEBUGCh = nil
+			for _, sdt := range t.tests[start:] {
+				runDistTest(sdt)
+			}
+		}
+		runDistTest(dt)
+	}
+	if simdGODEBUGCh != nil {
+		start := len(t.tests)
+		t.addSimdGODEBUGTests(<-simdGODEBUGCh)
+		for _, sdt := range t.tests[start:] {
+			runDistTest(sdt)
 		}
 	}
 	t.runPending(nil)
@@ -337,6 +365,7 @@ type goTest struct {
 	bench    bool     // Run benchmarks (briefly), not tests.
 	runTests string   // Regexp of tests to run
 	cpu      string   // If non-empty, -cpu flag
+	parallel int      // If > 0, -p flag
 	skip     string   // If non-empty, -skip flag
 
 	gcflags   string // If non-empty, build with -gcflags=all=X
@@ -489,6 +518,9 @@ func (opts *goTest) buildArgs(t *tester) (build, run, pkgs, testFlags []string, 
 	if opts.cpu != "" {
 		run = append(run, "-cpu="+opts.cpu)
 	}
+	if opts.parallel > 0 {
+		build = append(build, "-p="+strconv.Itoa(opts.parallel))
+	}
 	if opts.skip != "" {
 		run = append(run, "-skip="+opts.skip)
 	}
@@ -586,6 +618,11 @@ var (
 	benchMatches []string
 )
 
+// maxTestGOMAXPROCS caps per-process GOMAXPROCS when running many test
+// packages concurrently on high-core-count machines, avoiding severe
+// N*N thread oversubscription while keeping full build parallelism via -p.
+const maxTestGOMAXPROCS = 32
+
 func (t *tester) registerStdTest(pkg string) {
 	const stdTestHeading = "Testing packages." // known to addTest for a safety check
 	gcflags := gogcflags
@@ -605,11 +642,18 @@ func (t *tester) registerStdTest(pkg string) {
 		stdSpan := startSpan("go test std cmd")
 		defer stdSpan.done()
 
-		return (&goTest{
+		gt := &goTest{
 			gcflags: gcflags,
 			pkgs:    stdMatches,
 			trace:   "std",
-		}).run(t)
+		}
+		if len(stdMatches) > 1 && t.hasParallelism() && !isEnvSet("GOMAXPROCS") {
+			if n := runtime.GOMAXPROCS(0); n > maxTestGOMAXPROCS {
+				gt.parallel = n
+				gt.env = []string{"GOMAXPROCS=" + strconv.Itoa(maxTestGOMAXPROCS)}
+			}
+		}
+		return gt.run(t)
 	})
 }
 
@@ -1035,6 +1079,14 @@ func (t *tester) registerTests() {
 	}
 }
 
+type simdGODEBUGList struct {
+	env     []string
+	heading string
+	cmd     *exec.Cmd
+	out     []byte
+	err     error
+}
+
 // registerSimdGODEBUGTests registers a test of the simd package under each
 // GODEBUG setting that the simd test binary's -list-godebugs flag prints,
 // named like "simd:GODEBUG=simd=128".
@@ -1053,6 +1105,17 @@ func (t *tester) registerSimdGODEBUGTests() {
 		// out what they are.
 		return
 	}
+	if t.listMode || len(t.runNames) > 0 {
+		t.addSimdGODEBUGTests(t.listSimdGODEBUGs(false))
+		return
+	}
+	// Defer discovery so building and running the simd test binary overlaps
+	// with go test std cmd instead of blocking startup.
+	t.deferSimdGODEBUGs = true
+	t.simdGODEBUGInsertAt = len(t.tests)
+}
+
+func (t *tester) listSimdGODEBUGs(background bool) simdGODEBUGList {
 	// Like the simd tests above, turn on the simd experiment if it isn't
 	// on already.
 	var env []string
@@ -1063,31 +1126,52 @@ func (t *tester) registerSimdGODEBUGTests() {
 	}
 	// go test only shows what the test binary prints if it fails or if
 	// -v is set.
-	cmd := exec.Command(gorootBinGo, "test", "-v", "simd", "-list-godebugs")
+	args := []string{"test", "-v"}
+	throttle := background && len(stdMatches) > 0 && runtime.GOMAXPROCS(0) > 4
+	if throttle {
+		// Limit background discovery concurrency so it does not compete
+		// with go test std cmd's build phase.
+		args = append(args, "-p=4")
+	}
+	args = append(args, "simd", "-list-godebugs")
+	cmd := exec.Command(gorootBinGo, args...)
 	setDir(cmd, filepath.Join(goroot, "src"))
 	for _, kv := range env {
 		k, v, _ := strings.Cut(kv, "=")
 		setEnv(cmd, k, v)
 	}
+	if throttle && t.hasParallelism() {
+		setEnv(cmd, "GOMAXPROCS", "4")
+	}
 	out, err := cmd.CombinedOutput()
-	if err != nil {
+	return simdGODEBUGList{
+		env:     env,
+		heading: heading,
+		cmd:     cmd,
+		out:     out,
+		err:     err,
+	}
+}
+
+func (t *tester) addSimdGODEBUGTests(res simdGODEBUGList) {
+	if res.err != nil {
 		// Most likely the simd tests don't build. Report that as a
 		// failing test, rather than failing to register any tests.
-		t.addTest("simd:list-godebugs", heading+" -list-godebugs", func(*distTest) error {
-			return fmt.Errorf("%v: %v\n%s", cmd, err, out)
+		t.addTest("simd:list-godebugs", res.heading+" -list-godebugs", func(*distTest) error {
+			return fmt.Errorf("%v: %v\n%s", res.cmd, res.err, res.out)
 		})
 		return
 	}
 	// Each setting is a line of the form GODEBUG=something. The other
 	// lines are from go test.
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(string(res.out), "\n") {
 		setting := strings.TrimSpace(line)
 		if !strings.HasPrefix(setting, "GODEBUG=") {
 			continue
 		}
-		t.registerTest(setting+" "+heading, &goTest{
+		t.registerTest(setting+" "+res.heading, &goTest{
 			variant: setting,
-			env:     append(env[:len(env):len(env)], setting),
+			env:     append(res.env[:len(res.env):len(res.env)], setting),
 			pkg:     "simd",
 		})
 	}
@@ -1477,7 +1561,11 @@ func (t *tester) runPending(nextTest *distTest) {
 		pendingSpan = startSpan("runPending")
 	}
 	maxbg := runtime.GOMAXPROCS(0)
+	capProcs := len(worklist) > 1 && t.hasParallelism() && !isEnvSet("GOMAXPROCS") && maxbg > maxTestGOMAXPROCS
 	for i, w := range worklist {
+		if capProcs && !slices.ContainsFunc(w.cmd.Env, func(kv string) bool { return strings.HasPrefix(kv, "GOMAXPROCS=") }) {
+			setEnv(w.cmd, "GOMAXPROCS", strconv.Itoa(maxTestGOMAXPROCS))
+		}
 		w.start = make(chan bool)
 		w.end = make(chan struct{})
 		// w.cmd must be set up to write to w.out. We can't check that, but we

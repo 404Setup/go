@@ -110,6 +110,30 @@ func (x Int8s) AndNot(y Int8s) (z Int8s) {
 	return z
 }
 
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Int8s) ConcatEven(y Int8s) (z Int8s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Int8s) ConcatOdd(y Int8s) (z Int8s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // Equal returns a mask indicating which elements of x and y are equal.
 //
 //	z[i] = x[i] == y[i]
@@ -156,6 +180,29 @@ func (x Int8s) GreaterEqual(y Int8s) (z Mask8s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Int8s) HiToLo() (z Int8s) {
 	copy(z.v[:8], x.v[8:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Int8s) InterleaveHi(y Int8s) (z Int8s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Int8s) InterleaveLo(y Int8s) (z Int8s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -534,6 +581,47 @@ func (x Int16s) AndNot(y Int16s) (z Int16s) {
 	return z
 }
 
+// DotProductPairs multiplies corresponding elements of x and y, and sums
+// adjacent pairs, returning a vector of half as many elements, each with twice
+// the input element size.
+//
+//	w[i] = x[i] * y[i]        // Double width
+//	z[j] = w[2*j] + w[2*j+1]
+//
+// While the products can never overflow, the sum wraps on overflow.
+//
+// This happens in exactly one situation: if all four input elements are MinInt16.
+func (x Int16s) DotProductPairs(y Int16s) (z Int32s) {
+	for i := range z.v {
+		z.v[i] = int32(x.v[2*i])*int32(y.v[2*i]) + int32(x.v[2*i+1])*int32(y.v[2*i+1])
+	}
+	return z
+}
+
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Int16s) ConcatEven(y Int16s) (z Int16s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Int16s) ConcatOdd(y Int16s) (z Int16s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // Equal returns a mask indicating which elements of x and y are equal.
 //
 //	z[i] = x[i] == y[i]
@@ -580,6 +668,29 @@ func (x Int16s) GreaterEqual(y Int16s) (z Mask16s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Int16s) HiToLo() (z Int16s) {
 	copy(z.v[:4], x.v[4:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Int16s) InterleaveHi(y Int16s) (z Int16s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Int16s) InterleaveLo(y Int16s) (z Int16s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -930,6 +1041,30 @@ func (x Int32s) AndNot(y Int32s) (z Int32s) {
 	return z
 }
 
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Int32s) ConcatEven(y Int32s) (z Int32s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Int32s) ConcatOdd(y Int32s) (z Int32s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // ConvertToFloat32 converts each element of x to float32.
 //
 //	z[i] = float32(x[i])
@@ -987,6 +1122,29 @@ func (x Int32s) GreaterEqual(y Int32s) (z Mask32s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Int32s) HiToLo() (z Int32s) {
 	copy(z.v[:2], x.v[2:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Int32s) InterleaveHi(y Int32s) (z Int32s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Int32s) InterleaveLo(y Int32s) (z Int32s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -1318,6 +1476,30 @@ func (x Int64s) AndNot(y Int64s) (z Int64s) {
 	return z
 }
 
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Int64s) ConcatEven(y Int64s) (z Int64s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Int64s) ConcatOdd(y Int64s) (z Int64s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // Equal returns a mask indicating which elements of x and y are equal.
 //
 //	z[i] = x[i] == y[i]
@@ -1355,6 +1537,29 @@ func (x Int64s) GreaterEqual(y Int64s) (z Mask64s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Int64s) HiToLo() (z Int64s) {
 	copy(z.v[:1], x.v[1:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Int64s) InterleaveHi(y Int64s) (z Int64s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Int64s) InterleaveLo(y Int64s) (z Int64s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -1614,6 +1819,30 @@ func (x Uint8s) AndNot(y Uint8s) (z Uint8s) {
 	return z
 }
 
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Uint8s) ConcatEven(y Uint8s) (z Uint8s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Uint8s) ConcatOdd(y Uint8s) (z Uint8s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // Average returns the elementwise average of x and y, rounded toward +∞.
 //
 //	z[i] = (x[i] + y[i] + 1) / 2
@@ -1671,6 +1900,29 @@ func (x Uint8s) GreaterEqual(y Uint8s) (z Mask8s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Uint8s) HiToLo() (z Uint8s) {
 	copy(z.v[:8], x.v[8:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Uint8s) InterleaveHi(y Uint8s) (z Uint8s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Uint8s) InterleaveLo(y Uint8s) (z Uint8s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -2014,6 +2266,30 @@ func (x Uint16s) AndNot(y Uint16s) (z Uint16s) {
 	return z
 }
 
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Uint16s) ConcatEven(y Uint16s) (z Uint16s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Uint16s) ConcatOdd(y Uint16s) (z Uint16s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // Average returns the elementwise average of x and y, rounded toward +∞.
 //
 //	z[i] = (x[i] + y[i] + 1) / 2
@@ -2071,6 +2347,29 @@ func (x Uint16s) GreaterEqual(y Uint16s) (z Mask16s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Uint16s) HiToLo() (z Uint16s) {
 	copy(z.v[:4], x.v[4:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Uint16s) InterleaveHi(y Uint16s) (z Uint16s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Uint16s) InterleaveLo(y Uint16s) (z Uint16s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -2452,6 +2751,30 @@ func (x Uint32s) AndNot(y Uint32s) (z Uint32s) {
 	return z
 }
 
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Uint32s) ConcatEven(y Uint32s) (z Uint32s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Uint32s) ConcatOdd(y Uint32s) (z Uint32s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // Equal returns a mask indicating which elements of x and y are equal.
 //
 //	z[i] = x[i] == y[i]
@@ -2498,6 +2821,29 @@ func (x Uint32s) GreaterEqual(y Uint32s) (z Mask32s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Uint32s) HiToLo() (z Uint32s) {
 	copy(z.v[:2], x.v[2:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Uint32s) InterleaveHi(y Uint32s) (z Uint32s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Uint32s) InterleaveLo(y Uint32s) (z Uint32s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -2869,6 +3215,30 @@ func (x Uint64s) AndNot(y Uint64s) (z Uint64s) {
 	return z
 }
 
+// ConcatEven concatenates the even-indexed elements of x and y.
+//
+//	z = {x[0], x[2], ..., x[n-2], y[0], y[2], ..., y[n-2]}, where n = x.Len()
+func (x Uint64s) ConcatEven(y Uint64s) (z Uint64s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i]
+		z.v[half+i] = y.v[2*i]
+	}
+	return z
+}
+
+// ConcatOdd concatenates the odd-indexed elements of x and y.
+//
+//	z = {x[1], x[3], ..., x[n-1], y[1], y[3], ..., y[n-1]}, where n = x.Len()
+func (x Uint64s) ConcatOdd(y Uint64s) (z Uint64s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[i] = x.v[2*i+1]
+		z.v[half+i] = y.v[2*i+1]
+	}
+	return z
+}
+
 // Equal returns a mask indicating which elements of x and y are equal.
 //
 //	z[i] = x[i] == y[i]
@@ -2912,6 +3282,29 @@ func (x Uint64s) GreaterEqual(y Uint64s) (z Mask64s) {
 //	z = {x[n/2], x[n/2+1], ..., x[n-1], 0, ..., 0}, where n = x.Len()
 func (x Uint64s) HiToLo() (z Uint64s) {
 	copy(z.v[:1], x.v[1:])
+	return z
+}
+
+// InterleaveHi interleaves the elements of the high halves of x and y.
+//
+//	z = {x[n/2], y[n/2], x[n/2+1], y[n/2+1], ..., x[n-1], y[n-1]}, where n = x.Len()
+func (x Uint64s) InterleaveHi(y Uint64s) (z Uint64s) {
+	half := len(z.v) / 2
+	for i := range half {
+		z.v[2*i] = x.v[half+i]
+		z.v[2*i+1] = y.v[half+i]
+	}
+	return z
+}
+
+// InterleaveLo interleaves the elements of the low halves of x and y.
+//
+//	z = {x[0], y[0], x[1], y[1], ..., x[n/2-1], y[n/2-1]}, where n = x.Len()
+func (x Uint64s) InterleaveLo(y Uint64s) (z Uint64s) {
+	for i := range len(z.v) / 2 {
+		z.v[2*i] = x.v[i]
+		z.v[2*i+1] = y.v[i]
+	}
 	return z
 }
 
@@ -3223,8 +3616,18 @@ func (x Float32s) Ceil() (z Float32s) {
 //	z[i] = int32(x[i])
 //
 // When a conversion is inexact, this truncates the result (rounds toward zero).
-// If the converted result would be outside the representable range, the result
-// is architecture-dependent.
+//
+// The handling of NaN and values whose truncated result is outside the
+// representable range of int32 is architecture-dependent. ARM64 and WASM map
+// NaN to 0 and saturate out-of-range values (including ±Inf). AMD64 returns
+// math.MinInt32 (the integer indefinite value) for NaN and all out-of-range
+// values.
+//
+//	trunc(x)          ARM64/WASM  AMD64
+//	----------------  ----------  --------
+//	NaN               0           MinInt32
+//	< MinInt32, -Inf  MinInt32    MinInt32
+//	> MaxInt32, +Inf  MaxInt32    MinInt32
 func (x Float32s) ConvertToInt32() (z Int32s) {
 	var res Int32s
 	for i := 0; i < 4; i++ {
@@ -4910,6 +5313,178 @@ func (x Float64s) ConvertToFloat32() (z Float32s) {
 	}
 	return z
 }
+
+// ConvertToFloat64 converts each element of x to float64.
+//
+//	z[i] = float64(x[i])
+//
+// Only the low z.Len() elements of x are converted.
+// The remaining elements of x are ignored.
+func (x Int32s) ConvertToFloat64() (z Float64s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, float64(x.get(i)))
+	}
+	return z
+}
+
+// ConvertToInt32 converts each element of x to int32.
+//
+//	z[i] = int32(x[i])
+//
+// When a conversion is inexact, this truncates the result (rounds toward zero).
+//
+// The handling of NaN and values whose truncated result is outside the
+// representable range of int32 is architecture-dependent. ARM64 and WASM map
+// NaN to 0 and saturate out-of-range values (including ±Inf). AMD64 returns
+// math.MinInt32 (the integer indefinite value) for NaN and all out-of-range
+// values.
+//
+//	trunc(x)          ARM64/WASM  AMD64
+//	----------------  ----------  --------
+//	NaN               0           MinInt32
+//	< MinInt32, -Inf  MinInt32    MinInt32
+//	> MaxInt32, +Inf  MaxInt32    MinInt32
+//
+// The results are stored in the low x.Len() elements of z.
+// The remaining elements of z are zero.
+func (x Float64s) ConvertToInt32() (z Int32s) {
+	for i := 0; i < 2; i++ {
+		z.set(i, int32(x.get(i)))
+	}
+	return z
+}
+
+func reduceMaxSlice[E int8 | int16 | int32 | int64 | uint8 | uint16 | uint32 | uint64 | float32 | float64](v []E) E {
+	z := v[0]
+	for _, e := range v[1:] {
+		z = max(z, e)
+	}
+	return z
+}
+
+func reduceMinSlice[E int8 | int16 | int32 | int64 | uint8 | uint16 | uint32 | uint64 | float32 | float64](v []E) E {
+	z := v[0]
+	for _, e := range v[1:] {
+		z = min(z, e)
+	}
+	return z
+}
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Int8s) ReduceMax() (z int8) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Int8s) ReduceMin() (z int8) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Int16s) ReduceMax() (z int16) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Int16s) ReduceMin() (z int16) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Int32s) ReduceMax() (z int32) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Int32s) ReduceMin() (z int32) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Int64s) ReduceMax() (z int64) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Int64s) ReduceMin() (z int64) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Uint8s) ReduceMax() (z uint8) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Uint8s) ReduceMin() (z uint8) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Uint16s) ReduceMax() (z uint16) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Uint16s) ReduceMin() (z uint16) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Uint32s) ReduceMax() (z uint32) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Uint32s) ReduceMin() (z uint32) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+func (x Uint64s) ReduceMax() (z uint64) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+func (x Uint64s) ReduceMin() (z uint64) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+//
+// If any element is NaN, the result is NaN, and -0 is considered less than +0.
+// This matches Go's max built-in and the IEEE 754-2019 maximum operation. Note
+// that on AMD64 (and only AMD64), it differs from [Max].
+func (x Float32s) ReduceMax() (z float32) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+//
+// If any element is NaN, the result is NaN, and -0 is considered less than +0.
+// This matches Go's min built-in and the IEEE 754-2019 minimum operation. Note
+// that on AMD64 (and only AMD64), it differs from [Min].
+func (x Float32s) ReduceMin() (z float32) { return reduceMinSlice(x.v[:]) }
+
+// ReduceMax returns the largest element of x.
+//
+//	z = max(x[0], x[1], ...)
+//
+// If any element is NaN, the result is NaN, and -0 is considered less than +0.
+// This matches Go's max built-in and the IEEE 754-2019 maximum operation. Note
+// that on AMD64 (and only AMD64), it differs from [Max].
+func (x Float64s) ReduceMax() (z float64) { return reduceMaxSlice(x.v[:]) }
+
+// ReduceMin returns the smallest element of x.
+//
+//	z = min(x[0], x[1], ...)
+//
+// If any element is NaN, the result is NaN, and -0 is considered less than +0.
+// This matches Go's min built-in and the IEEE 754-2019 minimum operation. Note
+// that on AMD64 (and only AMD64), it differs from [Min].
+func (x Float64s) ReduceMin() (z float64) { return reduceMinSlice(x.v[:]) }
 
 // lanesToWords packs the lanes of v into two 64-bit words, with lane 0 in the
 // low bits of the first word. This defines the lane order of reshapes

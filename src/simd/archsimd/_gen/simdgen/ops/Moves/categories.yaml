@@ -100,6 +100,17 @@
   commutative: false
   noTypes: "true"
   noGenericOps: "true"
+# insertInt128 and extractInt128 generate the VINSERTI128 and VEXTRACTI128
+# machine ops, which the AMD64 rules use for 256-bit integer SetLo, SetHi, Lo,
+# and Hi when AVX2 is available.
+- go: insertInt128
+  commutative: false
+  noTypes: "true"
+  noGenericOps: "true"
+- go: extractInt128
+  commutative: false
+  noTypes: "true"
+  noGenericOps: "true"
 - go: Expand
   commutative: false
   documentation: !string |-
@@ -181,11 +192,11 @@
   commutative: false
   documentation: !string |-
     // NAME interleaves the elements of the low halves of x and y.
-- go: InterleaveHiGrouped
+- go: interleaveHiGrouped
   commutative: false
   documentation: !string |-
     // NAME interleaves the elements of the high half of each 128-bit subvector of x and y.
-- go: InterleaveLoGrouped
+- go: interleaveLoGrouped
   commutative: false
   documentation: !string |-
     // NAME interleaves the elements of the low half of each 128-bit subvector of x and y.

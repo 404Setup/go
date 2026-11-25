@@ -307,6 +307,8 @@ func (x Int64x2) ToMask() (z Mask64x2) {
 // ToMask returns a mask indicating which elements of x are non-zero.
 //
 //	z[i] = x[i] != 0
+//
+// Emulated, CPU Feature: AVX2
 func (x Int8x32) ToMask() (z Mask8x32) {
 	return x.NotEqual(Int8x32{})
 }
@@ -314,6 +316,8 @@ func (x Int8x32) ToMask() (z Mask8x32) {
 // ToMask returns a mask indicating which elements of x are non-zero.
 //
 //	z[i] = x[i] != 0
+//
+// Emulated, CPU Feature: AVX2
 func (x Int16x16) ToMask() (z Mask16x16) {
 	return x.NotEqual(Int16x16{})
 }
@@ -321,6 +325,8 @@ func (x Int16x16) ToMask() (z Mask16x16) {
 // ToMask returns a mask indicating which elements of x are non-zero.
 //
 //	z[i] = x[i] != 0
+//
+// Emulated, CPU Feature: AVX2
 func (x Int32x8) ToMask() (z Mask32x8) {
 	return x.NotEqual(Int32x8{})
 }
@@ -328,6 +334,8 @@ func (x Int32x8) ToMask() (z Mask32x8) {
 // ToMask returns a mask indicating which elements of x are non-zero.
 //
 //	z[i] = x[i] != 0
+//
+// Emulated, CPU Feature: AVX2
 func (x Int64x4) ToMask() (z Mask64x4) {
 	return x.NotEqual(Int64x4{})
 }
@@ -1080,7 +1088,13 @@ func (x Mask64x2) String() string {
 // means true.
 func (x Mask8x32) String() string {
 	var s [32]int8
-	x.ToInt8x32().Neg().StoreArray(&s)
+	x.ToInt8x32().StoreArray(&s)
+	// True elements are -1. Negate them in scalar code: a vector Neg of a
+	// 256-bit integer vector would require AVX2, but the 256-bit mask types
+	// only require AVX.
+	for i := range s {
+		s[i] = -s[i]
+	}
 	return simdfmt.SliceToString(s[:])
 }
 
@@ -1088,7 +1102,13 @@ func (x Mask8x32) String() string {
 // means true.
 func (x Mask16x16) String() string {
 	var s [16]int16
-	x.ToInt16x16().Neg().StoreArray(&s)
+	x.ToInt16x16().StoreArray(&s)
+	// True elements are -1. Negate them in scalar code: a vector Neg of a
+	// 256-bit integer vector would require AVX2, but the 256-bit mask types
+	// only require AVX.
+	for i := range s {
+		s[i] = -s[i]
+	}
 	return simdfmt.SliceToString(s[:])
 }
 
@@ -1096,7 +1116,13 @@ func (x Mask16x16) String() string {
 // means true.
 func (x Mask32x8) String() string {
 	var s [8]int32
-	x.ToInt32x8().Neg().StoreArray(&s)
+	x.ToInt32x8().StoreArray(&s)
+	// True elements are -1. Negate them in scalar code: a vector Neg of a
+	// 256-bit integer vector would require AVX2, but the 256-bit mask types
+	// only require AVX.
+	for i := range s {
+		s[i] = -s[i]
+	}
 	return simdfmt.SliceToString(s[:])
 }
 
@@ -1104,7 +1130,13 @@ func (x Mask32x8) String() string {
 // means true.
 func (x Mask64x4) String() string {
 	var s [4]int64
-	x.ToInt64x4().Neg().StoreArray(&s)
+	x.ToInt64x4().StoreArray(&s)
+	// True elements are -1. Negate them in scalar code: a vector Neg of a
+	// 256-bit integer vector would require AVX2, but the 256-bit mask types
+	// only require AVX.
+	for i := range s {
+		s[i] = -s[i]
+	}
 	return simdfmt.SliceToString(s[:])
 }
 
@@ -1210,7 +1242,7 @@ func (x Uint64x2) RotateAllRight(shift uint64) (z Uint64x2) {
 //
 //	z[i] = rotateLeft(x[i], shift)
 //
-// Emulated
+// Emulated, CPU Feature: AVX2
 func (x Uint16x16) RotateAllLeft(shift uint64) (z Uint16x16) {
 	shift = shift & (16 - 1)
 	nshift := 16 - shift
@@ -1221,7 +1253,7 @@ func (x Uint16x16) RotateAllLeft(shift uint64) (z Uint16x16) {
 //
 //	z[i] = rotateRight(x[i], shift)
 //
-// Emulated
+// Emulated, CPU Feature: AVX2
 func (x Uint16x16) RotateAllRight(shift uint64) (z Uint16x16) {
 	shift = shift & (16 - 1)
 	nshift := 16 - shift
@@ -1232,7 +1264,7 @@ func (x Uint16x16) RotateAllRight(shift uint64) (z Uint16x16) {
 //
 //	z[i] = rotateLeft(x[i], shift)
 //
-// Emulated
+// Emulated, CPU Feature: AVX2
 func (x Uint32x8) RotateAllLeft(shift uint64) (z Uint32x8) {
 	shift = shift & (32 - 1)
 	nshift := 32 - shift
@@ -1243,7 +1275,7 @@ func (x Uint32x8) RotateAllLeft(shift uint64) (z Uint32x8) {
 //
 //	z[i] = rotateRight(x[i], shift)
 //
-// Emulated
+// Emulated, CPU Feature: AVX2
 func (x Uint32x8) RotateAllRight(shift uint64) (z Uint32x8) {
 	shift = shift & (32 - 1)
 	nshift := 32 - shift
@@ -1254,7 +1286,7 @@ func (x Uint32x8) RotateAllRight(shift uint64) (z Uint32x8) {
 //
 //	z[i] = rotateLeft(x[i], shift)
 //
-// Emulated
+// Emulated, CPU Feature: AVX2
 func (x Uint64x4) RotateAllLeft(shift uint64) (z Uint64x4) {
 	shift = shift & (64 - 1)
 	nshift := 64 - shift
@@ -1265,7 +1297,7 @@ func (x Uint64x4) RotateAllLeft(shift uint64) (z Uint64x4) {
 //
 //	z[i] = rotateRight(x[i], shift)
 //
-// Emulated
+// Emulated, CPU Feature: AVX2
 func (x Uint64x4) RotateAllRight(shift uint64) (z Uint64x4) {
 	shift = shift & (64 - 1)
 	nshift := 64 - shift

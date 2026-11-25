@@ -82,7 +82,7 @@ and its test source files to identify significant problems. If go vet
 finds any problems, go test reports those and does not run the test
 binary. Only a high-confidence subset of the default go vet checks are
 used. That subset is: atomic, bools, buildtag, directive, errorsas,
-ifaceassert, nilfunc, printf, stdversion, stringintconv, and tests.
+ifaceassert, nilfunc, printf, slog, stdversion, stringintconv, and tests.
 You can see the documentation for these and other vet tests via
 "go doc cmd/vet". To disable the running of go vet, use the -vet=off flag.
 To run all checks, use the -vet=all flag.
@@ -699,14 +699,6 @@ func runTest(ctx context.Context, cmd *base.Command, args []string) {
 	pkgArgs, testArgs = testFlags(args)
 	moduleLoader.InitWorkfile() // The test command does custom flag processing; initialize workspaces after that.
 
-	if cfg.Experiment.VetFiles {
-		if runAnalysisToolChild(ctx, moduleLoader) {
-			// This process is 'go test' running as a child of 'go test'
-			// in a special mode to build the analysis tool for its parent.
-			return
-		}
-	}
-
 	if cfg.DebugTrace != "" {
 		var close func() error
 		var err error
@@ -1322,7 +1314,22 @@ func builderTest(ld *modload.Loader, b *work.Builder, ctx context.Context, pkgOp
 
 	var vetRunAction *work.Action
 	if testC {
-		printAction = &work.Action{Mode: "test print (nop)", Package: p, Deps: []*work.Action{runAction}} // nop
+		printAction = &work.Action{
+			Mode:       "test print (nop)",
+			Package:    p,
+			Deps:       []*work.Action{runAction},
+			IgnoreFail: true,
+			Actor: work.ActorFunc(func(b *work.Builder, ctx context.Context, a *work.Action) error {
+				if buildAction.Failed == nil {
+					for _, dep := range a.Deps {
+						if dep.Mode == "vet" && dep.Failed != nil {
+							b.ReportDeferredVetError(dep.Failed)
+						}
+					}
+				}
+				return nil
+			}),
+		}
 		vetRunAction = printAction
 	} else {
 		// run test
@@ -1403,18 +1410,15 @@ func addTestVet(ld *modload.Loader, b *work.Builder, p *load.Package, runAction,
 	if testVet.off {
 		return
 	}
-	if cfg.Experiment.VetFiles {
+	if cfg.Experiment.VetFiles && !analysisUsesCmdVet() {
 		// Use the analysis driver instead of cmd/vet (see analysis.go).
 		addTestAnalysis(ld, b, p, runAction, installAction)
 		return
 	}
 
-	vet := b.VetAction(ld, work.ModeBuild, work.ModeBuild, false, p)
+	vet := b.VetAction(p, false)
 	runAction.Deps = append(runAction.Deps, vet)
-	// Install will clean the build directory.
-	// Make sure vet runs first.
-	// The install ordering in b.VetAction does not apply here
-	// because we are using a custom installAction (created above).
+	// Make sure vet succeeds before installing the test binary.
 	if installAction != nil {
 		installAction.Deps = append(installAction.Deps, vet)
 	}
@@ -1540,6 +1544,15 @@ func (r *runTestActor) Act(b *work.Builder, ctx context.Context, a *work.Action)
 	close(r.next)
 
 	if a.Failed != nil {
+		if buildAction.Failed == nil {
+			for _, dep := range barrierAction.Deps {
+				if dep.Mode == "vet" && dep.Failed != nil {
+					b.ReportDeferredVetError(dep.Failed)
+				}
+			}
+		} else {
+			a.Failed = buildAction.Failed
+		}
 		// We were unable to build the binary.
 		if json != nil && a.Failed.Package != nil {
 			if gotestjsonbuildtext.Value() == "1" {

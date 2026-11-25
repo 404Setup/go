@@ -219,17 +219,17 @@ func TestCTR_AES_multiblock_random_IV(t *testing.T) {
 
 			for part1 := 0; part1 <= Size; part1++ {
 				t.Run(fmt.Sprintf("part1=%d", part1), func(t *testing.T) {
+					// Don't run each part2 as a subtest: that would be
+					// over 15,000 subtests across the key sizes.
 					for part2 := 0; part2 <= Size-part1; part2++ {
-						t.Run(fmt.Sprintf("part2=%d", part2), func(t *testing.T) {
-							_, multiblockCtr := makeTestingCiphers(aesBlock, iv)
-							multiblockCiphertext := make([]byte, len(plaintext))
-							multiblockCtr.XORKeyStream(multiblockCiphertext[:part1], plaintext[:part1])
-							multiblockCtr.XORKeyStream(multiblockCiphertext[part1:part1+part2], plaintext[part1:part1+part2])
-							multiblockCtr.XORKeyStream(multiblockCiphertext[part1+part2:], plaintext[part1+part2:])
-							if !bytes.Equal(genericCiphertext, multiblockCiphertext) {
-								t.Fatal("multiblock CTR's output does not match generic CTR's output")
-							}
-						})
+						_, multiblockCtr := makeTestingCiphers(aesBlock, iv)
+						multiblockCiphertext := make([]byte, len(plaintext))
+						multiblockCtr.XORKeyStream(multiblockCiphertext[:part1], plaintext[:part1])
+						multiblockCtr.XORKeyStream(multiblockCiphertext[part1:part1+part2], plaintext[part1:part1+part2])
+						multiblockCtr.XORKeyStream(multiblockCiphertext[part1+part2:], plaintext[part1+part2:])
+						if !bytes.Equal(genericCiphertext, multiblockCiphertext) {
+							t.Errorf("part2=%d: multiblock CTR's output does not match generic CTR's output", part2)
+						}
 					}
 				})
 			}
@@ -352,6 +352,58 @@ func TestCTR_AES_multiblock_XORKeyStreamAt(t *testing.T) {
 
 			if !bytes.Equal(genericCiphertext, multiblockCiphertext) {
 				t.Fatal("multiblock CTR's output does not match generic CTR's output")
+			}
+		})
+	}
+}
+
+// Check that XORKeyStreamAt calls interleaved with XORKeyStream calls don't
+// affect the XORKeyStream state.
+func TestCTR_AES_XORKeyStreamAt_interleaved(t *testing.T) {
+	if boring.Enabled {
+		t.Skip("XORKeyStreamAt is not available in boring mode")
+	}
+
+	r := rand.New(rand.NewSource(424242))
+	const Size = 200
+	plaintext := randBytes(t, r, Size)
+
+	for _, keySize := range []int{16, 24, 32} {
+		t.Run(fmt.Sprintf("keySize=%d", keySize), func(t *testing.T) {
+			key := randBytes(t, r, keySize)
+			iv := randBytes(t, r, aesBlockSize)
+
+			aesBlock, err := aes.NewCipher(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			genericCtr, _ := makeTestingCiphers(aesBlock, iv)
+			fipsBlock, err := fipsaes.New(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := make([]byte, Size)
+			genericCtr.XORKeyStream(want, plaintext)
+
+			for _, split := range []int{1, 7, 15, 17, 33, 100} {
+				for _, atOffset := range []int{0, 3, 16, 21, 150} {
+					for _, atLen := range []int{1, 9, 16, 30} {
+						ctr := fipsaes.NewCTR(fipsBlock, iv)
+						got := make([]byte, Size)
+						ctr.XORKeyStream(got[:split], plaintext[:split])
+
+						at := make([]byte, atLen)
+						ctr.XORKeyStreamAt(at, plaintext[atOffset:atOffset+atLen], uint64(atOffset))
+						if !bytes.Equal(at, want[atOffset:atOffset+atLen]) {
+							t.Errorf("split=%d atOffset=%d atLen=%d: XORKeyStreamAt output mismatch", split, atOffset, atLen)
+						}
+
+						ctr.XORKeyStream(got[split:], plaintext[split:])
+						if !bytes.Equal(got, want) {
+							t.Errorf("split=%d atOffset=%d atLen=%d: XORKeyStream output mismatch", split, atOffset, atLen)
+						}
+					}
+				}
 			}
 		})
 	}

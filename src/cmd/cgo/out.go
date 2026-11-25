@@ -14,6 +14,7 @@ import (
 	"go/ast"
 	"go/printer"
 	"go/token"
+	"internal/buildcfg"
 	"internal/xcoff"
 	"io"
 	"os"
@@ -65,6 +66,11 @@ func (p *Package) writeDefs() {
 		fmt.Fprintf(fm, "size_t _cgo_wait_runtime_init_done(void) { return 0; }\n")
 		fmt.Fprintf(fm, "void _cgo_release_context(size_t ctxt __attribute__((unused))) { }\n")
 		fmt.Fprintf(fm, "char* _cgo_topofstack(void) { return (char*)0; }\n")
+		if buildcfg.Experiment.RuntimeCgoPurego {
+			fmt.Fprintf(fm, "void (*_cgo_tsan_acquire_fn)(void*);\n")
+			fmt.Fprintf(fm, "void (*_cgo_tsan_release_fn)(void*);\n")
+			fmt.Fprintf(fm, "void (*_cgo_yield)(void);\n")
+		}
 	} else {
 		// If we're not importing runtime/cgo, we *are* runtime/cgo,
 		// which provides these functions. We just need a prototype.
@@ -979,6 +985,9 @@ func (p *Package) writeExports(fgo2, fm, fgcc, fgcch io.Writer) {
 	fmt.Fprintf(fgcc, "extern char* _cgo_topofstack(void);")
 	fmt.Fprintf(fgcc, "%s\n", tsanProlog)
 	fmt.Fprintf(fgcc, "%s\n", msanProlog)
+	if buildcfg.Experiment.RuntimeCgoPurego && *importRuntimeCgo && !*gccgo {
+		fmt.Fprintf(fgcc, "%s\n", sanitizerInitProlog)
+	}
 
 	for _, exp := range p.ExpFunc {
 		fn := exp.Func
@@ -1635,12 +1644,6 @@ extern char* _cgo_topofstack(void);
 `
 
 // Prologue defining TSAN functions in C.
-const noTsanProlog = `
-#define CGO_NO_SANITIZE_THREAD
-#define _cgo_tsan_acquire()
-#define _cgo_tsan_release()
-`
-
 // This must match the TSAN code in runtime/cgo/libcgo.h.
 // This is used when the code is built with the C/C++ Thread SANitizer,
 // which is not the same as the Go race detector.
@@ -1663,7 +1666,16 @@ const noTsanProlog = `
 // we will be hiding races. But when using TSAN on mixed Go C/C++ code
 // it is more important to avoid false positives, which reduce confidence
 // in the tool, than to avoid false negatives.
-const yesTsanProlog = `
+const tsanProlog = `
+#undef _CGO_TSAN
+#if defined(__SANITIZE_THREAD__)
+#define _CGO_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define _CGO_TSAN 1
+#endif
+#endif
+#ifdef _CGO_TSAN
 #line 1 "cgo-tsan-prolog"
 #define CGO_NO_SANITIZE_THREAD __attribute__ ((no_sanitize_thread))
 
@@ -1673,37 +1685,75 @@ extern void __tsan_acquire(void*);
 extern void __tsan_release(void*);
 
 __attribute__ ((unused))
-static void _cgo_tsan_acquire() {
+static void _cgo_tsan_acquire(void) {
 	__tsan_acquire(&_cgo_sync);
 }
 
 __attribute__ ((unused))
-static void _cgo_tsan_release() {
+static void _cgo_tsan_release(void) {
 	__tsan_release(&_cgo_sync);
 }
+#line 1 "cgo-generated-wrappers"
+#else
+#define CGO_NO_SANITIZE_THREAD
+#define _cgo_tsan_acquire()
+#define _cgo_tsan_release()
+#endif
 `
 
-// Set to yesTsanProlog if we see -fsanitize=thread in the flags for gcc.
-var tsanProlog = noTsanProlog
-
-// noMsanProlog is a prologue defining an MSAN function in C.
-// This is used when not compiling with -fsanitize=memory.
-const noMsanProlog = `
-#define _cgo_msan_write(addr, sz)
+// sanitizerInitProlog is emitted into _cgo_export.c under
+// GOEXPERIMENT=runtimecgopurego to register C/C++ TSAN callbacks
+// with the pure-Go runtime/cgo package at program startup.
+const sanitizerInitProlog = `
+#if defined(_CGO_TSAN) && !defined(_WIN32)
+#line 1 "cgo-sanitizer-init-prolog"
+#include <string.h>
+static char _cgo_yield_strncpy_src = 0;
+static char _cgo_yield_strncpy_dst = 0;
+static volatile size_t _cgo_yield_strncpy_n = 0;
+static void _cgo_tsan_yield(void) {
+	strncpy(&_cgo_yield_strncpy_dst, &_cgo_yield_strncpy_src, _cgo_yield_strncpy_n);
+}
+extern void (*_cgo_tsan_acquire_fn)(void*);
+extern void (*_cgo_tsan_release_fn)(void*);
+extern void (*_cgo_yield)(void);
+#ifdef __ELF__
+__attribute__((constructor(101)))
+#else
+__attribute__((constructor))
+#endif
+CGO_NO_SANITIZE_THREAD
+static void _cgo_sanitizer_init(void) {
+	void (*expected)(void) = 0;
+	/* Store release first so a concurrent caller never acquires without releasing. */
+	__atomic_store_n(&_cgo_tsan_release_fn, __tsan_release, __ATOMIC_RELEASE);
+	__atomic_store_n(&_cgo_tsan_acquire_fn, __tsan_acquire, __ATOMIC_RELEASE);
+	/* Only set _cgo_yield once so multiple cgo packages or Darwin libInit do not overwrite it concurrently. */
+	__atomic_compare_exchange_n(&_cgo_yield, &expected, _cgo_tsan_yield, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+#line 1 "cgo-generated-wrappers"
+#endif
 `
 
-// yesMsanProlog is a prologue defining an MSAN function in C.
-// This is used when compiling with -fsanitize=memory.
+// msanProlog is a prologue defining an MSAN function in C.
 // See the comment above where _cgo_msan_write is called.
-const yesMsanProlog = `
+const msanProlog = `
+#undef _CGO_MSAN
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define _CGO_MSAN 1
+#endif
+#endif
+#ifdef _CGO_MSAN
+#line 1 "cgo-msan-prolog"
 extern void __msan_unpoison(const volatile void *, size_t);
 
 #define _cgo_msan_write(addr, sz) __msan_unpoison((addr), (sz))
+#line 1 "cgo-generated-wrappers"
+#else
+#define _cgo_msan_write(addr, sz)
+#endif
 `
-
-// msanProlog is set to yesMsanProlog if we see -fsanitize=memory in the flags
-// for the C compiler.
-var msanProlog = noMsanProlog
 
 const builtinProlog = `
 #line 1 "cgo-builtin-prolog"

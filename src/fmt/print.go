@@ -1577,12 +1577,12 @@ formatLoop:
 		i += size
 
 		switch {
-		case verb == '%': // Percent does not absorb operands and ignores f.wid and f.prec.
-			p.fmt.flags = flags
-			p.buf.writeByte('%')
 		case !p.goodArgNum:
 			p.fmt.flags = flags
 			p.badArgNum(verb)
+		case verb == '%': // Percent does not absorb operands and ignores f.wid and f.prec.
+			p.fmt.flags = flags
+			p.buf.writeByte('%')
 		case argNum >= len(a): // No argument left over to print for the current verb.
 			p.fmt.flags = flags
 			p.missingArg(verb)

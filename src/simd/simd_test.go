@@ -7,6 +7,7 @@
 package simd_test
 
 import (
+	"math"
 	"math/rand"
 	"runtime"
 	"simd"
@@ -488,6 +489,32 @@ func TestReduceSum(t *testing.T) {
 	test_helpers.TestV2S(t, test_helpers.Uint8s(), simd.LoadUint8s, simd.Uint8s.ReduceSum, test_helpers.ReduceSum)
 }
 
+func TestReduceMax(t *testing.T) {
+	test_helpers.TestV2S(t, test_helpers.Int8s(), simd.LoadInt8s, simd.Int8s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Int16s(), simd.LoadInt16s, simd.Int16s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Int32s(), simd.LoadInt32s, simd.Int32s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Int64s(), simd.LoadInt64s, simd.Int64s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Uint8s(), simd.LoadUint8s, simd.Uint8s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Uint16s(), simd.LoadUint16s, simd.Uint16s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Uint32s(), simd.LoadUint32s, simd.Uint32s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Uint64s(), simd.LoadUint64s, simd.Uint64s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Float32s(), simd.LoadFloat32s, simd.Float32s.ReduceMax, test_helpers.ReduceMax)
+	test_helpers.TestV2S(t, test_helpers.Float64s(), simd.LoadFloat64s, simd.Float64s.ReduceMax, test_helpers.ReduceMax)
+}
+
+func TestReduceMin(t *testing.T) {
+	test_helpers.TestV2S(t, test_helpers.Int8s(), simd.LoadInt8s, simd.Int8s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Int16s(), simd.LoadInt16s, simd.Int16s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Int32s(), simd.LoadInt32s, simd.Int32s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Int64s(), simd.LoadInt64s, simd.Int64s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Uint8s(), simd.LoadUint8s, simd.Uint8s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Uint16s(), simd.LoadUint16s, simd.Uint16s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Uint32s(), simd.LoadUint32s, simd.Uint32s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Uint64s(), simd.LoadUint64s, simd.Uint64s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Float32s(), simd.LoadFloat32s, simd.Float32s.ReduceMin, test_helpers.ReduceMin)
+	test_helpers.TestV2S(t, test_helpers.Float64s(), simd.LoadFloat64s, simd.Float64s.ReduceMin, test_helpers.ReduceMin)
+}
+
 func TestMaskRange(t *testing.T) {
 	test_helpers.TestMaskAllAny(t, simd.LoadUint8s)
 }
@@ -634,4 +661,108 @@ func TestLookupOrZeroUint8s(t *testing.T) {
 	if !slices.Equal(want, got) {
 		t.Errorf("Wanted %v, got %v", want, got)
 	}
+}
+
+func TestDotProductPairs(t *testing.T) {
+	vals := test_helpers.Int16s()
+	n := (simd.Int16s{}).Len()
+	nOut := (simd.Int32s{}).Len()
+	got := make([]int32, nOut)
+	want := make([]int32, nOut)
+
+	for i := 0; i+n <= len(vals); i += n {
+		x := vals[i : i+n]
+		for j := 0; j+n <= len(vals); j += n {
+			y := vals[j : j+n]
+			simd.LoadInt16s(x).DotProductPairs(simd.LoadInt16s(y)).Store(got)
+			for k := range nOut {
+				want[k] = int32(x[2*k])*int32(y[2*k]) + int32(x[2*k+1])*int32(y[2*k+1])
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("DotProductPairs(%v, %v) = %v, want %v", x, y, got, want)
+			}
+		}
+	}
+
+	// Test the overflow case where all four inputs to a sum are MinInt16,
+	// wrapping to MinInt32, alongside the largest non-overflowing sum.
+	m := int16(math.MinInt16)
+	x := make([]int16, n)
+	y := make([]int16, n)
+	for i := range n {
+		x[i] = m
+		y[i] = m
+	}
+	y[3] = m + 1
+	x[4], x[5] = 1, 2
+	y[4], y[5] = 3, 4
+	simd.LoadInt16s(x).DotProductPairs(simd.LoadInt16s(y)).Store(got)
+	for k := range nOut {
+		want[k] = int32(x[2*k])*int32(y[2*k]) + int32(x[2*k+1])*int32(y[2*k+1])
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("DotProductPairs overflow(%v, %v) = %v, want %v", x, y, got, want)
+	}
+}
+
+func testTwoInputShuffles[E ~int8 | ~int16 | ~int32 | ~int64 | ~uint8 | ~uint16 | ~uint32 | ~uint64, V interface {
+	Len() int
+	Store([]E)
+	InterleaveLo(V) V
+	InterleaveHi(V) V
+	ConcatEven(V) V
+	ConcatOdd(V) V
+}](t *testing.T, name string, load func([]E) V) {
+	t.Helper()
+	var zero V
+	n := zero.Len()
+	half := n / 2
+	xs := make([]E, n)
+	ys := make([]E, n)
+	for i := range n {
+		xs[i] = E(i + 1)
+		ys[i] = E(n + i + 1)
+	}
+	xv := load(xs)
+	yv := load(ys)
+
+	check := func(op string, gotV V, want []E) {
+		t.Helper()
+		got := make([]E, n)
+		gotV.Store(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s.%s: got %v, want %v", name, op, got, want)
+		}
+	}
+
+	wantLo := make([]E, n)
+	wantHi := make([]E, n)
+	wantEven := make([]E, n)
+	wantOdd := make([]E, n)
+	for i := range half {
+		wantLo[2*i] = xs[i]
+		wantLo[2*i+1] = ys[i]
+		wantHi[2*i] = xs[half+i]
+		wantHi[2*i+1] = ys[half+i]
+		wantEven[i] = xs[2*i]
+		wantEven[half+i] = ys[2*i]
+		wantOdd[i] = xs[2*i+1]
+		wantOdd[half+i] = ys[2*i+1]
+	}
+
+	check("InterleaveLo", xv.InterleaveLo(yv), wantLo)
+	check("InterleaveHi", xv.InterleaveHi(yv), wantHi)
+	check("ConcatEven", xv.ConcatEven(yv), wantEven)
+	check("ConcatOdd", xv.ConcatOdd(yv), wantOdd)
+}
+
+func TestTwoInputShuffles(t *testing.T) {
+	testTwoInputShuffles(t, "Int8s", simd.LoadInt8s)
+	testTwoInputShuffles(t, "Int16s", simd.LoadInt16s)
+	testTwoInputShuffles(t, "Int32s", simd.LoadInt32s)
+	testTwoInputShuffles(t, "Int64s", simd.LoadInt64s)
+	testTwoInputShuffles(t, "Uint8s", simd.LoadUint8s)
+	testTwoInputShuffles(t, "Uint16s", simd.LoadUint16s)
+	testTwoInputShuffles(t, "Uint32s", simd.LoadUint32s)
+	testTwoInputShuffles(t, "Uint64s", simd.LoadUint64s)
 }

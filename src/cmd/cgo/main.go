@@ -365,15 +365,6 @@ func main() {
 	copy(osArgs, os.Args[:])
 	goFiles := args[i:]
 
-	for _, arg := range args[:i] {
-		if arg == "-fsanitize=thread" {
-			tsanProlog = yesTsanProlog
-		}
-		if arg == "-fsanitize=memory" {
-			msanProlog = yesMsanProlog
-		}
-	}
-
 	p := newPackage(args[:i], fset)
 
 	flag.Visit(func(f *flag.Flag) {
@@ -414,7 +405,7 @@ func main() {
 		if !buildcfg.Experiment.CgoBindings {
 			fatalf("-binding requires GOEXPERIMENT=cgobindings")
 		}
-		if !platform.CgoSupported(goos, goarch) {
+		if !platform.CgoSupported(goos, goarch) || platform.Broken(goos, goarch) {
 			fatalf("-binding is not supported on %s/%s", goos, goarch)
 		}
 		p.processBinding(goFiles)
@@ -425,7 +416,7 @@ func main() {
 		if !buildcfg.Experiment.CgoBindings {
 			fatalf("-gen-binding requires GOEXPERIMENT=cgobindings")
 		}
-		if !platform.CgoSupported(goos, goarch) {
+		if !platform.CgoSupported(goos, goarch) || platform.Broken(goos, goarch) {
 			fatalf("-gen-binding is not supported on %s/%s", goos, goarch)
 		}
 	}

@@ -199,6 +199,7 @@ func init() {
 		pred2pred      = regInfo{inputs: []regMask{pred, pred}, outputs: []regMask{pred}}
 		pred3pred      = regInfo{inputs: []regMask{pred, pred, pred}, outputs: []regMask{pred}}
 		pred2flags     = regInfo{inputs: []regMask{pred, pred}}
+		pred2gp        = regInfo{inputs: []regMask{pred, pred}, outputs: []regMask{gp}}
 		fp11           = regInfo{inputs: []regMask{fp}, outputs: []regMask{fp}}
 		fpgp           = regInfo{inputs: []regMask{fp}, outputs: []regMask{gp}}
 		fpgpfp         = regInfo{inputs: []regMask{fp, gp}, outputs: []regMask{fp}}
@@ -210,6 +211,7 @@ func init() {
 		pred1fp        = regInfo{inputs: []regMask{pred}, outputs: []regMask{fp}}
 		fp1predfp      = regInfo{inputs: []regMask{fp, pred}, outputs: []regMask{fp}}
 		fp1pred07fp    = regInfo{inputs: []regMask{fp, pred07}, outputs: []regMask{fp}}
+		fp1pred07gp    = regInfo{inputs: []regMask{fp, pred07}, outputs: []regMask{gp}}
 		fpgppred07fp   = regInfo{inputs: []regMask{fp, gp, pred07}, outputs: []regMask{fp}}
 		fp2pred07pred  = regInfo{inputs: []regMask{fp, fp, pred07}, outputs: []regMask{pred}}
 		fp2predfp      = regInfo{inputs: []regMask{fp, fp, pred}, outputs: []regMask{fp}}
@@ -841,9 +843,11 @@ func init() {
 		{name: "DMB", argLength: 1, aux: "Int64", asm: "DMB", hasSideEffects: true},       // Do data barrier. arg0=memory, aux=option.
 		{name: "ZERO", zeroWidth: true, fixedReg: true, earlyOk: true, zeroUpperBits: 56}, // reads-as-zero register
 
-		// Broadcast constant to each lane of a SIMD register. aux=constant.
-		// TODO: add the other arrangements after assembler supports them, to be used in simdgen-generated opt rules.
+		// Broadcast constant to each lane of a SIMD register. aux=pre-shifted lane value.
 		{name: "VMOVI16B", argLength: 0, reg: fp01, asm: "VMOVI", aux: "UInt8", commutative: false, typ: "Vec128", resultInArg0: false},
+		{name: "VMOVI8H", argLength: 0, reg: fp01, asm: "VMOVI", aux: "Int64", commutative: false, typ: "Vec128", resultInArg0: false},
+		{name: "VMOVI4S", argLength: 0, reg: fp01, asm: "VMOVI", aux: "Int64", commutative: false, typ: "Vec128", resultInArg0: false},
+		{name: "VMOVI2D", argLength: 0, reg: fp01, asm: "VMOVI", aux: "Int64", commutative: false, typ: "Vec128", resultInArg0: false},
 
 		// SVE whole-register (unpredicated, VL-scaled) load/store of a scalable
 		// vector. These lower generic Load/Store of a 256-bit SIMD value; the
@@ -874,6 +878,15 @@ func init() {
 		{name: "PBICB", argLength: 3, reg: pred3pred, asm: "PBIC", typ: "Mask"}, // arg0=governing predicate, arg1 AND NOT arg2
 		{name: "PORRB", argLength: 3, reg: pred3pred, asm: "PORR", typ: "Mask"}, // arg0=governing predicate, arg1 OR arg2
 		{name: "PEORB", argLength: 3, reg: pred3pred, asm: "PEOR", typ: "Mask"}, // arg0=governing predicate, arg1 XOR arg2
+		// PBRKB sets the bytes that arg0 governs and that precede the first
+		// governed set byte of arg1; every other byte is zeroed.
+		{name: "PBRKB", argLength: 2, reg: pred2pred, asm: "PBRKB", typ: "Mask"}, // arg0=governing predicate, arg1
+		// PCNTP{B,H,S,D} count the elements of arg1 that arg0 governs and that
+		// are set, at the given element size.
+		{name: "PCNTPB", argLength: 2, reg: pred2gp, asm: "PCNTP"}, // arg0=governing predicate, arg1
+		{name: "PCNTPH", argLength: 2, reg: pred2gp, asm: "PCNTP"}, // arg0=governing predicate, arg1
+		{name: "PCNTPS", argLength: 2, reg: pred2gp, asm: "PCNTP"}, // arg0=governing predicate, arg1
+		{name: "PCNTPD", argLength: 2, reg: pred2gp, asm: "PCNTP"}, // arg0=governing predicate, arg1
 		// PPTEST sets the flags from the lanes of arg1 that arg0 governs: Z if
 		// none is set.
 		{name: "PPTEST", argLength: 2, reg: pred2flags, asm: "PPTEST", typ: "Flags"}, // arg0=governing predicate, arg1
@@ -897,6 +910,16 @@ func init() {
 		{name: "ZDUPIH", argLength: 1, aux: "UInt8", reg: fp11, asm: "ZDUP", typ: "Vec256"}, // arg0=vector, auxint=element index
 		{name: "ZDUPIS", argLength: 1, aux: "UInt8", reg: fp11, asm: "ZDUP", typ: "Vec256"}, // arg0=vector, auxint=element index
 		{name: "ZDUPID", argLength: 1, aux: "UInt8", reg: fp11, asm: "ZDUP", typ: "Vec256"}, // arg0=vector, auxint=element index
+		// ZLASTB{B,H,S,D} copy the last element of arg0 that arg1 governs to a
+		// general register, zero-extended; ZLASTBfp{S,D} copy it to a
+		// floating-point register. LASTB encodes arg1 in three bits, so it is
+		// one of P0-P7.
+		{name: "ZLASTBB", argLength: 2, reg: fp1pred07gp, asm: "ZLASTBW"},                   // arg0=vector, arg1=predicate
+		{name: "ZLASTBH", argLength: 2, reg: fp1pred07gp, asm: "ZLASTBW"},                   // arg0=vector, arg1=predicate
+		{name: "ZLASTBS", argLength: 2, reg: fp1pred07gp, asm: "ZLASTBW"},                   // arg0=vector, arg1=predicate
+		{name: "ZLASTBD", argLength: 2, reg: fp1pred07gp, asm: "ZLASTB"},                    // arg0=vector, arg1=predicate
+		{name: "ZLASTBfpS", argLength: 2, reg: fp1pred07fp, asm: "ZLASTBS", typ: "Float32"}, // arg0=vector, arg1=predicate
+		{name: "ZLASTBfpD", argLength: 2, reg: fp1pred07fp, asm: "ZLASTBD", typ: "Float64"}, // arg0=vector, arg1=predicate
 		// ZCPY is the predicated counterpart of ZDUP.
 		// ZCPY{B,H,S,D}const broadcasts a signed 8-bit immediate to the selected
 		// lanes of a scalable vector and zeroes the inactive lanes (Pg/Z).

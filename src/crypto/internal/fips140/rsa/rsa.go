@@ -246,8 +246,7 @@ func checkPrivateKey(priv *PrivateKey) error {
 		return errors.New("crypto/rsa: invalid CRT exponent")
 	}
 	de := bigmod.NewNat()
-	de.SetUint(uint(priv.pub.E)).ExpandFor(pMinus1)
-	de.Mul(dP, pMinus1)
+	de.SetBits(dP.Bits()).MulShort(uint(priv.pub.E), pMinus1)
 	if de.IsOne() != 1 {
 		return errors.New("crypto/rsa: invalid CRT exponent")
 	}
@@ -260,8 +259,7 @@ func checkPrivateKey(priv *PrivateKey) error {
 	if err != nil {
 		return errors.New("crypto/rsa: invalid CRT exponent")
 	}
-	de.SetUint(uint(priv.pub.E)).ExpandFor(qMinus1)
-	de.Mul(dQ, qMinus1)
+	de.SetBits(dQ.Bits()).MulShort(uint(priv.pub.E), qMinus1)
 	if de.IsOne() != 1 {
 		return errors.New("crypto/rsa: invalid CRT exponent")
 	}
@@ -293,23 +291,26 @@ func checkPrivateKey(priv *PrivateKey) error {
 	// factored using Fermat's factorization method. Broken RSA implementations
 	// do generate such keys. See Hanno Böck, Fermat Factorization in the Wild,
 	// https://eprint.iacr.org/2023/026.pdf.
-	diff := bigmod.NewNat()
+	diffMinusOne := bigmod.NewNat()
 	if qP, err := bigmod.NewNat().SetBytes(q.Nat().Bytes(q), p); err != nil {
 		// q > p
 		pQ, err := bigmod.NewNat().SetBytes(p.Nat().Bytes(p), q)
 		if err != nil {
 			return errors.New("crypto/rsa: p == q")
 		}
-		// diff = 0 - p mod q = q - p
-		diff.ExpandFor(q).Sub(pQ, q)
+		// diffMinusOne = 0 - p - 1 mod q = q - p - 1
+		diffMinusOne.ExpandFor(q).Sub(pQ, q).SubOne(q)
 	} else {
 		// p > q
-		// diff = 0 - q mod p = p - q
-		diff.ExpandFor(p).Sub(qP, p)
+		// diffMinusOne = 0 - q - 1 mod p = p - q - 1
+		diffMinusOne.ExpandFor(p).Sub(qP, p).SubOne(p)
 	}
+	// Since p != q, |p - q| >= 1, so |p - q| <= 2^k is equivalent to
+	// BitLen(|p - q| - 1) <= k.
+	//
 	// A tiny bit of leakage is acceptable because it's not adaptive, an
 	// attacker only learns the magnitude of p - q.
-	if diff.BitLenVarTime() <= N.BitLen()/2-100 {
+	if diffMinusOne.BitLenVarTime() <= N.BitLen()/2-100 {
 		return errors.New("crypto/rsa: |p - q| too small")
 	}
 

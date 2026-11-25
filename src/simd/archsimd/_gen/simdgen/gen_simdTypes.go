@@ -334,14 +334,10 @@ func (x simdType) CPUFeature() string {
 		case 128:
 			return "AVX"
 		case 256:
-			switch x.Shape.Elem.Base {
-			case "float", "mask":
-				return "AVX"
-			case "int", "uint":
-				return "AVX2"
-			default:
-				panic(fmt.Errorf("unexpected element base %q", x.Shape.Elem.Base))
-			}
+			// Loading, storing, and reinterpreting 256-bit vectors requires
+			// only AVX, even for integer elements. Most integer operations
+			// require AVX2, which they document individually.
+			return "AVX"
 		case 512:
 			return "AVX512"
 		default:
@@ -471,6 +467,9 @@ func (x {{.Name}}) Not() {{.Name}}
 func (x {{.Name}}) To{{.VectorCounterpart}}() {{.VectorCounterpart}} {
 	return Broadcast{{.VectorCounterpart}}(-1).Masked(x)
 }
+
+// Asm: Emulated (BRKB + CNTP), CPU Feature: SVE
+func (x {{.Name}}) TrailingZeros() int
 {{end}}
 
 {{define "sveIfElseTmpl"}}
@@ -597,6 +596,7 @@ func (x {{.Name}}) StoreArray(y *[{{.Lanes}}]{{.Base}})
 // move — min(len(s), Len()), and nothing for an empty or nil slice — and call the
 // unexported raw predicated load/store intrinsic. Keeping the length logic in Go
 // (rather than in the intrinsic) makes the bounds behavior explicit and safe.
+// Elem and SetElem check their index against Len() in Go the same way.
 const simdScalableLoadStoreTemplate = `
 // Len returns the number of elements in {{.Article}} {{.Name}}.
 func (x {{.Name}}) Len() int { return {{.LenExpr}} }
@@ -659,6 +659,25 @@ func (x {{.Name}}) StorePart(s []{{.Base}}) int {
 
 //go:noescape
 func (x {{.Name}}) storePart(s []{{.Base}})
+
+// Asm: Emulated (a bounds check that can panic, then ZLASTB), CPU Feature: SVE
+func (x {{.Name}}) Elem(i uint8) {{.Base}} {
+	if int(i) >= x.Len() {
+		panic("simd: {{.Name}}.Elem: index out of range")
+	}
+	return x.elem(i)
+}
+
+func (x {{.Name}}) elem(i uint8) {{.Base}}
+
+// Asm: Emulated (a bounds check that can panic, then PNEXT and ZCPY), CPU Feature: SVE
+func (x {{.Name}}) SetElem(i uint8, y {{.Base}}) {{.Name}} {
+	if int(i) >= x.Len() {
+		panic("simd: {{.Name}}.SetElem: index out of range")
+	}
+	lane := Mask{{.ElemBits}}sAllTrue().Next(Mask{{.ElemBits}}sFromCount(int(i)))
+	return Broadcast{{.Name}}(y).IfElse(lane, x)
+}
 `
 
 const simdMaskFromValTemplate = `
@@ -908,23 +927,23 @@ func (x {{.Name}}) To{{.VectorCounterpart}}() (z {{.VectorCounterpart}})
 // asMask converts from {{.VectorCounterpart}} to {{.Name}}.
 func (from {{.VectorCounterpart}}) asMask() (to {{.Name}})
 
-{{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
+{{if .CPUFeature}}// CPU Feature: {{.CPUFeature}}
 {{end -}}
 func (x {{.Name}}) And(y {{.Name}}) {{.Name}}
 
-{{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
+{{if .CPUFeature}}// CPU Feature: {{.CPUFeature}}
 {{end -}}
 func (x {{.Name}}) AndNot(y {{.Name}}) {{.Name}}
 
-{{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
+{{if .CPUFeature}}// CPU Feature: {{.CPUFeature}}
 {{end -}}
 func (x {{.Name}}) Or(y {{.Name}}) {{.Name}}
 
-{{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
+{{if .CPUFeature}}// CPU Feature: {{.CPUFeature}}
 {{end -}}
 func (x {{.Name}}) Xor(y {{.Name}}) {{.Name}}
 {{if .HasNot}}
-{{if .VectorCounterpart.CPUFeature}}// CPU Feature: {{.VectorCounterpart.CPUFeature}}
+{{if .CPUFeature}}// CPU Feature: {{.CPUFeature}}
 {{end -}}
 func (x {{.Name}}) Not() {{.Name}}
 {{end}}`)

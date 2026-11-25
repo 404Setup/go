@@ -63,14 +63,13 @@ func (gcToolchain) gc(b *Builder, a *Action, export string, importcfg, embedcfg 
 	sh := b.Shell(a)
 	objdir := a.Objdir
 
-	// earlyExport indicates we will create an os.Pipe and pass the -exportfd flag to
+	// earlyExport indicates we will create a named pipe and pass the -exportpipe flag to
 	// the compiler for it to signal when it is done writing the export data. The compiler
 	// writes the same output files independent of this.
 	// TODO(matloob,thepudds): Give a more precise description of exactly what earlyExport controls.
-	// TODO(matloob): Support early export on Windows, and likely with -toolexec, -x, and possibly other flags.
+	// TODO(matloob): Support early export with -toolexec, -x, and possibly other flags.
 	hasObjectAction := slices.ContainsFunc(a.triggers, func(t *Action) bool { return t.Mode == "build" && t.Package == a.Package })
-	goosSupported := runtime.GOOS != "windows" && runtime.GOOS != "plan9"
-	earlyExport := export != "" && hasObjectAction && goosSupported && !(cfg.BuildN || cfg.BuildX || len(cfg.BuildToolexec) > 0)
+	earlyExport := export != "" && hasObjectAction && earlyExportSupported && !(cfg.BuildN || cfg.BuildX || len(cfg.BuildToolexec) > 0)
 	if export == "" {
 		export = objdir + "_go_.x"
 	}
@@ -148,15 +147,16 @@ func (gcToolchain) gc(b *Builder, a *Action, export string, importcfg, embedcfg 
 			return "", nil, nil, err
 		}
 	}
-	var pipeR, pipeW *os.File
-	var extraFiles []*os.File
+	var ep *exportPipe
 	if earlyExport {
-		pipeR, pipeW, err = os.Pipe()
-		if err != nil {
-			return "", nil, nil, err
+		var perr error
+		ep, perr = newExportPipe(objdir)
+		if perr != nil {
+			// Fall back to waiting for the full compile if creating
+			// the named pipe fails (for example, on a filesystem
+			// that does not support FIFOs).
+			earlyExport = false
 		}
-		defer pipeR.Close()
-		extraFiles = []*os.File{pipeW}
 	}
 
 	// Add -c=N to use concurrent backend compilation, if possible.
@@ -181,7 +181,7 @@ func (gcToolchain) gc(b *Builder, a *Action, export string, importcfg, embedcfg 
 		args = append(args, "-asmhdr", objdir+"go_asm.h")
 	}
 	if earlyExport {
-		args = append(args, "-exportfd=3")
+		args = append(args, "-exportpipe="+ep.name())
 	}
 
 	for _, f := range gofiles {
@@ -201,20 +201,26 @@ func (gcToolchain) gc(b *Builder, a *Action, export string, importcfg, embedcfg 
 		// code that uses those values to expect absolute paths.
 		args = append(args, fsys.Actual(f))
 	}
-	sc, err := sh.startOut(base.Cwd(), cfgChangedEnv, extraFiles, release, args...)
-	// If -n is provided sc will always be nil because we don't actually start a command.
-	if err != nil || sc == nil {
-		release()
-		return ofile, nil, nil, err
-	}
 	if !earlyExport {
-		output, err = sc.wait()
+		defer release()
+		output, err = sh.runOut(base.Cwd(), cfgChangedEnv, args...)
 		return ofile, output, nil, err
 	}
-	var ping [1]byte
-	if _, err := pipeR.Read(ping[:]); err != nil {
+	done := func() {
+		ep.close()
+		release()
+	}
+	sc, err := sh.startOut(base.Cwd(), cfgChangedEnv, done, args...)
+	if err != nil || sc == nil {
+		done()
+		return ofile, nil, nil, err
+	}
+	if err := ep.wait(); err != nil {
 		output, werr := sc.wait()
-		return ofile, output, nil, errors.Join(err, werr)
+		if werr != nil || errors.Is(err, io.EOF) {
+			return ofile, output, nil, werr
+		}
+		return ofile, output, nil, err
 	}
 	return ofile, nil, sc, nil
 }
@@ -301,8 +307,25 @@ func (a *Action) trimpath() string {
 	// The trimmed paths are a little different, but we need to trim in the
 	// same situations.
 
-	// Strip the object directory entirely.
+	// Strip the object directories of this action and any cover or cgo actions
+	// that generate source files compiled or assembled here.
 	objdir := strings.TrimSuffix(a.Objdir, string(filepath.Separator))
+	objdirs := []string{objdir}
+	deps := a.Deps
+	if a.Mode == "build" && len(a.Deps) > 0 {
+		deps = a.Deps[0].Deps
+	}
+	for _, dep := range deps {
+		switch dep.Mode {
+		case "cover", "cgo run", "collect cgo":
+			if dep.Objdir != "" && dep.Objdir != a.Objdir {
+				d := strings.TrimSuffix(dep.Objdir, string(filepath.Separator))
+				if !slices.Contains(objdirs, d) {
+					objdirs = append(objdirs, d)
+				}
+			}
+		}
+	}
 	rewrite := ""
 
 	rewriteDir := a.Package.Dir
@@ -353,7 +376,9 @@ func (a *Action) trimpath() string {
 				// Generate rewrites for non-Go files copied to files in objdir.
 				if filepath.Dir(path) == a.Package.Dir {
 					// This is a file copied to objdir.
-					overlayNonGoRewrites += filepath.Join(objdir, base) + "=>" + filepath.Join(rewriteDir, base) + ";"
+					for _, d := range objdirs {
+						overlayNonGoRewrites += filepath.Join(d, base) + "=>" + filepath.Join(rewriteDir, base) + ";"
+					}
 				}
 			} else {
 				// Non-overlay Go files are covered by the a.Package.Dir rewrite rule above.
@@ -363,7 +388,12 @@ func (a *Action) trimpath() string {
 	if hasCgoOverlay {
 		rewrite += overlayNonGoRewrites
 	}
-	rewrite += objdir + "=>"
+	for i, d := range objdirs {
+		if i > 0 {
+			rewrite += ";"
+		}
+		rewrite += d + "=>"
+	}
 
 	return rewrite
 }
@@ -737,7 +767,13 @@ func (gcToolchain) ld(b *Builder, root *Action, targetPath, importcfg, mainpkg s
 
 // linkEnv returns the environment for the linker.
 func linkEnv() []string {
-	return append(slices.Clip(cfgChangedEnv), "GOROOT="+linkGOROOT())
+	env := append(slices.Clip(cfgChangedEnv), "GOROOT="+linkGOROOT())
+	if cfg.RestrictedBuild() {
+		env = append(env, "GORESTRICTEDBUILD=1")
+	} else {
+		env = append(env, "GORESTRICTEDBUILD=0")
+	}
+	return env
 }
 
 // linkGOROOT returns the GOROOT that the linker expands "$GOROOT" to.
@@ -762,13 +798,16 @@ func checkBindingExternalLinker(root *Action, ldBuildmode string, cxx bool, comp
 	if !bindingNeedsExternalLink(ldBuildmode) {
 		return nil
 	}
+	// The link action depends on all packages in the program.
+	if !slices.ContainsFunc(root.Deps, func(a *Action) bool { return a.Package != nil && a.Package.ImportPath == "runtime/cgo" }) {
+		return nil
+	}
+	if cfg.RestrictedBuild() {
+		return fmt.Errorf("cgo bindings on %s/%s require external linking, which is not allowed when GORESTRICTEDBUILD=1", cfg.Goos, cfg.Goarch)
+	}
 	if slices.ContainsFunc(ldflags, func(f string) bool {
 		return f == "-extld" || f == "--extld" || strings.HasPrefix(f, "-extld=") || strings.HasPrefix(f, "--extld=")
 	}) {
-		return nil
-	}
-	// The link action depends on all packages in the program.
-	if !slices.ContainsFunc(root.Deps, func(a *Action) bool { return a.Package != nil && a.Package.ImportPath == "runtime/cgo" }) {
 		return nil
 	}
 	envName, defaultCC := "CC", cfg.DefaultCC

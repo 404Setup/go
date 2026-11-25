@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build (!amd64 && !s390x && !ppc64 && !ppc64le && !arm64 && !loong64) || purego
+//go:build (!amd64 && !s390x && !ppc64 && !ppc64le && !arm64 && !loong64 && !riscv64) || purego
 
 package gcm
 
@@ -12,10 +12,10 @@ type gcmPlatformData struct{}
 
 func initGCM(g *GCM) {}
 
-func seal(out []byte, g *GCM, nonce, plaintext, data []byte) {
-	sealGeneric(out, g, nonce, plaintext, data)
+func seal(out, tag []byte, g *GCM, nonce, plaintext, data []byte) {
+	sealGeneric(out, tag, g, nonce, plaintext, data)
 }
 
-func open(out []byte, g *GCM, nonce, ciphertext, data []byte) error {
-	return openGeneric(out, g, nonce, ciphertext, data)
+func open(out []byte, g *GCM, nonce, ciphertext, tag, data []byte) error {
+	return openGeneric(out, g, nonce, ciphertext, tag, data)
 }

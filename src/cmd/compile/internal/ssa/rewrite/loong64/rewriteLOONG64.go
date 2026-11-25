@@ -5525,6 +5525,94 @@ func rewriteValue_OpLOONG64MOVWreg(v *ssa.Value) bool {
 		v.CopyOf(x)
 		return true
 	}
+	// match: (MOVWreg x:(SLL _ _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64SLL || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
+	// match: (MOVWreg x:(SRL _ _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64SRL || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
+	// match: (MOVWreg x:(SRA _ _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64SRA || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
+	// match: (MOVWreg x:(ROTR _ _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64ROTR || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
+	// match: (MOVWreg x:(SLLconst _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64SLLconst || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
+	// match: (MOVWreg x:(SRLconst _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64SRLconst || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
+	// match: (MOVWreg x:(SRAconst _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64SRAconst || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
+	// match: (MOVWreg x:(ROTRconst _))
+	// cond: (x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned()))
+	// result: x
+	for {
+		x := v_0
+		if x.Op != ssaop.OpLOONG64ROTRconst || !(x.Type.Size() == 8 || (x.Type.Size() == 4 && x.Type.IsSigned())) {
+			break
+		}
+		v.CopyOf(x)
+		return true
+	}
 	// match: (MOVWreg x)
 	// cond: v.Type.Size() <= 4
 	// result: x
@@ -9933,7 +10021,7 @@ func rewriteValue_OpRotateLeft16(v *ssa.Value) bool {
 		return true
 	}
 	// match: (RotateLeft16 <t> x y)
-	// result: (ROTR <t> (OR <typ.UInt32> (ZeroExt16to32 x) (SLLVconst <t> (ZeroExt16to32 x) [16])) (NEGV <typ.Int64> y))
+	// result: (ROTR <t> (OR <typ.UInt32> (ZeroExt16to32 x) (SLLVconst <typ.UInt32> (ZeroExt16to32 x) [16])) (NEGV <typ.Int64> y))
 	for {
 		t := v.Type
 		x := v_0
@@ -9943,7 +10031,7 @@ func rewriteValue_OpRotateLeft16(v *ssa.Value) bool {
 		v0 := b.NewValue0(v.Pos, ssaop.OpLOONG64OR, typ.UInt32)
 		v1 := b.NewValue0(v.Pos, ssaop.OpZeroExt16to32, typ.UInt32)
 		v1.AddArg(x)
-		v2 := b.NewValue0(v.Pos, ssaop.OpLOONG64SLLVconst, t)
+		v2 := b.NewValue0(v.Pos, ssaop.OpLOONG64SLLVconst, typ.UInt32)
 		v2.AuxInt = ssa.Int64ToAuxInt(16)
 		v2.AddArg(v1)
 		v0.AddArg2(v1, v2)

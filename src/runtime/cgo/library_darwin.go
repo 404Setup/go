@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.cgobindings && !msan && !tsan && darwin
+//go:build goexperiment.cgobindings && darwin
 
 package cgo
 
@@ -16,9 +16,7 @@ const (
 	dlopenFlags = _RTLD_NOW | _RTLD_LOCAL
 )
 
-// Open is the only user of dlopen, dlsym, and dlerror, so import them only
-// when the cgobindings experiment is enabled.
+// Open is the only user of dlopen, so import it only when the cgobindings
+// experiment is enabled (dlsym and dlerror are imported in cgo_darwin.go).
 
 //go:cgo_import_dynamic _cgo_libc_dlopen dlopen "/usr/lib/libSystem.B.dylib"
-//go:cgo_import_dynamic _cgo_libc_dlsym dlsym "/usr/lib/libSystem.B.dylib"
-//go:cgo_import_dynamic _cgo_libc_dlerror dlerror "/usr/lib/libSystem.B.dylib"

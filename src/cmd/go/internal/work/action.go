@@ -111,15 +111,10 @@ type Action struct {
 	actionID         cache.ActionID // cache ID of action input
 	buildID          string         // build ID of action output
 
-	VetxOnly   bool       // Mode=="vet": only being called to supply info about dependencies
-	needVet    bool       // Mode=="build": need to fill in vet config
-	needBuild  bool       // Mode=="build": need to do actual build (can be false if needVet is true)
-	needFix    bool       // Mode=="vet": need secondary target, a .zip file containing fixes
-	vetCfg     *vetConfig // vet config
-	FixArchive string     // the created .zip file containing fixes (if needFix)
-	output     []byte     // output redirect buffer (nil means use b.Print)
-
-	analysis *analysisAction // Mode=="analysisvet" only; see analysis.go
+	VetxOnly   bool   // Mode=="vet": only being called to supply info about dependencies
+	needFix    bool   // Mode=="vet": need secondary target, a .zip file containing fixes
+	FixArchive string // the created .zip file containing fixes (if needFix)
+	output     []byte // output redirect buffer (nil means use b.Print)
 
 	sh *Shell // lazily created per-Action shell; see Builder.Shell
 
@@ -189,8 +184,6 @@ type actionJSON struct {
 	Failed     bool      `json:",omitempty"`
 	Built      string    `json:",omitempty"`
 	VetxOnly   bool      `json:",omitempty"`
-	NeedVet    bool      `json:",omitempty"`
-	NeedBuild  bool      `json:",omitempty"`
 	ActionID   string    `json:",omitempty"`
 	BuildID    string    `json:",omitempty"`
 	TimeReady  time.Time `json:",omitempty"`
@@ -242,8 +235,6 @@ func actionGraphJSON(a *Action) string {
 				Priority:   a.priority,
 				Built:      a.built,
 				VetxOnly:   a.VetxOnly,
-				NeedBuild:  a.needBuild,
-				NeedVet:    a.needVet,
 			}
 			if a.Package != nil {
 				// TODO(rsc): Make this a unique key for a.Package somehow.
@@ -272,8 +263,6 @@ const (
 	ModeBuild BuildMode = iota
 	ModeInstall
 	ModeBuggyInstall
-
-	ModeVetOnly = 1 << 8
 )
 
 // NewBuilder returns a new Builder ready for use.
@@ -552,10 +541,11 @@ type coverProvider struct {
 
 // runCgoActor implements the Actor interface for running the cgo command for the package.
 type runCgoActor struct {
+	cover bool
 }
 
 func (c runCgoActor) Act(b *Builder, ctx context.Context, a *Action) error {
-	return b.runCgo(ctx, a)
+	return b.runCgo(ctx, a, c.cover)
 }
 
 type cgoCompileActor struct {
@@ -572,6 +562,10 @@ func (c cgoCompileActor) Act(b *Builder, ctx context.Context, a *Action) error {
 	}
 	a.nonGoOverlay = pr.nonGoOverlay
 
+	if err := b.Shell(a).Mkdir(a.Objdir); err != nil {
+		return err
+	}
+
 	a.actionID = b.cgoCompileActionID(a, c.file, c.getFlagsFunc(pr))
 	targetBase := filepath.Base(a.Target)
 	if err := b.loadCachedObjdirFile(a, cache.Default(), targetBase); err == nil {
@@ -580,7 +574,7 @@ func (c cgoCompileActor) Act(b *Builder, ctx context.Context, a *Action) error {
 	}
 	defer b.flushOutput(a)
 
-	if err := c.compileFunc(a, a.Objdir, a.Target, c.getFlagsFunc(pr), c.file); err != nil {
+	if err := c.compileFunc(a, a.Deps[0].Objdir, a.Target, c.getFlagsFunc(pr), c.file); err != nil {
 		return err
 	}
 
@@ -598,10 +592,7 @@ func (c cgoCompileActor) Act(b *Builder, ctx context.Context, a *Action) error {
 // the build action completing signifies that the complete archive for
 // a package is ready.
 func (b *Builder) BuildExportAction(mode, depMode BuildMode, p *load.Package) *Action {
-	vetOnly := mode&ModeVetOnly != 0
-	mode &^= ModeVetOnly
-
-	a := b.cacheAction("build-export", p, func() *Action {
+	return b.cacheAction("build-export", p, func() *Action {
 		a := &Action{
 			Mode:    "build-export",
 			Package: p,
@@ -654,35 +645,18 @@ func (b *Builder) BuildExportAction(mode, depMode BuildMode, p *load.Package) *A
 		}
 
 		// Create a cover action if we need to instrument the code for coverage.
-		// The cover action always runs in the same go build invocation as the build,
-		// and is not cached separately, so it can use the same objdir.
-		var coverAction *Action
 		if p.Internal.Cover.Mode != "" {
-			coverAction = b.cacheAction("cover", p, func() *Action {
-				return &Action{
-					Mode:    "cover",
-					Package: p,
-					Actor:   ActorFunc((*Builder).runCover),
-					Objdir:  a.Objdir,
-				}
-			})
-			a.Deps = append(a.Deps, coverAction)
+			a.Deps = append(a.Deps, b.coverAction(p))
 		}
 
 		// Create actions to run swig and cgo if needed. These actions
 		// cache their outputs independently under their own action IDs.
 		if p.UsesCgo() || p.UsesSwig() {
-			var cgoDeps []*Action
-			if coverAction != nil {
-				cgoDeps = append(cgoDeps, coverAction)
-			}
-			a.Deps = append(a.Deps, b.cgoAction(p, a.Objdir, cgoDeps, coverAction != nil))
+			a.Deps = append(a.Deps, b.cgoAction(p, a.Objdir))
 		}
 
 		return a
 	})
-	a.needBuild = a.needBuild || !vetOnly
-	return a
 }
 
 // CompileAction returns the action for compiling and possibly installing
@@ -726,16 +700,40 @@ func (b *Builder) CompileAction(mode, depMode BuildMode, p *load.Package) *Actio
 	return a
 }
 
-func (b *Builder) cgoAction(p *load.Package, objdir string, deps []*Action, hasCover bool) *Action {
-	runCgo := b.cacheAction("cgo run", p, func() *Action {
+func (b *Builder) coverAction(p *load.Package) *Action {
+	return b.cacheAction("cover", p, func() *Action {
+		return &Action{
+			Mode:    "cover",
+			Package: p,
+			Actor:   ActorFunc((*Builder).runCover),
+			Objdir:  b.NewObjdir(),
+		}
+	})
+}
+
+func (b *Builder) runCgoAction(p *load.Package, cover bool) *Action {
+	cover = cover && p.Internal.Cover.Mode != ""
+	mode := "cgo run"
+	if cover {
+		mode = "cgo run cover"
+	}
+	return b.cacheAction(mode, p, func() *Action {
+		var deps []*Action
+		if cover {
+			deps = append(deps, b.coverAction(p))
+		}
 		return &Action{
 			Package: p,
 			Mode:    "cgo run",
-			Actor:   &runCgoActor{},
-			Objdir:  objdir,
+			Actor:   &runCgoActor{cover: cover},
+			Objdir:  b.NewObjdir(),
 			Deps:    deps,
 		}
 	})
+}
+
+func (b *Builder) cgoAction(p *load.Package, objdir string) *Action {
+	runCgo := b.runCgoAction(p, true)
 	if p.UsesCgoBinding() {
 		return runCgo
 	}
@@ -745,7 +743,7 @@ func (b *Builder) cgoAction(p *load.Package, objdir string, deps []*Action, hasC
 		// Determine which files swig will produce in the cgo run action. We'll need to create
 		// actions to compile the C and C++ files produced by swig, as well as the C file
 		// produced by cgo processing swig's Go file outputs.
-		swigGo, swigC, swigCXX := b.swigOutputs(p, objdir)
+		swigGo, swigC, swigCXX := b.swigOutputs(p, runCgo.Objdir)
 
 		oseq := 0
 		nextOfile := func() string {
@@ -770,7 +768,7 @@ func (b *Builder) cgoAction(p *load.Package, objdir string, deps []*Action, hasC
 
 		// Add compile actions for C files generated by cgo.
 		cgoFiles := p.CgoFiles
-		if hasCover {
+		if p.Internal.Cover.Mode != "" {
 			cgoFiles = slices.Clone(cgoFiles)
 			for i := range cgoFiles {
 				cgoFiles[i] = strings.TrimSuffix(cgoFiles[i], ".go") + ".cover.go"
@@ -781,7 +779,7 @@ func (b *Builder) cgoAction(p *load.Package, objdir string, deps []*Action, hasC
 			cfiles = append(cfiles, strings.TrimSuffix(filepath.Base(fn), ".go")+".cgo2.c")
 		}
 		for _, f := range cfiles {
-			collectDeps = append(collectDeps, compileAction(objdir+f, (*runCgoProvider).cflags, b.gcc))
+			collectDeps = append(collectDeps, compileAction(runCgo.Objdir+f, (*runCgoProvider).cflags, b.gcc))
 		}
 
 		// Add compile actions for S files.
@@ -834,11 +832,11 @@ func (b *Builder) cgoAction(p *load.Package, objdir string, deps []*Action, hasC
 			Actor: ActorFunc(func(b *Builder, ctx context.Context, a *Action) error {
 				// Use the cgo run action's provider as our provider output,
 				// so it can be easily accessed by the build action.
-				a.Provider = a.Deps[0].Deps[0].Provider
+				a.Provider = runCgo.Provider
 				return nil
 			}),
 			Deps:   collectDeps,
-			Objdir: objdir,
+			Objdir: runCgo.Objdir,
 		}
 	})
 
@@ -846,50 +844,47 @@ func (b *Builder) cgoAction(p *load.Package, objdir string, deps []*Action, hasC
 }
 
 // VetAction returns the action for running go vet on package p.
-// It depends on the action for compiling p.
 // If the caller may be causing p to be installed, it is up to the caller
 // to make sure that the install depends on (runs after) vet.
-func (b *Builder) VetAction(s *modload.Loader, mode, depMode BuildMode, needFix bool, p *load.Package) *Action {
-	a := b.vetAction(s, mode, depMode, p)
+func (b *Builder) VetAction(p *load.Package, needFix bool) *Action {
+	a := b.vetAction(p)
 	a.VetxOnly = false
 	a.needFix = needFix
 	return a
 }
 
-func (b *Builder) vetAction(s *modload.Loader, mode, depMode BuildMode, p *load.Package) *Action {
+func (b *Builder) vetAction(p *load.Package) *Action {
 	// Construct vet action.
 	a := b.cacheAction("vet", p, func() *Action {
-		a1 := b.BuildExportAction(mode|ModeVetOnly, depMode, p)
-
 		var deps []*Action
-		if a1.buggyInstall {
-			// (*Builder).vet expects deps[0] to be the package.
-			// If we see buggyInstall
-			// here then a1 is an install of a shared library,
-			// and the real package is a1.Deps[0].
-			deps = []*Action{a1.Deps[0], a1}
-		} else {
-			deps = []*Action{a1}
-		}
-		for _, p1 := range p.Internal.Imports {
-			deps = append(deps, b.vetAction(s, mode, depMode, p1))
+		if p.Error == nil || !p.Error.IsImportCycle {
+			for _, p1 := range p.Internal.Imports {
+				deps = append(deps, b.vetAction(p1))
+			}
 		}
 
 		a := &Action{
 			Mode:       "vet",
 			Package:    p,
 			Deps:       deps,
-			Objdir:     a1.Objdir,
+			Objdir:     b.NewObjdir(),
 			VetxOnly:   true,
 			IgnoreFail: true, // it's OK if vet of dependencies "fails" (reports problems)
 		}
-		if a1.Actor == nil {
-			// Built-in packages like unsafe.
-			return a
+		if p.Standard {
+			switch p.ImportPath {
+			case "builtin", "unsafe":
+				// Built-in packages like unsafe.
+				return a
+			}
+			if cfg.BuildToolchainName == "gccgo" {
+				return a
+			}
 		}
-		deps[0].needVet = true
+		if p.UsesCgo() || p.UsesSwig() {
+			a.Deps = append(a.Deps, b.runCgoAction(p, false))
+		}
 		a.Actor = ActorFunc((*Builder).vet)
-		b.addTransitiveCompileActions(a, a1)
 		return a
 	})
 	return a
@@ -917,9 +912,9 @@ func (b *Builder) ExportAction(p *load.Package) *Action {
 		for i, imp := range p.Internal.Imports {
 			a.Deps[i] = b.ExportAction(imp)
 		}
-		if p.UsesCgo() { // TODO(mark): What about SWIG?
+		if p.UsesCgo() || p.UsesSwig() {
 			// Run the cgo preprocessor; export must examine its output files.
-			a.Deps = append(a.Deps, b.cgoAction(p, a.Objdir, nil, false))
+			a.Deps = append(a.Deps, b.runCgoAction(p, false))
 		}
 		return a
 	})
@@ -1123,7 +1118,7 @@ func (b *Builder) addInstallHeaderAction(a *Action) {
 			Package: a.Package,
 			Deps:    []*Action{a.Deps[0]},
 			Actor:   ActorFunc((*Builder).installHeader),
-			Objdir:  a.Deps[0].Objdir,
+			Objdir:  b.runCgoAction(p, true).Objdir,
 			Target:  hdrTarget,
 		}
 		a.Deps = append(a.Deps, ah)

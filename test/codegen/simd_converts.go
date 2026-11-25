@@ -50,3 +50,20 @@ func simdExtendHiUint32x4(x archsimd.Uint32x4) archsimd.Uint64x2 {
 	// wasm:`I64x2ExtendHighI32x4U` -`ExtractLane` -`ReplaceLane`
 	return x.HiToLo().ExtendToUint64()
 }
+
+func simdConvertInt32x4ToFloat64(x archsimd.Int32x4) archsimd.Float64x2 {
+	// arm64:`VSXTL\s` `VSCVTF`
+	// wasm:`F64x2ConvertLowI32x4S`
+	return x.ConvertToFloat64()
+}
+
+func simdConvertHiInt32x4ToFloat64(x archsimd.Int32x4) archsimd.Float64x2 {
+	// arm64:`VSXTL2` `VSCVTF` -`VDUP`
+	return x.HiToLo().ConvertToFloat64()
+}
+
+func simdConvertFloat64x2ToInt32(x archsimd.Float64x2) archsimd.Int32x4 {
+	// arm64:`VFCVTZS` `VSQXTN`
+	// wasm:`I32x4TruncSatF64x2SZero`
+	return x.ConvertToInt32()
+}

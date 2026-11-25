@@ -1076,7 +1076,7 @@ func (x {{.VType}}) NotEqual(y {{.VType}}) Mask{{.WxC}} {
 var uintRotateAllTemplate = sgutil.TemplateNamed("uintRotateAll", `
 // RotateAllLeft rotates all elements left by the specified amount
 //
-// Emulated
+// Emulated{{if eq .Vwidth 256}}, CPU Feature: AVX2{{end}}
 func (x {{.VType}}) RotateAllLeft(shift uint64) {{.VType}} {
 	shift = shift & ({{.EWidth}}-1)
 	nshift := {{.EWidth}} - shift
@@ -1085,7 +1085,7 @@ func (x {{.VType}}) RotateAllLeft(shift uint64) {{.VType}} {
 
 // RotateAllRight rotates all elements right by the specified amount
 //
-// Emulated
+// Emulated{{if eq .Vwidth 256}}, CPU Feature: AVX2{{end}}
 func (x {{.VType}}) RotateAllRight(shift uint64) {{.VType}} {
 	shift = shift & ({{.EWidth}}-1)
 	nshift := {{.EWidth}} - shift
@@ -1383,6 +1383,28 @@ func (x {{.VType}}) HiToLo() {{.VType}} {
 }
 `))
 
+// lessTemplateSVE implements Less for SVE scalable vectors as Greater with
+// the operands swapped, as arm64LessTemplate does for NEON. SVE's CMPLT, CMPLO
+// and FCMLT are assembler aliases of CMPGT, CMPHI and FCMGT with swapped
+// operands.
+var lessTemplateSVE = template.Must(template.New("sve Less methods").Parse(`
+// Emulated, CPU Feature: SVE
+func (x {{.VType}}) Less(y {{.VType}}) Mask{{.EWidth}}s {
+	return y.Greater(x)
+}
+`))
+
+// lessEqualTemplateSVE implements LessEqual for SVE scalable vectors as
+// GreaterEqual with the operands swapped, as arm64LessEqualTemplate does for
+// NEON. SVE's CMPLE, CMPLS and FCMLE are assembler aliases of CMPGE, CMPHS and
+// FCMGE with swapped operands.
+var lessEqualTemplateSVE = template.Must(template.New("sve LessEqual methods").Parse(`
+// Emulated, CPU Feature: SVE
+func (x {{.VType}}) LessEqual(y {{.VType}}) Mask{{.EWidth}}s {
+	return y.GreaterEqual(x)
+}
+`))
+
 var reduceSumTemplateArm64 = shapedTemplateOf(arm64ReduceIntegerShapes, "arm64_ReduceSum methods", `
 // ReduceSum reduces x by summing all elements.
 //
@@ -1435,6 +1457,10 @@ func (x {{.VType}}) ReduceMin() {{.Etype}} {
 
 var maskCvtTemplate = shapedTemplateOf(intShapes, "Mask conversions", `
 // ToMask returns a mask whose i'th element is set if x[i] is non-zero.
+{{- if eq .Vwidth 256}}
+//
+// Emulated, CPU Feature: AVX2
+{{- end}}
 func (x {{.Base}}{{.WxC}}) ToMask() (z Mask{{.WxC}}) {
 	return x.NotEqual({{.Base}}{{.WxC}}{})
 }
@@ -1550,7 +1576,17 @@ var maskToString = shapedTemplateOf(intShapes, "maskToString", `
 // String returns a string representation of SIMD mask x.
 func (x Mask{{.WxC}}) String() string {
 	var s [{{.Count}}]{{.Etype}}
+{{- if eq .Vwidth 256}}
+	x.ToInt{{.WxC}}().StoreArray(&s)
+	// True elements are -1. Negate them in scalar code: a vector Neg of a
+	// 256-bit integer vector would require AVX2, but the 256-bit mask types
+	// only require AVX.
+	for i := range s {
+		s[i] = -s[i]
+	}
+{{- else}}
 	x.ToInt{{.WxC}}().Neg().StoreArray(&s)
+{{- end}}
 	return simdfmt.SliceToString(s[:])
 }
 `)
@@ -1573,6 +1609,7 @@ func main() {
 	op := flag.String("op", SIMD+"other_gen_amd64.go", "file name for other operations")
 	ush := flag.String("ush", SIMD+"unsafe_helpers.go", "file name for unsafe helpers")
 	nc := flag.String("nc", SIMD+"converts_gen_amd64.go", "file name for emulated narrowing conversions")
+	shf := flag.String("shf", SIMD+"shuffles_gen_amd64.go", "file name for emulated shuffles")
 	bh := flag.String("bh", TD+"binary_helpers_%W_test.go", "file name for binary test helpers")
 	uh := flag.String("uh", TD+"unary_helpers_%W_test.go", "file name for unary test helpers")
 	cvh := flag.String("cvh", TD+"convert_helpers_%W_test.go", "file name for conversion test helpers")
@@ -1643,6 +1680,9 @@ func main() {
 	}
 	if *nc != "" {
 		narrowConversions(*nc)
+	}
+	if *shf != "" {
+		emulatedShuffles(*shf)
 	}
 	if *ush != "" {
 		one(*ush, unsafePrologue, unsafePATemplate)
@@ -1736,7 +1776,7 @@ func main() {
 
 	// SVE-specific generation
 	if *opSVE != "" {
-		oneSVE(*opSVE, svePrologue, hiToLoTemplateSVE)
+		oneSVE(*opSVE, svePrologue, hiToLoTemplateSVE, lessTemplateSVE, lessEqualTemplateSVE)
 	}
 
 	nonTemplateRewrites(SSA+"tern_helpers.go", ssaPrologue, classifyBooleanSIMD, ternOpForLogical)
@@ -1758,6 +1798,10 @@ func ternOpForLogical(op ssaop.Op) ssaop.Op {
 		fmt.Fprintf(out, "case ssaop.OpAndInt%[1]dx%[2]d, ssaop.OpOrInt%[1]dx%[2]d, ssaop.OpXorInt%[1]dx%[2]d,ssaop.OpAndNotInt%[1]dx%[2]d: return ssaop.OpternInt%[3]dx%[4]d\n", w, c, wt, ct)
 		fmt.Fprintf(out, "case ssaop.OpAndUint%[1]dx%[2]d, ssaop.OpOrUint%[1]dx%[2]d, ssaop.OpXorUint%[1]dx%[2]d,ssaop.OpAndNotUint%[1]dx%[2]d: return ssaop.OpternUint%[3]dx%[4]d\n", w, c, wt, ct)
 	}, out)
+
+	// 256-bit mask logic has its own ops, which the 256-bit integer ternary
+	// logic op can implement.
+	fmt.Fprintf(out, "case ssaop.OpAndMask256, ssaop.OpOrMask256, ssaop.OpXorMask256, ssaop.OpAndNotMask256: return ssaop.OpternInt32x8\n")
 
 	fmt.Fprintf(out, `
 	}
@@ -1793,7 +1837,7 @@ func classifyBooleanSIMD(v *ssa.Value) SIMDLogicalOP {
 		fmt.Fprintf(out, "ssaop.Op%s%s%dx%d", op, upperT, w, c)
 	}, out)
 
-	fmt.Fprintf(out, `:
+	fmt.Fprintf(out, `, ssaop.OpAndMask256:
 		return sloAnd
 
 		case `)
@@ -1805,7 +1849,7 @@ func classifyBooleanSIMD(v *ssa.Value) SIMDLogicalOP {
 		fmt.Fprintf(out, "ssaop.Op%s%s%dx%d", op, upperT, w, c)
 	}, out)
 
-	fmt.Fprintf(out, `:
+	fmt.Fprintf(out, `, ssaop.OpOrMask256:
 		return sloOr
 
 		case `)
@@ -1817,8 +1861,10 @@ func classifyBooleanSIMD(v *ssa.Value) SIMDLogicalOP {
 		fmt.Fprintf(out, "ssaop.Op%s%s%dx%d", op, upperT, w, c)
 	}, out)
 
-	fmt.Fprintf(out, `:
+	fmt.Fprintf(out, `, ssaop.OpAndNotMask256:
 		return sloAndNot
+	case ssaop.OpXorMask256:
+		return sloXor
 `)
 
 	// "Not" is encoded as x.Xor(x.Equal(x).ToInt8x16().ToBits())

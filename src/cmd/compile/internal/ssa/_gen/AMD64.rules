@@ -1768,9 +1768,12 @@
 // == on SIMD vectors and masks. Integer vectors and masks are equal if they
 // are bitwise equal. Float vectors are equal if no element compares
 // not-equal-or-unordered (predicate 4, NEQ_UQ), so NaN elements are unequal
-// and +0 equals -0. The 512-bit forms compare into a K mask.
+// and +0 equals -0. The 512-bit forms compare into a K mask. VPXOR on 256-bit
+// vectors requires AVX2, but 256-bit integer vectors and masks require only AVX,
+// so use VXORPS unless AVX2 is known to be available.
 (EqualVec128 x y) => (SETEQ (VPTEST t:(VPXOR128 x y) t))
-(EqualVec256 x y) => (SETEQ (VPTEST t:(VPXOR256 x y) t))
+(EqualVec256 x y) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (SETEQ (VPTEST t:(VPXOR256 x y) t))
+(EqualVec256 x y) => (SETEQ (VPTEST t:(VXORPS256 x y) t))
 (EqualVec512 x y) => (SETEQ (TESTB t:(KMOVBi <typ.UInt8> (VPCMPQ512 [4] x y)) t))
 (EqualVecFloat32x4 x y) => (SETEQ (VPTEST t:(VCMPPS128 [4] x y) t))
 (EqualVecFloat32x8 x y) => (SETEQ (VPTEST t:(VCMPPS256 [4] x y) t))
@@ -1815,6 +1818,28 @@
 (IfElseFloat(32|64) <t> x mask y) && t.Size() == 32 => (VBLENDVP(S|D)256 y x mask)
 (IfElseFloat(32|64) <t> x mask y) && t.Size() == 64 => (VPBLENDM(D|Q)Masked512 y x (VPMOVVec(32x16|64x8)ToM <types.TypeMask> mask))
 
+// 256-bit mask logic. If AVX2 is available, use the integer instructions, which
+// the mask rules below can optimize further. Otherwise, use the floating-point
+// instructions, which require only AVX and do the same thing to masks.
+// (VPANDN x y) and (VANDNPS x y) compute ^x & y.
+(AndMask256 x y) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VPAND256 x y)
+(OrMask256 x y) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VPOR256 x y)
+(XorMask256 x y) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VPXOR256 x y)
+(AndNotMask256 x y) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VPANDN256 y x)
+(AndMask256 x y) => (VANDPS256 x y)
+(OrMask256 x y) => (VORPS256 x y)
+(XorMask256 x y) => (VXORPS256 x y)
+(AndNotMask256 x y) => (VANDNPS256 y x)
+
+// Lo, Hi, SetLo, and SetHi on 256-bit integer vectors require only AVX, so the
+// generated rules use VEXTRACTF128 and VINSERTF128. If AVX2 is available, use
+// VEXTRACTI128 and VINSERTI128 instead, which keep integer data in the integer
+// domain. These come before the generated rules, so they take precedence.
+(Lo(Int8x32|Int16x16|Int32x8|Int64x4|Uint8x32|Uint16x16|Uint32x8|Uint64x4) x) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VEXTRACTI128128 [0] x)
+(Hi(Int8x32|Int16x16|Int32x8|Int64x4|Uint8x32|Uint16x16|Uint32x8|Uint64x4) x) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VEXTRACTI128128 [1] x)
+(SetLo(Int8x32|Int16x16|Int32x8|Int64x4|Uint8x32|Uint16x16|Uint32x8|Uint64x4) x y) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VINSERTI128256 [0] x y)
+(SetHi(Int8x32|Int16x16|Int32x8|Int64x4|Uint8x32|Uint16x16|Uint32x8|Uint64x4) x y) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx2) => (VINSERTI128256 [1] x y)
+
 (ZeroSIMD <t>) && t.Size() == 16 => (Zero128 <t>)
 (ZeroSIMD <t>) && t.Size() == 32 => (Zero256 <t>)
 (ZeroSIMD <t>) && t.Size() == 64 => (Zero512 <t>)
@@ -1823,6 +1848,7 @@
 // do these before the mask rewrites
 (VPOR128 (VCMPP(S|D)128 [3] x x) (VCMPP(S|D)128 [3] y y)) => (VCMPP(S|D)128 [3] x y)
 (VPOR256 (VCMPP(S|D)256 [3] x x) (VCMPP(S|D)256 [3] y y)) => (VCMPP(S|D)256 [3] x y)
+(VORPS256 (VCMPP(S|D)256 [3] x x) (VCMPP(S|D)256 [3] y y)) => (VCMPP(S|D)256 [3] x y)
 (VPORD512 (VPMOVMToVec32x16 (VCMPPS512 [3] x x)) (VPMOVMToVec32x16 (VCMPPS512 [3] y y))) =>
 	(VPMOVMToVec32x16 (VCMPPS512 [3] x y))
 (VPORD512 (VPMOVMToVec64x8  (VCMPPD512 [3] x x)) (VPMOVMToVec64x8  (VCMPPD512 [3] y y))) =>

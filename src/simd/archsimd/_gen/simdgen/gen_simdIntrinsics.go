@@ -106,10 +106,17 @@ func simd{{GetSIMDTag}}Intrinsics(addF func(pkg, fn string, b intrinsicBuilder, 
 
 	var mask = templateNamed("mask", `	addF(simdPackage, "{{.Name}}.To{{.VectorCounterpart}}", func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value { return args[0] }, {{GetSysArch}})
 	addF(simdPackage, "{{.VectorCounterpart}}.asMask", func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value { return args[0] }, {{GetSysArch}})
+{{- if and (eq GetSysArch "sys.AMD64") (eq .Size 256)}}
+	addF(simdPackage, "{{.Name}}.And", opLen2(ssaop.OpAndMask256, types.TypeVec256), {{GetSysArch}})
+	addF(simdPackage, "{{.Name}}.Or", opLen2(ssaop.OpOrMask256, types.TypeVec256), {{GetSysArch}})
+	addF(simdPackage, "{{.Name}}.AndNot", opLen2(ssaop.OpAndNotMask256, types.TypeVec256), {{GetSysArch}})
+	addF(simdPackage, "{{.Name}}.Xor", opLen2(ssaop.OpXorMask256, types.TypeVec256), {{GetSysArch}})
+{{- else}}
 	addF(simdPackage, "{{.Name}}.And", opLen2(ssaop.OpAnd{{.ReshapedVectorWithAndOr}}, types.TypeVec{{.Size}}), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.Or", opLen2(ssaop.OpOr{{.ReshapedVectorWithAndOr}}, types.TypeVec{{.Size}}), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.AndNot", opLen2(ssaop.OpAndNot{{.ReshapedVectorWithAndOr}}, types.TypeVec{{.Size}}), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.Xor", opLen2(ssaop.OpXor{{.ReshapedVectorWithAndOr}}, types.TypeVec{{.Size}}), {{GetSysArch}})
+{{- end}}
 {{- if eq GetSysArch "sys.ARM64"}}
 	addF(simdPackage, "{{.Name}}.Not", opLen1(ssaop.OpNot{{.ReshapedVectorWithAndOr}}, types.TypeVec{{.Size}}), {{GetSysArch}})
 {{- else}}
@@ -128,7 +135,8 @@ func simd{{GetSIMDTag}}Intrinsics(addF func(pkg, fn string, b intrinsicBuilder, 
 	addF(simdPackage, "{{.Name}}.AndNot", opLen2(ssaop.Op{{.Name}}AndNot, types.TypeMask), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.Or", opLen2(ssaop.Op{{.Name}}Or, types.TypeMask), {{GetSysArch}})
 	addF(simdPackage, "{{.Name}}.Xor", opLen2(ssaop.Op{{.Name}}Xor, types.TypeMask), {{GetSysArch}})
-	addF(simdPackage, "{{.Name}}.Not", opLen1(ssaop.Op{{.Name}}Not, types.TypeMask), {{GetSysArch}})`)
+	addF(simdPackage, "{{.Name}}.Not", opLen1(ssaop.Op{{.Name}}Not, types.TypeMask), {{GetSysArch}})
+	addF(simdPackage, "{{.Name}}.TrailingZeros", opLen1(ssaop.Op{{.Name}}TrailingZeros, types.Types[types.TINT]), {{GetSysArch}})`)
 
 	var maskedLoadStore = templateNamed("maskedLoadStore", `	addF(simdPackage, "load{{.Name}}ArrayMasked", simdMaskedLoad(ssaop.OpLoadMasked{{.ElemBits}}), sys.AMD64)
 	addF(simdPackage, "{{.Name}}.StoreArrayMasked", simdMaskedStore(ssaop.OpStoreMasked{{.ElemBits}}), sys.AMD64)`)

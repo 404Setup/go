@@ -14,8 +14,8 @@ import (
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/modload"
 	"cmd/internal/quoted"
+	"errors"
 	"fmt"
-	"internal/buildcfg"
 	"internal/platform"
 	"os"
 	"os/exec"
@@ -24,7 +24,6 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 )
 
@@ -60,14 +59,43 @@ func BuildInit(ld *modload.Loader) {
 	buildInitStarted = true
 	base.AtExit(closeBuilders)
 
+	if cfg.GORESTRICTEDBUILD != "0" && cfg.GORESTRICTEDBUILD != "1" {
+		base.Fatalf("go: invalid GORESTRICTEDBUILD value %q (must be 0 or 1)", cfg.GORESTRICTEDBUILD)
+	}
+	if cfg.RestrictedBuild() {
+		if cfg.BuildContext.CgoEnabled == build.CgoEnabled {
+			cfg.BuildContext.CgoEnabled = build.CgoDisabled
+		}
+		if cfg.BuildBuildvcs == "true" {
+			base.Fatalf("go: -buildvcs=true is not allowed when GORESTRICTEDBUILD=1")
+		}
+		cfg.BuildBuildvcs = "false"
+		if cfg.BuildToolchainName == "gccgo" {
+			base.Fatalf("go: -compiler=gccgo is not allowed when GORESTRICTEDBUILD=1")
+		}
+		if cfg.BuildASan {
+			base.Fatalf("go: -asan is not allowed when GORESTRICTEDBUILD=1")
+		}
+		if cfg.BuildMSan {
+			base.Fatalf("go: -msan is not allowed when GORESTRICTEDBUILD=1")
+		}
+		if cfg.BuildLinkshared {
+			base.Fatalf("go: -linkshared is not allowed when GORESTRICTEDBUILD=1")
+		}
+		switch cfg.BuildBuildmode {
+		case "c-archive", "c-shared", "shared", "plugin":
+			base.Fatalf("go: -buildmode=%s is not allowed when GORESTRICTEDBUILD=1", cfg.BuildBuildmode)
+		}
+	}
+
 	// Check CGO_ENABLED=bindings here rather than at startup, so that
 	// commands like go env, go version, and go help keep working with a
 	// saved CGO_ENABLED=bindings setting.
 	if cfg.BuildContext.CgoEnabled == build.CgoBindings {
+		if !platform.CgoSupported(cfg.Goos, cfg.Goarch) || platform.Broken(cfg.Goos, cfg.Goarch) {
+			base.Fatalf("go: CGO_ENABLED=bindings is not supported on %s/%s", cfg.Goos, cfg.Goarch)
+		}
 		if cfg.Experiment != nil && !cfg.Experiment.CgoBindings {
-			if exp, err := buildcfg.ParseGOEXPERIMENT(cfg.Goos, cfg.Goarch, "cgobindings"); err != nil || !exp.CgoBindings {
-				base.Fatalf("go: CGO_ENABLED=bindings is not supported on %s/%s", cfg.Goos, cfg.Goarch)
-			}
 			base.Fatalf("go: CGO_ENABLED=bindings requires GOEXPERIMENT=cgobindings")
 		}
 		if cfg.BuildContext.Compiler != "gc" {
@@ -148,9 +176,6 @@ func fuzzInstrumentFlags() []string {
 }
 
 func instrumentInit() {
-	if cfg.BuildContext.CgoEnabled == build.CgoEnabled && cgoTSanEnabled() {
-		cfg.BuildContext.ToolTags = append(cfg.BuildContext.ToolTags, "tsan")
-	}
 	if !cfg.BuildRace && !cfg.BuildMSan && !cfg.BuildASan {
 		return
 	}
@@ -235,41 +260,6 @@ func instrumentInit() {
 	}
 	cfg.BuildContext.InstallSuffix += mode
 	cfg.BuildContext.ToolTags = append(cfg.BuildContext.ToolTags, mode)
-}
-
-// cgoTSanEnabled reports whether the C compiler flags in CC, CGO_CPPFLAGS, or
-// CGO_CFLAGS enable ThreadSanitizer (-fsanitize=thread).
-func cgoTSanEnabled() bool {
-	tsan := false
-	for _, key := range []string{"CC", "CGO_CPPFLAGS", "CGO_CFLAGS"} {
-		v := cfg.Getenv(key)
-		if key == "CC" && v == "" {
-			v = cfg.DefaultCC(cfg.Goos, cfg.Goarch)
-		}
-		args, err := quoted.Split(v)
-		if err != nil {
-			continue
-		}
-		if key == "CC" && len(args) > 0 {
-			args = args[1:]
-		}
-		for _, arg := range args {
-			if list, ok := strings.CutPrefix(arg, "-fsanitize="); ok {
-				for s := range strings.SplitSeq(list, ",") {
-					if s == "thread" {
-						tsan = true
-					}
-				}
-			} else if list, ok := strings.CutPrefix(arg, "-fno-sanitize="); ok {
-				for s := range strings.SplitSeq(list, ",") {
-					if s == "thread" || s == "all" {
-						tsan = false
-					}
-				}
-			}
-		}
-	}
-	return tsan
 }
 
 func buildModeInit() {
@@ -443,6 +433,9 @@ var compiler struct {
 // It returns a non-nil error if the compiler matches a known version schema but
 // the version could not be parsed, or if $(go env CC) could not be determined.
 func compilerVersion() (version, error) {
+	if cfg.RestrictedBuild() {
+		return version{}, errors.New("C compiler invocation is not allowed when GORESTRICTEDBUILD=1")
+	}
 	compiler.Once.Do(func() {
 		compiler.err = func() error {
 			compiler.name = "unknown"
