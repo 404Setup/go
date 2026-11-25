@@ -654,6 +654,10 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 						traceRelease(trace)
 					}
 				}
+				if s.isImmutable {
+					sysImmutableUnprotectOS(unsafe.Pointer(s.base()), s.npages*pageSize)
+					s.isImmutable = false
+				}
 				if debug.clobberfree != 0 {
 					clobberfree(unsafe.Pointer(x), size)
 				}

@@ -15,6 +15,8 @@ pkg encoding/json/v2, func MarshalWriteOf[$0 interface{}](io.Writer, $0, ...json
 pkg encoding/json/v2, func UnmarshalDecodeOf[$0 interface{}](*jsontext.Decoder, *$0, ...jsonopts.Options) error #80000
 pkg encoding/json/v2, func UnmarshalOf[$0 interface{}]([]uint8, *$0, ...jsonopts.Options) error #80000
 pkg encoding/json/v2, func UnmarshalReadOf[$0 interface{}](io.Reader, *$0, ...jsonopts.Options) error #80000
+pkg maps, func IsImmutable[$0 interface{ ~map[$1]$2 }, $1 comparable, $2 interface{}]($0) bool #80000
+pkg maps, func ToImmutable[$0 interface{ ~map[$1]$2 }, $1 comparable, $2 interface{}]($0) $0 #80000
 pkg net/http/server, const RequestIDKey = "server.request_id" #80000
 pkg net/http/server, const RequestIDKey ideal-string #80000
 pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80000
@@ -214,6 +216,8 @@ pkg net/http/server, type StaticConfig struct, Index string #80000
 pkg net/http/server, var ErrBodyTooLarge error #80000
 pkg net/http/server, var ErrInvalidJSON error #80000
 pkg net/http/server, var ErrUnsupportedMediaType error #80000
+pkg slices, func IsImmutable[$0 interface{ ~[]$1 }, $1 interface{}]($0) bool #80000
+pkg slices, func ToImmutable[$0 interface{ ~[]$1 }, $1 interface{}]($0) $0 #80000
 pkg sync/atomic/v2, method (*Value[$0]) CompareAndSwap($0, $0) bool #80000
 pkg sync/atomic/v2, method (*Value[$0]) Load() $0 #80000
 pkg sync/atomic/v2, method (*Value[$0]) Store($0) #80000

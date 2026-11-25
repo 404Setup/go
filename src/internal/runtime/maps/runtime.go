@@ -42,6 +42,9 @@ func newobject(typ *abi.Type) unsafe.Pointer
 //go:linkname errNilAssign
 var errNilAssign error
 
+//go:linkname errImmutableMap
+var errImmutableMap error
+
 // TODO: move zeroVal to internal/abi?
 //
 //go:linkname zeroVal runtime.zeroVal
@@ -161,6 +164,9 @@ func runtime_mapaccess2(typ *abi.MapType, m *Map, key unsafe.Pointer) (unsafe.Po
 func runtime_mapassign(typ *abi.MapType, m *Map, key unsafe.Pointer) unsafe.Pointer {
 	if m == nil {
 		panic(errNilAssign)
+	}
+	if m.IsImmutable() {
+		panic(errImmutableMap)
 	}
 	if race.Enabled {
 		callerpc := sys.GetCallerPC()

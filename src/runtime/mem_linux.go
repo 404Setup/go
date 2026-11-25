@@ -160,6 +160,22 @@ func sysFaultOS(v unsafe.Pointer, n uintptr) {
 	madvise(v, n, _MADV_DONTNEED)
 }
 
+const hasImmutablePageProtect = true
+
+func sysImmutableProtectOS(v unsafe.Pointer, n uintptr) bool {
+	_, err := mprotect(v, n, _PROT_READ)
+	return err == 0
+}
+
+//go:nosplit
+func sysImmutableUnprotectOS(v unsafe.Pointer, n uintptr) {
+	_, err := mprotect(v, n, _PROT_READ|_PROT_WRITE)
+	if err != 0 {
+		print("runtime: mprotect(", v, ", ", n, ") returned ", err, "\n")
+		throw("runtime: failed to restore writable protection on freed immutable span")
+	}
+}
+
 func sysReserveOS(v unsafe.Pointer, n uintptr, vmaName string) unsafe.Pointer {
 	p, err := mmap(v, n, _PROT_NONE, _MAP_ANON|_MAP_PRIVATE, -1, 0)
 	if err != 0 {

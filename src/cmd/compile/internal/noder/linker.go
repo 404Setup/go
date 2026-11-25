@@ -328,6 +328,7 @@ func (l *linker) relocTypeExt(w *pkgbits.Encoder, name *ir.Name) {
 func (l *linker) relocVarExt(w *pkgbits.Encoder, name *ir.Name) {
 	w.Sync(pkgbits.SyncVarExt)
 	l.linkname(w, name)
+	l.pragmaFlag(w, name.Pragma())
 }
 
 func (l *linker) linkname(w *pkgbits.Encoder, name *ir.Name) {

@@ -391,6 +391,7 @@ type (
 	}
 
 	AssignStmt struct {
+		Pragma   Pragma
 		Op       Operator // 0 means no operation
 		Lhs, Rhs Expr     // Rhs == nil means Lhs++ (Op == Add) or Lhs-- (Op == Sub)
 		simpleStmt

@@ -260,8 +260,23 @@ type Map struct {
 	tombstonePossible bool
 
 	// clearSeq is a sequence counter of calls to Clear. It is used to
-	// detect map clears during iteration.
+	// detect map clears during iteration. The high bit (clearSeqImmutable)
+	// marks the map as immutable.
 	clearSeq uint64
+}
+
+const clearSeqImmutable uint64 = 1 << 63
+
+// IsImmutable reports whether m is frozen against modifications.
+func (m *Map) IsImmutable() bool {
+	return m != nil && m.clearSeq&clearSeqImmutable != 0
+}
+
+// SetImmutable marks m as immutable so all subsequent write operations panic.
+func (m *Map) SetImmutable() {
+	if m != nil {
+		m.clearSeq |= clearSeqImmutable
+	}
 }
 
 // Use 64-bit hash on 64-bit systems, except on Wasm, where we use
@@ -397,6 +412,9 @@ func (m *Map) Grow(typ *abi.MapType, n uintptr) {
 
 // grow is Grow with an explicit allocation limit, for tests.
 func (m *Map) grow(typ *abi.MapType, n uintptr, maxAlloc uintptr) {
+	if m != nil && m.IsImmutable() {
+		panic(errImmutableMap)
+	}
 	if m.writing != 0 {
 		fatal("concurrent map writes")
 	}
@@ -676,6 +694,9 @@ func (m *Map) Put(typ *abi.MapType, key, elem unsafe.Pointer) {
 //
 // PutSlot never returns nil.
 func (m *Map) PutSlot(typ *abi.MapType, key unsafe.Pointer) unsafe.Pointer {
+	if m.IsImmutable() {
+		panic(errImmutableMap)
+	}
 	if m.writing != 0 {
 		fatal("concurrent map writes")
 	}
@@ -839,6 +860,9 @@ func (m *Map) growToTable(typ *abi.MapType) *table {
 }
 
 func (m *Map) Delete(typ *abi.MapType, key unsafe.Pointer) {
+	if m != nil && m.IsImmutable() {
+		panic(errImmutableMap)
+	}
 	if m == nil || m.Used() == 0 {
 		if err := mapKeyError(typ, key); err != nil {
 			panic(err) // see issue 23734
@@ -927,6 +951,9 @@ func (m *Map) deleteSmall(typ *abi.MapType, hash uintptr, key unsafe.Pointer) {
 
 // Clear deletes all entries from the map resulting in an empty map.
 func (m *Map) Clear(typ *abi.MapType) {
+	if m != nil && m.IsImmutable() {
+		panic(errImmutableMap)
+	}
 	if m == nil || m.Used() == 0 && !m.tombstonePossible {
 		return
 	}
@@ -952,7 +979,7 @@ func (m *Map) Clear(typ *abi.MapType) {
 		m.tombstonePossible = false
 		// TODO: shrink directory?
 	}
-	m.clearSeq++
+	m.clearSeq = (m.clearSeq + 1) &^ clearSeqImmutable
 
 	// Reset the hash seed to make it more difficult for attackers to
 	// repeatedly trigger hash collisions. See https://go.dev/issue/25237.
@@ -984,6 +1011,7 @@ func (m *Map) Clone(typ *abi.MapType) *Map {
 	// Shallow copy the Map structure.
 	m2 := new(Map)
 	*m2 = *m
+	m2.clearSeq &^= clearSeqImmutable
 	m = m2
 
 	// We need to just deep copy the dirPtr field.

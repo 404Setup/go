@@ -250,6 +250,16 @@ func sysMapOS(v unsafe.Pointer, n uintptr, _ string) {
 func sysFaultOS(v unsafe.Pointer, n uintptr) {
 }
 
+const hasImmutablePageProtect = false
+
+func sysImmutableProtectOS(v unsafe.Pointer, n uintptr) bool {
+	return false
+}
+
+//go:nosplit
+func sysImmutableUnprotectOS(v unsafe.Pointer, n uintptr) {
+}
+
 func sysReserveOS(v unsafe.Pointer, n uintptr, _ string) unsafe.Pointer {
 	var p uintptr
 	systemstack(func() {

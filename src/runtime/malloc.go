@@ -921,6 +921,9 @@ func (h *mheap) enableMetadataHugePages() {
 // base address for all 0-byte allocations
 var zerobase uintptr
 
+// base address for 0-byte immutable slices
+var immutableZerobase uintptr
+
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
 func nextFreeFast(s *mspan) gclinkptr {
@@ -1890,6 +1893,11 @@ func freegc(ptr unsafe.Pointer, size uintptr, noscan bool) bool {
 
 	if mp.curg.stack.lo <= uintptr(ptr) && uintptr(ptr) < mp.curg.stack.hi {
 		// This points into our stack, so free is a no-op.
+		mp.mallocing = 0
+		releasem(mp)
+		return false
+	}
+	if span := spanOf(uintptr(ptr)); span == nil || span.isImmutable {
 		mp.mallocing = 0
 		releasem(mp)
 		return false

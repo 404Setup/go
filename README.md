@@ -22,8 +22,9 @@ This fork is a personal Go branch maintained by 404Setup.
 - **`net/http`, `net/textproto`, `net/url`**: Allocation and throughput optimizations across HTTP/1.1, HTTP/2, and HTTP/3.
 - **`net/http/server`**: HTTP router with path parameters, route groups, pooled contexts, and middleware.
 - **`reflect`**: Fast paths for `Equal`, `DeepEqual`, `Comparable`, `Call`, `Select`, `MapKeys`, and struct fields.
-- **`runtime`**: Faster span reclamation, GC sweep, bit-scanning, stack/page/mcache management, and write-barrier deduplication.
-- **`cmd/compile`**: Stack small-buffer optimization for non-escaping slices/strings and static constant lowering.
+- **`slices`, `maps`**: `ToImmutable` and `IsImmutable` returning native `[]E` and `map[K]V` values backed by read-only allocations (copies mutable inputs; zero-alloc no-op when already immutable).
+- **`runtime`**: Faster span reclamation, GC sweep, bit-scanning, stack/page/mcache management, write-barrier deduplication, read-only slice spans (`mprotect` / `sigpanic`), and immutable map guards.
+- **`cmd/compile`**: `//go:immutable` directive for slice, array, and map variables (compile-time mutation checks plus runtime freezing), stack small-buffer optimization for non-escaping slices/strings, and static constant lowering.
 
 ### Compiler & Linker Flags
 - **`-ldflags="-o2"`**: Bounded loop unrolling and post-SCCP/prove dead branch elimination.
@@ -648,6 +649,31 @@ xychart-beta
 | `BenchmarkScanRecursiveIntReaderWrapper` | 84,117 µs/op | **432.9 µs/op** | **-99.5%** (194.32×) | 1,599 (27.9 KB) → **802 (12.8 KB)** |
 
 > *Zero-alloc fast paths (`-cpu=2`): `BenchmarkFprintfLiteral` **16.36 ns/op** (0 allocs), `BenchmarkAppendfIntString` **123.6 ns/op** (0 allocs), `BenchmarkSscanIntFloat` **630.7 ns/op** (0 allocs), `BenchmarkSscanfMixed` **1,026 ns/op** (0 allocs). Allocation counts in `TestCountMallocs` dropped for `Sprintf("xxx")` (1 → 0) and `Sprintf("%80000s")` (3 → 2).*
+
+---
+
+### 10. Immutable Collections (`slices`, `maps`, `//go:immutable`)
+
+`//go:immutable` annotates slice, array, or map variable declarations (package-level `var` or initialized local `var` / `:=`) so mutations, reassignments, address-taking, `clear`, `delete`, `copy` into the target, and pointer-receiver method calls fail at compile time, while runtime freezing protects aliased views and `reflect` writes. `slices.ToImmutable` and `maps.ToImmutable` freeze mutable collections into native `[]E` and `map[K]V` values without wrapper types (cloning mutable inputs and returning already-immutable inputs without allocation).
+
+```go
+//go:immutable
+var allowed = []string{"read", "write"}
+
+frozenSlice := slices.ToImmutable([]int64{1, 2, 3})
+frozenMap := maps.ToImmutable(map[string]int{"ok": 200})
+```
+
+Benchmarked on `linux/amd64` (`Intel Xeon @ 2.30 GHz`, `-cpu=2`, 3 runs median):
+
+| Benchmark | Latency | Memory / Allocs | Notes |
+| :--- | ---: | ---: | :--- |
+| `ImmutableSliceRead/Mutable` vs `Immutable` | 2,216 vs 2,170 ns/op | 0 B / 0 allocs | 1,024 `int64` elements; read parity |
+| `ToImmutableSliceIdempotent` | 10.41 ns/op | 0 B / 0 allocs | returns already-immutable slice directly |
+| `ToImmutableSlice` (1,024 × `int64`) | 39.77 µs/op | 8,192 B / 1 alloc | dedicated read-only span via `mprotect` |
+| `ImmutableMapLookup/Mutable` vs `Immutable` | 4,199 vs 4,276 ns/op | 0 B / 0 allocs | 256 `string` keys; lookup parity |
+| `ToImmutableMapIdempotent` | 4.13 ns/op | 0 B / 0 allocs | returns already-immutable map directly |
+| `ToImmutableMap` (256 entries) | 6.41 µs/op | 13,656 B / 4 allocs | cloned SwissMap marked read-only |
 
 ---
 

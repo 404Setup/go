@@ -211,6 +211,9 @@ func wbMove(typ *_type, dst, src unsafe.Pointer) {
 //
 //go:linkname reflect_typedmemmove reflect.typedmemmove
 func reflect_typedmemmove(typ *_type, dst, src unsafe.Pointer) {
+	if (raceenabled || msanenabled || asanenabled || !hasImmutablePageProtect) && isImmutableSlicePtr(dst) {
+		panic(errorString("modification of immutable slice"))
+	}
 	if raceenabled {
 		raceWriteObjectPC(typ, dst, sys.GetCallerPC(), abi.FuncPCABIInternal(reflect_typedmemmove))
 		raceReadObjectPC(typ, src, sys.GetCallerPC(), abi.FuncPCABIInternal(reflect_typedmemmove))
@@ -280,6 +283,10 @@ func typedslicecopy(typ *_type, dstPtr unsafe.Pointer, dstLen int, srcPtr unsafe
 	}
 	if n == 0 {
 		return 0
+	}
+
+	if (raceenabled || msanenabled || asanenabled || !hasImmutablePageProtect) && isImmutableSlicePtr(dstPtr) {
+		panic(errorString("modification of immutable slice"))
 	}
 
 	// The compiler emits calls to typedslicecopy before
@@ -400,6 +407,9 @@ func reflect_typedmemclrpartial(typ *_type, ptr unsafe.Pointer, off, size uintpt
 
 //go:linkname reflect_typedarrayclear reflect.typedarrayclear
 func reflect_typedarrayclear(typ *_type, ptr unsafe.Pointer, len int) {
+	if len > 0 && (raceenabled || msanenabled || asanenabled || !hasImmutablePageProtect) && isImmutableSlicePtr(ptr) {
+		panic(errorString("modification of immutable slice"))
+	}
 	size := typ.Size_ * uintptr(len)
 	if writeBarrier.enabled && typ.Pointers() {
 		// This always clears whole elements of an array, so it's
@@ -425,6 +435,9 @@ func reflect_typedarrayclear(typ *_type, ptr unsafe.Pointer, len int) {
 //go:linkname memclrHasPointers
 //go:nosplit
 func memclrHasPointers(ptr unsafe.Pointer, n uintptr) {
+	if n > 0 && (raceenabled || msanenabled || asanenabled || !hasImmutablePageProtect) && isImmutableSlicePtr(ptr) {
+		panic(errorString("modification of immutable slice"))
+	}
 	// Pass nil for the type since we don't have one here anyway.
 	bulkBarrierPreWrite(uintptr(ptr), 0, n, nil)
 	memclrNoHeapPointers(ptr, n)

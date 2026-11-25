@@ -99,6 +99,11 @@ type pkgWriter struct {
 	// cgoPragmas accumulates any //go:cgo_* pragmas that need to be
 	// passed through to cmd/link.
 	cgoPragmas [][]string
+
+	// //go:immutable tracking
+	immutableVars     map[*types2.Var]bool
+	immutableDefStmts map[*syntax.AssignStmt]bool
+	importedImmutable map[*types2.Var]bool
 }
 
 // newPkgWriter returns an initialized pkgWriter for the specified
@@ -126,6 +131,9 @@ func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo ma
 			remote string
 			std    bool
 		}),
+
+		immutableVars:     make(map[*types2.Var]bool),
+		immutableDefStmts: make(map[*syntax.AssignStmt]bool),
 	}
 }
 
@@ -1248,6 +1256,11 @@ func (w *writer) typeExt(obj *types2.TypeName) {
 func (w *writer) varExt(obj *types2.Var) {
 	w.Sync(pkgbits.SyncVarExt)
 	w.linkname(obj)
+	var pragma ir.PragmaFlag
+	if w.p.immutableVars[obj] {
+		pragma |= ir.Immutable
+	}
+	w.pragmaFlag(pragma)
 }
 
 func (w *writer) linkname(obj types2.Object) {
@@ -1533,6 +1546,22 @@ func (w *writer) assign(expr syntax.Expr) {
 			// TODO(mdempsky): Minimize locals index size by deferring
 			// this until the variables actually come into scope.
 			w.addLocal(obj)
+
+			if w.p.immutableVars[obj] {
+				w.Bool(true)
+				switch u := types2.Unalias(obj.Type()).Underlying().(type) {
+				case *types2.Slice:
+					w.Len(1)
+					w.rtype(u.Elem())
+				case *types2.Map:
+					w.Len(2)
+					w.rtype(obj.Type())
+				default:
+					w.Len(0)
+				}
+			} else {
+				w.Bool(false)
+			}
 			return
 		}
 	}
@@ -2889,12 +2918,57 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		return c.withTParams(obj)
 
 	case *syntax.VarDecl:
-		pw.checkPragmas(n.Pragma, 0, true)
+		pw.checkPragmas(n.Pragma, ir.Immutable, true)
 
 		if p, ok := n.Pragma.(*pragmas); ok && len(p.Embeds) > 0 {
 			if err := checkEmbed(n, c.file.importedEmbed, c.withinFunc); err != nil {
 				pw.errorf(p.Embeds[0].Pos, "%s", err)
 			}
+		}
+
+		if asPragmaFlag(n.Pragma)&ir.Immutable != 0 {
+			if c.withinFunc && n.Values == nil {
+				pw.errorf(n, "//go:immutable local variable must have an initializer")
+			}
+			for _, name := range n.NameList {
+				if name.Value == "_" {
+					pw.errorf(name, "cannot use //go:immutable on blank identifier")
+					continue
+				}
+				if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
+					if !isImmutableSupportedType(obj.Type()) {
+						pw.errorf(name, "//go:immutable only applies to slice, array, or map variables")
+						continue
+					}
+					pw.immutableVars[obj] = true
+				}
+			}
+		}
+
+	case *syntax.AssignStmt:
+		if n.Op == syntax.Def {
+			pw.checkPragmas(n.Pragma, ir.Immutable, false)
+			if asPragmaFlag(n.Pragma)&ir.Immutable != 0 {
+				pw.immutableDefStmts[n] = true
+				for _, lhsExpr := range syntax.UnpackListExpr(n.Lhs) {
+					name, ok := syntax.Unparen(lhsExpr).(*syntax.Name)
+					if !ok || name.Value == "_" {
+						pw.errorf(lhsExpr, "cannot use //go:immutable on %v", lhsExpr)
+						continue
+					}
+					if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
+						if !isImmutableSupportedType(obj.Type()) {
+							pw.errorf(name, "//go:immutable only applies to slice, array, or map variables")
+							continue
+						}
+						pw.immutableVars[obj] = true
+					} else {
+						pw.errorf(name, "cannot apply //go:immutable to redeclared variable %s", name.Value)
+					}
+				}
+			}
+		} else {
+			pw.checkPragmas(n.Pragma, 0, false)
 		}
 
 	case *syntax.BlockStmt:
@@ -2953,6 +3027,9 @@ func (pw *pkgWriter) collectDecls(noders []*noder) {
 			}
 		}
 	}
+
+	pw.checkImmutable(noders)
+	base.ExitIfErrors()
 }
 
 func (pw *pkgWriter) checkPragmas(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {

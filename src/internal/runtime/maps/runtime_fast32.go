@@ -188,6 +188,9 @@ func runtime_mapassign_fast32(typ *abi.MapType, m *Map, key uint32) unsafe.Point
 	if m == nil {
 		panic(errNilAssign)
 	}
+	if m.IsImmutable() {
+		panic(errImmutableMap)
+	}
 	if race.Enabled {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(runtime_mapassign_fast32)
@@ -337,6 +340,9 @@ func runtime_mapassign_fast32ptr(typ *abi.MapType, m *Map, key unsafe.Pointer) u
 	if m == nil {
 		panic(errNilAssign)
 	}
+	if m.IsImmutable() {
+		panic(errImmutableMap)
+	}
 	if race.Enabled {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(runtime_mapassign_fast32ptr)
@@ -477,6 +483,9 @@ outer:
 
 //go:linkname runtime_mapdelete_fast32 runtime.mapdelete_fast32
 func runtime_mapdelete_fast32(typ *abi.MapType, m *Map, key uint32) {
+	if m != nil && m.IsImmutable() {
+		panic(errImmutableMap)
+	}
 	if race.Enabled {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(runtime_mapdelete_fast32)

@@ -2605,12 +2605,23 @@ func (p *parser) stmtOrNil() Stmt {
 	// Most statements (assignments) start with an identifier;
 	// look for it first before doing anything more expensive.
 	if p.tok == _Name {
-		p.clearPragma()
+		prag := p.takePragma()
 		lhs := p.exprList()
 		if label, ok := lhs.(*Name); ok && p.tok == _Colon {
+			if prag != nil {
+				p.pragh(p.pos(), p.scanner.blank, "", prag)
+			}
 			return p.labeledStmtOrNil(label)
 		}
-		return p.simpleStmt(lhs, 0)
+		s := p.simpleStmt(lhs, 0)
+		if prag != nil {
+			if as, ok := s.(*AssignStmt); ok && as.Op == Def {
+				as.Pragma = prag
+			} else {
+				p.pragh(p.pos(), p.scanner.blank, "", prag)
+			}
+		}
+		return s
 	}
 
 	switch p.tok {

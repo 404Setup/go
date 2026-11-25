@@ -20,6 +20,9 @@ const (
 //go:linkname maps_errNilAssign internal/runtime/maps.errNilAssign
 var maps_errNilAssign error = plainError("assignment to entry in nil map")
 
+//go:linkname maps_errImmutableMap internal/runtime/maps.errImmutableMap
+var maps_errImmutableMap error = errorString("modification of immutable map")
+
 func makemap64(t *abi.MapType, hint int64, m *maps.Map) *maps.Map {
 	if int64(int(hint)) != hint {
 		hint = 0
@@ -333,4 +336,40 @@ func mapgrow(m any, n int) {
 		panic(maps_errNilAssign)
 	}
 	map_.Grow(typ, uintptr(n))
+}
+
+// mapimmutable implements maps.ToImmutable.
+//
+//go:linkname mapimmutable maps.toImmutable
+func mapimmutable(m any) any {
+	e := efaceOf(&m)
+	typ := (*abi.MapType)(unsafe.Pointer(e._type))
+	map_ := (*maps.Map)(e.data)
+	if map_ == nil || map_.IsImmutable() {
+		return m
+	}
+	map_ = map_.Clone(typ)
+	map_.SetImmutable()
+	e.data = (unsafe.Pointer)(map_)
+	return m
+}
+
+// mapisImmutable implements maps.IsImmutable.
+//
+//go:linkname mapisImmutable maps.isImmutable
+func mapisImmutable(m any) bool {
+	e := efaceOf(&m)
+	map_ := (*maps.Map)(e.data)
+	return map_.IsImmutable()
+}
+
+// freezeImmutableMap is called by compiler-generated initialization code for
+// //go:immutable map variables.
+func freezeImmutableMap(t *abi.MapType, m *maps.Map) *maps.Map {
+	if m == nil || m.IsImmutable() {
+		return m
+	}
+	m2 := m.Clone(t)
+	m2.SetImmutable()
+	return m2
 }

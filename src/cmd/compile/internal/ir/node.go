@@ -456,6 +456,7 @@ const (
 
 	RegisterParams // TODO(register args) remove after register abi is working
 
+	Immutable // //go:immutable variable
 )
 
 var BlankNode *Name

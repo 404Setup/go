@@ -456,6 +456,7 @@ type mspan struct {
 	// initialized (see also the assignment of freeIndexForScan in
 	// mallocgc, and issue 54596).
 	freeIndexForScan uint16
+	isImmutable      bool // span holds read-only immutable slice backing storage
 
 	// Cache of the allocBits at freeindex. allocCache is shifted
 	// such that the lowest bit corresponds to the bit freeindex.
@@ -1763,6 +1764,10 @@ func (h *mheap) freeSpan(s *mspan) {
 		}
 
 		lock(&h.lock)
+		if s.isImmutable {
+			sysImmutableUnprotectOS(unsafe.Pointer(s.base()), s.npages*pageSize)
+			s.isImmutable = false
+		}
 		if msanenabled {
 			// Tell msan that this entire span is no longer in use.
 			base := unsafe.Pointer(s.base())
@@ -1920,6 +1925,7 @@ func (span *mspan) init(base uintptr, npages uintptr) {
 	span.needzero = 0
 	span.freeindex = 0
 	span.freeIndexForScan = 0
+	span.isImmutable = false
 	span.allocBits = nil
 	span.gcmarkBits = nil
 	span.pinnerBits = nil
