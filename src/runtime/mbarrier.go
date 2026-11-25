@@ -385,6 +385,9 @@ func typedmemclr(typ *_type, ptr unsafe.Pointer) {
 //
 //go:linkname reflect_typedmemclr reflect.typedmemclr
 func reflect_typedmemclr(typ *_type, ptr unsafe.Pointer) {
+	if typ.Size_ > 0 && (raceenabled || msanenabled || asanenabled || !hasImmutablePageProtect) && isImmutableSlicePtr(ptr) {
+		panic(errorString("modification of immutable slice"))
+	}
 	typedmemclr(typ, ptr)
 }
 
@@ -395,6 +398,9 @@ func maps_typedmemclr(typ *_type, ptr unsafe.Pointer) {
 
 //go:linkname reflect_typedmemclrpartial reflect.typedmemclrpartial
 func reflect_typedmemclrpartial(typ *_type, ptr unsafe.Pointer, off, size uintptr) {
+	if size > 0 && (raceenabled || msanenabled || asanenabled || !hasImmutablePageProtect) && isImmutableSlicePtr(ptr) {
+		panic(errorString("modification of immutable slice"))
+	}
 	if writeBarrier.enabled && typ.Pointers() {
 		// Pass nil for the type. ptr does not point to value of type typ,
 		// but rather points into one so it's not safe to apply the optimization.

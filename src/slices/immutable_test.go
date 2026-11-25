@@ -134,6 +134,7 @@ func TestToImmutableSliceMutationPanics(t *testing.T) {
 	})
 	mustPanic(t, "string sort", func() { slices.Sort(strs) })
 	mustPanic(t, "string reflect index set", func() { reflect.ValueOf(strs).Index(1).SetString("hacked") })
+	mustPanic(t, "string reflect index setZero", func() { reflect.ValueOf(strs).Index(1).SetZero() })
 	mustPanic(t, "string reflect copy", func() { reflect.Copy(reflect.ValueOf(strs), reflect.ValueOf([]string{"x"})) })
 	mustPanic(t, "string reflect clear", func() { reflect.ValueOf(strs).Clear() })
 
@@ -147,6 +148,16 @@ func TestToImmutableSliceMutationPanics(t *testing.T) {
 }
 
 func TestToImmutableSliceGCAndConcurrency(t *testing.T) {
+	// Repeatedly allocate and drop immutable slices across GC cycles to
+	// exercise span reuse, mprotect unprotection, and sanitizer state.
+	for i := range 16 {
+		tmp := slices.ToImmutable([]int64{int64(i), 2, 3, 4})
+		if tmp[0] != int64(i) {
+			t.Fatalf("tmp[0] = %d, want %d", tmp[0], i)
+		}
+		runtime.GC()
+	}
+
 	type box struct {
 		val string
 	}
@@ -232,4 +243,3 @@ func BenchmarkImmutableSliceRead(b *testing.B) {
 		}
 	})
 }
-

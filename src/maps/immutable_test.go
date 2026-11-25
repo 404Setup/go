@@ -150,9 +150,10 @@ func TestToImmutableMapAllPaths(t *testing.T) {
 		reflect.ValueOf(mslow).SetMapIndex(reflect.ValueOf(bigKey{1, 2, 3}), reflect.ValueOf(bigVal{9}))
 	})
 
-	// Concurrent reads and panicked writes must preserve contents.
+	// Concurrent reads and panicked writes/deletes/clears must preserve contents
+	// and not trigger race detector reports.
 	var wg sync.WaitGroup
-	for range 8 {
+	for range 4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -160,6 +161,29 @@ func TestToImmutableMapAllPaths(t *testing.T) {
 				if v, ok := immStr["a"]; !ok || v != 0 {
 					t.Errorf("unexpected lookup result: %d %v", v, ok)
 				}
+				if v, ok := mslow[bigKey{1, 2, 3}]; !ok || v[0] != 1 {
+					t.Errorf("unexpected slow lookup result: %v %v", v[0], ok)
+				}
+			}
+		}()
+	}
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				func() {
+					defer func() { _ = recover() }()
+					delete(mslow, bigKey{1, 2, 3})
+				}()
+				func() {
+					defer func() { _ = recover() }()
+					clear(mslow)
+				}()
+				func() {
+					defer func() { _ = recover() }()
+					delete(immStr, "a")
+				}()
 			}
 		}()
 	}
@@ -223,4 +247,3 @@ func BenchmarkImmutableMapLookup(b *testing.B) {
 		}
 	})
 }
-

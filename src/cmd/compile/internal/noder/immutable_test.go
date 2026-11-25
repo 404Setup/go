@@ -83,8 +83,21 @@ type User struct {
 	Name string
 }
 
+type Inner struct {
+	X int
+}
+
+func (in *Inner) Set(v int) { in.X = v }
+
+type OuterPtr struct {
+	*Inner
+}
+
 //go:immutable
 var userPtrs = []*User{{Name: "alice"}}
+
+//go:immutable
+var outerPtrs = []OuterPtr{{Inner: &Inner{X: 1}}}
 
 //go:immutable
 var matrix = [][]int{{1, 2}, {3, 4}}
@@ -114,6 +127,15 @@ func genericImmutable[T comparable](a, b T) []T {
 		panic("generic local slice not immutable")
 	}
 	return s
+}
+
+func genericImmutableMap[K comparable, V any](k K, v V) map[K]V {
+	//go:immutable
+	m := map[K]V{k: v}
+	if !maps.IsImmutable(m) {
+		panic("generic local map not immutable")
+	}
+	return m
 }
 
 func main() {
@@ -147,10 +169,15 @@ func main() {
 		panic("append from immutable misbehaved")
 	}
 
-	// Allowed non-collection-backing writes: pointer element target & inner slice.
+	// Allowed non-collection-backing writes: pointer element target, embedded pointer, & inner slice.
 	userPtrs[0].Name = "bob"
 	if userPtrs[0].Name != "bob" {
 		panic("userPtrs target update failed")
+	}
+	outerPtrs[0].X = 7
+	outerPtrs[0].Set(9)
+	if outerPtrs[0].X != 9 {
+		panic("outerPtrs embedded pointer update failed")
 	}
 	matrix[0][1] = 99
 	if matrix[0][1] != 99 {
@@ -163,26 +190,32 @@ func main() {
 	mustPanic("alias map", func() { mutateMap(immdef.Codes) })
 	mustPanic("delete map", func() { deleteMap(immdef.Codes) })
 	mustPanic("reflect slice", func() { reflect.ValueOf(immdef.Allowed).Index(0).SetString("hacked") })
+	mustPanic("reflect slice SetZero", func() { reflect.ValueOf(immdef.Allowed).Index(0).SetZero() })
 	mustPanic("reflect map", func() { reflect.ValueOf(immdef.Codes).SetMapIndex(reflect.ValueOf("ok"), reflect.ValueOf(1)) })
 
 	// Local //go:immutable var & :=
 	//go:immutable
 	localS := []string{"a", "b"}
 	//go:immutable
+	var localVarS = []string{"c", "d"}
+	//go:immutable
 	var localM = map[string]int{"x": 1}
 	//go:immutable
 	pairA, pairB := []int64{1, 2}, map[int]string{1: "one"}
 
-	if !slices.IsImmutable(localS) || !maps.IsImmutable(localM) || !slices.IsImmutable(pairA) || !maps.IsImmutable(pairB) {
+	if !slices.IsImmutable(localS) || !slices.IsImmutable(localVarS) || !maps.IsImmutable(localM) || !slices.IsImmutable(pairA) || !maps.IsImmutable(pairB) {
 		panic("local //go:immutable not runtime-frozen")
 	}
 	mustPanic("local slice via fn", func() { mutateSlice(localS) })
+	mustPanic("local var slice via fn", func() { mutateSlice(localVarS) })
 	mustPanic("local map via fn", func() { mutateMap(localM) })
 	mustPanic("local pair slice via fn", func() { mutateInts(pairA) })
 
 	// Generic local //go:immutable
 	gs := genericImmutable("hello", "world")
 	mustPanic("generic local slice", func() { gs[0] = "hacked" })
+	gm := genericImmutableMap("k", 42)
+	mustPanic("generic local map", func() { gm["k"] = 99 })
 
 	fmt.Println("PASS")
 }
@@ -542,6 +575,56 @@ func main() { _ = &def.S[0] }
 `,
 			},
 			wantErr: "cannot take address of //go:immutable variable S",
+		},
+		{
+			name: "slice_nested_array",
+			files: map[string]string{
+				"main.go": `package main
+//go:immutable
+var a = [2][3]int{{1, 2, 3}, {4, 5, 6}}
+func main() { _ = a[0][:] }
+`,
+			},
+			wantErr: "cannot slice //go:immutable variable a",
+		},
+		{
+			name: "slice_struct_array_field",
+			files: map[string]string{
+				"main.go": `package main
+type Box struct { Arr [3]int }
+//go:immutable
+var boxes = []Box{{Arr: [3]int{1, 2, 3}}}
+func main() { _ = boxes[0].Arr[:] }
+`,
+			},
+			wantErr: "cannot slice //go:immutable variable boxes",
+		},
+		{
+			name: "embedded_value_field_write",
+			files: map[string]string{
+				"main.go": `package main
+type Inner struct { X int }
+type Outer struct { Inner }
+//go:immutable
+var list = []Outer{{Inner: Inner{X: 1}}}
+func main() { list[0].X = 2 }
+`,
+			},
+			wantErr: "cannot assign to //go:immutable variable list",
+		},
+		{
+			name: "embedded_value_ptr_method",
+			files: map[string]string{
+				"main.go": `package main
+type Inner struct { X int }
+func (in *Inner) Set(v int) { in.X = v }
+type Outer struct { Inner }
+//go:immutable
+var list = []Outer{{Inner: Inner{X: 1}}}
+func main() { list[0].Set(2) }
+`,
+			},
+			wantErr: "cannot call pointer-receiver method on //go:immutable variable list",
 		},
 	}
 

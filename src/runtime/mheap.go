@@ -1088,6 +1088,14 @@ func (s spanAllocType) manual() bool {
 // Returns a span that has been fully initialized. span.needzero indicates
 // whether the span has been zeroed. Note that it may not be.
 func (h *mheap) alloc(npages uintptr, spanclass spanClass) *mspan {
+	return h.allocWithAlign(npages, spanclass, false)
+}
+
+func (h *mheap) allocAligned(npages uintptr, spanclass spanClass) *mspan {
+	return h.allocWithAlign(npages, spanclass, true)
+}
+
+func (h *mheap) allocWithAlign(npages uintptr, spanclass spanClass, physAlign bool) *mspan {
 	// Don't do any operations that lock the heap on the G stack.
 	// It might trigger stack growth, and the stack growth code needs
 	// to be able to allocate heap.
@@ -1098,13 +1106,13 @@ func (h *mheap) alloc(npages uintptr, spanclass spanClass) *mspan {
 		if !isSweepDone() {
 			h.reclaim(npages)
 		}
-		s = h.allocSpan(npages, spanAllocHeap, spanclass)
+		s = h.allocSpanAligned(npages, spanAllocHeap, spanclass, physAlign)
 		for s == nil && h.reclaimIndex.Load() < 1<<63 {
 			h.reclaimBeforeGrow(npages)
-			s = h.allocSpan(npages, spanAllocHeap, spanclass)
+			s = h.allocSpanAligned(npages, spanAllocHeap, spanclass, physAlign)
 		}
 		if s == nil {
-			s = h.allocSpan(npages, spanAllocHeap, spanclass)
+			s = h.allocSpanAligned(npages, spanAllocHeap, spanclass, physAlign)
 		}
 	})
 	return s
@@ -1325,19 +1333,24 @@ func (h *mheap) freeMSpanLocked(s *mspan) {
 //
 //go:systemstack
 func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass) (s *mspan) {
+	return h.allocSpanAligned(npages, typ, spanclass, physPageAlignedStacks && typ == spanAllocStack && pageSize < physPageSize)
+}
+
+//go:systemstack
+func (h *mheap) allocSpanAligned(npages uintptr, typ spanAllocType, spanclass spanClass, physAlign bool) (s *mspan) {
 	// Function-global state.
 	gp := getg()
 	base, scav := uintptr(0), uintptr(0)
 	growth := uintptr(0)
 
-	// On some platforms we need to provide physical page aligned stack
+	// On some platforms we need to provide physical page aligned
 	// allocations. Where the page size is less than the physical page
 	// size, we already manage to do this by default.
-	needPhysPageAlign := physPageAlignedStacks && typ == spanAllocStack && pageSize < physPageSize
+	needPhysPageAlign := physAlign && pageSize < physPageSize
 
 	// If the allocation is small enough, try the page cache!
 	// The page cache does not support aligned allocations, so we cannot use
-	// it if we need to provide a physical page aligned stack allocation.
+	// it if we need to provide a physical page aligned allocation.
 	pp := gp.m.p.ptr()
 	if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
 		c := &pp.pcache
@@ -1379,6 +1392,10 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 		// just come with a performance cost.
 		base, _ = h.pages.find(npages + extraPages)
 		if base == 0 {
+			if !typ.manual() && h.reclaimIndex.Load() < 1<<63 {
+				unlock(&h.lock)
+				return nil
+			}
 			var ok bool
 			growth, ok = h.grow(npages + extraPages)
 			if !ok {

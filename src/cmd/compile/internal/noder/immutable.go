@@ -133,7 +133,7 @@ func (c *immutableChecker) Visit(n syntax.Node) syntax.Visitor {
 				if recv := fn.Signature().Recv(); recv != nil {
 					if _, recvIsPtr := types2.Unalias(recv.Type()).Underlying().(*types2.Pointer); recvIsPtr {
 						if xt := pw.info.TypeOf(n.X); xt != nil {
-							if _, xIsPtr := types2.Unalias(xt).Underlying().(*types2.Pointer); !xIsPtr {
+							if _, xIsPtr := types2.Unalias(xt).Underlying().(*types2.Pointer); !xIsPtr && !selectionTraversesPtr(xt, sel.Index()) {
 								c.checkMutationExpr(n.X, "call pointer-receiver method on")
 							}
 						}
@@ -148,6 +148,12 @@ func (c *immutableChecker) Visit(n syntax.Node) syntax.Visitor {
 				if !(c.inInit && obj.Parent() == pw.curpkg.Scope()) {
 					pw.errorf(n, "cannot slice //go:immutable array %s", obj.Name())
 				}
+				break
+			}
+		}
+		if xt := pw.info.TypeOf(n.X); xt != nil {
+			if _, isArr := types2.Unalias(xt).Underlying().(*types2.Array); isArr {
+				c.checkMutationExpr(n.X, "slice")
 			}
 		}
 
@@ -179,6 +185,28 @@ func (c *immutableChecker) Visit(n syntax.Node) syntax.Visitor {
 	}
 
 	return c
+}
+
+func selectionTraversesPtr(xt types2.Type, indices []int) bool {
+	if len(indices) <= 1 || xt == nil {
+		return false
+	}
+	cur := types2.Unalias(xt).Underlying()
+	if _, isPtr := cur.(*types2.Pointer); isPtr {
+		return true
+	}
+	for _, idx := range indices[:len(indices)-1] {
+		st, ok := cur.(*types2.Struct)
+		if !ok || idx < 0 || idx >= st.NumFields() {
+			return false
+		}
+		ft := types2.Unalias(st.Field(idx).Type()).Underlying()
+		if _, isPtr := ft.(*types2.Pointer); isPtr {
+			return true
+		}
+		cur = ft
+	}
+	return false
 }
 
 func (c *immutableChecker) checkMutationExpr(expr syntax.Expr, verb string) {
@@ -232,7 +260,8 @@ func (pw *pkgWriter) immutableRootVar(e syntax.Expr) (*types2.Var, bool) {
 			}
 			return nil, false
 		case *syntax.SelectorExpr:
-			if pw.info.Selections[n] == nil {
+			sel := pw.info.Selections[n]
+			if sel == nil {
 				if obj, ok := pw.info.Uses[n.Sel].(*types2.Var); ok && pw.isImmutableVar(obj) {
 					return obj, true
 				}
@@ -243,6 +272,9 @@ func (pw *pkgWriter) immutableRootVar(e syntax.Expr) (*types2.Var, bool) {
 				return nil, false
 			}
 			if _, isPtr := types2.Unalias(xt).Underlying().(*types2.Pointer); isPtr {
+				return nil, false
+			}
+			if selectionTraversesPtr(xt, sel.Index()) {
 				return nil, false
 			}
 			cur = n.X

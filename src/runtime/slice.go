@@ -478,7 +478,7 @@ func makeImmutableSlice(et *_type, from unsafe.Pointer, n int) unsafe.Pointer {
 	if overflow || mem > maxAlloc {
 		panicmakeslicelen()
 	}
-	x, _ := mallocgcLarge(mem, et, true)
+	x := mallocgcLargeImmutable(mem, et)
 	if raceenabled {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(makeImmutableSlice)
@@ -490,26 +490,24 @@ func makeImmutableSlice(et *_type, from unsafe.Pointer, n int) unsafe.Pointer {
 	if asanenabled {
 		asanread(from, mem)
 	}
-	if et.Pointers() {
-		bulkBarrierPreWriteSrcOnly(uintptr(x), uintptr(from), mem, et)
+	if writeBarrier.enabled && et.Pointers() {
+		bulkBarrierPreWriteSrcOnly(uintptr(x), uintptr(from), mem-et.Size_+et.PtrBytes, et)
 	}
 	memmove(x, from, mem)
 	publicationBarrier()
 
 	span := spanOf(uintptr(x))
-	span.isImmutable = true
-	publicationBarrier()
-
 	if hasImmutablePageProtect {
 		nbytes := span.npages * pageSize
 		if !sysImmutableProtectOS(x, nbytes) {
 			GC()
 			if !sysImmutableProtectOS(x, nbytes) {
-				span.isImmutable = false
 				panic(errorString("failed to protect immutable slice"))
 			}
 		}
 	}
+	span.isImmutable = true
+	publicationBarrier()
 	return x
 }
 

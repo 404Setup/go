@@ -163,12 +163,18 @@ func sysFaultOS(v unsafe.Pointer, n uintptr) {
 const hasImmutablePageProtect = true
 
 func sysImmutableProtectOS(v unsafe.Pointer, n uintptr) bool {
+	if uintptr(v)&(physPageSize-1) != 0 || n&(physPageSize-1) != 0 {
+		return false
+	}
 	_, err := mprotect(v, n, _PROT_READ)
 	return err == 0
 }
 
 //go:nosplit
 func sysImmutableUnprotectOS(v unsafe.Pointer, n uintptr) {
+	if uintptr(v)&(physPageSize-1) != 0 || n&(physPageSize-1) != 0 {
+		throw("runtime: unaligned immutable span")
+	}
 	_, err := mprotect(v, n, _PROT_READ|_PROT_WRITE)
 	if err != 0 {
 		print("runtime: mprotect(", v, ", ", n, ") returned ", err, "\n")

@@ -126,6 +126,9 @@ func mapassign(t *abi.MapType, m *maps.Map, key unsafe.Pointer) unsafe.Pointer
 //
 //go:linkname mapdelete
 func mapdelete(t *abi.MapType, m *maps.Map, key unsafe.Pointer) {
+	if m != nil && m.IsImmutable() {
+		panic(maps_errImmutableMap)
+	}
 	if raceenabled && m != nil {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(mapdelete)
@@ -169,6 +172,9 @@ func mapIterNext(it *maps.Iter) {
 
 // mapclear deletes all keys from a map.
 func mapclear(t *abi.MapType, m *maps.Map) {
+	if m != nil && m.IsImmutable() {
+		panic(maps_errImmutableMap)
+	}
 	if raceenabled && m != nil {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(mapclear)
@@ -345,6 +351,10 @@ func mapimmutable(m any) any {
 	e := efaceOf(&m)
 	typ := (*abi.MapType)(unsafe.Pointer(e._type))
 	map_ := (*maps.Map)(e.data)
+	if raceenabled && map_ != nil {
+		callerpc := sys.GetCallerPC()
+		racereadpc(unsafe.Pointer(map_), callerpc, abi.FuncPCABIInternal(mapimmutable))
+	}
 	if map_ == nil || map_.IsImmutable() {
 		return m
 	}
@@ -360,6 +370,10 @@ func mapimmutable(m any) any {
 func mapisImmutable(m any) bool {
 	e := efaceOf(&m)
 	map_ := (*maps.Map)(e.data)
+	if raceenabled && map_ != nil {
+		callerpc := sys.GetCallerPC()
+		racereadpc(unsafe.Pointer(map_), callerpc, abi.FuncPCABIInternal(mapisImmutable))
+	}
 	return map_.IsImmutable()
 }
 

@@ -532,12 +532,6 @@ func Repeat[S ~[]E, E any](x S, count int) S {
 	return newslice
 }
 
-type sliceHeader struct {
-	data unsafe.Pointer
-	len  int
-	cap  int
-}
-
 //go:linkname makeImmutableSlice slices.makeImmutableSlice
 func makeImmutableSlice(et *abi.Type, from unsafe.Pointer, n int) unsafe.Pointer
 
@@ -553,18 +547,13 @@ func ToImmutable[S ~[]E, E any](s S) S {
 	if s == nil {
 		return nil
 	}
-	sh := (*sliceHeader)(unsafe.Pointer(&s))
-	if len(s) > 0 && isImmutableSlicePtr(sh.data) {
+	data := unsafe.Pointer(unsafe.SliceData(s))
+	if len(s) > 0 && isImmutableSlicePtr(data) {
 		return s[:len(s):len(s)]
 	}
-	p := makeImmutableSlice(abi.TypeFor[E](), sh.data, len(s))
+	p := makeImmutableSlice(abi.TypeFor[E](), data, len(s))
 	runtime.KeepAlive(s)
-	var out S
-	outH := (*sliceHeader)(unsafe.Pointer(&out))
-	outH.data = p
-	outH.len = len(s)
-	outH.cap = len(s)
-	return out
+	return S(unsafe.Slice((*E)(p), len(s)))
 }
 
 // IsImmutable reports whether s is backed by immutable storage.
@@ -573,6 +562,5 @@ func IsImmutable[S ~[]E, E any](s S) bool {
 	if s == nil {
 		return false
 	}
-	sh := (*sliceHeader)(unsafe.Pointer(&s))
-	return isImmutableSlicePtr(sh.data)
+	return isImmutableSlicePtr(unsafe.Pointer(unsafe.SliceData(s)))
 }
