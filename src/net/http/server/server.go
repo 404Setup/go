@@ -686,6 +686,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						releaseContext(c)
 						return
 					}
+					if pc.n > 0 {
+						pc.rollback(0)
+					}
 					releaseContext(c)
 				}
 			}
@@ -734,6 +737,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					releaseContext(c)
 					return
 				}
+				if pc.n > 0 {
+					pc.rollback(0)
+				}
 				releaseContext(c)
 			}
 		}
@@ -764,6 +770,9 @@ func (s *Server) tryServeUnescapedAny(snap *routerSnapshot, w http.ResponseWrite
 		}
 		releaseContext(c)
 		return true
+	}
+	if pc.n > 0 {
+		pc.rollback(0)
 	}
 	releaseContext(c)
 	return false
@@ -820,6 +829,9 @@ func (s *Server) serveSlow(snap *routerSnapshot, w http.ResponseWriter, r *http.
 			}
 			releaseContext(c)
 			return
+		}
+		if pc.n > 0 {
+			pc.rollback(0)
 		}
 	}
 

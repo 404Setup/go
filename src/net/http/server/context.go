@@ -966,13 +966,31 @@ func (c *Context) effectiveMaxBodyBytes() int64 {
 	return defaultMaxBodyBytes
 }
 
+// maxBytesTarget unwraps c.ResponseWriter() to the innermost writer so
+// http.MaxBytesReader can invoke net/http's unexported requestTooLarge hook
+// even when wrapped by responseWriter, compressResponseWriter, or middleware.
+func (c *Context) maxBytesTarget() http.ResponseWriter {
+	w := c.ResponseWriter()
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return w
+		}
+		next := u.Unwrap()
+		if next == nil {
+			return w
+		}
+		w = next
+	}
+}
+
 // markRequestTooLarge notifies the underlying net/http server to close the
 // connection after an oversized request body, matching http.MaxBytesReader.
 func (c *Context) markRequestTooLarge() {
 	if c.req.Body == nil || c.req.Body == http.NoBody {
 		return
 	}
-	mbr := http.MaxBytesReader(c.ResponseWriter(), c.req.Body, 0)
+	mbr := http.MaxBytesReader(c.maxBytesTarget(), c.req.Body, 0)
 	c.req.Body = mbr
 	c.bodyLimitApplied = 1
 	var b [1]byte
@@ -981,7 +999,7 @@ func (c *Context) markRequestTooLarge() {
 
 func (c *Context) wrapBodyLimit(limit int64) {
 	if limit > 0 && (c.bodyLimitApplied == 0 || limit < c.bodyLimitApplied) && c.req.Body != nil && c.req.Body != http.NoBody {
-		c.req.Body = http.MaxBytesReader(c.ResponseWriter(), c.req.Body, limit)
+		c.req.Body = http.MaxBytesReader(c.maxBytesTarget(), c.req.Body, limit)
 		c.bodyLimitApplied = limit
 	}
 }
@@ -1004,7 +1022,7 @@ func (c *Context) readBodyInto(jrb *jsonReadBuf, limit int64) error {
 	}
 
 	var err error
-	if limit > 0 {
+	if limit > 0 && limit < 1<<63-1 {
 		jrb.lr.R = c.req.Body
 		jrb.lr.N = limit + 1
 		_, err = jrb.buf.ReadFrom(&jrb.lr)

@@ -531,3 +531,30 @@ func TestMiddlewareCompressETagWeakeningNoTransformAndStrictQValue(t *testing.T)
 		}
 	}
 }
+
+func TestCompressExplicitNilContentType(t *testing.T) {
+	s := server.New()
+	s.Use(server.CompressWithConfig(server.CompressConfig{MinLength: 16}))
+	large := strings.Repeat("<html><body>hello</body></html>", 10)
+
+	s.GET("/write-bytes", func(c *server.Context) error {
+		c.ResponseWriter().Header()["Content-Type"] = nil
+		_, err := c.ResponseWriter().Write([]byte(large))
+		return err
+	})
+	s.GET("/write-string", func(c *server.Context) error {
+		c.ResponseWriter().Header()["Content-Type"] = nil
+		_, err := io.WriteString(c.ResponseWriter(), large)
+		return err
+	})
+
+	for _, path := range []string{"/write-bytes", "/write-string"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if vals, ok := rec.Header()["Content-Type"]; !ok || len(vals) != 0 {
+			t.Fatalf("%s: expected Content-Type key present with nil/empty slice, got ok=%v vals=%v", path, ok, vals)
+		}
+	}
+}

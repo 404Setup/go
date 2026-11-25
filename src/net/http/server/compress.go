@@ -303,7 +303,7 @@ func (w *compressResponseWriter) Write(p []byte) (int, error) {
 	// Sniff Content-Type from up to 512 bytes of uncompressed data before
 	// deciding to compress.
 	h := w.rw.Header()
-	if len(h["Content-Type"]) == 0 {
+	if _, hasCT := h["Content-Type"]; !hasCT {
 		var sample []byte
 		if len(w.buf) == 0 {
 			sample = p
@@ -371,7 +371,7 @@ func (w *compressResponseWriter) WriteString(s string) (int, error) {
 	}
 
 	h := w.rw.Header()
-	if len(h["Content-Type"]) == 0 {
+	if _, hasCT := h["Content-Type"]; !hasCT {
 		var sniffBuf [512]byte
 		n := copy(sniffBuf[:], w.buf)
 		if n < len(sniffBuf) {

@@ -561,6 +561,9 @@ func (pc *paramCapture) pushOverflow(val string) {
 }
 
 func (pc *paramCapture) rollback(mark int) {
+	for i := mark; i < pc.n && i < maxInlineParams; i++ {
+		pc.buf[i] = ""
+	}
 	pc.n = mark
 	if pc.extra != nil {
 		extraLen := mark - maxInlineParams
@@ -568,6 +571,7 @@ func (pc *paramCapture) rollback(mark int) {
 			extraLen = 0
 		}
 		if len(*pc.extra) > extraLen {
+			clear((*pc.extra)[extraLen:])
 			*pc.extra = (*pc.extra)[:extraLen]
 		}
 	}

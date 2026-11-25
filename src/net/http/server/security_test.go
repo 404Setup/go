@@ -719,3 +719,120 @@ func TestSecurityNestedTighterBodyLimitAndEncodedPrefixRejection(t *testing.T) {
 		t.Fatalf("custom index encoded dir redirect: status=%d loc=%q", rec.Code, rec.Header().Get("Location"))
 	}
 }
+
+// TestSecurityMaxBytesConnectionCloseAndMaxInt64 verifies that 413 responses
+// triggered via markRequestTooLarge or wrapBodyLimit notify net/http to close
+// keep-alive connections even through responseWriter and compressResponseWriter,
+// and that SetMaxBodyBytes(MaxInt64) does not integer-overflow.
+func TestSecurityMaxBytesConnectionCloseAndMaxInt64(t *testing.T) {
+	s := server.New()
+	s.Use(server.Compress())
+
+	s.POST("/json-small", func(c *server.Context) error {
+		c.SetMaxBodyBytes(16)
+		var v map[string]any
+		if err := c.BindJSON(&v); err != nil {
+			return err
+		}
+		return c.JSON(http.StatusOK, v)
+	})
+	s.POST("/limit-wrap", server.BodyLimit(16), func(c *server.Context) error {
+		_, err := c.BodyBytes()
+		return err
+	})
+	s.POST("/max-int64", func(c *server.Context) error {
+		c.SetMaxBodyBytes(int64(1<<63 - 1))
+		var v struct {
+			OK bool `json:"ok"`
+		}
+		if err := c.BindJSON(&v); err != nil {
+			return err
+		}
+		return c.JSON(http.StatusOK, v)
+	})
+
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	client := ts.Client()
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+		gzip bool
+	}{
+		{"ContentLengthTooLarge", "/json-small", `{"data":"` + strings.Repeat("x", 64) + `"}`, false},
+		{"ContentLengthTooLargeCompressed", "/json-small", `{"data":"` + strings.Repeat("x", 64) + `"}`, true},
+		{"BodyLimitTooLarge", "/limit-wrap", strings.Repeat("y", 64), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, ts.URL+tc.path, strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tc.gzip {
+				req.Header.Set("Accept-Encoding", "gzip")
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413", resp.StatusCode)
+			}
+			if !resp.Close {
+				t.Fatalf("expected Connection: close (resp.Close == true) after 413 with unread body, got resp.Close == false (Header=%v)", resp.Header)
+			}
+		})
+	}
+
+	// Verify SetMaxBodyBytes(math.MaxInt64) does not overflow limit+1 to MinInt64.
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/max-int64", strings.NewReader(`{"ok":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("MaxInt64 BindJSON status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestSecurityMissedRouteParamScrub verifies that partially captured parameters
+// from failed or backtracked route matches are not visible in NotFound handlers
+// or subsequent pooled Context reuse.
+func TestSecurityMissedRouteParamScrub(t *testing.T) {
+	s := server.New()
+	s.NotFound(func(c *server.Context) error {
+		if c.Param("p1") != "" || c.Param("p2") != "" || c.Param("p9") != "" {
+			return c.Text(http.StatusInternalServerError, fmt.Sprintf("leaked param: p1=%q p2=%q p9=%q", c.Param("p1"), c.Param("p2"), c.Param("p9")))
+		}
+		return c.Text(http.StatusNotFound, "not found")
+	})
+
+	s.GET("/a/{p1}/{p2}/leaf", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Param("p1")+":"+c.Param("p2"))
+	})
+	s.GET("/a/{p1}/{p2}/{p3}/{p4}/{p5}/{p6}/{p7}/{p8}/{p9}/deep", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Param("p9"))
+	})
+
+	// Miss after capturing 2 inline params and 9 (>maxInlineParams) params.
+	for _, target := range []string{
+		"/a/secret1/secret2/wrong",
+		"/a/s1/s2/s3/s4/s5/s6/s7/s8/s9/wrong",
+		"/a/s1%20x/s2/wrong",
+	} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%q: status=%d body=%q, want 404", target, rec.Code, rec.Body.String())
+		}
+	}
+}
