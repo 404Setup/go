@@ -53,6 +53,10 @@ func encodeNEON(dst, src *byte, n int, lut *byte)
 //go:noescape
 func decodeNEON(dst, src *byte, n int, lut *byte) int
 
+func dumpLinesSIMD(out, data []byte, offset uint32) int {
+	return 0
+}
+
 func encodeSIMD(dst, src []byte) (si, di int) {
 	n := len(src) &^ 15
 	if n == 0 || hasUnsafeForwardOverlap(dst, src, n*2, n) {

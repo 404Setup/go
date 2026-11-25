@@ -54,6 +54,25 @@ var (
 		}
 		return tab
 	}()
+
+	hexDecLUT4 = func() (lut [4][256]uint32) {
+		for j := range 4 {
+			for i := range 256 {
+				lut[j][i] = 0x80000000
+			}
+		}
+		for i := range 256 {
+			v := reverseHexTable[i]
+			if v <= 0x0f {
+				u := uint32(v)
+				lut[0][i] = u << 4
+				lut[1][i] = u
+				lut[2][i] = u << 12
+				lut[3][i] = u << 8
+			}
+		}
+		return lut
+	}()
 )
 
 // EncodedLen returns the length of an encoding of n source bytes.
@@ -66,14 +85,28 @@ func EncodedLen(n int) int { return n * 2 }
 // Encode implements hexadecimal encoding.
 func Encode(dst, src []byte) int {
 	srcLen := len(src)
-	if srcLen == 0 {
-		return 0
+	if srcLen < 4 {
+		if srcLen == 0 {
+			return 0
+		}
+		dstLen := srcLen * 2
+		_ = dst[dstLen-1]
+		if srcLen >= 2 {
+			v := uint32(hexEncodeLUT16[src[0]]) | uint32(hexEncodeLUT16[src[1]])<<16
+			byteorder.LEPutUint32(dst, v)
+			if srcLen == 3 {
+				byteorder.LEPutUint16(dst[4:], hexEncodeLUT16[src[2]])
+			}
+			return dstLen
+		}
+		byteorder.LEPutUint16(dst, hexEncodeLUT16[src[0]])
+		return 2
 	}
 	dstLen := srcLen * 2
 	_ = dst[dstLen-1] // Early bounds check; guarantees safety of writes below.
 
 	src, dst = src[:srcLen:srcLen], dst[:dstLen:dstLen]
-	if srcLen >= minSIMDEncode && haveSIMD {
+	if srcLen >= 16 && haveSIMD && srcLen >= minSIMDEncode {
 		si, di := encodeSIMD(dst, src)
 		src = src[si:]
 		dst = dst[di:]
@@ -136,50 +169,42 @@ func DecodedLen(x int) int { return x / 2 }
 // If the input is malformed, Decode returns the number
 // of bytes decoded before the error.
 func Decode(dst, src []byte) (int, error) {
-	if len(src) == 0 {
-		return 0, nil
-	}
-
-	di := 0
-	if haveSIMD && len(src) >= minSIMDDecode && len(dst) >= minSIMDDecodeOut {
-		var si int
-		si, di = decodeSIMD(dst, src)
+	origDstLen := len(dst)
+	if len(src) >= 16 && haveSIMD && len(src) >= minSIMDDecode && len(dst) >= minSIMDDecodeOut {
+		si, di := decodeSIMD(dst, src)
+		if si == len(src) {
+			return di, nil
+		}
 		src = src[si:]
 		dst = dst[di:]
 	}
 
-	// Process 8 source bytes (4 output bytes) at a time with coalesced validation.
+	t0, t1, t2, t3 := &hexDecLUT4[0], &hexDecLUT4[1], &hexDecLUT4[2], &hexDecLUT4[3]
 	for len(src) >= 8 {
 		_ = dst[3] // Eliminate bounds checks.
-		a0, b0 := reverseHexTable[src[0]], reverseHexTable[src[1]]
-		a1, b1 := reverseHexTable[src[2]], reverseHexTable[src[3]]
-		a2, b2 := reverseHexTable[src[4]], reverseHexTable[src[5]]
-		a3, b3 := reverseHexTable[src[6]], reverseHexTable[src[7]]
-		if (a0 | b0 | a1 | b1 | a2 | b2 | a3 | b3) > 0x0f {
+		v0 := t0[src[0]] | t1[src[1]] | t2[src[2]] | t3[src[3]]
+		v1 := t0[src[4]] | t1[src[5]] | t2[src[6]] | t3[src[7]]
+		if (v0|v1)&0x80000000 != 0 {
 			break
 		}
-		v := uint32((a0<<4)|b0) |
-			uint32((a1<<4)|b1)<<8 |
-			uint32((a2<<4)|b2)<<16 |
-			uint32((a3<<4)|b3)<<24
-		byteorder.LEPutUint32(dst, v)
+		byteorder.LEPutUint32(dst, v0|(v1<<16))
 		src = src[8:]
 		dst = dst[4:]
-		di += 4
 	}
 
-	// Process the rest (and locate the exact invalid byte if the 8-byte loop stopped early).
+	// Process the rest.
+	var p, q, a, b byte
 	i, j := 0, 0
 	for ; j < len(src)-1; j += 2 {
-		p := src[j]
-		q := src[j+1]
-		a := reverseHexTable[p]
-		b := reverseHexTable[q]
+		p = src[j]
+		q = src[j+1]
+		a = reverseHexTable[p]
+		b = reverseHexTable[q]
 		if a > 0x0f {
-			return di + i, InvalidByteError(p)
+			return origDstLen - len(dst) + i, InvalidByteError(p)
 		}
 		if b > 0x0f {
-			return di + i, InvalidByteError(q)
+			return origDstLen - len(dst) + i, InvalidByteError(q)
 		}
 		dst[i] = (a << 4) | b
 		i++
@@ -187,14 +212,14 @@ func Decode(dst, src []byte) (int, error) {
 	if j == len(src)-1 { // true if and only if len(src)%2 == 1
 		// Check for invalid char before reporting bad length,
 		// since the invalid char (if present) is an earlier problem.
-		p := src[j]
+		p = src[j]
 		if reverseHexTable[p] > 0x0f {
-			return di + i, InvalidByteError(p)
+			return origDstLen - len(dst) + i, InvalidByteError(p)
 		}
-		return di + i, ErrLength
+		return origDstLen - len(dst) + i, ErrLength
 	}
 
-	return di + i, nil
+	return origDstLen - len(dst) + i, nil
 }
 
 // AppendDecode appends the hexadecimally decoded src to dst
@@ -207,35 +232,20 @@ func AppendDecode(dst, src []byte) ([]byte, error) {
 	return dst[:len(dst)+n], err
 }
 
-type encodeToStringState struct {
-	buf [64]byte
-	s   string
-}
-
 // EncodeToString returns the hexadecimal encoding of src.
 func EncodeToString(src []byte) string {
 	if len(src) == 0 {
 		return ""
 	}
-	// Kept small so that it is inlined and a short
-	// result can stay on the caller's stack.
-	var st encodeToStringState
-	if b := encodeBuf(&st, src); b != nil {
-		return string(b)
+	if len(src) <= 7 {
+		var buf [14]byte
+		n := Encode(buf[:], src)
+		return string(buf[:n])
 	}
-	return st.s
-}
-
-func encodeBuf(st *encodeToStringState, src []byte) []byte {
 	n := EncodedLen(len(src))
-	if n <= len(st.buf) {
-		Encode(st.buf[:n], src)
-		return st.buf[:n]
-	}
 	b := bytealg.MakeNoZero(n)
 	Encode(b, src)
-	st.s = unsafe.String(unsafe.SliceData(b), n)
-	return nil
+	return unsafe.String(unsafe.SliceData(b), n)
 }
 
 // DecodeString returns the bytes represented by the hexadecimal string s.
@@ -250,42 +260,62 @@ func DecodeString(s string) ([]byte, error) {
 	return dst[:n], err
 }
 
-const spaces48 = "                                                "
+const spaces50 = "                                                  "
 
 func formatDumpLine(line *[79]byte, offset uint32, chunk []byte) int {
-	byteorder.LEPutUint16(line[0:2], hexEncodeLUT16[byte(offset>>24)])
-	byteorder.LEPutUint16(line[2:4], hexEncodeLUT16[byte(offset>>16)])
-	byteorder.LEPutUint16(line[4:6], hexEncodeLUT16[byte(offset>>8)])
-	byteorder.LEPutUint16(line[6:8], hexEncodeLUT16[byte(offset)])
-	line[8] = ' '
-	line[9] = ' '
+	o := uint64(hexEncodeLUT16[byte(offset>>24)]) |
+		uint64(hexEncodeLUT16[byte(offset>>16)])<<16 |
+		uint64(hexEncodeLUT16[byte(offset>>8)])<<32 |
+		uint64(hexEncodeLUT16[byte(offset)])<<48
+	byteorder.LEPutUint64(line[0:8], o)
+	byteorder.LEPutUint16(line[8:10], 0x2020)
 
-	pos := 10
 	if len(chunk) == 16 {
 		_ = chunk[15]
-		for i := range 8 {
-			byteorder.LEPutUint16(line[pos:pos+2], hexEncodeLUT16[chunk[i]])
-			line[pos+2] = ' '
-			pos += 3
-		}
-		line[pos] = ' '
-		pos++
-		for i := 8; i < 16; i++ {
-			byteorder.LEPutUint16(line[pos:pos+2], hexEncodeLUT16[chunk[i]])
-			line[pos+2] = ' '
-			pos += 3
-		}
-		line[pos] = ' '
-		line[pos+1] = '|'
-		pos += 2
+		byteorder.LEPutUint64(line[10:18],
+			uint64(hexEncodeLUT16[chunk[0]])|
+				uint64(' ')<<16|
+				uint64(hexEncodeLUT16[chunk[1]])<<24|
+				uint64(' ')<<40|
+				uint64(hexEncodeLUT16[chunk[2]])<<48)
+		byteorder.LEPutUint32(line[18:22],
+			uint32(' ')|uint32(hexEncodeLUT16[chunk[3]])<<8|uint32(' ')<<24)
+		byteorder.LEPutUint64(line[22:30],
+			uint64(hexEncodeLUT16[chunk[4]])|
+				uint64(' ')<<16|
+				uint64(hexEncodeLUT16[chunk[5]])<<24|
+				uint64(' ')<<40|
+				uint64(hexEncodeLUT16[chunk[6]])<<48)
+		byteorder.LEPutUint32(line[30:34],
+			uint32(' ')|uint32(hexEncodeLUT16[chunk[7]])<<8|uint32(' ')<<24)
+		line[34] = ' '
+
+		byteorder.LEPutUint64(line[35:43],
+			uint64(hexEncodeLUT16[chunk[8]])|
+				uint64(' ')<<16|
+				uint64(hexEncodeLUT16[chunk[9]])<<24|
+				uint64(' ')<<40|
+				uint64(hexEncodeLUT16[chunk[10]])<<48)
+		byteorder.LEPutUint32(line[43:47],
+			uint32(' ')|uint32(hexEncodeLUT16[chunk[11]])<<8|uint32(' ')<<24)
+		byteorder.LEPutUint64(line[47:55],
+			uint64(hexEncodeLUT16[chunk[12]])|
+				uint64(' ')<<16|
+				uint64(hexEncodeLUT16[chunk[13]])<<24|
+				uint64(' ')<<40|
+				uint64(hexEncodeLUT16[chunk[14]])<<48)
+		byteorder.LEPutUint32(line[55:59],
+			uint32(' ')|uint32(hexEncodeLUT16[chunk[15]])<<8|uint32(' ')<<24)
+
+		byteorder.LEPutUint16(line[59:61], 0x7c20)
 		for i := range 16 {
-			line[pos+i] = dumpCharTable[chunk[i]]
+			line[61+i] = dumpCharTable[chunk[i]]
 		}
-		line[pos+16] = '|'
-		line[pos+17] = '\n'
+		byteorder.LEPutUint16(line[77:79], 0x0a7c)
 		return 79
 	}
 
+	pos := 10
 	for i := range len(chunk) {
 		byteorder.LEPutUint16(line[pos:pos+2], hexEncodeLUT16[chunk[i]])
 		line[pos+2] = ' '
@@ -297,7 +327,7 @@ func formatDumpLine(line *[79]byte, offset uint32, chunk []byte) int {
 	}
 	const hexAreaEnd = 60 // 10 + 8*3 + 1 + 8*3 + 1
 	if pos < hexAreaEnd {
-		copy(line[pos:hexAreaEnd], spaces48)
+		copy(line[pos:hexAreaEnd], spaces50)
 	}
 	line[hexAreaEnd] = '|'
 	pos = hexAreaEnd + 1
@@ -320,6 +350,13 @@ func dumpSmall(data []byte, totalLen int) string {
 func fillDump(out, data []byte) {
 	pos := 0
 	var offset uint32
+	if haveSIMD && len(data) >= 32 {
+		if lines := dumpLinesSIMD(out, data, 0); lines > 0 {
+			pos = lines * 79
+			offset = uint32(lines * 16)
+			data = data[lines*16:]
+		}
+	}
 	for len(data) >= 16 {
 		formatDumpLine((*[79]byte)(out[pos:pos+79]), offset, data[:16])
 		pos += 79

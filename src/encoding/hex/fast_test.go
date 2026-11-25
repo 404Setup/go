@@ -399,16 +399,296 @@ func TestFastAllocations(t *testing.T) {
 	}); allocs != 1 {
 		t.Errorf("Dump(1024) allocs = %v, want 1", allocs)
 	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		_ = EncodeToString(nil)
+	}); allocs != 0 {
+		t.Errorf("EncodeToString(nil) allocs = %v, want 0", allocs)
+	}
 }
 
+func refDump(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for off := 0; off < len(data); off += 16 {
+		end := min(off+16, len(data))
+		chunk := data[off:end]
+		fmt.Fprintf(&sb, "%08x  ", uint32(off))
+		for i := range 16 {
+			if i < len(chunk) {
+				fmt.Fprintf(&sb, "%02x ", chunk[i])
+			} else {
+				sb.WriteString("   ")
+			}
+			if i == 7 {
+				sb.WriteByte(' ')
+			}
+		}
+		sb.WriteString(" |")
+		for _, b := range chunk {
+			if b >= 32 && b <= 126 {
+				sb.WriteByte(b)
+			} else {
+				sb.WriteByte('.')
+			}
+		}
+		sb.WriteString("|\n")
+	}
+	return sb.String()
+}
+
+func TestFastDumpExhaustive(t *testing.T) {
+	// Test lengths spanning stack-buffered, multi-line SIMD, and partial tail lines.
+	lengths := make([]int, 0, 80)
+	for n := 0; n <= 66; n++ {
+		lengths = append(lengths, n)
+	}
+	lengths = append(lengths, 127, 128, 129, 255, 256, 257, 1024)
+	for _, n := range lengths {
+		in := makeDeterministicBytes(n, byte(n))
+		want := refDump(in)
+		if got := Dump(in); got != want {
+			t.Fatalf("Dump(len=%d) mismatch:\ngot:\n%s\nwant:\n%s", n, got, want)
+		}
+	}
+
+	// Exhaustively test all byte values 0x00..0xff across all 16 line positions
+	// in both multi-line SIMD dumps and partial tail lines.
+	var allBytes [256]byte
+	for i := range allBytes {
+		allBytes[i] = byte(i)
+	}
+	if got, want := Dump(allBytes[:]), refDump(allBytes[:]); got != want {
+		t.Fatalf("Dump(0..255) mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	// Boundary ASCII bytes around printable range [0x20, 0x7e] at every offset in a 64-byte dump.
+	boundaries := []byte{0x00, 0x1f, 0x20, 0x21, 0x7d, 0x7e, 0x7f, 0x80, 0xfe, 0xff}
+	for _, b := range boundaries {
+		for pos := range 32 {
+			buf := bytes.Repeat([]byte{'A'}, 48)
+			buf[pos] = b
+			if got, want := Dump(buf), refDump(buf); got != want {
+				t.Fatalf("Dump(boundary=%#x pos=%d) mismatch", b, pos)
+			}
+		}
+	}
+}
+
+func TestFastForwardOverlapAndShortDst(t *testing.T) {
+	// Forward overlap Decode(buf[off:], buf[:n]): hasUnsafeForwardOverlap must
+	// inhibit SIMD batching when dst starts inside (src[0], src[n]).
+	for _, n := range []int{16, 32, 48, 64, 128} {
+		raw := makeDeterministicBytes(n/2, 55)
+		enc := refEncode(raw)
+		for _, off := range []int{1, 2, 3} {
+			buf := make([]byte, len(enc)+off)
+			copy(buf, enc)
+			dn, err := Decode(buf[off:off+n/2], buf[:n])
+			if err != nil || dn != n/2 || !bytes.Equal(buf[off:off+dn], raw) {
+				t.Fatalf("forward-overlap Decode n=%d off=%d failed: dn=%d err=%v", n, off, dn, err)
+			}
+		}
+	}
+
+	// Short dst with early error must return partial count and exact error without panic.
+	dst := make([]byte, 1)
+	n, err := Decode(dst, []byte("00zz"))
+	if n != 1 || !errors.Is(err, InvalidByteError('z')) || dst[0] != 0x00 {
+		t.Fatalf("short dst early error: got (%d, %v, %x)", n, err, dst[0])
+	}
+
+	// Empty DecodeString must return a non-nil empty slice (matching upstream).
+	empty, err := DecodeString("")
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("DecodeString(\"\") = (%#v, %v), want non-nil empty slice", empty, err)
+	}
+}
+
+type errAfterReader struct {
+	chunks [][]byte
+	errs   []error
+	idx    int
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if r.idx >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.idx])
+	err := r.errs[r.idx]
+	if n == len(r.chunks[r.idx]) {
+		r.idx++
+	} else {
+		r.chunks[r.idx] = r.chunks[r.idx][n:]
+		err = nil
+	}
+	return n, err
+}
+
+func TestFastDecoderEdgeCases(t *testing.T) {
+	raw := makeDeterministicBytes(600, 77)
+	encoded := refEncode(raw)
+
+	// One-byte reader with large (2048) and small (7) Read buffers.
+	for _, bufSize := range []int{7, 2048} {
+		dec := NewDecoder(&chunkedReader{data: encoded, step: 1})
+		buf := make([]byte, bufSize)
+		var out []byte
+		for {
+			n, err := dec.Read(buf)
+			out = append(out, buf[:n]...)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("OneByteReader buf=%d err=%v", bufSize, err)
+			}
+		}
+		if !bytes.Equal(out, raw) {
+			t.Fatalf("OneByteReader buf=%d mismatch", bufSize)
+		}
+	}
+
+	// Non-EOF error paired with odd byte count on large Read buffer, then repeated Read.
+	sentinelErr := errors.New("read interrupted")
+	r := &errAfterReader{
+		chunks: [][]byte{[]byte("41424")},
+		errs:   []error{sentinelErr},
+	}
+	dec := NewDecoder(r)
+	big := make([]byte, 2048)
+	n, err := dec.Read(big)
+	if n != 2 || !errors.Is(err, sentinelErr) || string(big[:n]) != "AB" {
+		t.Fatalf("odd+err Read got (%d, %v, %q), want (2, %v, \"AB\")", n, err, big[:n], sentinelErr)
+	}
+	n2, err2 := dec.Read(big)
+	if n2 != 0 || !errors.Is(err2, sentinelErr) {
+		t.Fatalf("repeat Read after err got (%d, %v), want (0, %v)", n2, err2, sentinelErr)
+	}
+
+	// Repeated Read after InvalidByteError on large buffer (two-call EOF reader).
+	decErr := NewDecoder(strings.NewReader("0001z"))
+	n, err = decErr.Read(big)
+	if n != 2 || err != nil {
+		t.Fatalf("invalid trailing byte first Read got (%d, %v), want (2, nil)", n, err)
+	}
+	n2, err2 = decErr.Read(big)
+	if n2 != 0 || !errors.Is(err2, InvalidByteError('z')) {
+		t.Fatalf("invalid trailing byte second Read got (%d, %v), want (0, InvalidByteError('z'))", n2, err2)
+	}
+	n3, err3 := decErr.Read(big)
+	if n3 != 0 || !errors.Is(err3, InvalidByteError('z')) {
+		t.Fatalf("repeat Read after InvalidByteError got (%d, %v)", n3, err3)
+	}
+
+	// Single-call EOF reader with trailing invalid byte on large buffer.
+	decErrEOF := NewDecoder(&errAfterReader{
+		chunks: [][]byte{[]byte("0001z")},
+		errs:   []error{io.EOF},
+	})
+	n, err = decErrEOF.Read(big)
+	if n != 2 || !errors.Is(err, InvalidByteError('z')) {
+		t.Fatalf("single-call EOF trailing invalid byte got (%d, %v)", n, err)
+	}
+	n2, err2 = decErrEOF.Read(big)
+	if n2 != 0 || !errors.Is(err2, InvalidByteError('z')) {
+		t.Fatalf("repeat Read after single-call EOF error got (%d, %v)", n2, err2)
+	}
+}
+
+func FuzzEncodeDecode(f *testing.F) {
+	f.Add([]byte{}, []byte{})
+	f.Add([]byte{0x00, 0xff, 0x7f, 0x80}, []byte("00ff7f80"))
+	f.Add(bytes.Repeat([]byte{0x12, 0xab, 0xcd, 0xef}, 17), []byte("000102030405060708090a0b0c0d0e0f1011"))
+	f.Fuzz(func(t *testing.T, raw, hexIn []byte) {
+		wantEnc := refEncode(raw)
+		gotEnc := make([]byte, EncodedLen(len(raw)))
+		if n := Encode(gotEnc, raw); n != len(wantEnc) || !bytes.Equal(gotEnc, wantEnc) {
+			t.Fatalf("Encode mismatch for len=%d", len(raw))
+		}
+		if s := EncodeToString(raw); s != string(wantEnc) {
+			t.Fatalf("EncodeToString mismatch for len=%d", len(raw))
+		}
+		decBuf := make([]byte, DecodedLen(len(wantEnc)))
+		if n, err := Decode(decBuf, wantEnc); err != nil || n != len(raw) || !bytes.Equal(decBuf[:n], raw) {
+			t.Fatalf("Decode roundtrip mismatch for len=%d: n=%d err=%v", len(raw), n, err)
+		}
+
+		wantDec := make([]byte, DecodedLen(len(hexIn)))
+		wantN, wantErr := refDecode(wantDec, hexIn)
+		gotDec := make([]byte, DecodedLen(len(hexIn)))
+		gotN, gotErr := Decode(gotDec, hexIn)
+		if gotN != wantN || !errors.Is(gotErr, wantErr) || !bytes.Equal(gotDec[:gotN], wantDec[:wantN]) {
+			t.Fatalf("Decode(hexIn len=%d) = (%d, %v), want (%d, %v)", len(hexIn), gotN, gotErr, wantN, wantErr)
+		}
+		gotStrDec, gotStrErr := DecodeString(string(hexIn))
+		if len(gotStrDec) != wantN || !errors.Is(gotStrErr, wantErr) || !bytes.Equal(gotStrDec, wantDec[:wantN]) {
+			t.Fatalf("DecodeString(hexIn len=%d) mismatch", len(hexIn))
+		}
+	})
+}
+
+func FuzzDump(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte("Hello, Go!"))
+	f.Add(bytes.Repeat([]byte{0x00, 0x1f, 0x20, 0x7e, 0x7f, 0x80, 0xff}, 9))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 4096 {
+			data = data[:4096]
+		}
+		want := refDump(data)
+		if got := Dump(data); got != want {
+			t.Fatalf("Dump mismatch for len=%d", len(data))
+		}
+	})
+}
+
+var (
+	benchSinkString string
+	benchSinkBytes  []byte
+)
+
 func BenchmarkEncodeToString(b *testing.B) {
-	for _, size := range []int{16, 64, 1024, 8192} {
+	for _, size := range []int{4, 16, 64, 1024, 8192} {
 		src := makeDeterministicBytes(size, 5)
 		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(size))
 			for b.Loop() {
-				_ = EncodeToString(src)
+				benchSinkString = EncodeToString(src)
+			}
+		})
+	}
+}
+
+func BenchmarkAppendEncode(b *testing.B) {
+	for _, size := range []int{16, 64, 1024} {
+		src := makeDeterministicBytes(size, 6)
+		dst := make([]byte, 0, EncodedLen(size))
+		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			for b.Loop() {
+				benchSinkBytes = AppendEncode(dst[:0], src)
+			}
+		})
+	}
+}
+
+func BenchmarkAppendDecode(b *testing.B) {
+	for _, size := range []int{16, 64, 1024} {
+		src := refEncode(makeDeterministicBytes(size/2, 8))
+		dst := make([]byte, 0, size/2)
+		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			for b.Loop() {
+				var err error
+				benchSinkBytes, err = AppendDecode(dst[:0], src)
+				if err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

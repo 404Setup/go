@@ -39,6 +39,21 @@ func encodeSSSE3Asm(dst, src *byte, n int)
 //go:noescape
 func decodeSSSE3Asm(dst, src *byte, srcLen, dstLen int) (si, di int)
 
+//go:noescape
+func dumpLinesAVX2Asm(out, data *byte, lines int, offset uint32)
+
+func dumpLinesSIMD(out, data []byte, offset uint32) int {
+	if !haveAVX2 {
+		return 0
+	}
+	lines := len(data) / 16
+	if lines == 0 || len(out) < lines*79 {
+		return 0
+	}
+	dumpLinesAVX2Asm(&out[0], &data[0], lines, offset)
+	return lines
+}
+
 func encodeSIMD(dst, src []byte) (si, di int) {
 	n := len(src) &^ 15
 	if n == 0 {
@@ -47,7 +62,7 @@ func encodeSIMD(dst, src []byte) (si, di int) {
 	if hasUnsafeForwardOverlap(dst, src, n*2, n) {
 		return 0, 0
 	}
-	if haveAVX2 {
+	if haveAVX2 && n >= 32 {
 		encodeAVX2Asm(&dst[0], &src[0], n)
 		return n, n * 2
 	}

@@ -13,6 +13,10 @@ const (
 	minSIMDDecodeOut = 0
 )
 
+func dumpLinesSIMD(out, data []byte, offset uint32) int {
+	return 0
+}
+
 func encodeSIMD(dst, src []byte) (si, di int) {
 	return 0, 0
 }

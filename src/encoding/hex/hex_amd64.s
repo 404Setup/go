@@ -200,9 +200,9 @@ dec_avx2_loop2:
 
 dec_avx2_loop1_check:
 	CMPQ	R8, $32
-	JL	dec_avx2_done
+	JL	dec_avx2_16_check
 	CMPQ	R9, $16
-	JL	dec_avx2_done
+	JL	dec_avx2_16_check
 
 	VMOVDQU		(SI), Y0
 	VPSRLD		$4, Y0, Y1
@@ -213,7 +213,7 @@ dec_avx2_loop1_check:
 	VPAND		Y6, Y7, Y6
 	VPCMPEQB	Y10, Y6, Y6
 	VPTEST		Y6, Y6
-	JNZ		dec_avx2_done
+	JNZ		dec_avx2_16_check
 
 	VPSHUFB		Y1, Y12, Y1
 	VPADDB		Y2, Y1, Y0
@@ -224,6 +224,34 @@ dec_avx2_loop1_check:
 
 	ADDQ	$32, SI
 	ADDQ	$16, DI
+	SUBQ	$32, R8
+	SUBQ	$16, R9
+
+dec_avx2_16_check:
+	CMPQ	R8, $16
+	JL	dec_avx2_done
+	CMPQ	R9, $8
+	JL	dec_avx2_done
+
+	VMOVDQU		(SI), X0
+	VPSRLD		$4, X0, X1
+	VPAND		X15, X0, X2
+	VPAND		X15, X1, X1
+	VPSHUFB		X2, X14, X6
+	VPSHUFB		X1, X13, X7
+	VPAND		X6, X7, X6
+	VPCMPEQB	X10, X6, X6
+	VPTEST		X6, X6
+	JNZ		dec_avx2_done
+
+	VPSHUFB		X1, X12, X1
+	VPADDB		X2, X1, X0
+	VPMADDUBSW	X11, X0, X0
+	VPACKUSWB	X0, X0, X0
+	MOVQ		X0, (DI)
+
+	ADDQ	$16, SI
+	ADDQ	$8, DI
 
 dec_avx2_done:
 	SUBQ	R10, SI
@@ -327,4 +355,99 @@ dec_ssse3_done:
 	SUBQ	R11, DI
 	MOVQ	SI, si+32(FP)
 	MOVQ	DI, di+40(FP)
+	RET
+
+DATA hex_dump_shuf1<>+0(SB)/8, $0x0504800302800100
+DATA hex_dump_shuf1<>+8(SB)/8, $0x0a80090880070680
+GLOBL hex_dump_shuf1<>(SB), RODATA|NOPTR, $16
+
+DATA hex_dump_sp1<>+0(SB)/8, $0x0000200000200000
+DATA hex_dump_sp1<>+8(SB)/8, $0x0020000020000020
+GLOBL hex_dump_sp1<>(SB), RODATA|NOPTR, $16
+
+DATA hex_dump_shuf2<>+0(SB)/8, $0x800f0e800d0c800b
+DATA hex_dump_shuf2<>+8(SB)/8, $0x8080808080808080
+GLOBL hex_dump_shuf2<>(SB), RODATA|NOPTR, $16
+
+DATA hex_dump_sp2<>+0(SB)/8, $0x2000002000002000
+DATA hex_dump_sp2<>+8(SB)/8, $0x0000000000000000
+GLOBL hex_dump_sp2<>(SB), RODATA|NOPTR, $16
+
+// func dumpLinesAVX2Asm(out, data *byte, lines int, offset uint32)
+// lines must be > 0; out must have at least lines*79 bytes; data must have at least lines*16 bytes.
+TEXT ·dumpLinesAVX2Asm(SB), NOSPLIT, $0-28
+	MOVQ	out+0(FP), DI
+	MOVQ	data+8(FP), SI
+	MOVQ	lines+16(FP), CX
+	MOVL	offset+24(FP), R9
+
+	MOVOU	hex_c0f<>+0(SB), X15
+	MOVOU	hex_enc_lut<>+0(SB), X14
+	MOVL	$0x60, AX
+	MOVD	AX, X13
+	VPBROADCASTB X13, X13
+	MOVL	$0xde, AX
+	MOVD	AX, X12
+	VPBROADCASTB X12, X12
+	MOVL	$0x2e, AX
+	MOVD	AX, X11
+	VPBROADCASTB X11, X11
+	MOVOU	hex_dump_shuf1<>+0(SB), X10
+	MOVOU	hex_dump_sp1<>+0(SB), X9
+	MOVOU	hex_dump_shuf2<>+0(SB), X8
+	MOVOU	hex_dump_sp2<>+0(SB), X7
+
+dump_avx2_loop:
+	// Format 8-hex-digit offset + "  "
+	MOVL		R9, AX
+	BSWAPL		AX
+	VMOVD		AX, X0
+	VPSRLW		$4, X0, X1
+	VPAND		X15, X1, X1
+	VPAND		X15, X0, X2
+	VPUNPCKLBW	X2, X1, X1
+	VPSHUFB		X1, X14, X1
+	MOVQ		X1, (DI)
+	MOVW		$0x2020, 8(DI)
+
+	// Load 16 input bytes and encode to hex nibbles
+	VMOVDQU		(SI), X0
+	VPSRLW		$4, X0, X1
+	VPAND		X15, X1, X1
+	VPAND		X15, X0, X2
+	VPSHUFB		X1, X14, X1
+	VPSHUFB		X2, X14, X2
+	VPUNPCKLBW	X2, X1, X3
+	VPUNPCKHBW	X2, X1, X4
+
+	// First 8 bytes -> line[10:35]
+	VPSHUFB		X10, X3, X5
+	VPOR		X9, X5, X5
+	VMOVDQU		X5, 10(DI)
+	VPSHUFB		X8, X3, X6
+	VPOR		X7, X6, X6
+	MOVQ		X6, 26(DI)
+	MOVB		$0x20, 34(DI)
+
+	// Second 8 bytes -> line[35:61]
+	VPSHUFB		X10, X4, X5
+	VPOR		X9, X5, X5
+	VMOVDQU		X5, 35(DI)
+	VPSHUFB		X8, X4, X6
+	VPOR		X7, X6, X6
+	MOVQ		X6, 51(DI)
+	MOVW		$0x7c20, 59(DI)
+
+	// Printable ASCII [0x20..0x7e] -> line[61:77] + "|\n"
+	VPADDB		X13, X0, X5
+	VPCMPGTB	X12, X5, X5
+	VPBLENDVB	X5, X11, X0, X0
+	VMOVDQU		X0, 61(DI)
+	MOVW		$0x0a7c, 77(DI)
+
+	ADDL	$16, R9
+	ADDQ	$16, SI
+	ADDQ	$79, DI
+	DECQ	CX
+	JNZ	dump_avx2_loop
 	RET
