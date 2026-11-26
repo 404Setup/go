@@ -23,6 +23,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"sync/v2"
 	"time"
 )
@@ -232,6 +233,46 @@ func (cw closeWaiter) Close() {
 // Wait waits for the closeWaiter to become closed.
 func (cw closeWaiter) Wait() {
 	<-cw
+}
+
+// lazySignal is a one-shot close-to-broadcast signal whose underlying channel
+// is allocated only if awaited before being closed.
+type lazySignal struct {
+	closed atomic.Bool
+	mu     sync.Mutex
+	ch     chan struct{}
+}
+
+func (s *lazySignal) isClosed() bool {
+	return s.closed.Load()
+}
+
+func (s *lazySignal) close() {
+	if s.closed.Load() {
+		return
+	}
+	s.mu.Lock()
+	if !s.closed.Swap(true) && s.ch != nil {
+		close(s.ch)
+	}
+	s.mu.Unlock()
+}
+
+func (s *lazySignal) chan_() <-chan struct{} {
+	if s.closed.Load() {
+		return closedStreamChan
+	}
+	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return closedStreamChan
+	}
+	if s.ch == nil {
+		s.ch = make(chan struct{})
+	}
+	ch := s.ch
+	s.mu.Unlock()
+	return ch
 }
 
 // bufferedWriter is a buffered writer that writes to w.

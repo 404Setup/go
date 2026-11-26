@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newH2TestServer(t *testing.T, h http.Handler) (*httptest.Server, *http.Client) {
@@ -289,4 +290,114 @@ func TestHTTP2ServerRequestURLCoallocAndResponseHeaders(t *testing.T) {
 			t.Fatalf("retained URL[%d] mutated or wrong: got %+v, want %+v", i, savedURLs[i], u)
 		}
 	}
+}
+
+func TestHTTP2ClientLazySignalsEndToEnd(t *testing.T) {
+	ts, client := newH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok":
+			_, _ = io.WriteString(w, "ok-body")
+		case "/nobody":
+			w.WriteHeader(http.StatusNoContent)
+		case "/echo":
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write(b)
+		case "/slow":
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+				_, _ = io.WriteString(w, "late")
+			}
+		}
+	}))
+
+	// 1. 204 NoBody (waitDone) and 200 with body (Body.Close after EOF).
+	for range 5 {
+		resp, err := client.Get(ts.URL + "/nobody")
+		if err != nil {
+			t.Fatalf("GET /nobody: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("GET /nobody status = %d, want 204", resp.StatusCode)
+		}
+	}
+
+	// 2. Context cancellation & deprecated Request.Cancel (non-detached path).
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer cancel()
+	reqCtx, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/slow", nil)
+	if resp, err := client.Do(reqCtx); err == nil {
+		resp.Body.Close()
+		t.Fatal("expected context deadline error on /slow")
+	}
+
+	cancelCh := make(chan struct{})
+	reqCh, _ := http.NewRequest(http.MethodGet, ts.URL+"/slow", nil)
+	reqCh.Cancel = cancelCh
+	time.AfterFunc(15*time.Millisecond, func() { close(cancelCh) })
+	if resp, err := client.Do(reqCh); err == nil {
+		resp.Body.Close()
+		t.Fatal("expected Request.Cancel error on /slow")
+	}
+
+	// 3. ResponseHeaderTimeout on detached stream.
+	trTimeout := client.Transport.(*http.Transport).Clone()
+	trTimeout.ResponseHeaderTimeout = 20 * time.Millisecond
+	defer trTimeout.CloseIdleConnections()
+	cTimeout := &http.Client{Transport: trTimeout}
+	if resp, err := cTimeout.Get(ts.URL + "/slow"); err == nil {
+		resp.Body.Close()
+		t.Fatal("expected ResponseHeaderTimeout error on /slow")
+	}
+
+	// 4. Concurrent mixed GET/204/POST under -race.
+	var wg sync.WaitGroup
+	for g := range 6 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := range 20 {
+				switch (id + i) % 3 {
+				case 0:
+					resp, err := client.Get(ts.URL + "/ok")
+					if err != nil {
+						t.Errorf("GET /ok: %v", err)
+						return
+					}
+					b, _ := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if string(b) != "ok-body" {
+						t.Errorf("GET /ok body = %q", b)
+						return
+					}
+				case 1:
+					resp, err := client.Get(ts.URL + "/nobody")
+					if err != nil {
+						t.Errorf("GET /nobody: %v", err)
+						return
+					}
+					resp.Body.Close()
+				case 2:
+					payload := fmt.Sprintf("echo-%d-%d", id, i)
+					resp, err := client.Post(ts.URL+"/echo", "text/plain", strings.NewReader(payload))
+					if err != nil {
+						t.Errorf("POST /echo: %v", err)
+						return
+					}
+					b, _ := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if string(b) != payload {
+						t.Errorf("POST /echo body = %q, want %q", b, payload)
+						return
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }

@@ -7,6 +7,7 @@ package http2
 import (
 	"context"
 	"fmt"
+	"internal/race"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -192,6 +193,104 @@ func BenchmarkClientConnReadLoopCanonHeaderCached(b *testing.B) {
 	for b.Loop() {
 		for _, k := range keys {
 			_ = rl.canonicalHeader(k)
+		}
+	}
+}
+
+func TestLazySignalLifecycleAndRace(t *testing.T) {
+	// 1. Close before chan_(): never allocates a channel and returns closedStreamChan.
+	var s1 lazySignal
+	if s1.isClosed() {
+		t.Fatal("fresh lazySignal reported closed")
+	}
+	s1.close()
+	s1.close() // idempotent
+	if !s1.isClosed() {
+		t.Fatal("closed lazySignal reported not closed")
+	}
+	if s1.ch != nil {
+		t.Fatal("close() allocated channel unnecessarily")
+	}
+	select {
+	case <-s1.chan_():
+	default:
+		t.Fatal("chan_() after close() not immediately readable")
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if !s1.isClosed() {
+			t.Fatal("not closed")
+		}
+		select {
+		case <-s1.chan_():
+		default:
+			t.Fatal("not readable")
+		}
+	}); allocs != 0 {
+		t.Fatalf("closed lazySignal check allocs = %v, want 0", allocs)
+	}
+	if !race.Enabled {
+		var s lazySignal
+		if allocs := testing.AllocsPerRun(100, func() {
+			s.closed.Store(false)
+			s.close()
+			if !s.isClosed() {
+				t.Fatal("not closed")
+			}
+			select {
+			case <-s.chan_():
+			default:
+				t.Fatal("not readable")
+			}
+		}); allocs != 0 {
+			t.Fatalf("lazySignal close+check allocs = %v, want 0", allocs)
+		}
+	}
+
+	// 2. chan_() before close(): unblocks waiters once closed.
+	var s2 lazySignal
+	ch := s2.chan_()
+	select {
+	case <-ch:
+		t.Fatal("open lazySignal channel already closed")
+	default:
+	}
+	s2.close()
+	select {
+	case <-ch:
+	default:
+		t.Fatal("lazySignal channel not closed after close()")
+	}
+
+	// 3. Concurrent close()/chan_()/isClosed() under -race.
+	for range 200 {
+		var s lazySignal
+		var wg sync.WaitGroup
+		for i := range 8 {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				switch id % 3 {
+				case 0:
+					s.close()
+				case 1:
+					<-s.chan_()
+				case 2:
+					_ = s.isClosed()
+				}
+			}(i)
+		}
+		wg.Wait()
+	}
+}
+
+func BenchmarkLazySignalFastClose(b *testing.B) {
+	var s lazySignal
+	b.ReportAllocs()
+	for b.Loop() {
+		s.closed.Store(false)
+		s.close()
+		if !s.isClosed() {
+			b.Fatal("expected closed")
 		}
 	}
 }

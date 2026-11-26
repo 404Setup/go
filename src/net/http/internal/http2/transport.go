@@ -205,12 +205,13 @@ type clientStream struct {
 	isHead        bool
 
 	abortOnce sync.Once
-	abort     chan struct{} // closed to signal stream should end immediately
-	abortErr  error         // set if abort is closed
+	abort     lazySignal // closed to signal stream should end immediately
+	abortErr  error      // set if abort is closed
 
-	peerClosed chan struct{} // closed when the peer sends an END_STREAM flag
-	donec      chan struct{} // closed after the stream is in the closed state
-	on100      chan struct{} // buffered; written to if a 100 is received
+	peerClosedFlag bool          // guarded by cc.mu; true when the peer sends END_STREAM
+	peerClosed     chan struct{} // lazily allocated under cc.mu when awaited before END_STREAM
+	done           lazySignal    // closed after the stream is in the closed state
+	on100          chan struct{} // buffered; written to if a 100 is received
 
 	// detached, guarded by cc.mu, indicates that the writeRequest
 	// goroutine has exited without waiting for the stream to end, and
@@ -233,8 +234,9 @@ type clientStream struct {
 	// the stream ends (cleanupWriteRequest).
 	respHeaderTimeoutTimer *time.Timer
 
-	respHeaderRecv chan struct{}   // closed when headers are received
-	res            *ClientResponse // set if respHeaderRecv is closed
+	gotRespHeader     atomic.Bool
+	respHeaderOrAbort lazySignal      // closed when headers arrive or stream aborts
+	res               *ClientResponse // set if gotRespHeader is true
 
 	flow        outflow // guarded by cc.mu
 	inflow      inflow  // guarded by cc.mu
@@ -284,7 +286,8 @@ func (cs *clientStream) abortStream(err error) {
 func (cs *clientStream) abortStreamLocked(err error) {
 	cs.abortOnce.Do(func() {
 		cs.abortErr = err
-		close(cs.abort)
+		cs.abort.close()
+		cs.respHeaderOrAbort.close()
 	})
 	if cs.detached {
 		cs.detached = false
@@ -784,10 +787,6 @@ func (cc *ClientConn) roundTrip(req *ClientRequest, streamf func(*clientStream))
 		reqBody:              req.Body,
 		reqBodyContentLength: actualContentLength(req),
 		trace:                httptrace.ContextClientTrace(ctx),
-		peerClosed:           make(chan struct{}),
-		abort:                make(chan struct{}),
-		respHeaderRecv:       make(chan struct{}),
-		donec:                make(chan struct{}),
 		resTrailer:           req.ResTrailer,
 	}
 	cs := &req.stream
@@ -804,8 +803,11 @@ func (cc *ClientConn) roundTrip(req *ClientRequest, streamf func(*clientStream))
 	workerPool.Go(h2Task{kind: h2TaskDoRequest, creq: req, streamf: streamf})
 
 	waitDone := func() error {
+		if cs.done.isClosed() {
+			return nil
+		}
 		select {
-		case <-cs.donec:
+		case <-cs.done.chan_():
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -864,26 +866,27 @@ func (cc *ClientConn) roundTrip(req *ClientRequest, streamf func(*clientStream))
 	}
 
 	for {
-		select {
-		case <-cs.respHeaderRecv:
-			return handleResponseHeaders()
-		case <-cs.abort:
-			select {
-			case <-cs.respHeaderRecv:
-				// If both cs.respHeaderRecv and cs.abort are signaling,
-				// pick respHeaderRecv. The server probably wrote the
-				// response and immediately reset the stream.
-				// golang.org/issue/49645
+		if cs.respHeaderOrAbort.isClosed() {
+			if cs.gotRespHeader.Load() {
 				return handleResponseHeaders()
-			default:
-				if err := waitDone(); err != nil {
-					// If request cancellation races the abort cleaning up
-					// the request, prefer the cancellation error.
-					// We only return abortErr if the request really is done.
-					return nil, cancelRequest(cs, err)
-				}
-				return nil, cs.abortErr
 			}
+			if err := waitDone(); err != nil {
+				return nil, cancelRequest(cs, err)
+			}
+			return nil, cs.abortErr
+		}
+		select {
+		case <-cs.respHeaderOrAbort.chan_():
+			if cs.gotRespHeader.Load() {
+				return handleResponseHeaders()
+			}
+			if err := waitDone(); err != nil {
+				// If request cancellation races the abort cleaning up
+				// the request, prefer the cancellation error.
+				// We only return abortErr if the request really is done.
+				return nil, cancelRequest(cs, err)
+			}
+			return nil, cs.abortErr
 		case <-ctx.Done():
 			err := ctx.Err()
 			cs.abortStream(err)
@@ -928,36 +931,38 @@ var errStreamDetached = errors.New("http2: internal sentinel; stream detached fr
 // It reports whether the stream was detached. It returns false if the stream
 // has already ended, in which case the caller should wait for the stream end
 // events itself (they're already pending).
+func (cs *clientStream) getPeerClosedChan() <-chan struct{} {
+	cc := cs.cc
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cs.peerClosedFlag {
+		return closedStreamChan
+	}
+	if cs.peerClosed == nil {
+		cs.peerClosed = make(chan struct{})
+	}
+	return cs.peerClosed
+}
+
 func (cs *clientStream) detach(respHeaderTimeout time.Duration) bool {
 	cc := cs.cc
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	select {
-	case <-cs.peerClosed:
+	if cs.peerClosedFlag || cs.abort.isClosed() {
 		return false
-	case <-cs.abort:
-		return false
-	default:
 	}
-	if respHeaderTimeout != 0 {
-		select {
-		case <-cs.respHeaderRecv:
-			// Headers already arrived; nothing to enforce.
-		default:
-			cs.respHeaderTimeoutTimer = time.AfterFunc(respHeaderTimeout, func() {
-				cc.mu.Lock()
-				defer cc.mu.Unlock()
-				select {
-				case <-cs.respHeaderRecv:
-					// Headers arrived after all; we lost a race
-					// with the Stop in processHeaders. Not a
-					// timeout.
-					return
-				default:
-				}
-				cs.abortStreamLocked(errTimeout)
-			})
-		}
+	if respHeaderTimeout != 0 && !cs.gotRespHeader.Load() {
+		cs.respHeaderTimeoutTimer = time.AfterFunc(respHeaderTimeout, func() {
+			cc.mu.Lock()
+			defer cc.mu.Unlock()
+			if cs.gotRespHeader.Load() {
+				// Headers arrived after all; we lost a race
+				// with the Stop in processHeaders. Not a
+				// timeout.
+				return
+			}
+			cs.abortStreamLocked(errTimeout)
+		})
 	}
 	// Watch for request context cancellation without parking a goroutine
 	// on ctx.Done(). If the context was canceled already, AfterFunc runs
@@ -1073,7 +1078,7 @@ func (cs *clientStream) writeRequest(req *ClientRequest, streamf func(*clientStr
 				err = nil
 			case <-cs.on100:
 				err = nil
-			case <-cs.abort:
+			case <-cs.abort.chan_():
 				err = cs.abortErr
 			case <-ctx.Done():
 				err = ctx.Err()
@@ -1118,27 +1123,32 @@ func (cs *clientStream) writeRequest(req *ClientRequest, streamf func(*clientStr
 	}
 
 	var respHeaderTimer <-chan time.Time
-	var respHeaderRecv chan struct{}
-	if d := cc.responseHeaderTimeout(); d != 0 {
+	var respHeaderOrAbort <-chan struct{}
+	if d := cc.responseHeaderTimeout(); d != 0 && !cs.gotRespHeader.Load() {
 		timer := time.NewTimer(d)
 		defer timer.Stop()
 		respHeaderTimer = timer.C
-		respHeaderRecv = cs.respHeaderRecv
+		respHeaderOrAbort = cs.respHeaderOrAbort.chan_()
 	}
 
+	peerClosed := cs.getPeerClosedChan()
+	abortCh := cs.abort.chan_()
 	// Wait until the peer half-closes its end of the stream,
 	// or until the request is aborted (via context, error, or otherwise),
 	// whichever comes first.
 	for {
 		select {
-		case <-cs.peerClosed:
+		case <-peerClosed:
 			return nil
 		case <-respHeaderTimer:
 			return errTimeout
-		case <-respHeaderRecv:
-			respHeaderRecv = nil
+		case <-respHeaderOrAbort:
+			if !cs.gotRespHeader.Load() {
+				return cs.abortErr
+			}
+			respHeaderOrAbort = nil
 			respHeaderTimer = nil // keep waiting for END_STREAM
-		case <-cs.abort:
+		case <-abortCh:
 			return cs.abortErr
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1156,9 +1166,10 @@ func (cs *clientStream) encodeAndWriteHeaders(req *ClientRequest) error {
 	defer cc.wmu.Unlock()
 
 	// If the request was canceled while waiting for cc.mu, just quit.
-	select {
-	case <-cs.abort:
+	if cs.abort.isClosed() {
 		return cs.abortErr
+	}
+	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-cs.reqCancel:
@@ -1235,6 +1246,7 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 	draining := cc.draining
 	// Have we read any frames from the connection since sending this request?
 	readSinceStream := cc.readBeforeStreamID > cs.ID
+	peerClosed := cs.peerClosedFlag
 	cc.mu.Unlock()
 	if mustCloseBody {
 		cs.reqBody.Close()
@@ -1243,15 +1255,11 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 	if bodyClosed != nil {
 		<-bodyClosed
 	}
-	if err != nil && cs.sentEndStream {
+	if err != nil && cs.sentEndStream && peerClosed {
 		// If the connection is closed immediately after the response is read,
 		// we may be aborted before finishing up here. If the stream was closed
 		// cleanly on both sides, there is no error.
-		select {
-		case <-cs.peerClosed:
-			err = nil
-		default:
-		}
+		err = nil
 	}
 	if err != nil {
 		cs.abortStream(err) // possibly redundant, but harmless
@@ -1326,7 +1334,7 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 	}
 
 	cc.maybeCallStateHook()
-	close(cs.donec)
+	cs.done.close()
 }
 
 func (cc *ClientConn) checkIdleLocked() (closeConn bool) {
@@ -1358,10 +1366,8 @@ func (cc *ClientConn) goAwayErrorLocked(streamID uint32) error {
 // Must hold cc.mu.
 func (cc *ClientConn) awaitOpenSlotForStreamLocked(cs *clientStream) error {
 	for {
-		select {
-		case <-cs.abort:
+		if cs.abort.isClosed() {
 			return cs.abortErr
-		default:
 		}
 		if err := cc.goAwayErrorLocked(cc.nextStreamID); err != nil {
 			return err
@@ -1618,9 +1624,10 @@ func (cs *clientStream) awaitFlowControl(maxBytes int) (taken int32, err error) 
 		if cs.reqBodyClosed != nil {
 			return 0, errStopReqBodyWrite
 		}
-		select {
-		case <-cs.abort:
+		if cs.abort.isClosed() {
 			return 0, cs.abortErr
+		}
+		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		case <-cs.reqCancel:
@@ -1813,11 +1820,7 @@ func (rl *clientConnReadLoop) cleanup() {
 	cc.closed = true
 
 	for _, cs := range cc.streams {
-		select {
-		case <-cs.peerClosed:
-			// The server closed the stream before closing the conn,
-			// so no need to interrupt it.
-		default:
+		if !cs.peerClosedFlag {
 			cs.abortStreamLocked(err)
 		}
 	}
@@ -1980,7 +1983,8 @@ func (rl *clientConnReadLoop) processHeaders(f *MetaHeadersFrame) error {
 		return nil
 	}
 	cs.res = res
-	close(cs.respHeaderRecv)
+	cs.gotRespHeader.Store(true)
+	cs.respHeaderOrAbort.close()
 	// Stop a detached stream's response header timeout, if armed.
 	if rl.cc.t == nil || rl.cc.t.t1 == nil || rl.cc.responseHeaderTimeout() != 0 {
 		rl.cc.mu.Lock()
@@ -2316,8 +2320,11 @@ func (b transportResponseBody) Close() error {
 		cc.wmu.Unlock()
 	}
 
+	if cs.done.isClosed() {
+		return nil
+	}
 	select {
-	case <-cs.donec:
+	case <-cs.done.chan_():
 	case <-cs.ctx.Done():
 		// See golang/go#49366: The net/http package can cancel the
 		// request context after the response body is fully read.
@@ -2463,7 +2470,10 @@ func (rl *clientConnReadLoop) endStream(cs *clientStream) {
 		// cleanupWriteRequest to send a RST_STREAM.
 		cc.mu.Lock()
 		cs.bufPipe.closeWithErrorAndCode(io.EOF, copyTrailers)
-		close(cs.peerClosed)
+		cs.peerClosedFlag = true
+		if cs.peerClosed != nil {
+			close(cs.peerClosed)
+		}
 		if cs.detached {
 			cs.detached = false
 			if cs.sentEndStream && cs.reqBody == nil && cs.reqBodyClosed == nil &&
@@ -2484,7 +2494,7 @@ func (rl *clientConnReadLoop) endStream(cs *clientStream) {
 			stopCtxWatch()
 		}
 		if closeDone {
-			close(cs.donec)
+			cs.done.close()
 			cc.maybeCallStateHook()
 		}
 	}
