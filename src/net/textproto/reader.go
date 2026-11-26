@@ -7,6 +7,7 @@ package textproto
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -771,17 +772,15 @@ func readMIMEHeaderBuffered(b *bufio.Reader, maxMemory, maxHeaders int64, skipHo
 		key, ok := canonicalMIMEHeaderKey(k)
 		if !ok {
 			cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
+			err := ProtocolError(fmt.Sprintf("malformed MIME header line: %q", peek[sp.kStart:sp.vEnd]))
 			b.Discard(cur)
-			kv := peek[sp.kStart:sp.vEnd]
-			return m, haveHost, hostHeader, hostCount, true, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+			return m, haveHost, hostHeader, hostCount, true, err
 		}
-		for _, c := range v {
-			if !validHeaderValueByte(c) {
-				cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
-				b.Discard(cur)
-				kv := peek[sp.kStart:sp.vEnd]
-				return m, haveHost, hostHeader, hostCount, true, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
-			}
+		if !validHeaderValueBytes(v) {
+			cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
+			err := ProtocolError(fmt.Sprintf("malformed MIME header line: %q", peek[sp.kStart:sp.vEnd]))
+			b.Discard(cur)
+			return m, haveHost, hostHeader, hostCount, true, err
 		}
 
 		maxHeaders--
@@ -986,6 +985,18 @@ func CanonicalMIMEHeaderKey(s string) string {
 		"X-Requested-With":
 		return s
 	}
+	return canonicalMIMEHeaderKeySlow(s)
+}
+
+func canonicalMIMEHeaderKeySlow(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	if 'a' <= s[0] && s[0] <= 'z' {
+		if v := lookupLowerCommonHeader(s); v != "" {
+			return v
+		}
+	}
 	// Quick check for canonical encoding.
 	upper := true
 	for i := 0; i < len(s); i++ {
@@ -994,16 +1005,219 @@ func CanonicalMIMEHeaderKey(s string) string {
 			return s
 		}
 		if upper && 'a' <= c && c <= 'z' {
-			s, _ = canonicalMIMEHeaderKey([]byte(s))
-			return s
+			return canonicalMIMEHeaderKeyString(s, i)
 		}
 		if !upper && 'A' <= c && c <= 'Z' {
-			s, _ = canonicalMIMEHeaderKey([]byte(s))
-			return s
+			return canonicalMIMEHeaderKeyString(s, i)
 		}
 		upper = c == '-'
 	}
 	return s
+}
+
+func canonicalMIMEHeaderKeyString(s string, firstBad int) string {
+	var stack [64]byte
+	var a []byte
+	if len(s) <= len(stack) {
+		a = stack[:len(s)]
+	} else {
+		a = make([]byte, len(s))
+	}
+	copy(a, s[:firstBad])
+	upper := firstBad == 0 || s[firstBad-1] == '-'
+	for i := firstBad; i < len(s); i++ {
+		c := s[i]
+		if !validHeaderFieldByte(c) {
+			return s
+		}
+		if upper && 'a' <= c && c <= 'z' {
+			c -= toLower
+		} else if !upper && 'A' <= c && c <= 'Z' {
+			c += toLower
+		}
+		a[i] = c
+		upper = c == '-'
+	}
+	if v := lookupCommonHeader(a); v != "" {
+		return v
+	}
+	commonHeaderOnce.Do(initCommonHeader)
+	if v := commonHeader[string(a)]; v != "" {
+		return v
+	}
+	return string(a)
+}
+
+func lookupLowerCommonHeader(s string) string {
+	switch len(s) {
+	case 2:
+		if s == "te" {
+			return "Te"
+		}
+	case 3:
+		if s == "via" {
+			return "Via"
+		}
+	case 4:
+		switch s {
+		case "date":
+			return "Date"
+		case "etag":
+			return "Etag"
+		case "from":
+			return "From"
+		case "host":
+			return "Host"
+		case "link":
+			return "Link"
+		case "vary":
+			return "Vary"
+		}
+	case 5:
+		if s == "range" {
+			return "Range"
+		}
+	case 6:
+		switch s {
+		case "accept":
+			return "Accept"
+		case "cookie":
+			return "Cookie"
+		case "expect":
+			return "Expect"
+		case "origin":
+			return "Origin"
+		case "pragma":
+			return "Pragma"
+		case "server":
+			return "Server"
+		}
+	case 7:
+		switch s {
+		case "expires":
+			return "Expires"
+		case "referer":
+			return "Referer"
+		case "trailer":
+			return "Trailer"
+		case "upgrade":
+			return "Upgrade"
+		case "warning":
+			return "Warning"
+		}
+	case 8:
+		switch s {
+		case "if-match":
+			return "If-Match"
+		case "if-range":
+			return "If-Range"
+		case "location":
+			return "Location"
+		}
+	case 9:
+		if s == "forwarded" {
+			return "Forwarded"
+		}
+	case 10:
+		switch s {
+		case "connection":
+			return "Connection"
+		case "set-cookie":
+			return "Set-Cookie"
+		case "user-agent":
+			return "User-Agent"
+		}
+	case 11:
+		if s == "retry-after" {
+			return "Retry-After"
+		}
+	case 12:
+		switch s {
+		case "content-type":
+			return "Content-Type"
+		case "max-forwards":
+			return "Max-Forwards"
+		case "x-real-ip":
+			return "X-Real-Ip"
+		}
+	case 13:
+		switch s {
+		case "authorization":
+			return "Authorization"
+		case "cache-control":
+			return "Cache-Control"
+		case "content-range":
+			return "Content-Range"
+		case "if-none-match":
+			return "If-None-Match"
+		case "last-modified":
+			return "Last-Modified"
+		case "x-powered-by":
+			return "X-Powered-By"
+		}
+	case 14:
+		switch s {
+		case "accept-charset":
+			return "Accept-Charset"
+		case "content-length":
+			return "Content-Length"
+		}
+	case 15:
+		switch s {
+		case "accept-encoding":
+			return "Accept-Encoding"
+		case "accept-language":
+			return "Accept-Language"
+		case "x-forwarded-for":
+			return "X-Forwarded-For"
+		}
+	case 16:
+		switch s {
+		case "content-encoding":
+			return "Content-Encoding"
+		case "content-language":
+			return "Content-Language"
+		case "content-location":
+			return "Content-Location"
+		case "www-authenticate":
+			return "Www-Authenticate"
+		case "x-frame-options":
+			return "X-Frame-Options"
+		case "x-requested-with":
+			return "X-Requested-With"
+		}
+	case 17:
+		switch s {
+		case "if-modified-since":
+			return "If-Modified-Since"
+		case "transfer-encoding":
+			return "Transfer-Encoding"
+		case "x-forwarded-host":
+			return "X-Forwarded-Host"
+		}
+	case 19:
+		switch s {
+		case "content-disposition":
+			return "Content-Disposition"
+		case "if-unmodified-since":
+			return "If-Unmodified-Since"
+		case "x-forwarded-proto":
+			return "X-Forwarded-Proto"
+		}
+	case 22:
+		if s == "x-content-type-options" {
+			return "X-Content-Type-Options"
+		}
+	case 23:
+		if s == "content-security-policy" {
+			return "Content-Security-Policy"
+		}
+	case 25:
+		if s == "strict-transport-security" {
+			return "Strict-Transport-Security"
+		}
+	}
+	return ""
 }
 
 const toLower = 'a' - 'A'
@@ -1058,6 +1272,28 @@ func validHeaderFieldByte(c byte) bool {
 //	VCHAR          =  %x21-7E
 func validHeaderValueByte(c byte) bool {
 	return (c >= ' ' && c != 0x7f) || c == '\t'
+}
+
+func validHeaderValueBytes(v []byte) bool {
+	i := 0
+	for ; i+8 <= len(v); i += 8 {
+		w := binary.LittleEndian.Uint64(v[i:])
+		x := w ^ 0x7f7f7f7f7f7f7f7f
+		if ((w|(w-0x2020202020202020))&0x8080808080808080) != 0 ||
+			(((x-0x0101010101010101)&^x)&0x8080808080808080) != 0 {
+			for j := i; j < i+8; j++ {
+				if !validHeaderValueByte(v[j]) {
+					return false
+				}
+			}
+		}
+	}
+	for ; i < len(v); i++ {
+		if !validHeaderValueByte(v[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // canonicalMIMEHeaderKey is like CanonicalMIMEHeaderKey but is
@@ -1428,8 +1664,11 @@ func internHeaderValue(v []byte) (string, bool) {
 			return "gzip,deflate,sdch", true
 		}
 	case 18:
-		if string(v) == "Go-http-client/1.1" {
+		switch string(v) {
+		case "Go-http-client/1.1":
 			return "Go-http-client/1.1", true
+		case "Go-http-client/2.0":
+			return "Go-http-client/2.0", true
 		}
 	case 24:
 		if string(v) == "text/html; charset=utf-8" {
