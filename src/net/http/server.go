@@ -353,7 +353,6 @@ func (c *conn) hijacked() bool {
 
 func (c *conn) setReadDeadline(d time.Time) error {
 	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
 	if !d.IsZero() {
 		c.readDeadlineSet.Store(true)
 	}
@@ -363,6 +362,7 @@ func (c *conn) setReadDeadline(d time.Time) error {
 	} else if err != nil {
 		c.readDeadlineSet.Store(true)
 	}
+	c.deadlineMu.Unlock()
 	return err
 }
 
@@ -375,7 +375,6 @@ func (c *conn) clearReadDeadline() {
 
 func (c *conn) setWriteDeadline(d time.Time) error {
 	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
 	if !d.IsZero() {
 		c.writeDeadlineSet.Store(true)
 	}
@@ -385,6 +384,7 @@ func (c *conn) setWriteDeadline(d time.Time) error {
 	} else if err != nil {
 		c.writeDeadlineSet.Store(true)
 	}
+	c.deadlineMu.Unlock()
 	return err
 }
 

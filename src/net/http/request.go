@@ -1199,9 +1199,16 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 	if ctx == nil {
 		return nil, errors.New("net/http: nil Context")
 	}
-	u, err := urlpkg.Parse(url)
-	if err != nil {
-		return nil, err
+	var ru *requestWithURL
+	var u *urlpkg.URL
+	var simpleURL urlpkg.URL
+	hasSimpleURL := parseSimpleHTTPURL(url, &simpleURL)
+	if !hasSimpleURL {
+		var err error
+		u, err = urlpkg.Parse(url)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var rc io.ReadCloser
 	var contentLength int64
@@ -1259,6 +1266,27 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 			// guess. Maybe retry later. See Issue 18117.
 		}
 	}
+	if hasSimpleURL {
+		// The host's colon:port should be normalized. See Issue 14836.
+		simpleURL.Host = strings.TrimSuffix(simpleURL.Host, ":")
+		ru = &requestWithURL{
+			req: Request{
+				ctx:           ctx,
+				Method:        method,
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        make(Header),
+				Body:          rc,
+				ContentLength: contentLength,
+				GetBody:       getBody,
+				Host:          simpleURL.Host,
+			},
+			url: simpleURL,
+		}
+		ru.req.URL = &ru.url
+		return &ru.req, nil
+	}
 	// The host's colon:port should be normalized. See Issue 14836.
 	u.Host = strings.TrimSuffix(u.Host, ":")
 	req := &Request{
@@ -1276,6 +1304,92 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 	}
 
 	return req, nil
+}
+
+// parseSimpleHTTPURL parses common ASCII http:// and https:// URLs without
+// percent-escapes, fragments, userinfo, or IPv6 brackets directly into dst,
+// matching net/url.Parse.
+func parseSimpleHTTPURL(rawurl string, dst *urlpkg.URL) bool {
+	var scheme, rest string
+	if strings.HasPrefix(rawurl, "http://") {
+		scheme = "http"
+		rest = rawurl[len("http://"):]
+	} else if strings.HasPrefix(rawurl, "https://") {
+		scheme = "https"
+		rest = rawurl[len("https://"):]
+	} else {
+		return false
+	}
+	if len(rest) == 0 {
+		return false
+	}
+	authEnd := len(rest)
+	colon := -1
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if c == '/' || c == '?' {
+			authEnd = i
+			break
+		}
+		if c == ':' {
+			if colon >= 0 {
+				return false
+			}
+			colon = i
+			continue
+		}
+		if colon >= 0 {
+			if c < '0' || c > '9' {
+				return false
+			}
+			continue
+		}
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	if authEnd == 0 || colon == 0 {
+		return false
+	}
+	host := rest[:authEnd]
+	if authEnd == len(rest) {
+		*dst = urlpkg.URL{
+			Scheme: scheme,
+			Host:   host,
+		}
+		return true
+	}
+	tail := rest[authEnd:]
+	qIdx := -1
+	for i := 0; i < len(tail); i++ {
+		c := tail[i]
+		if c <= ' ' || c >= 0x7f || c == '#' || c == '%' || c == '\\' {
+			return false
+		}
+		if c == '?' && qIdx < 0 {
+			qIdx = i
+		}
+	}
+	var path, rawQuery string
+	var forceQuery bool
+	if qIdx < 0 {
+		path = tail
+	} else {
+		path = tail[:qIdx]
+		if qIdx == len(tail)-1 {
+			forceQuery = true
+		} else {
+			rawQuery = tail[qIdx+1:]
+		}
+	}
+	*dst = urlpkg.URL{
+		Scheme:     scheme,
+		Host:       host,
+		Path:       path,
+		ForceQuery: forceQuery,
+		RawQuery:   rawQuery,
+	}
+	return true
 }
 
 // BasicAuth returns the username and password provided in the request's

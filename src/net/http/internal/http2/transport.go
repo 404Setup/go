@@ -801,7 +801,7 @@ func (cc *ClientConn) roundTrip(req *ClientRequest, streamf func(*clientStream))
 	cc.pendingRequests++
 	cc.mu.Unlock()
 
-	go cs.doRequest(req, streamf)
+	workerPool.Go(h2Task{kind: h2TaskDoRequest, cs: cs, creq: req, streamf: streamf})
 
 	waitDone := func() error {
 		select {
@@ -1718,10 +1718,33 @@ func (cc *ClientConn) forgetStreamIDLocked(id uint32) {
 	cc.cond.Broadcast()
 }
 
+const maxClientCachedCanonicalHeadersKeysSize = 16384
+
 // clientConnReadLoop is the state owned by the clientConn's frame-reading readLoop.
 type clientConnReadLoop struct {
-	_  incomparable
-	cc *ClientConn
+	_                   incomparable
+	cc                  *ClientConn
+	canonHeader         map[string]string
+	canonHeaderKeysSize int
+}
+
+func (rl *clientConnReadLoop) canonicalHeader(v string) string {
+	if cv, ok := httpcommon.CachedCanonicalHeader(v); ok {
+		return cv
+	}
+	if cv, ok := rl.canonHeader[v]; ok {
+		return cv
+	}
+	cv := textproto.CanonicalMIMEHeaderKey(v)
+	size := 100 + len(v)*2
+	if rl.canonHeaderKeysSize+size <= maxClientCachedCanonicalHeadersKeysSize {
+		if rl.canonHeader == nil {
+			rl.canonHeader = make(map[string]string)
+		}
+		rl.canonHeader[v] = cv
+		rl.canonHeaderKeysSize += size
+	}
+	return cv
 }
 
 // readLoop runs in its own goroutine and reads and dispatches frames.
@@ -2017,7 +2040,7 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		Status:     status,
 	}
 	for _, hf := range regularFields {
-		key := httpcommon.CanonicalHeader(hf.Name)
+		key := rl.canonicalHeader(hf.Name)
 		if key == "Trailer" {
 			t := res.Trailer
 			if t == nil {
@@ -2025,7 +2048,7 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 				res.Trailer = t
 			}
 			foreachHeaderElement(hf.Value, func(v string) {
-				t[httpcommon.CanonicalHeader(v)] = nil
+				t[rl.canonicalHeader(v)] = nil
 			})
 		} else {
 			vv := header[key]

@@ -571,13 +571,65 @@ func (sc *serverConn) curOpenStreams() uint32 {
 	return sc.curClientStreams + sc.curPushedStreams
 }
 
+var closedStreamChan = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+type streamContext struct {
+	base     context.Context
+	canceled atomic.Bool
+	mu       sync.Mutex
+	childCtx context.Context
+	childCan context.CancelFunc
+}
+
+func (c *streamContext) Deadline() (time.Time, bool) { return c.base.Deadline() }
+func (c *streamContext) Value(key any) any           { return c.base.Value(key) }
+func (c *streamContext) Err() error {
+	if c.canceled.Load() {
+		return context.Canceled
+	}
+	return c.base.Err()
+}
+
+func (c *streamContext) Done() <-chan struct{} {
+	c.mu.Lock()
+	if c.childCtx == nil {
+		if c.canceled.Load() {
+			c.mu.Unlock()
+			return closedStreamChan
+		}
+		c.childCtx, c.childCan = context.WithCancel(c.base)
+		if c.canceled.Load() {
+			c.childCan()
+		}
+	}
+	ch := c.childCtx.Done()
+	c.mu.Unlock()
+	return ch
+}
+
+func (c *streamContext) cancel() {
+	if c.canceled.Load() {
+		return
+	}
+	c.mu.Lock()
+	if c.canceled.Swap(true) {
+		c.mu.Unlock()
+		return
+	}
+	can := c.childCan
+	c.mu.Unlock()
+	if can != nil {
+		can()
+	}
+}
+
 // stream represents a stream. This is the minimal metadata needed by
-// the serve goroutine. Most of the actual stream state is owned by
-// the http.Handler's goroutine in the responseWriter. Because the
-// responseWriter's responseWriterState is recycled at the end of a
-// handler, this struct intentionally has no pointer to the
-// *responseWriter{,State} itself, as the Handler ending nils out the
-// responseWriter's state field.
+// the serve goroutine. Most of the actual stream state is owned by the
+// Handler's goroutine in responseWriterState.
 type stream struct {
 	// immutable:
 	sc        *serverConn
@@ -587,6 +639,7 @@ type stream struct {
 	cw        closeWaiter // closed wait stream transitions to closed state
 	ctx       context.Context
 	cancelCtx func()
+	sctx      streamContext
 
 	// owned by serverConn's serve loop:
 	bodyBytes        int64   // body bytes seen so far
@@ -606,6 +659,14 @@ type stream struct {
 
 	reqBodyStorage requestBody
 	resHeaders     writeResHeaders
+}
+
+func (st *stream) cancel() {
+	if st.cancelCtx != nil {
+		st.cancelCtx()
+		return
+	}
+	st.sctx.cancel()
 }
 
 func (sc *serverConn) Framer() *Framer  { return sc.framer }
@@ -1471,7 +1532,7 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 					sc.wroteFrame(frameWriteResult{wr: wr, err: err})
 				} else {
 					sc.writingFrameAsync = true
-					go sc.writeEmptyEndStreamAsync(wr, wrh.streamID)
+					workerPool.Go(h2Task{kind: h2TaskWriteEmptyEndStreamAsync, sc: sc, wr: wr})
 				}
 			} else {
 				sc.writingFrameAsync = false
@@ -1489,7 +1550,7 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 			sc.wroteFrame(frameWriteResult{wr: wr, err: err})
 		} else {
 			sc.writingFrameAsync = true
-			go sc.writeResHeadersAsync(wr, wrh, headerBlock)
+			workerPool.Go(h2Task{kind: h2TaskWriteResHeadersAsync, sc: sc, wr: wr, wrh: wrh, headerBlock: headerBlock})
 		}
 	} else if wd, ok := wr.write.(*writeData); ok {
 		// Encode the frame in the serve goroutine, to ensure we don't have
@@ -1497,10 +1558,10 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 		// See https://go.dev/issue/58446.
 		sc.framer.startWriteDataPadded(wd.streamID, wd.endStream, wd.p, nil)
 		sc.writingFrameAsync = true
-		go sc.writeFrameAsync(wr, wd)
+		workerPool.Go(h2Task{kind: h2TaskWriteFrameAsync, sc: sc, wr: wr, wd: wd})
 	} else {
 		sc.writingFrameAsync = true
-		go sc.writeFrameAsync(wr, nil)
+		workerPool.Go(h2Task{kind: h2TaskWriteFrameAsync, sc: sc, wr: wr})
 	}
 }
 
@@ -1891,7 +1952,7 @@ func (sc *serverConn) processResetStream(f *RSTStreamFrame) error {
 		return sc.countError("reset_idle_stream", ConnectionError(ErrCodeProtocol))
 	}
 	if st != nil {
-		st.cancelCtx()
+		st.cancel()
 		sc.closeStream(st, streamError(f.StreamID, f.ErrCode))
 	}
 	return nil
@@ -1936,7 +1997,7 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 		}
 	}
 	st.closeErr = err
-	st.cancelCtx()
+	st.cancel()
 	st.cw.Close() // signals Handler's CloseNotifier, unblocks writes, etc
 	sc.writeSched.CloseStream(st.id)
 }
@@ -2423,14 +2484,15 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState, priority
 		panic("internal error: cannot create stream with id 0")
 	}
 
-	ctx, cancelCtx := context.WithCancel(sc.baseCtx)
 	st := &stream{
-		sc:        sc,
-		id:        id,
-		state:     state,
-		ctx:       ctx,
-		cancelCtx: cancelCtx,
+		sc:    sc,
+		id:    id,
+		state: state,
+		sctx: streamContext{
+			base: sc.baseCtx,
+		},
 	}
+	st.ctx = &st.sctx
 	st.cw.Init()
 	st.flow.conn = &sc.flow // link to conn-level counter
 	st.inflow.init(sc.initialStreamRecvWindowSize)
@@ -2631,7 +2693,7 @@ func (sc *serverConn) scheduleHandler(st *stream, rw *responseWriter, req *Serve
 	maxHandlers := sc.advMaxStreams
 	if sc.curHandlers < maxHandlers {
 		sc.curHandlers++
-		go sc.runHandler(rw, req, handleRequest)
+		workerPool.Go(h2Task{kind: h2TaskRunHandler, sc: sc, rw: rw, sreq: req, handleRequest: handleRequest})
 		return nil
 	}
 	if len(sc.unstartedHandlers) > int(4*sc.advMaxStreams) {
@@ -2666,7 +2728,7 @@ func (sc *serverConn) handlerDone() {
 			break
 		}
 		sc.curHandlers++
-		go sc.runHandler(u.rw, u.req, u.handleRequest)
+		workerPool.Go(h2Task{kind: h2TaskRunHandler, sc: sc, rw: u.rw, sreq: u.req, handleRequest: u.handleRequest})
 		sc.unstartedHandlers[i] = unstartedHandler{} // don't retain references
 	}
 	sc.unstartedHandlers = sc.unstartedHandlers[i:]
@@ -2679,7 +2741,7 @@ func (sc *serverConn) handlerDone() {
 func (sc *serverConn) runHandler(rw *responseWriter, req *ServerRequest, handleRequest func(*ResponseWriter, *ServerRequest) error) {
 	defer sc.sendServeMsg(handlerDoneMsg)
 	err := handleRequest(rw, req)
-	rw.rws.stream.cancelCtx()
+	rw.rws.stream.cancel()
 	if b := rw.rws.stream.reqBody; b != nil {
 		// Closing the body refunds flow control credit for any unconsumed data.
 		// (reqBody is nil for Upgrade: h2c requests, but those do not use flow

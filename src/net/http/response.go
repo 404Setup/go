@@ -155,6 +155,11 @@ func (r *Response) Location() (*url.URL, error) {
 // Clients must call resp.Body.Close when finished reading resp.Body.
 // After that call, clients can inspect resp.Trailer to find key/value
 // pairs included in the response trailer.
+type responseWithBody struct {
+	resp Response
+	body body
+}
+
 func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 	// Parse the first line of the response.
 	lineBytes, err := readLineBytes(r)
@@ -164,9 +169,12 @@ func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 		}
 		return nil, err
 	}
-	resp := &Response{
-		Request: req,
+	rb := &responseWithBody{
+		resp: Response{
+			Request: req,
+		},
 	}
+	resp := &rb.resp
 	if string(lineBytes) == "HTTP/1.1 200 OK" {
 		resp.Proto = "HTTP/1.1"
 		resp.Status = "200 OK"
@@ -246,7 +254,7 @@ func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 
 	fixPragmaCacheControl(resp.Header)
 
-	err = readTransfer(resp, r, math.MaxInt64)
+	err = readTransferWithBody(resp, r, math.MaxInt64, &rb.body)
 	if err != nil {
 		return nil, err
 	}

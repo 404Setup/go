@@ -233,9 +233,14 @@ type http2ClientConn struct {
 	http2.NetHTTPClientConn
 }
 
+type http2RoundTripState struct {
+	resp Response
+	creq http2.ClientRequest
+}
+
 func (cc http2ClientConn) RoundTrip(req *Request) (*Response, error) {
-	resp := &Response{}
-	creq := http2.ClientRequest{
+	st := &http2RoundTripState{}
+	st.creq = http2.ClientRequest{
 		Context:       req.Context(),
 		Method:        req.Method,
 		URL:           req.URL,
@@ -246,13 +251,13 @@ func (cc http2ClientConn) RoundTrip(req *Request) (*Response, error) {
 		ContentLength: req.ContentLength,
 		Cancel:        req.Cancel,
 		Close:         req.Close,
-		ResTrailer:    (*http2.Header)(&resp.Trailer),
+		ResTrailer:    (*http2.Header)(&st.resp.Trailer),
 	}
-	cresp, err := cc.NetHTTPClientConn.RoundTrip(&creq)
+	cresp, err := cc.NetHTTPClientConn.RoundTrip(&st.creq)
 	if err != nil {
 		return nil, err
 	}
-	return populateHTTP2Response(resp, req, cresp), nil
+	return populateHTTP2Response(&st.resp, req, cresp), nil
 }
 
 // transportConfig implements the http2.TransportConfig interface,

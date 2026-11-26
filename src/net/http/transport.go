@@ -2753,7 +2753,8 @@ func canonicalHostPort(url *url.URL) (host, port, joined string) {
 						return hostPart, h[colon+1:], h
 					}
 				} else if len(hostPart) >= 3 && hostPart[len(hostPart)-1] == ']' {
-					if strings.IndexByte(hostPart[1:len(hostPart)-1], ':') >= 0 {
+					inner := hostPart[1 : len(hostPart)-1]
+					if strings.IndexByte(inner, ':') >= 0 && strings.IndexByte(inner, '[') < 0 && strings.IndexByte(inner, ']') < 0 {
 						return hostPart, h[colon+1:], h
 					}
 				}

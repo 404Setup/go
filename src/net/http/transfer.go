@@ -622,6 +622,10 @@ func suppressedHeaders(status int) []string {
 
 // msg is *Request or *Response.
 func readTransfer(msg any, r *bufio.Reader, maxTrailerHeaders int64) (err error) {
+	return readTransferWithBody(msg, r, maxTrailerHeaders, nil)
+}
+
+func readTransferWithBody(msg any, r *bufio.Reader, maxTrailerHeaders int64, bodyBuf *body) (err error) {
 	t := transferReader{RequestMethod: "GET"}
 
 	// Unify input
@@ -673,17 +677,31 @@ func readTransfer(msg any, r *bufio.Reader, maxTrailerHeaders int64) (err error)
 		if isResponse && (noResponseBodyExpected(t.RequestMethod) || !bodyAllowedForStatus(t.StatusCode)) {
 			t.Body = NoBody
 		} else {
-			t.Body = &body{src: internal.NewChunkedReader(r), hdr: msg, r: r, closing: t.Close, maxTrailerHeaders: maxTrailerHeaders}
+			b := bodyBuf
+			if b == nil {
+				b = &body{}
+			}
+			*b = body{src: internal.NewChunkedReader(r), hdr: msg, r: r, closing: t.Close, maxTrailerHeaders: maxTrailerHeaders}
+			t.Body = b
 		}
 	case t.RealBodyLength == 0:
 		t.Body = NoBody
 	case t.RealBodyLength > 0:
-		b := &body{lr: io.LimitedReader{R: r, N: t.RealBodyLength}, closing: t.Close}
+		b := bodyBuf
+		if b == nil {
+			b = &body{}
+		}
+		*b = body{lr: io.LimitedReader{R: r, N: t.RealBodyLength}, closing: t.Close}
 		b.src = &b.lr
 		t.Body = b
 	case t.Close:
 		// Close semantics (no Transfer-Encoding or Content-Length).
-		t.Body = &body{src: r, closing: t.Close}
+		b := bodyBuf
+		if b == nil {
+			b = &body{}
+		}
+		*b = body{src: r, closing: t.Close}
+		t.Body = b
 	default:
 		// This shouldn't be possible.
 		return errors.New("http: unexpected body length (bug)")
