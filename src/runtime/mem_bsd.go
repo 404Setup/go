@@ -54,16 +54,6 @@ func sysFaultOS(v unsafe.Pointer, n uintptr) {
 	mmap(v, n, _PROT_NONE, _MAP_ANON|_MAP_PRIVATE|_MAP_FIXED, -1, 0)
 }
 
-const hasImmutablePageProtect = false
-
-func sysImmutableProtectOS(v unsafe.Pointer, n uintptr) bool {
-	return false
-}
-
-//go:nosplit
-func sysImmutableUnprotectOS(v unsafe.Pointer, n uintptr) {
-}
-
 // Indicates not to reserve swap space for the mapping.
 const _sunosMAP_NORESERVE = 0x40
 

@@ -160,17 +160,6 @@ type reader struct {
 
 	// Label to return to.
 	retlabel *types.Sym
-
-	// Pending runtime freezes for local //go:immutable vars in current stmtAssign.
-	pendingImmutableFreezes []immutableFreeze
-}
-
-type immutableFreeze struct {
-	name    *ir.Name
-	kind    int // 0=array, 1=slice, 2=map, 3=container
-	rtype   ir.Node
-	baseFn  ir.Node
-	dictPtr ir.Node
 }
 
 // A readerDict represents an instantiated "compile-time dictionary,"
@@ -1236,22 +1225,6 @@ func (r *reader) funcExt(name *ir.Name, method *types.Sym) {
 	}
 
 	fn.Pragma = r.pragmaFlag()
-	if fn.Pragma&ir.Immutable != 0 {
-		nparams := r.Len()
-		params := make([]int, nparams)
-		for i := range params {
-			params[i] = r.Len()
-		}
-		nresults := r.Len()
-		results := make([]int, nresults)
-		for i := range results {
-			results[i] = r.Len()
-		}
-		fn.SetImmutableInfo(&ir.ImmutableFuncInfo{
-			Params:  params,
-			Results: results,
-		})
-	}
 	r.linkname(name)
 
 	if buildcfg.GOARCH == "wasm" || buildcfg.GOARCH == "wasm32" {
@@ -1325,7 +1298,6 @@ func (r *reader) typeExt(name *ir.Name) {
 func (r *reader) varExt(name *ir.Name) {
 	r.Sync(pkgbits.SyncVarExt)
 	r.linkname(name)
-	name.SetPragma(r.pragmaFlag())
 }
 
 func (r *reader) linkname(name *ir.Name) {
@@ -1818,10 +1790,7 @@ func (r *reader) stmt1(tag codeStmt, out *ir.Nodes) ir.Node {
 		lno := base.Pos
 		defer func() { base.Pos = lno }()
 		base.Pos = pos
-		r.pendingImmutableFreezes = nil
 		names, lhs := r.assignList()
-		freezes := r.pendingImmutableFreezes
-		r.pendingImmutableFreezes = nil
 		rhs := r.multiExpr()
 
 		if len(rhs) == 0 {
@@ -1833,65 +1802,14 @@ func (r *reader) stmt1(tag codeStmt, out *ir.Nodes) ir.Node {
 			return nil
 		}
 
-		var n ir.Node
 		if len(lhs) == 1 && len(rhs) == 1 {
-			as := ir.NewAssignStmt(pos, lhs[0], rhs[0])
-			as.Def = r.initDefn(as, names)
-			n = as
-		} else {
-			as := ir.NewAssignListStmt(pos, ir.OAS2, lhs, rhs)
-			as.Def = r.initDefn(as, names)
-			n = as
+			n := ir.NewAssignStmt(pos, lhs[0], rhs[0])
+			n.Def = r.initDefn(n, names)
+			return n
 		}
 
-		if len(freezes) > 0 {
-			out.Append(typecheck.Stmt(r.curfn, n))
-			for _, fr := range freezes {
-				switch fr.kind {
-				case 1: // slice
-					elemType := fr.name.Type().Elem()
-					fn := typecheck.LookupRuntime("freezeImmutableSlice", elemType, elemType)
-					sliceTyp := types.NewSlice(elemType)
-					var arg ir.Node = fr.name
-					if !types.Identical(fr.name.Type(), sliceTyp) {
-						arg = ir.NewConvExpr(pos, ir.OCONVNOP, sliceTyp, fr.name)
-					}
-					call := ir.NewCallExpr(pos, ir.OCALL, fn, []ir.Node{arg, fr.rtype})
-					var val ir.Node = call
-					if !types.Identical(fr.name.Type(), sliceTyp) {
-						val = ir.NewConvExpr(pos, ir.OCONVNOP, fr.name.Type(), call)
-					}
-					out.Append(typecheck.Stmt(r.curfn, ir.NewAssignStmt(pos, fr.name, val)))
-				case 2: // map
-					mt := fr.name.Type()
-					fn := typecheck.LookupRuntime("freezeImmutableMap", mt.Key(), mt.Elem(), mt.Key(), mt.Elem())
-					mapTyp := types.NewMap(mt.Key(), mt.Elem())
-					var arg ir.Node = fr.name
-					if !types.Identical(mt, mapTyp) {
-						arg = ir.NewConvExpr(pos, ir.OCONVNOP, mapTyp, fr.name)
-					}
-					call := ir.NewCallExpr(pos, ir.OCALL, fn, []ir.Node{fr.rtype, arg})
-					var val ir.Node = call
-					if !types.Identical(mt, mapTyp) {
-						val = ir.NewConvExpr(pos, ir.OCONVNOP, mt, call)
-					}
-					out.Append(typecheck.Stmt(r.curfn, ir.NewAssignStmt(pos, fr.name, val)))
-				case 3: // container
-					var args ir.Nodes
-					args.Append(fr.name)
-					if fr.dictPtr != nil {
-						args.Append(fr.dictPtr)
-					}
-					call := typecheck.Call(r.curfn, pos, fr.baseFn, args, false)
-					var val ir.Node = call
-					if !types.Identical(fr.name.Type(), call.Type()) {
-						val = ir.NewConvExpr(pos, ir.OCONVNOP, fr.name.Type(), call)
-					}
-					out.Append(typecheck.Stmt(r.curfn, ir.NewAssignStmt(pos, fr.name, val)))
-				}
-			}
-			return nil
-		}
+		n := ir.NewAssignListStmt(pos, ir.OAS2, lhs, rhs)
+		n.Def = r.initDefn(n, names)
 		return n
 
 	case stmtAssignOp:
@@ -1997,23 +1915,6 @@ func (r *reader) assign() (ir.Node, bool) {
 		setBasePos(pos) // test/fixedbugs/issue49767.go depends on base.Pos being set for the r.typ() call here, ugh
 		name := r.curfn.NewLocal(pos, r.localIdent(), r.typ())
 		r.addLocal(name)
-		if r.Bool() {
-			name.SetPragma(ir.Immutable)
-			kind := r.Len()
-			var rt, baseFn, dictPtr ir.Node
-			if kind == 1 || kind == 2 {
-				rt = r.rtype(pos)
-			} else if kind == 3 {
-				_, baseFn, dictPtr = r.methodExpr()
-			}
-			r.pendingImmutableFreezes = append(r.pendingImmutableFreezes, immutableFreeze{
-				name:    name,
-				kind:    kind,
-				rtype:   rt,
-				baseFn:  baseFn,
-				dictPtr: dictPtr,
-			})
-		}
 		return name, true
 
 	case assignExpr:
@@ -3696,39 +3597,6 @@ func (r *reader) pkgInit(self *types.Pkg, target *ir.Package) {
 	r.pkgInitOrder(target)
 
 	r.pkgDecls(target)
-
-	if n := r.Len(); n > 0 {
-		pos := base.AutogeneratedPos
-		lno := base.Pos
-		base.Pos = pos
-
-		fnInit := ir.NewFunc(pos, pos, Renameinit(), types.NewSignature(nil, nil, nil))
-		fnInit.SetIsPackageInit(true)
-		fnInit.SetInlinabilityChecked(true)
-		typecheck.DeclFunc(fnInit)
-
-		old := r.curfn
-		r.curfn = fnInit
-		for range n {
-			v := r.obj().(*ir.Name)
-			_, baseFn, dictPtr := r.methodExpr()
-			var args ir.Nodes
-			args.Append(v)
-			if dictPtr != nil {
-				args.Append(dictPtr)
-			}
-			call := typecheck.Call(fnInit, pos, baseFn, args, false)
-			var val ir.Node = call
-			if !types.Identical(v.Type(), call.Type()) {
-				val = ir.NewConvExpr(pos, ir.OCONVNOP, v.Type(), call)
-			}
-			fnInit.Body.Append(typecheck.Stmt(fnInit, ir.NewAssignStmt(pos, v, val)))
-		}
-		r.curfn = old
-		base.Pos = lno
-
-		target.Inits = append(target.Inits, fnInit)
-	}
 
 	r.Sync(pkgbits.SyncEOF)
 }

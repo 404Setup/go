@@ -921,9 +921,6 @@ func (h *mheap) enableMetadataHugePages() {
 // base address for all 0-byte allocations
 var zerobase uintptr
 
-// base address for 0-byte immutable slices
-var immutableZerobase uintptr
-
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
 func nextFreeFast(s *mspan) gclinkptr {
@@ -1094,7 +1091,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				}
 			}
 		} else {
-			x, elemsize = mallocgcLarge(size, typ, needzero, false)
+			x, elemsize = mallocgcLarge(size, typ, needzero)
 		}
 	} else {
 		if size <= maxSmallSize-gc.MallocHeaderSize {
@@ -1119,7 +1116,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				}
 			}
 		} else {
-			x, elemsize = mallocgcLarge(size, typ, needzero, false)
+			x, elemsize = mallocgcLarge(size, typ, needzero)
 		}
 	}
 
@@ -1646,64 +1643,7 @@ func mallocgcSmallScanHeader(size uintptr, typ *_type) (unsafe.Pointer, uintptr)
 	return x, size
 }
 
-func mallocgcLargeImmutable(size uintptr, typ *_type) unsafe.Pointer {
-	if doubleCheckMalloc {
-		if gcphase == _GCmarktermination {
-			throw("mallocgc called with gcphase == _GCmarktermination")
-		}
-	}
-	lockRankMayQueueFinalizer()
-
-	if debug.malloc && debug.sbrk == 0 && inittrace.active && inittrace.id == getg().goid {
-		inittrace.allocs += 1
-	}
-
-	var asanRZ uintptr
-	if asanenabled {
-		asanRZ = redZoneSize(size)
-		size += asanRZ
-	}
-
-	if gcBlackenEnabled != 0 {
-		deductAssistCredit(size)
-	}
-
-	x, elemsize := mallocgcLarge(size, typ, true, hasImmutablePageProtect)
-
-	gp := getg()
-	if goexperiment.RuntimeSecret && gp.secret > 0 {
-		addSecret(x, size)
-	}
-
-	if raceenabled {
-		racemalloc(x, size-asanRZ)
-	}
-	if msanenabled {
-		msanmalloc(x, size-asanRZ)
-	}
-	if asanenabled {
-		asanpoison(unsafe.Add(x, size-asanRZ), asanRZ)
-		asanunpoison(x, size-asanRZ)
-	}
-	if valgrindenabled {
-		valgrindMalloc(x, size-asanRZ)
-	}
-
-	if gcBlackenEnabled != 0 && elemsize != 0 {
-		if assistG := getg().m.curg; assistG != nil {
-			assistG.gcAssistBytes -= int64(elemsize - size)
-		}
-	}
-
-	if debug.malloc {
-		postMallocgcDebug(x, elemsize, typ)
-	}
-	return x
-}
-
-// mallocgcLarge allocates a large object. It deliberately does not go through
-// a wrapper function: an extra frame would show up in memory profile stacks.
-func mallocgcLarge(size uintptr, typ *_type, needzero, physPageAlign bool) (unsafe.Pointer, uintptr) {
+func mallocgcLarge(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uintptr) {
 	// Set mp.mallocing to keep from being preempted by GC.
 	mp := acquirem()
 	if doubleCheckMalloc {
@@ -1719,7 +1659,7 @@ func mallocgcLarge(size uintptr, typ *_type, needzero, physPageAlign bool) (unsa
 	c := getMCache(mp)
 	// For large allocations, keep track of zeroed state so that
 	// bulk zeroing can be happen later in a preemptible context.
-	span := c.allocLargeAligned(size, typ == nil || !typ.Pointers(), physPageAlign)
+	span := c.allocLarge(size, typ == nil || !typ.Pointers())
 	span.freeindex = 1
 	span.allocCount = 1
 	span.largeType = nil // Tell the GC not to look at this yet.
@@ -1950,11 +1890,6 @@ func freegc(ptr unsafe.Pointer, size uintptr, noscan bool) bool {
 
 	if mp.curg.stack.lo <= uintptr(ptr) && uintptr(ptr) < mp.curg.stack.hi {
 		// This points into our stack, so free is a no-op.
-		mp.mallocing = 0
-		releasem(mp)
-		return false
-	}
-	if span := spanOf(uintptr(ptr)); span == nil || span.isImmutable {
 		mp.mallocing = 0
 		releasem(mp)
 		return false

@@ -262,9 +262,6 @@ func runtime_mapassign_faststr(typ *abi.MapType, m *Map, key string) unsafe.Poin
 	if m == nil {
 		panic(errNilAssign)
 	}
-	if m.IsImmutable() {
-		panic(errImmutableMap)
-	}
 	if race.Enabled {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(runtime_mapassign_faststr)
@@ -410,9 +407,6 @@ outer:
 
 //go:linkname runtime_mapdelete_faststr runtime.mapdelete_faststr
 func runtime_mapdelete_faststr(typ *abi.MapType, m *Map, key string) {
-	if m != nil && m.IsImmutable() {
-		panic(errImmutableMap)
-	}
 	if race.Enabled {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(runtime_mapdelete_faststr)

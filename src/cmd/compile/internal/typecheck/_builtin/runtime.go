@@ -213,9 +213,6 @@ func moveSliceNoScan(elemSize uintptr, old *byte, len, cap int) (*byte, int, int
 func moveSliceNoCap(typ *byte, old *byte, len int) (*byte, int, int)
 func moveSliceNoCapNoScan(elemSize uintptr, old *byte, len int) (*byte, int, int)
 
-func freezeImmutableMap(mapType *byte, hmap map[any]any) map[any]any
-func freezeImmutableSlice(s []any, et *byte) []any
-
 func memmove(to *any, frm *any, length uintptr)
 func memclrNoHeapPointers(ptr unsafe.Pointer, n uintptr)
 func memclrHasPointers(ptr unsafe.Pointer, n uintptr)

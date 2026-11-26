@@ -27,9 +27,8 @@ import (
 type OrderedMap[K comparable, V any] struct {
 	_ noCopy
 
-	shrinkMu  sync.RWMutex
-	state     atomic.Pointer[orderedMapState[K, V]]
-	immutable atomic.Bool
+	shrinkMu sync.RWMutex
+	state    atomic.Pointer[orderedMapState[K, V]]
 }
 
 type orderedMapState[K comparable, V any] struct {
@@ -120,9 +119,6 @@ func (m *OrderedMap[K, V]) Store(key K, value V) {
 // its index and order chain for garbage collection once concurrent readers
 // finish with them.
 func (m *OrderedMap[K, V]) Clear() {
-	if m.immutable.Load() {
-		panic(errImmutableContainer)
-	}
 	m.shrinkMu.Lock()
 	m.state.Store(nil)
 	m.shrinkMu.Unlock()
@@ -137,9 +133,6 @@ func (m *OrderedMap[K, V]) Clear() {
 // Mutating operations block while Shrink runs. Loads and iterations may
 // continue concurrently on the old storage.
 func (m *OrderedMap[K, V]) Shrink() {
-	if m.immutable.Load() {
-		panic(errImmutableContainer)
-	}
 	m.shrinkMu.Lock()
 	defer m.shrinkMu.Unlock()
 
@@ -189,9 +182,6 @@ func (m *OrderedMap[K, V]) Shrink() {
 // stores and returns the given value. The loaded result is true if the value was
 // loaded, false if stored.
 func (m *OrderedMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
-	if m.immutable.Load() {
-		panic(errImmutableContainer)
-	}
 	// A hit is a read operation and need not wait for Clear or Shrink.
 	if actual, loaded = m.Load(key); loaded {
 		return actual, true
@@ -221,9 +211,6 @@ func (m *OrderedMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 // LoadAndDelete deletes the value for a key, returning the previous value if
 // any. The loaded result reports whether the key was present.
 func (m *OrderedMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
-	if m.immutable.Load() {
-		panic(errImmutableContainer)
-	}
 	if m.state.Load() == nil {
 		return value, false
 	}
@@ -262,9 +249,6 @@ func (m *OrderedMap[K, V]) Delete(key K) {
 // Swap swaps the value for a key and returns the previous value if any. The
 // loaded result reports whether the key was present.
 func (m *OrderedMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
-	if m.immutable.Load() {
-		panic(errImmutableContainer)
-	}
 	replacement := &orderedMapValue[K, V]{key: key, value: value}
 	m.shrinkMu.RLock()
 	defer m.shrinkMu.RUnlock()
@@ -291,9 +275,6 @@ func (m *OrderedMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 // CompareAndSwap swaps the old and new values for key if the value stored in
 // the map is equal to old. It panics if V is not a comparable type.
 func (m *OrderedMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
-	if m.immutable.Load() {
-		panic(errImmutableContainer)
-	}
 	eq := mapValueEqualFunc[V]("CompareAndSwap")
 	if m.state.Load() == nil {
 		return false
@@ -332,9 +313,6 @@ func (m *OrderedMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 //
 // If there is no current value for key, CompareAndDelete returns false.
 func (m *OrderedMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
-	if m.immutable.Load() {
-		panic(errImmutableContainer)
-	}
 	eq := mapValueEqualFunc[V]("CompareAndDelete")
 	if m.state.Load() == nil {
 		return false
@@ -400,68 +378,4 @@ func (m *OrderedMap[K, V]) All() iter.Seq2[K, V] {
 // same concurrent-iteration guarantees as All, and f may call any method on m.
 func (m *OrderedMap[K, V]) Range(f func(key K, value V) bool) {
 	m.All()(f)
-}
-
-// IsImmutable reports whether m is immutable.
-// It returns false if m is nil.
-func (m *OrderedMap[K, V]) IsImmutable() bool {
-	return m != nil && m.immutable.Load()
-}
-
-// ToImmutable returns an immutable snapshot of m. Any subsequent mutating
-// method call on the returned map panics at runtime.
-// If m is already immutable or nil, ToImmutable returns m without allocating.
-func (m *OrderedMap[K, V]) ToImmutable() *OrderedMap[K, V] {
-	if m == nil || m.immutable.Load() {
-		return m
-	}
-	m.shrinkMu.RLock()
-	defer m.shrinkMu.RUnlock()
-
-	c := &OrderedMap[K, V]{}
-	current := m.state.Load()
-	if current != nil {
-		stop := current.tail.Load()
-		count := 0
-		if stop != nil {
-			for entry := current.head.Load(); entry != nil; entry = entry.next.Load() {
-				if entry.value.Load() != nil {
-					count++
-				}
-				if entry == stop {
-					break
-				}
-			}
-		}
-		if count > 0 {
-			next := new(orderedMapState[K, V])
-			entries := make([]orderedMapEntry[K, V], count)
-			var head, tail *orderedMapEntry[K, V]
-			used := 0
-			for entry := current.head.Load(); entry != nil && used < len(entries); entry = entry.next.Load() {
-				if value := entry.value.Load(); value != nil {
-					candidate := &entries[used]
-					used++
-					candidate.value.Store(value)
-					if tail == nil {
-						head = candidate
-					} else {
-						tail.next.Store(candidate)
-					}
-					tail = candidate
-					next.index.StoreUnique(value.key, candidate)
-				}
-				if entry == stop {
-					break
-				}
-			}
-			if tail != nil {
-				next.head.Store(head)
-				next.tail.Store(tail)
-				c.state.Store(next)
-			}
-		}
-	}
-	c.immutable.Store(true)
-	return c
 }

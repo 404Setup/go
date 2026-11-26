@@ -456,7 +456,6 @@ type mspan struct {
 	// initialized (see also the assignment of freeIndexForScan in
 	// mallocgc, and issue 54596).
 	freeIndexForScan uint16
-	isImmutable      bool // span holds read-only immutable slice backing storage
 
 	// Cache of the allocBits at freeindex. allocCache is shifted
 	// such that the lowest bit corresponds to the bit freeindex.
@@ -1088,14 +1087,6 @@ func (s spanAllocType) manual() bool {
 // Returns a span that has been fully initialized. span.needzero indicates
 // whether the span has been zeroed. Note that it may not be.
 func (h *mheap) alloc(npages uintptr, spanclass spanClass) *mspan {
-	return h.allocWithAlign(npages, spanclass, false)
-}
-
-func (h *mheap) allocAligned(npages uintptr, spanclass spanClass) *mspan {
-	return h.allocWithAlign(npages, spanclass, true)
-}
-
-func (h *mheap) allocWithAlign(npages uintptr, spanclass spanClass, physAlign bool) *mspan {
 	// Don't do any operations that lock the heap on the G stack.
 	// It might trigger stack growth, and the stack growth code needs
 	// to be able to allocate heap.
@@ -1106,13 +1097,13 @@ func (h *mheap) allocWithAlign(npages uintptr, spanclass spanClass, physAlign bo
 		if !isSweepDone() {
 			h.reclaim(npages)
 		}
-		s = h.allocSpanAligned(npages, spanAllocHeap, spanclass, physAlign)
+		s = h.allocSpan(npages, spanAllocHeap, spanclass)
 		for s == nil && h.reclaimIndex.Load() < 1<<63 {
 			h.reclaimBeforeGrow(npages)
-			s = h.allocSpanAligned(npages, spanAllocHeap, spanclass, physAlign)
+			s = h.allocSpan(npages, spanAllocHeap, spanclass)
 		}
 		if s == nil {
-			s = h.allocSpanAligned(npages, spanAllocHeap, spanclass, physAlign)
+			s = h.allocSpan(npages, spanAllocHeap, spanclass)
 		}
 	})
 	return s
@@ -1333,24 +1324,19 @@ func (h *mheap) freeMSpanLocked(s *mspan) {
 //
 //go:systemstack
 func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass) (s *mspan) {
-	return h.allocSpanAligned(npages, typ, spanclass, physPageAlignedStacks && typ == spanAllocStack && pageSize < physPageSize)
-}
-
-//go:systemstack
-func (h *mheap) allocSpanAligned(npages uintptr, typ spanAllocType, spanclass spanClass, physAlign bool) (s *mspan) {
 	// Function-global state.
 	gp := getg()
 	base, scav := uintptr(0), uintptr(0)
 	growth := uintptr(0)
 
-	// On some platforms we need to provide physical page aligned
+	// On some platforms we need to provide physical page aligned stack
 	// allocations. Where the page size is less than the physical page
 	// size, we already manage to do this by default.
-	needPhysPageAlign := physAlign && pageSize < physPageSize
+	needPhysPageAlign := physPageAlignedStacks && typ == spanAllocStack && pageSize < physPageSize
 
 	// If the allocation is small enough, try the page cache!
 	// The page cache does not support aligned allocations, so we cannot use
-	// it if we need to provide a physical page aligned allocation.
+	// it if we need to provide a physical page aligned stack allocation.
 	pp := gp.m.p.ptr()
 	if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
 		c := &pp.pcache
@@ -1392,10 +1378,6 @@ func (h *mheap) allocSpanAligned(npages uintptr, typ spanAllocType, spanclass sp
 		// just come with a performance cost.
 		base, _ = h.pages.find(npages + extraPages)
 		if base == 0 {
-			if !typ.manual() && h.reclaimIndex.Load() < 1<<63 {
-				unlock(&h.lock)
-				return nil
-			}
 			var ok bool
 			growth, ok = h.grow(npages + extraPages)
 			if !ok {
@@ -1781,10 +1763,6 @@ func (h *mheap) freeSpan(s *mspan) {
 		}
 
 		lock(&h.lock)
-		if s.isImmutable {
-			sysImmutableUnprotectOS(unsafe.Pointer(s.base()), s.npages*pageSize)
-			s.isImmutable = false
-		}
 		if msanenabled {
 			// Tell msan that this entire span is no longer in use.
 			base := unsafe.Pointer(s.base())
@@ -1942,7 +1920,6 @@ func (span *mspan) init(base uintptr, npages uintptr) {
 	span.needzero = 0
 	span.freeindex = 0
 	span.freeIndexForScan = 0
-	span.isImmutable = false
 	span.allocBits = nil
 	span.gcmarkBits = nil
 	span.pinnerBits = nil

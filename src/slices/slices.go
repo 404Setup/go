@@ -7,9 +7,7 @@ package slices
 
 import (
 	"cmp"
-	"internal/abi"
 	"math/bits"
-	"runtime"
 	"unsafe"
 )
 
@@ -530,37 +528,4 @@ func Repeat[S ~[]E, E any](x S, count int) S {
 		n += copy(newslice[n:], newslice[:n])
 	}
 	return newslice
-}
-
-//go:linkname makeImmutableSlice slices.makeImmutableSlice
-func makeImmutableSlice(et *abi.Type, from unsafe.Pointer, n int) unsafe.Pointer
-
-//go:linkname isImmutableSlicePtr slices.isImmutableSlicePtr
-func isImmutableSlicePtr(ptr unsafe.Pointer) bool
-
-// ToImmutable returns an immutable copy of s with capacity equal to len(s).
-// Modifying elements of the returned slice (directly or via sub-slicing,
-// copy, clear, or reflect) panics at runtime.
-// If s is already immutable, ToImmutable returns s[:len(s):len(s)] without allocating.
-// If s is nil, ToImmutable returns nil.
-func ToImmutable[S ~[]E, E any](s S) S {
-	if s == nil {
-		return nil
-	}
-	data := unsafe.Pointer(unsafe.SliceData(s))
-	if len(s) > 0 && isImmutableSlicePtr(data) {
-		return s[:len(s):len(s)]
-	}
-	p := makeImmutableSlice(abi.TypeFor[E](), data, len(s))
-	runtime.KeepAlive(s)
-	return S(unsafe.Slice((*E)(p), len(s)))
-}
-
-// IsImmutable reports whether s is backed by immutable storage.
-// It returns false for nil slices.
-func IsImmutable[S ~[]E, E any](s S) bool {
-	if s == nil {
-		return false
-	}
-	return isImmutableSlicePtr(unsafe.Pointer(unsafe.SliceData(s)))
 }

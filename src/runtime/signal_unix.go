@@ -939,9 +939,6 @@ func sigpanic() {
 		if (gp.sigcode0 == 0 || gp.sigcode0 == _SEGV_MAPERR || gp.sigcode0 == _SEGV_ACCERR) && gp.sigcode1 < 0x1000 {
 			panicmem()
 		}
-		if (gp.sigcode0 == 0 || gp.sigcode0 == _SEGV_ACCERR) && isImmutableFault(gp.sigcode1) {
-			panic(errorString("modification of immutable slice"))
-		}
 		// Support runtime/debug.SetPanicOnFault.
 		if gp.paniconfault {
 			panicmemAddr(gp.sigcode1)

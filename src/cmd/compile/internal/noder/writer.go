@@ -99,16 +99,6 @@ type pkgWriter struct {
 	// cgoPragmas accumulates any //go:cgo_* pragmas that need to be
 	// passed through to cmd/link.
 	cgoPragmas [][]string
-
-	// //go:immutable tracking
-	immutableVars             map[*types2.Var]bool
-	immutableParamVars        map[*types2.Var]bool
-	immutableResultVars       map[*types2.Var]bool
-	immutableDefStmts         map[*syntax.AssignStmt]bool
-	importedImmutable         map[*types2.Var]bool
-	immutableFuncs            map[*types2.Func]*ir.ImmutableFuncInfo
-	importedImmutableFuncs    map[*types2.Func]*ir.ImmutableFuncInfo
-	immutableContainerGlobals []*types2.Var
 }
 
 // newPkgWriter returns an initialized pkgWriter for the specified
@@ -136,12 +126,6 @@ func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo ma
 			remote string
 			std    bool
 		}),
-
-		immutableVars:       make(map[*types2.Var]bool),
-		immutableParamVars:  make(map[*types2.Var]bool),
-		immutableResultVars: make(map[*types2.Var]bool),
-		immutableDefStmts:   make(map[*syntax.AssignStmt]bool),
-		immutableFuncs:      make(map[*types2.Func]*ir.ImmutableFuncInfo),
 	}
 }
 
@@ -1218,12 +1202,6 @@ func (w *writer) funcExt(obj *types2.Func) {
 	}
 
 	sig, block := obj.Type().(*types2.Signature), decl.Body
-	immInfo := w.p.immutableFuncs[obj]
-	if immInfo == nil {
-		pragma &^= ir.Immutable
-	} else if sig.Recv() != nil && len(immInfo.Params) > 0 {
-		pragma |= ir.Nointerface
-	}
 	body, closureVars := w.p.bodyIdx(sig, block, w.dict)
 	if len(closureVars) > 0 {
 		fmt.Fprintln(os.Stderr, "CLOSURE", closureVars)
@@ -1232,16 +1210,6 @@ func (w *writer) funcExt(obj *types2.Func) {
 
 	w.Sync(pkgbits.SyncFuncExt)
 	w.pragmaFlag(pragma)
-	if pragma&ir.Immutable != 0 {
-		w.Len(len(immInfo.Params))
-		for _, idx := range immInfo.Params {
-			w.Len(idx)
-		}
-		w.Len(len(immInfo.Results))
-		for _, idx := range immInfo.Results {
-			w.Len(idx)
-		}
-	}
 	w.linkname(obj)
 
 	if buildcfg.GOARCH == "wasm" || buildcfg.GOARCH == "wasm32" {
@@ -1280,11 +1248,6 @@ func (w *writer) typeExt(obj *types2.TypeName) {
 func (w *writer) varExt(obj *types2.Var) {
 	w.Sync(pkgbits.SyncVarExt)
 	w.linkname(obj)
-	var pragma ir.PragmaFlag
-	if w.p.immutableVars[obj] {
-		pragma |= ir.Immutable
-	}
-	w.pragmaFlag(pragma)
 }
 
 func (w *writer) linkname(obj types2.Object) {
@@ -1570,27 +1533,6 @@ func (w *writer) assign(expr syntax.Expr) {
 			// TODO(mdempsky): Minimize locals index size by deferring
 			// this until the variables actually come into scope.
 			w.addLocal(obj)
-
-			if w.p.immutableVars[obj] {
-				w.Bool(true)
-				switch u := types2.CommonUnderlying(obj.Type()).(type) {
-				case *types2.Slice:
-					w.Len(1)
-					w.rtype(u.Elem())
-				case *types2.Map:
-					w.Len(2)
-					w.rtype(obj.Type())
-				default:
-					if isImmutableContainerType(obj.Type()) {
-						w.Len(3)
-						w.containerFreezeMethod(obj, obj.Type())
-					} else {
-						w.Len(0)
-					}
-				}
-			} else {
-				w.Bool(false)
-			}
 			return
 		}
 	}
@@ -2394,14 +2336,6 @@ func (w *writer) funcInst(obj *types2.Func, targs []types2.Type) {
 	w.objInfo(info)
 }
 
-func (w *writer) containerFreezeMethod(pos poser, recv types2.Type) {
-	methodObj, _, _ := types2.LookupFieldOrMethod(recv, false, nil, "ToImmutable")
-	if methodObj == nil {
-		w.p.fatalf(pos, "missing ToImmutable method on %v", recv)
-	}
-	w.methodExprFunc(pos, nil, recv, methodObj.(*types2.Func))
-}
-
 // methodExpr writes out a reference to the method selected by
 // expr. sel should be the corresponding types2.Selection, and recv
 // the type produced after any implicit addressing, dereferencing, and
@@ -2409,10 +2343,7 @@ func (w *writer) containerFreezeMethod(pos poser, recv types2.Type) {
 // parameter in the case of interface types, and is needed for
 // handling type parameter methods.)
 func (w *writer) methodExpr(expr *syntax.SelectorExpr, recv types2.Type, sel *types2.Selection) {
-	w.methodExprFunc(expr, expr.Sel, recv, sel.Obj().(*types2.Func))
-}
-
-func (w *writer) methodExprFunc(pos poser, selName *syntax.Name, recv types2.Type, fun *types2.Func) {
+	fun := sel.Obj().(*types2.Func)
 	sig := fun.Type().(*types2.Signature)
 
 	w.typ(recv)
@@ -2428,7 +2359,7 @@ func (w *writer) methodExprFunc(pos poser, selName *syntax.Name, recv types2.Typ
 		w.typ(sig)
 	}
 
-	w.pos(pos)
+	w.pos(expr)
 	w.selector(fun)
 
 	// Method on a type parameter. These require an indirect call
@@ -2442,7 +2373,7 @@ func (w *writer) methodExprFunc(pos poser, selName *syntax.Name, recv types2.Typ
 	}
 
 	if isInterface(recv) != isInterface(sig.Recv().Type()) {
-		w.p.fatalf(pos, "isInterface inconsistency: %v and %v", recv, sig.Recv().Type())
+		w.p.fatalf(expr, "isInterface inconsistency: %v and %v", recv, sig.Recv().Type())
 	}
 
 	if isConcreteMethod(sig) {
@@ -2450,7 +2381,7 @@ func (w *writer) methodExprFunc(pos poser, selName *syntax.Name, recv types2.Typ
 		var info objInfo
 		if isGenericMethod(sig) {
 			// For generic methods, the shaped object is the method itself.
-			mExplicits := asTypeSlice(w.p.info.Instances[selName].TypeArgs)
+			mExplicits := asTypeSlice(w.p.info.Instances[expr.Sel].TypeArgs)
 			info = w.p.objInstIdx(fun.Origin(), slices.Concat(tExplicits, mExplicits), w.dict)
 		} else {
 			// For non-generic concrete methods on generic types, the shaped object
@@ -2930,7 +2861,6 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 
 		obj := pw.info.Defs[n.Name].(*types2.Func)
 		pw.funDecls[obj] = n
-		pw.collectImmutableFunc(n, obj)
 
 		return c.withTParams(obj)
 
@@ -2959,66 +2889,12 @@ func (c *declCollector) Visit(n syntax.Node) syntax.Visitor {
 		return c.withTParams(obj)
 
 	case *syntax.VarDecl:
-		pw.checkPragmas(n.Pragma, ir.Immutable, true)
+		pw.checkPragmas(n.Pragma, 0, true)
 
 		if p, ok := n.Pragma.(*pragmas); ok && len(p.Embeds) > 0 {
 			if err := checkEmbed(n, c.file.importedEmbed, c.withinFunc); err != nil {
 				pw.errorf(p.Embeds[0].Pos, "%s", err)
 			}
-		}
-
-		if asPragmaFlag(n.Pragma)&ir.Immutable != 0 {
-			if p, ok := n.Pragma.(*pragmas); ok && p.Immutable != nil && len(p.Immutable.Args) > 0 {
-				pw.errorf(p.Immutable.Pos, "//go:immutable arguments are only allowed on function declarations")
-			}
-			if c.withinFunc && n.Values == nil {
-				pw.errorf(n, "//go:immutable local variable must have an initializer")
-			}
-			for _, name := range n.NameList {
-				if name.Value == "_" {
-					pw.errorf(name, "cannot use //go:immutable on blank identifier")
-					continue
-				}
-				if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
-					if !isImmutableSupportedType(obj.Type()) {
-						pw.errorf(name, "//go:immutable only applies to slice, array, map, or container variables")
-						continue
-					}
-					pw.immutableVars[obj] = true
-					if !c.withinFunc && isImmutableContainerType(obj.Type()) {
-						pw.immutableContainerGlobals = append(pw.immutableContainerGlobals, obj)
-					}
-				}
-			}
-		}
-
-	case *syntax.AssignStmt:
-		if n.Op == syntax.Def {
-			pw.checkPragmas(n.Pragma, ir.Immutable, false)
-			if asPragmaFlag(n.Pragma)&ir.Immutable != 0 {
-				if p, ok := n.Pragma.(*pragmas); ok && p.Immutable != nil && len(p.Immutable.Args) > 0 {
-					pw.errorf(p.Immutable.Pos, "//go:immutable arguments are only allowed on function declarations")
-				}
-				pw.immutableDefStmts[n] = true
-				for _, lhsExpr := range syntax.UnpackListExpr(n.Lhs) {
-					name, ok := syntax.Unparen(lhsExpr).(*syntax.Name)
-					if !ok || name.Value == "_" {
-						pw.errorf(lhsExpr, "cannot use //go:immutable on %v", lhsExpr)
-						continue
-					}
-					if obj, ok := pw.info.Defs[name].(*types2.Var); ok {
-						if !isImmutableSupportedType(obj.Type()) {
-							pw.errorf(name, "//go:immutable only applies to slice, array, map, or container variables")
-							continue
-						}
-						pw.immutableVars[obj] = true
-					} else {
-						pw.errorf(name, "cannot apply //go:immutable to redeclared variable %s", name.Value)
-					}
-				}
-			}
-		} else {
-			pw.checkPragmas(n.Pragma, 0, false)
 		}
 
 	case *syntax.BlockStmt:
@@ -3077,9 +2953,6 @@ func (pw *pkgWriter) collectDecls(noders []*noder) {
 			}
 		}
 	}
-
-	pw.checkImmutable(noders)
-	base.ExitIfErrors()
 }
 
 func (pw *pkgWriter) checkPragmas(p syntax.Pragma, allowed ir.PragmaFlag, embedOK bool) {
@@ -3117,12 +2990,6 @@ func (w *writer) pkgInit(noders []*noder) {
 		}
 	}
 	w.Code(declEnd)
-
-	w.Len(len(w.p.immutableContainerGlobals))
-	for _, v := range w.p.immutableContainerGlobals {
-		w.obj(v, nil)
-		w.containerFreezeMethod(v, v.Type())
-	}
 
 	w.Sync(pkgbits.SyncEOF)
 }

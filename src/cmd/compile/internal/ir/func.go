@@ -15,7 +15,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"internal/buildcfg"
-	"sync"
 	"unicode/utf8"
 )
 
@@ -173,41 +172,6 @@ type WasmImport struct {
 // WasmExport stores metadata associated with the //go:wasmexport pragma.
 type WasmExport struct {
 	Name string
-}
-
-// ImmutableFuncInfo stores parameter and result immutability constraints
-// declared via //go:immutable on a function or method.
-type ImmutableFuncInfo struct {
-	Params  []int
-	Results []int
-}
-
-var (
-	immutableFuncMu   sync.RWMutex
-	immutableFuncInfo = make(map[*Func]*ImmutableFuncInfo)
-)
-
-func (f *Func) ImmutableInfo() *ImmutableFuncInfo {
-	if f == nil || f.Pragma&Immutable == 0 {
-		return nil
-	}
-	immutableFuncMu.RLock()
-	info := immutableFuncInfo[f]
-	immutableFuncMu.RUnlock()
-	return info
-}
-
-func (f *Func) SetImmutableInfo(info *ImmutableFuncInfo) {
-	if f == nil {
-		return
-	}
-	immutableFuncMu.Lock()
-	if info == nil {
-		delete(immutableFuncInfo, f)
-	} else {
-		immutableFuncInfo[f] = info
-	}
-	immutableFuncMu.Unlock()
 }
 
 // NewFunc returns a new Func with the given name and type.

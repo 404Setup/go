@@ -101,30 +101,3 @@ func DeleteFunc[M ~map[K]V, K comparable, V any](m M, del func(K, V) bool) {
 		}
 	}
 }
-
-// toImmutable and isImmutable are implemented in the runtime package.
-//
-//go:linkname toImmutable maps.toImmutable
-func toImmutable(m any) any
-
-//go:linkname isImmutable maps.isImmutable
-func isImmutable(m any) bool
-
-// ToImmutable returns an immutable copy of m. Any subsequent write, delete,
-// clear, or grow operation on the returned map panics at runtime.
-// If m is already immutable or nil, ToImmutable returns m without allocating.
-func ToImmutable[M ~map[K]V, K comparable, V any](m M) M {
-	if m == nil {
-		return nil
-	}
-	return toImmutable(m).(M)
-}
-
-// IsImmutable reports whether m is an immutable map.
-// It returns false for nil maps.
-func IsImmutable[M ~map[K]V, K comparable, V any](m M) bool {
-	if m == nil {
-		return false
-	}
-	return isImmutable(m)
-}

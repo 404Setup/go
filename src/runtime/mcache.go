@@ -240,26 +240,12 @@ func (c *mcache) refill(spc spanClass) {
 
 // allocLarge allocates a span for a large object.
 func (c *mcache) allocLarge(size uintptr, noscan bool) *mspan {
-	return c.allocLargeAligned(size, noscan, false)
-}
-
-// allocLargeAligned allocates a span for a large object, optionally aligned
-// and rounded up to physPageSize when pageSize < physPageSize.
-func (c *mcache) allocLargeAligned(size uintptr, noscan, physPageAlign bool) *mspan {
 	if size+pageSize < size {
 		throw("out of memory")
 	}
 	npages := size >> gc.PageShift
 	if size&pageMask != 0 {
 		npages++
-	}
-	if physPageAlign && pageSize < physPageSize {
-		pagesPerPhys := physPageSize / pageSize
-		aligned := alignUp(npages, pagesPerPhys)
-		if aligned < npages || aligned*pageSize < size {
-			throw("out of memory")
-		}
-		npages = aligned
 	}
 
 	// Deduct credit for this span allocation and sweep if
@@ -268,12 +254,7 @@ func (c *mcache) allocLargeAligned(size uintptr, noscan, physPageAlign bool) *ms
 	deductSweepCredit(npages*pageSize, npages)
 
 	spc := makeSpanClass(0, noscan)
-	var s *mspan
-	if physPageAlign && pageSize < physPageSize {
-		s = mheap_.allocAligned(npages, spc)
-	} else {
-		s = mheap_.alloc(npages, spc)
-	}
+	s := mheap_.alloc(npages, spc)
 	if s == nil {
 		throw("out of memory")
 	}

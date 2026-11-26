@@ -18,14 +18,13 @@ import (
 // A TreeMap must be created with NewTreeMap. It is not safe for concurrent
 // writes and must not be copied after first use.
 type TreeMap[K, V any] struct {
-	_         noCopy
-	compare   func(K, K) int
-	root      *treeMapNode[K, V]
-	free      *treeMapNode[K, V]
-	freeLen   int
-	length    int
-	immutable bool
-	version   uint64
+	_       noCopy
+	compare func(K, K) int
+	root    *treeMapNode[K, V]
+	free    *treeMapNode[K, V]
+	freeLen int
+	length  int
+	version uint64
 }
 
 type treeMapNode[K, V any] struct {
@@ -110,9 +109,6 @@ func (m *TreeMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 }
 
 func (m *TreeMap[K, V]) store(key K, value V, overwrite bool) (previous V, loaded bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	if m.compare == nil {
 		panic("sync/v2/container: uninitialized TreeMap")
 	}
@@ -177,9 +173,6 @@ func (m *TreeMap[K, V]) store(key K, value V, overwrite bool) (previous V, loade
 
 // LoadAndDelete removes key and returns its previous value, if any.
 func (m *TreeMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	if m.root == nil {
 		return value, false
 	}
@@ -207,9 +200,6 @@ func (m *TreeMap[K, V]) Delete(key K) { m.LoadAndDelete(key) }
 // CompareAndSwap replaces the value for key if it equals old. It panics if V
 // is not comparable, or if the comparison involves an uncomparable dynamic value.
 func (m *TreeMap[K, V]) CompareAndSwap(key K, old, new V) bool {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	eq := mapValueEqualFunc[V]("CompareAndSwap")
 	if n := m.find(key); n != nil && eq(unsafe.Pointer(&n.value), abi.NoEscape(unsafe.Pointer(&old))) {
 		n.value = new
@@ -221,9 +211,6 @@ func (m *TreeMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 // CompareAndDelete removes key if its value equals old. It has the same
 // comparability requirements as CompareAndSwap.
 func (m *TreeMap[K, V]) CompareAndDelete(key K, old V) bool {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	eq := mapValueEqualFunc[V]("CompareAndDelete")
 	if n := m.find(key); n != nil && eq(unsafe.Pointer(&n.value), abi.NoEscape(unsafe.Pointer(&old))) {
 		m.deletePresent(key)
@@ -234,9 +221,6 @@ func (m *TreeMap[K, V]) CompareAndDelete(key K, old V) bool {
 
 // Clear removes all entries, releasing the tree storage and retaining the comparator.
 func (m *TreeMap[K, V]) Clear() {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	m.root = nil
 	m.free = nil
 	m.freeLen = 0
@@ -278,9 +262,6 @@ func (m *TreeMap[K, V]) Last() (key K, value V, ok bool) {
 
 // PollFirst removes and returns the least entry.
 func (m *TreeMap[K, V]) PollFirst() (key K, value V, ok bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	if m.root == nil {
 		return key, value, false
 	}
@@ -301,9 +282,6 @@ func (m *TreeMap[K, V]) PollFirst() (key K, value V, ok bool) {
 
 // PollLast removes and returns the greatest entry.
 func (m *TreeMap[K, V]) PollLast() (key K, value V, ok bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	if m.root == nil {
 		return key, value, false
 	}
@@ -586,46 +564,4 @@ func (m *TreeMap[K, V]) remove(n *treeMapNode[K, V], key K) (root *treeMapNode[K
 		}
 	}
 	return treeMapBalance(n), removed, ok
-}
-
-func cloneTreeMapSubtree[K, V any](src *treeMapNode[K, V], nodes []treeMapNode[K, V], idx *int) *treeMapNode[K, V] {
-	if src == nil {
-		return nil
-	}
-	dst := &nodes[*idx]
-	*idx++
-	dst.key = src.key
-	dst.value = src.value
-	dst.red = src.red
-	dst.left = cloneTreeMapSubtree(src.left, nodes, idx)
-	dst.right = cloneTreeMapSubtree(src.right, nodes, idx)
-	return dst
-}
-
-// IsImmutable reports whether m is immutable.
-// It returns false if m is nil.
-func (m *TreeMap[K, V]) IsImmutable() bool {
-	return m != nil && m.immutable
-}
-
-// ToImmutable returns an immutable copy of m retaining its comparator and
-// entries. Any subsequent mutating method call on the returned map panics at
-// runtime.
-// If m is already immutable or nil, ToImmutable returns m without allocating.
-func (m *TreeMap[K, V]) ToImmutable() *TreeMap[K, V] {
-	if m == nil || m.immutable {
-		return m
-	}
-	c := &TreeMap[K, V]{
-		compare:   m.compare,
-		length:    m.length,
-		immutable: true,
-	}
-	if m.root == nil || m.length == 0 {
-		return c
-	}
-	nodes := make([]treeMapNode[K, V], m.length)
-	idx := 0
-	c.root = cloneTreeMapSubtree(m.root, nodes, &idx)
-	return c
 }

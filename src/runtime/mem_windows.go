@@ -117,16 +117,6 @@ func sysFaultOS(v unsafe.Pointer, n uintptr) {
 	sysUnusedOS(v, n)
 }
 
-const hasImmutablePageProtect = false
-
-func sysImmutableProtectOS(v unsafe.Pointer, n uintptr) bool {
-	return false
-}
-
-//go:nosplit
-func sysImmutableUnprotectOS(v unsafe.Pointer, n uintptr) {
-}
-
 func sysReserveOS(v unsafe.Pointer, n uintptr, _ string) unsafe.Pointer {
 	// v is just a hint.
 	// First try at v.

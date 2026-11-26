@@ -54,16 +54,6 @@ func sysFaultOS(v unsafe.Pointer, n uintptr) {
 	mmap(v, n, _PROT_NONE, _MAP_ANON|_MAP_PRIVATE|_MAP_FIXED, -1, 0)
 }
 
-const hasImmutablePageProtect = false
-
-func sysImmutableProtectOS(v unsafe.Pointer, n uintptr) bool {
-	return false
-}
-
-//go:nosplit
-func sysImmutableUnprotectOS(v unsafe.Pointer, n uintptr) {
-}
-
 func sysReserveOS(v unsafe.Pointer, n uintptr, _ string) unsafe.Pointer {
 	p, err := mmap(v, n, _PROT_NONE, _MAP_ANON|_MAP_PRIVATE, -1, 0)
 	if err != 0 {

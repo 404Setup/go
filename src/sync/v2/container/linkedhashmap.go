@@ -27,7 +27,6 @@ type LinkedHashMap[K comparable, V any] struct {
 	free        *linkedHashMapNode[K, V]
 	freeLen     int
 	accessOrder bool
-	immutable   bool
 	version     uint64
 }
 
@@ -115,7 +114,7 @@ func (m *LinkedHashMap[K, V]) Peek(key K) (value V, ok bool) {
 // Load returns the value for key. In access order it moves the entry to the end.
 func (m *LinkedHashMap[K, V]) Load(key K) (value V, ok bool) {
 	if e := m.index[key]; e != nil {
-		if m.accessOrder && !m.immutable && e != m.order.tail {
+		if m.accessOrder && e != m.order.tail {
 			m.order.moveToBack(e)
 			m.version++
 		}
@@ -125,7 +124,7 @@ func (m *LinkedHashMap[K, V]) Load(key K) (value V, ok bool) {
 }
 
 func (m *LinkedHashMap[K, V]) touch(e *linkedHashMapNode[K, V]) {
-	if m.accessOrder && !m.immutable && e != m.order.tail {
+	if m.accessOrder && e != m.order.tail {
 		m.order.moveToBack(e)
 		m.version++
 	}
@@ -136,9 +135,6 @@ func (m *LinkedHashMap[K, V]) Store(key K, value V) { m.Swap(key, value) }
 
 // Swap sets the value for key and returns its previous value, if any.
 func (m *LinkedHashMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	if e := m.index[key]; e != nil {
 		previous = e.value
 		e.value = value
@@ -167,9 +163,6 @@ func (m *LinkedHashMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 // LoadOrStore returns the existing value, or stores and returns value if absent.
 // The loaded result reports whether the key was already present.
 func (m *LinkedHashMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	if e := m.index[key]; e != nil {
 		m.touch(e)
 		return e.value, true
@@ -195,9 +188,6 @@ func (m *LinkedHashMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool
 
 // LoadAndDelete removes key and returns its previous value, if any.
 func (m *LinkedHashMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	if e := m.index[key]; e != nil {
 		_, value, _ = m.remove(e)
 		return value, true
@@ -211,9 +201,6 @@ func (m *LinkedHashMap[K, V]) Delete(key K) { m.LoadAndDelete(key) }
 // CompareAndSwap replaces the value for key if it equals old. It panics if V
 // is not comparable, or if the comparison involves an uncomparable dynamic value.
 func (m *LinkedHashMap[K, V]) CompareAndSwap(key K, old, new V) bool {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	eq := mapValueEqualFunc[V]("CompareAndSwap")
 	if e := m.index[key]; e != nil {
 		if eq(unsafe.Pointer(&e.value), abi.NoEscape(unsafe.Pointer(&old))) {
@@ -228,9 +215,6 @@ func (m *LinkedHashMap[K, V]) CompareAndSwap(key K, old, new V) bool {
 // CompareAndDelete removes key if its value equals old. It has the same
 // comparability requirements as CompareAndSwap.
 func (m *LinkedHashMap[K, V]) CompareAndDelete(key K, old V) bool {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	eq := mapValueEqualFunc[V]("CompareAndDelete")
 	if e := m.index[key]; e != nil && eq(unsafe.Pointer(&e.value), abi.NoEscape(unsafe.Pointer(&old))) {
 		m.remove(e)
@@ -241,9 +225,6 @@ func (m *LinkedHashMap[K, V]) CompareAndDelete(key K, old V) bool {
 
 // Clear removes all entries and releases the hash index and list storage.
 func (m *LinkedHashMap[K, V]) Clear() {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	m.index = nil
 	m.order.init()
 	m.free = nil
@@ -253,9 +234,6 @@ func (m *LinkedHashMap[K, V]) Clear() {
 
 // Shrink rebuilds the hash index to fit the current entries, preserving order.
 func (m *LinkedHashMap[K, V]) Shrink() {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	m.free = nil
 	m.freeLen = 0
 	if m.order.len == 0 {
@@ -289,17 +267,11 @@ func (m *LinkedHashMap[K, V]) Last() (key K, value V, ok bool) {
 // least recently accessed entry. It takes O(n) time for a key containing NaN,
 // which cannot be removed from a Go map by key; otherwise it takes O(1) time.
 func (m *LinkedHashMap[K, V]) PollFirst() (key K, value V, ok bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	return m.remove(m.order.head)
 }
 
 // PollLast removes and returns the last entry. Its complexity is as for PollFirst.
 func (m *LinkedHashMap[K, V]) PollLast() (key K, value V, ok bool) {
-	if m.immutable {
-		panic(errImmutableContainer)
-	}
 	return m.remove(m.order.tail)
 }
 
@@ -361,46 +333,3 @@ func (m *LinkedHashMap[K, V]) Backward() iter.Seq2[K, V] {
 // Range calls f for each entry in order, stopping when f returns false.
 // It has the same mutation rules as All.
 func (m *LinkedHashMap[K, V]) Range(f func(K, V) bool) { m.All()(f) }
-
-// IsImmutable reports whether m is immutable.
-// It returns false if m is nil.
-func (m *LinkedHashMap[K, V]) IsImmutable() bool {
-	return m != nil && m.immutable
-}
-
-// ToImmutable returns an immutable copy of m preserving its current iteration
-// order without mutating order on Load. Any subsequent mutating method call on
-// the returned map panics at runtime.
-// If m is already immutable or nil, ToImmutable returns m without allocating.
-func (m *LinkedHashMap[K, V]) ToImmutable() *LinkedHashMap[K, V] {
-	if m == nil || m.immutable {
-		return m
-	}
-	c := &LinkedHashMap[K, V]{
-		immutable: true,
-	}
-	n := m.order.len
-	if n == 0 {
-		return c
-	}
-	c.index = make(map[K]*linkedHashMapNode[K, V], n)
-	nodes := make([]linkedHashMapNode[K, V], n)
-	i := 0
-	for src := m.order.head; src != nil && i < n; src = src.next {
-		dst := &nodes[i]
-		dst.key = src.key
-		dst.value = src.value
-		if i > 0 {
-			dst.prev = &nodes[i-1]
-			nodes[i-1].next = dst
-		}
-		c.index[dst.key] = dst
-		i++
-	}
-	if i > 0 {
-		c.order.head = &nodes[0]
-		c.order.tail = &nodes[i-1]
-		c.order.len = i
-	}
-	return c
-}

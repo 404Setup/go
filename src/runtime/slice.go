@@ -417,9 +417,6 @@ func slicecopy(toPtr unsafe.Pointer, toLen int, fromPtr unsafe.Pointer, fromLen 
 	}
 
 	size := uintptr(n) * width
-	if (raceenabled || msanenabled || asanenabled || !hasImmutablePageProtect) && isImmutableSlicePtr(toPtr) {
-		panic(errorString("modification of immutable slice"))
-	}
 	if raceenabled {
 		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(slicecopy)
@@ -442,87 +439,6 @@ func slicecopy(toPtr unsafe.Pointer, toLen int, fromPtr unsafe.Pointer, fromLen 
 		memmove(toPtr, fromPtr, size)
 	}
 	return n
-}
-
-//go:nosplit
-func isImmutableFault(addr uintptr) bool {
-	s := spanOf(addr)
-	if s == nil || s.state.get() != mSpanInUse || !s.isImmutable {
-		return false
-	}
-	return addr >= s.base() && addr < s.base()+s.npages*pageSize
-}
-
-//go:linkname isImmutableSlicePtr slices.isImmutableSlicePtr
-//go:nosplit
-func isImmutableSlicePtr(ptr unsafe.Pointer) bool {
-	if ptr == unsafe.Pointer(&immutableZerobase) {
-		return true
-	}
-	s := spanOfHeap(uintptr(ptr))
-	return s != nil && s.isImmutable
-}
-
-//go:linkname makeImmutableSlice slices.makeImmutableSlice
-func makeImmutableSlice(et *_type, from unsafe.Pointer, n int) unsafe.Pointer {
-	if n < 0 {
-		panicmakeslicelen()
-	}
-	if n == 0 || et.Size_ == 0 {
-		return unsafe.Pointer(&immutableZerobase)
-	}
-	if s := spanOfHeap(uintptr(from)); s != nil && s.isImmutable {
-		return from
-	}
-	mem, overflow := math.MulUintptr(et.Size_, uintptr(n))
-	if overflow || mem > maxAlloc {
-		panicmakeslicelen()
-	}
-	x := mallocgcLargeImmutable(mem, et)
-	if raceenabled {
-		callerpc := sys.GetCallerPC()
-		pc := abi.FuncPCABIInternal(makeImmutableSlice)
-		racereadrangepc(from, mem, callerpc, pc)
-	}
-	if msanenabled {
-		msanread(from, mem)
-	}
-	if asanenabled {
-		asanread(from, mem)
-	}
-	if writeBarrier.enabled && et.Pointers() {
-		bulkBarrierPreWriteSrcOnly(uintptr(x), uintptr(from), mem-et.Size_+et.PtrBytes, et)
-	}
-	memmove(x, from, mem)
-	publicationBarrier()
-
-	span := spanOf(uintptr(x))
-	if hasImmutablePageProtect {
-		nbytes := span.npages * pageSize
-		if !sysImmutableProtectOS(x, nbytes) {
-			GC()
-			if !sysImmutableProtectOS(x, nbytes) {
-				panic(errorString("failed to protect immutable slice"))
-			}
-		}
-	}
-	span.isImmutable = true
-	publicationBarrier()
-	return x
-}
-
-func freezeImmutableSlice(s slice, et *_type) slice {
-	if s.array == nil {
-		return s
-	}
-	if s.len == 0 {
-		return slice{unsafe.Pointer(&immutableZerobase), 0, 0}
-	}
-	if isImmutableSlicePtr(s.array) {
-		return slice{s.array, s.len, s.len}
-	}
-	p := makeImmutableSlice(et, s.array, s.len)
-	return slice{p, s.len, s.len}
 }
 
 //go:linkname bytealg_MakeNoZero internal/bytealg.MakeNoZero

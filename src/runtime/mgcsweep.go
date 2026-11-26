@@ -615,10 +615,6 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				}
 			} else {
 				// Pass 2: the object is truly dead, free (and handle) all specials.
-				if s.isImmutable {
-					sysImmutableUnprotectOS(unsafe.Pointer(s.base()), s.npages*pageSize)
-					s.isImmutable = false
-				}
 				for siter.valid() && siter.s.offset < endOffset {
 					// Find the exact byte for which the special was setup
 					// (as opposed to object beginning).
@@ -657,10 +653,6 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 						trace.HeapObjectFree(x)
 						traceRelease(trace)
 					}
-				}
-				if s.isImmutable {
-					sysImmutableUnprotectOS(unsafe.Pointer(s.base()), s.npages*pageSize)
-					s.isImmutable = false
 				}
 				if debug.clobberfree != 0 {
 					clobberfree(unsafe.Pointer(x), size)
@@ -853,10 +845,6 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 			// It should be possible to switch back to sysFree if we also
 			// implement and then call some kind of mheap.deleteSpan.
 			if debug.efence > 0 {
-				if s.isImmutable {
-					sysImmutableUnprotectOS(unsafe.Pointer(s.base()), s.npages*pageSize)
-					s.isImmutable = false
-				}
 				s.limit = 0 // prevent mlookup from finding this span
 				sysFault(unsafe.Pointer(s.base()), size)
 			} else {

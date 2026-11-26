@@ -636,9 +636,6 @@ func ImplementsExplain(t, iface *types.Type) string {
 	if isptrto(t, types.TINTER) {
 		return fmt.Sprintf("%v is pointer to interface, not interface", t)
 	} else if have != nil && have.Sym == missing.Sym && have.Nointerface() {
-		if n, ok := have.Nname.(*ir.Name); ok && n.Func != nil && n.Func.Pragma&ir.Immutable != 0 {
-			return fmt.Sprintf("%v does not implement %v (%v method has //go:immutable parameter constraints)", t, iface, missing.Sym)
-		}
 		return fmt.Sprintf("%v does not implement %v (%v method is marked 'nointerface')", t, iface, missing.Sym)
 	} else if have != nil && have.Sym == missing.Sym {
 		return fmt.Sprintf("%v does not implement %v (wrong type for %v method)\n"+

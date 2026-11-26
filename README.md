@@ -11,12 +11,11 @@ Preserves Go syntax and standard library API compatibility.
 
 ### Compiler & Runtime
 - **`cmd/compile`**: `-ldflags="-o2"` (loop unrolling, post-prove DCE), `-ldflags="-o3"` (cost-based inlining, loop interchange/tiling, cross-loop BCE, reflection/interface DCE), `-ldflags="-fmth"` (fast-math SSA), and stack SBO for non-escaping slices/strings (`all=` applies flags across dependencies).
-- **`//go:immutable`**: compile-time and runtime immutability for slices, arrays, maps, `*list.List`, `*ring.Ring`, and `sync/v2/container` maps. Applies to variable declarations (`var`, `:=`) and named functions/methods (`//go:immutable [args<N>...] [r|r<N>...]`; bare `//go:immutable` constrains all supported non-variadic parameters, `r` aliases `r0` for single-result functions, verified at compile time across call and return sites).
-- **`runtime`, `slices`, `maps`, `container/list`, `container/ring`**: span/stack/GC sweep optimizations, write-barrier deduplication, and `ToImmutable` / `IsImmutable`.
+- **`runtime`**: span/stack/GC sweep optimizations and write-barrier deduplication.
 - **`cmd/go`, `cmd/internal/{archive,bio,buildid,goobj,obj}`**: sharded per-bucket cache indexes (`idx`) and small-blob packing (`pack`), single-pass pooled `GOCACHE` writes, 64 KiB `bio`/copy/hash buffers, skipped empty stdout and unmodified source caching, and bounds-checked LZ4 object compression (`\x00go120lz`; `__.PKGDEF` remains uncompressed).
 
 ### Standard Library
-- **`sync/v2`, `sync/v2/container`, `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, and `LinkedHashMap`, `OrderedMap`, `TreeMap`, `ConcurrentSkipListMap` (`ToImmutable`, `IsImmutable`).
+- **`sync/v2`, `sync/v2/container`, `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, `LinkedHashMap`, `OrderedMap`, `TreeMap`, and `ConcurrentSkipListMap`.
 - **`encoding/base64`**: AVX2/SSSE3 (`amd64`), NEON/SVE2 (`arm64`) vector codecs, LUT4 scalar decode, and single-alloc `EncodeToString`.
 - **`encoding/hex`**: AVX2/SSSE3 (`amd64`) and NEON (`arm64`) vector encode/decode, LUT16 scalar encode, AVX2/packed `Dump`, zero-copy `DecodeString`, single-alloc `EncodeToString`, and large-buffer `Decoder.Read`.
 - **`encoding/json`, `encoding/json/v2`, `encoding/xml`**: compiled marshal/unmarshal plans, SWAR/SIMD scanning, pooled codecs, and generic `Append*`/`*Of` fast paths (`jsonv2` and `nojsonv2`).
