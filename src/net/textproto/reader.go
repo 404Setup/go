@@ -7,9 +7,9 @@ package textproto
 import (
 	"bufio"
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"internal/byteorder"
 	"io"
 	"math"
 	"strconv"
@@ -1313,7 +1313,7 @@ func validHeaderValueByte(c byte) bool {
 func validHeaderValueBytes(v []byte) bool {
 	i := 0
 	for ; i+8 <= len(v); i += 8 {
-		w := binary.LittleEndian.Uint64(v[i:])
+		w := byteorder.LEUint64(v[i:])
 		x := w ^ 0x7f7f7f7f7f7f7f7f
 		if ((w|(w-0x2020202020202020))&0x8080808080808080) != 0 ||
 			(((x-0x0101010101010101)&^x)&0x8080808080808080) != 0 {
