@@ -1363,11 +1363,18 @@ func parseSimpleHTTPURL(rawurl string, dst *urlpkg.URL) bool {
 	qIdx := -1
 	for i := 0; i < len(tail); i++ {
 		c := tail[i]
+		if qIdx < 0 {
+			if c == '?' {
+				qIdx = i
+				continue
+			}
+			if !cleanPathTable[c] {
+				return false
+			}
+			continue
+		}
 		if c <= ' ' || c >= 0x7f || c == '#' || c == '%' || c == '\\' {
 			return false
-		}
-		if c == '?' && qIdx < 0 {
-			qIdx = i
 		}
 	}
 	var path, rawQuery string

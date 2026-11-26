@@ -37,6 +37,10 @@ func TestParseSimpleHTTPURLParity(t *testing.T) {
 		"http://example.com/a%20b?x=1%262",
 		"http://example.com/path#frag",
 		"http://example.com/a;b",
+		"http://example.com/a!b",
+		"http://example.com/a(1)",
+		"http://example.com/a[1]",
+		`http://example.com/a"b?x=1`,
 		"http://example.com/a\\b",
 		"http://example.com/a b",
 		"HTTP://EXAMPLE.COM/Path",
@@ -378,4 +382,90 @@ func TestPersistConnTreqReuseConcurrentAndCancel(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+func TestSnapshotHeaderSinglePassAndOverflow(t *testing.T) {
+	// Exercise empty, small inline cwStrBuf, and multi-stage overflow into cwSnapStrs.
+	srv := &Server{}
+	mkResp := func() (*response, *bytes.Buffer) {
+		var out bytes.Buffer
+		c := &conn{server: srv}
+		w := &response{
+			conn:          c,
+			req:           &Request{Method: "GET", ProtoMajor: 1, ProtoMinor: 1},
+			handlerHeader: make(Header),
+			contentLength: -1,
+		}
+		w.cw.res = w
+		c.bufw = bufio.NewWriter(&out)
+		return w, &out
+	}
+
+	// 1. Empty header snapshot.
+	w0, _ := mkResp()
+	w0.snapshotHeader()
+	if !w0.cw.hasSnap || len(w0.cw.snap) != 0 {
+		t.Fatalf("empty snapshotHeader: hasSnap=%v len=%d", w0.cw.hasSnap, len(w0.cw.snap))
+	}
+
+	// 2. Overflow both cwSnapBuf (>16 keys) and cwStrBuf (>32 values), twice.
+	w1, _ := mkResp()
+	for i := range 24 {
+		k := CanonicalHeaderKey("X-Test-" + string(rune('A'+i)))
+		w1.handlerHeader[k] = []string{"v1", "v2", "v3"}
+	}
+	w1.snapshotHeader()
+	if len(w1.cw.snap) != 24 {
+		t.Fatalf("snap len = %d, want 24", len(w1.cw.snap))
+	}
+	// Mutating handlerHeader after snapshot must not corrupt snapshot.
+	w1.handlerHeader.Set("X-Test-A", "mutated")
+	for _, kv := range w1.cw.snap {
+		if kv.key == "X-Test-A" && kv.values[0] != "v1" {
+			t.Fatalf("snapshot aliased handlerHeader after mutation: %v", kv.values)
+		}
+		if len(kv.values) != 3 || kv.values[0] != "v1" || kv.values[1] != "v2" || kv.values[2] != "v3" {
+			t.Fatalf("unexpected snap values for %s: %v", kv.key, kv.values)
+		}
+	}
+
+	// Verify clearSnap clears references and reset does not leak across putResponse/re-use.
+	w1.w = bufio.NewWriter(io.Discard)
+	putResponse(w1)
+	if w1.handlerHeader != nil || w1.cw.hasSnap {
+		t.Fatalf("putResponse failed to reset response state")
+	}
+}
+
+func TestIsCleanEscapedMuxPathParity(t *testing.T) {
+	paths := []string{
+		"/",
+		"/a",
+		"/a/",
+		"/a/b/c",
+		"/a/b.",
+		"/a/b..",
+		"//",
+		"/a//b",
+		"/.",
+		"/..",
+		"/a/.",
+		"/a/..",
+		"/a/./b",
+		"/a/../b",
+		"/a%20b",
+		"/a b",
+		"/a?b",
+		"",
+		"relative",
+	}
+	for _, p := range paths {
+		u := &url.URL{Path: p}
+		escaped := u.EscapedPath()
+		cleaned := cleanPath(escaped)
+		want := len(p) > 0 && p[0] == '/' && escaped == p && cleaned == p
+		if got := isCleanEscapedMuxPath(p); got != want {
+			t.Fatalf("isCleanEscapedMuxPath(%q) = %v, want %v (escaped=%q cleaned=%q)", p, got, want, escaped, cleaned)
+		}
+	}
 }

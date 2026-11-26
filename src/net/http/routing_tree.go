@@ -87,55 +87,88 @@ func populateMethodStaticTable(methodNode *routingNode) {
 	if methodNode == nil {
 		return
 	}
-	var entries []entry[string, *routingNode]
-	allStatic := collectStaticLeaves(methodNode, &entries)
-	if len(entries) == 0 {
+	var exactEntries []entry[string, *routingNode]
+	var prefixEntries []entry[string, *routingNode]
+	allStatic := collectStaticLeaves(methodNode, &exactEntries, &prefixEntries)
+	total := len(exactEntries) + len(prefixEntries)
+	if total == 0 {
 		return
 	}
 	st := &staticRoutes{
-		minLen: len(entries[0].key),
-		maxLen: len(entries[0].key),
-		only:   allStatic,
+		only: allStatic,
 	}
-	if len(entries) == 1 {
-		st.key = entries[0].key
-		st.val = entries[0].value
+	if len(exactEntries) == 1 && len(prefixEntries) == 0 {
+		st.key = exactEntries[0].key
+		st.val = exactEntries[0].value
+		st.minLen = len(st.key)
+		st.maxLen = len(st.key)
+		st.lenMask = 1 << (uint(len(st.key)) & 63)
+	} else if len(exactEntries) == 0 && len(prefixEntries) == 1 {
+		st.key = prefixEntries[0].key
+		st.val = prefixEntries[0].value
+		st.minLen = len(st.key)
+		st.maxLen = len(st.key)
 		st.lenMask = 1 << (uint(len(st.key)) & 63)
 	} else {
-		m := make(map[string]*routingNode, len(entries))
-		for _, e := range entries {
+		m := make(map[string]*routingNode, total)
+		initBounds := false
+		addEntry := func(e entry[string, *routingNode]) {
 			l := len(e.key)
-			if l < st.minLen {
+			if !initBounds {
 				st.minLen = l
-			}
-			if l > st.maxLen {
 				st.maxLen = l
+				initBounds = true
+			} else {
+				if l < st.minLen {
+					st.minLen = l
+				}
+				if l > st.maxLen {
+					st.maxLen = l
+				}
 			}
 			st.lenMask |= 1 << (uint(l) & 63)
 			m[e.key] = e.value
+		}
+		// Insert prefix entries first so exact patterns (e.g. /foo/{$}) take precedence over /foo/.
+		for _, e := range prefixEntries {
+			addEntry(e)
+		}
+		for _, e := range exactEntries {
+			addEntry(e)
 		}
 		st.m = m
 	}
 	methodNode.static = st
 }
 
-func collectStaticLeaves(n *routingNode, out *[]entry[string, *routingNode]) (allStatic bool) {
+func collectStaticLeaves(n *routingNode, exactOut, prefixOut *[]entry[string, *routingNode]) (allStatic bool) {
 	if n == nil {
 		return true
 	}
 	allStatic = true
 	if n.pattern != nil {
-		if key, ok := staticPatternPath(n.pattern); ok {
-			*out = append(*out, entry[string, *routingNode]{key: key, value: n})
+		if key, exact, ok := staticPatternKey(n.pattern, n.namedMulti); ok {
+			if exact {
+				*exactOut = append(*exactOut, entry[string, *routingNode]{key: key, value: n})
+			} else {
+				*prefixOut = append(*prefixOut, entry[string, *routingNode]{key: key, value: n})
+				allStatic = false
+			}
 		} else {
 			allStatic = false
 		}
 	}
-	if n.emptyChild != nil || n.multiChild != nil {
+	if n.emptyChild != nil {
 		allStatic = false
 	}
+	if n.multiChild != nil {
+		allStatic = false
+		if !collectStaticLeaves(n.multiChild, exactOut, prefixOut) {
+			allStatic = false
+		}
+	}
 	n.children.eachPair(func(_ string, child *routingNode) bool {
-		if !collectStaticLeaves(child, out) {
+		if !collectStaticLeaves(child, exactOut, prefixOut) {
 			allStatic = false
 		}
 		return true
@@ -143,38 +176,48 @@ func collectStaticLeaves(n *routingNode, out *[]entry[string, *routingNode]) (al
 	return allStatic
 }
 
-func staticPatternPath(p *pattern) (string, bool) {
-	if len(p.segments) == 0 {
-		return "", false
+func staticPatternKey(p *pattern, namedMulti bool) (key string, exact bool, ok bool) {
+	if len(p.segments) == 0 || namedMulti {
+		return "", false, false
 	}
 	size := 0
+	exact = true
+	lastIdx := len(p.segments) - 1
 	for i, seg := range p.segments {
-		if seg.wild || seg.multi {
-			return "", false
+		if seg.multi {
+			if i != lastIdx || seg.s != "" {
+				return "", false, false
+			}
+			exact = false
+			size++
+			continue
+		}
+		if seg.wild {
+			return "", false, false
 		}
 		if seg.s == "/" {
-			if i != len(p.segments)-1 {
-				return "", false
+			if i != lastIdx {
+				return "", false, false
 			}
 			size++
 			continue
 		}
 		if seg.s == "" || strings.IndexByte(seg.s, '/') >= 0 || strings.IndexByte(seg.s, '%') >= 0 {
-			return "", false
+			return "", false, false
 		}
 		size += 1 + len(seg.s)
 	}
 	var b strings.Builder
 	b.Grow(size)
 	for _, seg := range p.segments {
-		if seg.s == "/" {
+		if seg.multi || seg.s == "/" {
 			b.WriteByte('/')
 		} else {
 			b.WriteByte('/')
 			b.WriteString(seg.s)
 		}
 	}
-	return b.String(), true
+	return b.String(), exact, true
 }
 
 func (st *staticRoutes) lookup(path string) *routingNode {

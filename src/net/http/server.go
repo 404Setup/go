@@ -1575,10 +1575,6 @@ func (w *response) snapshotHeader() {
 		w.cw.hasSnap = true
 		return
 	}
-	nv := 0
-	for _, vv := range h {
-		nv += len(vv)
-	}
 	var snap []keyValues
 	if len(h) <= len(w.cwSnapBuf) {
 		snap = w.cwSnapBuf[:0]
@@ -1590,27 +1586,41 @@ func (w *response) snapshotHeader() {
 		}
 		snap = w.cwSnap
 	}
-	var sv []string
-	if nv > 0 {
-		if nv <= len(w.cwStrBuf) {
-			sv = w.cwStrBuf[:nv]
-		} else {
-			if cap(w.cwSnapStrs) < nv {
-				w.cwSnapStrs = make([]string, nv)
-			} else {
-				w.cwSnapStrs = w.cwSnapStrs[:nv]
-			}
-			sv = w.cwSnapStrs
-		}
-	}
+	sv := w.cwStrBuf[:]
+	svOff := 0
+	usingHeap := false
 	for k, vv := range h {
 		if vv == nil {
 			snap = append(snap, keyValues{key: k, values: nil})
 			continue
 		}
-		n := copy(sv, vv)
-		snap = append(snap, keyValues{key: k, values: sv[:n:n]})
-		sv = sv[n:]
+		if svOff+len(vv) > len(sv) {
+			need := svOff + len(vv)
+			if need < 2*len(sv) {
+				need = 2 * len(sv)
+			}
+			var next []string
+			if !usingHeap && cap(w.cwSnapStrs) >= need {
+				next = w.cwSnapStrs[:cap(w.cwSnapStrs)]
+			} else {
+				next = make([]string, need)
+			}
+			copy(next, sv[:svOff])
+			off := 0
+			for i := range snap {
+				if snap[i].values != nil {
+					ln := len(snap[i].values)
+					snap[i].values = next[off : off+ln : off+ln]
+					off += ln
+				}
+			}
+			w.cwSnapStrs = next
+			sv = next
+			usingHeap = true
+		}
+		n := copy(sv[svOff:], vv)
+		snap = append(snap, keyValues{key: k, values: sv[svOff : svOff+n : svOff+n]})
+		svOff += n
 	}
 	if len(h) > len(w.cwSnapBuf) {
 		w.cwSnap = snap
@@ -3834,17 +3844,19 @@ func isCleanEscapedMuxPath(p string) bool {
 	if len(p) == 0 || p[0] != '/' {
 		return false
 	}
-	for i := 0; i < len(p); i++ {
+	if len(p) == 1 {
+		return true
+	}
+	prevSlash := true
+	for i := 1; i < len(p); i++ {
 		c := p[i]
 		if !cleanPathTable[c] {
 			return false
 		}
-		if c == '/' && i+1 < len(p) {
-			next := p[i+1]
-			if next == '/' || next == '.' {
-				return false
-			}
+		if prevSlash && (c == '/' || c == '.') {
+			return false
 		}
+		prevSlash = c == '/'
 	}
 	return true
 }

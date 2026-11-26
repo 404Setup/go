@@ -311,7 +311,7 @@ func newMuxTestResponseWriter() *muxTestResponseWriter {
 	return &muxTestResponseWriter{hdr: make(Header)}
 }
 
-func (w *muxTestResponseWriter) Header() Header         { return w.hdr }
+func (w *muxTestResponseWriter) Header() Header       { return w.hdr }
 func (w *muxTestResponseWriter) WriteHeader(code int) { w.code = code }
 func (w *muxTestResponseWriter) Write(p []byte) (int, error) {
 	w.body = append(w.body, p...)
@@ -694,3 +694,89 @@ func BenchmarkServeMuxSnap(b *testing.B) {
 	})
 }
 
+func TestServeMuxStaticPrefixPrecedence(t *testing.T) {
+	mux := NewServeMux()
+	tagHandler := func(tag string) Handler {
+		return HandlerFunc(func(w ResponseWriter, r *Request) {
+			_, _ = io.WriteString(w, tag)
+		})
+	}
+	mux.Handle("GET /api/", tagHandler("api-prefix"))
+	mux.Handle("GET /exact/", tagHandler("exact-prefix"))
+	mux.Handle("GET /exact/{$}", tagHandler("exact-end"))
+	mux.Handle("GET /api/items/{id}", HandlerFunc(func(w ResponseWriter, r *Request) {
+		_, _ = io.WriteString(w, "item:"+r.PathValue("id"))
+	}))
+	mux.Handle("GET /files/{path...}", HandlerFunc(func(w ResponseWriter, r *Request) {
+		_, _ = io.WriteString(w, "files:"+r.PathValue("path"))
+	}))
+
+	cases := []struct {
+		path     string
+		wantPat  string
+		wantBody string
+	}{
+		{"/api/", "GET /api/", "api-prefix"},
+		{"/api/unknown/sub", "GET /api/", "api-prefix"},
+		{"/exact/", "GET /exact/{$}", "exact-end"},
+		{"/exact/sub", "GET /exact/", "exact-prefix"},
+		{"/api/items/42", "GET /api/items/{id}", "item:42"},
+		{"/api/items/42/extra", "GET /api/", "api-prefix"},
+		{"/files/", "GET /files/{path...}", "files:"},
+		{"/files/a/b.txt", "GET /files/{path...}", "files:a/b.txt"},
+	}
+	for _, tc := range cases {
+		req := &Request{Method: MethodGet, Host: "example.com", URL: &url.URL{Path: tc.path}}
+		_, pat := mux.Handler(req)
+		if pat != tc.wantPat {
+			t.Fatalf("Handler(%q) pattern = %q, want %q", tc.path, pat, tc.wantPat)
+		}
+		w := newMuxTestResponseWriter()
+		mux.ServeHTTP(w, req)
+		if string(w.body) != tc.wantBody {
+			t.Fatalf("ServeHTTP(%q) body = %q, want %q", tc.path, w.body, tc.wantBody)
+		}
+	}
+
+	// Trailing-slash redirect for /api -> /api/ must remain intact.
+	redirReq := &Request{Method: MethodGet, Host: "example.com", URL: &url.URL{Path: "/api"}}
+	hRedir, _ := mux.Handler(redirReq)
+	wRedir := newMuxTestResponseWriter()
+	hRedir.ServeHTTP(wRedir, redirReq)
+	if wRedir.code != StatusTemporaryRedirect {
+		t.Fatalf("redirect status for /api = %d, want 307", wRedir.code)
+	}
+
+	// Static prefix exact lookup must allocate 0 bytes after snapshot build.
+	mux.maybeBuildSnap()
+	prefixReq := &Request{Method: MethodGet, Host: "example.com", URL: &url.URL{Path: "/api/"}}
+	for range 4 {
+		mux.Handler(prefixReq)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if _, pat := mux.Handler(prefixReq); pat != "GET /api/" {
+			t.Fatalf("unexpected pattern %q", pat)
+		}
+	}); allocs != 0 {
+		t.Fatalf("static prefix Handler allocs = %v, want 0", allocs)
+	}
+}
+
+func BenchmarkServeMuxStaticPrefix(b *testing.B) {
+	mux := NewServeMux()
+	noop := HandlerFunc(func(w ResponseWriter, r *Request) {})
+	for i := range 64 {
+		mux.Handle(fmt.Sprintf("GET /svc/%d/", i), noop)
+	}
+	req := &Request{Method: MethodGet, Host: "example.com", URL: &url.URL{Path: "/svc/42/"}}
+	for range 4 {
+		mux.Handler(req)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, pat := mux.Handler(req); pat == "" {
+			b.Fatal("no match")
+		}
+	}
+}
