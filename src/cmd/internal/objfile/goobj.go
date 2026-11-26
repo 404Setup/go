@@ -45,6 +45,9 @@ L:
 				return nil, err
 			}
 			r := goobj.NewReaderFromBytes(b, false)
+			if r == nil {
+				return nil, fmt.Errorf("open %s: invalid go object file %s", f.Name(), e.Name)
+			}
 			var arch *sys.Arch
 			for _, a := range sys.Archs {
 				if a.Name == e.Obj.Arch {
@@ -324,9 +327,7 @@ func readvarint(p *[]byte) uint32 {
 
 // We treat the whole object file as the text section.
 func (f *goobjFile) text() (textStart uint64, text []byte, err error) {
-	text = make([]byte, f.goobj.Size)
-	_, err = f.f.ReadAt(text, f.goobj.Offset)
-	return
+	return 0, f.r.Bytes(), nil
 }
 
 func (f *goobjFile) goarch() string {

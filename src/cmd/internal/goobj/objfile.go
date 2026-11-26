@@ -669,6 +669,11 @@ func NewReaderFromBytes(b []byte, readonly bool) *Reader {
 	return r
 }
 
+// Bytes returns the uncompressed object file bytes backing r.
+func (r *Reader) Bytes() []byte {
+	return r.b
+}
+
 func (r *Reader) BytesAt(off uint32, len int) []byte {
 	if len == 0 {
 		return nil
