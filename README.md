@@ -80,7 +80,7 @@ Measured on `linux/amd64` (Intel Xeon, `-cpu=2`) against upstream Go / pre-optim
 | `encoding/hex` | `EncodeToString` (8 KB) / `DecodeString` (4 KB) | 24,355 / 4,122 ns | **7,048 / 1,208 ns** | **3.46× / 3.41×** (1 alloc) |
 | `encoding/hex` | `Dump` (1 KB / 16 KB) | 21,879 / 387,694 ns | **2,462 / 30,950 ns** | **8.89× / 12.5×** (3 → **1 alloc**) |
 | `encoding/hex` | `Dumper` (4 KB) | 9,597 ns | **1,678 ns** | **5.72×** (2.44 GB/s, 1 alloc) |
-| `encoding/xml` | `Marshal` / `Unmarshal` / `EscapeTextPlain` | 7.80 / 21.11 / 12.31 µs | **1.19 / 4.54 / 0.25 µs** | **6.58× / 4.65× / 49.1×** |
+| `encoding/xml` | `Marshal` / `Unmarshal` / `EscapeTextPlain` | 7.80 / 21.11 / 12.31 µs | **1.02 / 3.81 / 0.24 µs** | **7.62× / 5.55× / 51.0×** |
 | `fmt` | `SprintfEmpty` / `SprintfInt` / `SprintfSliceInt` | 66.35 / 41.91 / 530.6 ns | **3.27 / 16.59 / 116.9 ns** | **20.3× / 2.53× / 4.54×** |
 
 ---
