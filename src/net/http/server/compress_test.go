@@ -1406,3 +1406,42 @@ func TestSecurityCompressionBombsAndConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestDecompressUnlimitedWithMaxBodyBytesErrorLimit(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.MaxBodyBytes = 64
+	cfg.Compression.MaxDecompressedBytes = -1
+	s := server.NewWithConfig(cfg)
+	var capturedErr error
+	s.POST("/stream", func(c *server.Context) error {
+		_, err := io.ReadAll(c.Request().Body)
+		capturedErr = err
+		return err
+	})
+
+	// Incompressible payload whose gzip stream exceeds MaxBodyBytes + compressedInputHeadroom.
+	big := make([]byte, 128*1024)
+	x := uint32(0x12345678)
+	for i := range big {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		big[i] = byte(x)
+	}
+	gz := gzipBytes(t, big)
+	req := httptest.NewRequest(http.MethodPost, "/stream", bytes.NewReader(gz))
+	req.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; err = %v", rec.Code, capturedErr)
+	}
+	var maxErr *http.MaxBytesError
+	if !errors.As(capturedErr, &maxErr) {
+		t.Fatalf("expected *http.MaxBytesError, got %v", capturedErr)
+	}
+	if maxErr.Limit != 64 {
+		t.Fatalf("MaxBytesError.Limit = %d, want 64", maxErr.Limit)
+	}
+}

@@ -606,6 +606,7 @@ type decompressReadCloser struct {
 	reader          io.Reader
 	configuredLimit int64
 	limit           int64
+	srcErrLimit     int64
 	decompressed    int64
 	initialized     bool
 	eof             bool
@@ -622,6 +623,7 @@ func (d *decompressReadCloser) init() error {
 		limit = d.ctx.effectiveMaxBodyBytes()
 	}
 	d.limit = limit
+	d.srcErrLimit = limit
 
 	var cur io.Reader = d.rawSrc
 	if limit > 0 {
@@ -635,6 +637,7 @@ func (d *decompressReadCloser) init() error {
 		cur = &d.srcLimit
 	} else if d.ctx != nil {
 		if bodyLimit := d.ctx.effectiveMaxBodyBytes(); bodyLimit > 0 {
+			d.srcErrLimit = bodyLimit
 			rawLimit := bodyLimit
 			if rawLimit <= (1<<63-1)-compressedInputHeadroom {
 				rawLimit += compressedInputHeadroom
@@ -681,7 +684,11 @@ func (d *decompressReadCloser) Read(p []byte) (int, error) {
 			if d.ctx != nil {
 				d.ctx.markRequestTooLarge()
 			}
-			d.err = WrapError(http.StatusRequestEntityTooLarge, "request body too large", fmt.Errorf("%w: %w", ErrBodyTooLarge, &http.MaxBytesError{Limit: d.limit}))
+			errLimit := d.limit
+			if d.srcLimit.exceeded && errLimit <= 0 {
+				errLimit = d.srcErrLimit
+			}
+			d.err = WrapError(http.StatusRequestEntityTooLarge, "request body too large", fmt.Errorf("%w: %w", ErrBodyTooLarge, &http.MaxBytesError{Limit: errLimit}))
 			return 0, d.err
 		}
 		if err == io.EOF {
@@ -707,7 +714,11 @@ func (d *decompressReadCloser) Read(p []byte) (int, error) {
 		if d.ctx != nil {
 			d.ctx.markRequestTooLarge()
 		}
-		d.err = WrapError(http.StatusRequestEntityTooLarge, "request body too large", fmt.Errorf("%w: %w", ErrBodyTooLarge, &http.MaxBytesError{Limit: d.limit}))
+		errLimit := d.limit
+		if errLimit <= 0 {
+			errLimit = d.srcErrLimit
+		}
+		d.err = WrapError(http.StatusRequestEntityTooLarge, "request body too large", fmt.Errorf("%w: %w", ErrBodyTooLarge, &http.MaxBytesError{Limit: errLimit}))
 		return 0, d.err
 	}
 	d.decompressed += int64(n)
