@@ -29,6 +29,9 @@ func TestCanonicalMIMEHeaderKeyExtended(t *testing.T) {
 		"x-content-type-options", "x-forwarded-for", "x-forwarded-host",
 		"x-forwarded-proto", "x-frame-options", "x-powered-by",
 		"x-real-ip", "x-request-id", "x-requested-with",
+		"cc", "to", "subject", "received", "content-id", "message-id",
+		"in-reply-to", "return-path", "mime-version", "x-imforwards",
+		"dkim-signature", "content-transfer-encoding",
 	}
 	for _, k := range common {
 		want, ok := canonicalMIMEHeaderKey([]byte(k))
@@ -40,6 +43,16 @@ func TestCanonicalMIMEHeaderKeyExtended(t *testing.T) {
 		}
 		if got := CanonicalMIMEHeaderKey(want); got != want {
 			t.Fatalf("CanonicalMIMEHeaderKey(%q) = %q, want %q", want, got, want)
+		}
+		if allocs := testing.AllocsPerRun(50, func() {
+			if got := CanonicalMIMEHeaderKey(k); got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+			if got := CanonicalMIMEHeaderKey(want); got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		}); allocs != 0 {
+			t.Fatalf("CanonicalMIMEHeaderKey(%q/%q) allocs = %.0f, want 0", k, want, allocs)
 		}
 	}
 
@@ -106,6 +119,29 @@ func TestReadMIMEHeaderBufferedMalformedError(t *testing.T) {
 		if _, ok := err.(ProtocolError); !ok {
 			t.Fatalf("expected ProtocolError for %q, got %T (%v)", raw, err, err)
 		}
+	}
+}
+
+func TestInternHeaderValueExtended(t *testing.T) {
+	vals := []string{
+		"gzip", "close", "Close", "bytes", "chunked", "private", "nosniff",
+		"no-cache", "no-store", "max-age=0", "localhost", "text/html",
+		"127.0.0.1", "keep-alive", "Keep-Alive", "text/plain", "golang.org",
+		"gzip,deflate", "gzip, deflate", "localhost:8080", "en-US,en;q=0.8",
+		"application/json", "gzip,deflate,sdch", "gzip, deflate, br",
+		"Go-http-client/1.1", "Go-http-client/2.0",
+		"text/html; charset=utf-8", "text/plain; charset=utf-8",
+		"application/json; charset=utf-8",
+	}
+	for _, want := range vals {
+		b := []byte(want)
+		got, ok := internHeaderValue(b)
+		if !ok || got != want {
+			t.Fatalf("internHeaderValue(%q) = (%q, %v), want (%q, true)", want, got, ok, want)
+		}
+	}
+	if _, ok := internHeaderValue([]byte("non-interned-custom-value")); ok {
+		t.Fatal("unexpected intern hit for custom value")
 	}
 }
 

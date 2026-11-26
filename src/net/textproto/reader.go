@@ -570,14 +570,12 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 		if !ok {
 			return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
 		}
+		if !validHeaderValueBytes(v) {
+			return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+		}
 		key, ok := canonicalMIMEHeaderKey(k)
 		if !ok {
 			return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
-		}
-		for _, c := range v {
-			if !validHeaderValueByte(c) {
-				return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
-			}
 		}
 
 		maxHeaders--
@@ -769,14 +767,14 @@ func readMIMEHeaderBuffered(b *bufio.Reader, maxMemory, maxHeaders int64, skipHo
 		k := peek[sp.kStart:sp.kEnd]
 		v := peek[sp.vStart:sp.vEnd]
 
-		key, ok := canonicalMIMEHeaderKey(k)
-		if !ok {
+		if !validHeaderValueBytes(v) {
 			cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
 			err := ProtocolError(fmt.Sprintf("malformed MIME header line: %q", peek[sp.kStart:sp.vEnd]))
 			b.Discard(cur)
 			return m, haveHost, hostHeader, hostCount, true, err
 		}
-		if !validHeaderValueBytes(v) {
+		key, ok := canonicalMIMEHeaderKey(k)
+		if !ok {
 			cur := int(sp.vEnd) + bytes.IndexByte(peek[sp.vEnd:pos], '\n') + 1
 			err := ProtocolError(fmt.Sprintf("malformed MIME header line: %q", peek[sp.kStart:sp.vEnd]))
 			b.Discard(cur)
@@ -1051,8 +1049,13 @@ func canonicalMIMEHeaderKeyString(s string, firstBad int) string {
 func lookupLowerCommonHeader(s string) string {
 	switch len(s) {
 	case 2:
-		if s == "te" {
+		switch s {
+		case "cc":
+			return "Cc"
+		case "te":
 			return "Te"
+		case "to":
+			return "To"
 		}
 	case 3:
 		if s == "via" {
@@ -1098,6 +1101,8 @@ func lookupLowerCommonHeader(s string) string {
 			return "Expires"
 		case "referer":
 			return "Referer"
+		case "subject":
+			return "Subject"
 		case "trailer":
 			return "Trailer"
 		case "upgrade":
@@ -1113,23 +1118,37 @@ func lookupLowerCommonHeader(s string) string {
 			return "If-Range"
 		case "location":
 			return "Location"
+		case "received":
+			return "Received"
 		}
 	case 9:
-		if s == "forwarded" {
+		switch s {
+		case "forwarded":
 			return "Forwarded"
+		case "x-real-ip":
+			return "X-Real-Ip"
 		}
 	case 10:
 		switch s {
 		case "connection":
 			return "Connection"
+		case "content-id":
+			return "Content-Id"
+		case "message-id":
+			return "Message-Id"
 		case "set-cookie":
 			return "Set-Cookie"
 		case "user-agent":
 			return "User-Agent"
 		}
 	case 11:
-		if s == "retry-after" {
+		switch s {
+		case "in-reply-to":
+			return "In-Reply-To"
+		case "retry-after":
 			return "Retry-After"
+		case "return-path":
+			return "Return-Path"
 		}
 	case 12:
 		switch s {
@@ -1137,11 +1156,19 @@ func lookupLowerCommonHeader(s string) string {
 			return "Content-Type"
 		case "max-forwards":
 			return "Max-Forwards"
-		case "x-real-ip":
-			return "X-Real-Ip"
+		case "mime-version":
+			return "Mime-Version"
+		case "x-imforwards":
+			return "X-Imforwards"
+		case "x-powered-by":
+			return "X-Powered-By"
+		case "x-request-id":
+			return "X-Request-Id"
 		}
 	case 13:
 		switch s {
+		case "accept-ranges":
+			return "Accept-Ranges"
 		case "authorization":
 			return "Authorization"
 		case "cache-control":
@@ -1152,8 +1179,6 @@ func lookupLowerCommonHeader(s string) string {
 			return "If-None-Match"
 		case "last-modified":
 			return "Last-Modified"
-		case "x-powered-by":
-			return "X-Powered-By"
 		}
 	case 14:
 		switch s {
@@ -1161,6 +1186,8 @@ func lookupLowerCommonHeader(s string) string {
 			return "Accept-Charset"
 		case "content-length":
 			return "Content-Length"
+		case "dkim-signature":
+			return "Dkim-Signature"
 		}
 	case 15:
 		switch s {
@@ -1170,6 +1197,8 @@ func lookupLowerCommonHeader(s string) string {
 			return "Accept-Language"
 		case "x-forwarded-for":
 			return "X-Forwarded-For"
+		case "x-frame-options":
+			return "X-Frame-Options"
 		}
 	case 16:
 		switch s {
@@ -1181,8 +1210,8 @@ func lookupLowerCommonHeader(s string) string {
 			return "Content-Location"
 		case "www-authenticate":
 			return "Www-Authenticate"
-		case "x-frame-options":
-			return "X-Frame-Options"
+		case "x-forwarded-host":
+			return "X-Forwarded-Host"
 		case "x-requested-with":
 			return "X-Requested-With"
 		}
@@ -1192,8 +1221,12 @@ func lookupLowerCommonHeader(s string) string {
 			return "If-Modified-Since"
 		case "transfer-encoding":
 			return "Transfer-Encoding"
-		case "x-forwarded-host":
-			return "X-Forwarded-Host"
+		case "x-forwarded-proto":
+			return "X-Forwarded-Proto"
+		}
+	case 18:
+		if s == "proxy-authenticate" {
+			return "Proxy-Authenticate"
 		}
 	case 19:
 		switch s {
@@ -1201,8 +1234,8 @@ func lookupLowerCommonHeader(s string) string {
 			return "Content-Disposition"
 		case "if-unmodified-since":
 			return "If-Unmodified-Since"
-		case "x-forwarded-proto":
-			return "X-Forwarded-Proto"
+		case "proxy-authorization":
+			return "Proxy-Authorization"
 		}
 	case 22:
 		if s == "x-content-type-options" {
@@ -1213,7 +1246,10 @@ func lookupLowerCommonHeader(s string) string {
 			return "Content-Security-Policy"
 		}
 	case 25:
-		if s == "strict-transport-security" {
+		switch s {
+		case "content-transfer-encoding":
+			return "Content-Transfer-Encoding"
+		case "strict-transport-security":
 			return "Strict-Transport-Security"
 		}
 	}
@@ -1309,6 +1345,11 @@ func validHeaderValueBytes(v []byte) bool {
 func canonicalMIMEHeaderKey(a []byte) (_ string, ok bool) {
 	if len(a) == 0 {
 		return "", false
+	}
+	if 'A' <= a[0] && a[0] <= 'Z' {
+		if v := lookupCommonHeader(a); v != "" {
+			return v, true
+		}
 	}
 
 	// See if a looks like a header key. If not, return it unchanged.
@@ -1605,6 +1646,8 @@ func internHeaderValue(v []byte) (string, bool) {
 			return "close", true
 		case "Close":
 			return "Close", true
+		case "bytes":
+			return "bytes", true
 		}
 	case 7:
 		switch string(v) {
@@ -1612,6 +1655,8 @@ func internHeaderValue(v []byte) (string, bool) {
 			return "chunked", true
 		case "private":
 			return "private", true
+		case "nosniff":
+			return "nosniff", true
 		}
 	case 8:
 		switch string(v) {
@@ -1628,6 +1673,8 @@ func internHeaderValue(v []byte) (string, bool) {
 			return "localhost", true
 		case "text/html":
 			return "text/html", true
+		case "127.0.0.1":
+			return "127.0.0.1", true
 		}
 	case 10:
 		switch string(v) {
@@ -1660,8 +1707,11 @@ func internHeaderValue(v []byte) (string, bool) {
 			return "application/json", true
 		}
 	case 17:
-		if string(v) == "gzip,deflate,sdch" {
+		switch string(v) {
+		case "gzip,deflate,sdch":
 			return "gzip,deflate,sdch", true
+		case "gzip, deflate, br":
+			return "gzip, deflate, br", true
 		}
 	case 18:
 		switch string(v) {
@@ -1677,6 +1727,10 @@ func internHeaderValue(v []byte) (string, bool) {
 	case 25:
 		if string(v) == "text/plain; charset=utf-8" {
 			return "text/plain; charset=utf-8", true
+		}
+	case 31:
+		if string(v) == "application/json; charset=utf-8" {
+			return "application/json; charset=utf-8", true
 		}
 	}
 	return "", false
