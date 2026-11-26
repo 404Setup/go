@@ -7,21 +7,13 @@ This fork is a personal Go branch maintained by 404Setup.
 
 ## Features
 
-Compatible with upstream Go syntax and standard library APIs.
+Compatible with upstream Go syntax and standard library APIs, with targeted compiler, runtime, and standard library improvements for throughput and lower memory overhead.
 
-### Compiler, Toolchain & Runtime
-- **`cmd/compile`**: `-ldflags="-o2"` / `"-o3"` optimization tiers, `-ldflags="-fmth"` fast math, and stack allocation for non-escaping small slices/strings.
-- **`runtime`**: span and GC sweep improvements and write-barrier deduplication.
-- **`cmd/go`**: packed/sharded build cache (`GOCACHE`), pooled cache writes, 64 KiB I/O buffers, and LZ4 object compression.
-
-### Standard Library
-- **`sync/v2` & `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, and ordered/concurrent map containers.
-- **`encoding/json`, `json/v2`, `xml`**: compiled codec plans, pooled encoders/decoders, and fast ASCII/SIMD scanning.
-- **`encoding/base64` & `encoding/hex`**: AVX2/SSSE3 (`amd64`) and NEON/SVE2 (`arm64`) vector codecs with reduced allocations.
-- **`fmt` & `io`**: stack-buffered formatting fast paths and exact-sized `io.ReadAll`.
-- **`reflect`**: fast paths for `Equal`, `DeepEqual`, `Comparable`, `Call`, and `VisibleFields`.
-- **`net` & `net/url`**: TTL DNS cache (`GODEBUG=netdnscache=0`) and fast `url.ParseQuery`.
-- **`net/http`, `net/textproto`, `net/http/server`**: co-allocated request/response structs, reused transport and HTTP/2 stream state, sharded HTTP/2 worker pool, fast header canonicalization/validation, and a zero-alloc `net/http/server` router.
+- **Compiler & Toolchain**: Expanded optimization options, improved code generation, and faster incremental builds with compact build caching.
+- **Runtime & Reflection**: Lower-overhead memory management, faster GC sweeping, and accelerated reflection checks and calls.
+- **Concurrency (`sync/v2`, `sync/atomic/v2`)**: Ergonomic generic synchronization primitives, concurrent containers, and low-overhead atomic values.
+- **Encoding & Formatting (`json`, `json/v2`, `xml`, `base64`, `hex`, `fmt`, `io`)**: Higher-throughput serialization, vectorized binary/text codecs, and reduced-allocation formatting and reading.
+- **Networking & HTTP (`net`, `net/http`, `net/http/server`)**: Faster DNS and HTTP header/request handling, alongside an ergonomic `net/http/server` package with routing, middleware, and built-in content compression.
 
 ---
 
