@@ -745,7 +745,9 @@ func (b *Builder) buildExport(ctx context.Context, a *Action) (err error) {
 		gofiles = append(gofiles, extraGo...)
 	}
 
-	b.cacheSrcFiles(a, gofiles)
+	if b.NeedCompiledGoFiles || b.hasWorkDirFiles(gofiles) {
+		b.cacheSrcFiles(a, gofiles)
+	}
 
 	// Sanity check only, since Package.load already checked as well.
 	if len(gofiles) == 0 {
@@ -1111,6 +1113,19 @@ func (b *Builder) loadCachedObjdirFile(a *Action, c cache.Cache, name string) er
 		return err
 	}
 	return b.Shell(a).CopyFile(a.Objdir+name, cached, 0666, true)
+}
+
+func (b *Builder) hasWorkDirFiles(srcfiles []string) bool {
+	if b.WorkDir == "" {
+		return false
+	}
+	workPrefix := b.WorkDir + string(filepath.Separator)
+	for _, file := range srcfiles {
+		if strings.HasPrefix(file, workPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Builder) cacheSrcFiles(a *Action, srcfiles []string) {
@@ -1511,6 +1526,11 @@ func (b *Builder) loadCachedCompiledGoFiles(a *Action) error {
 	c := cache.Default()
 	list, _, err := cache.GetBytes(c, cache.Subkey(a.actionID, "srcfiles"))
 	if err != nil {
+		p := a.Package
+		if p != nil && !p.UsesCgo() && !p.UsesSwig() && p.Internal.Cover.Mode == "" {
+			p.CompiledGoFiles = slices.Clone(p.GoFiles)
+			return nil
+		}
 		return fmt.Errorf("reading srcfiles list: %w", err)
 	}
 	var gofiles []string

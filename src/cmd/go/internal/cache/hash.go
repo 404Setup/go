@@ -130,6 +130,13 @@ var hashFileCache struct {
 	m map[string][HashSize]byte
 }
 
+var fileHashBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64<<10)
+		return &b
+	},
+}
+
 // FileHash returns the hash of the named file.
 // It caches repeated lookups for a given file,
 // and the cache entry for a file can be initialized
@@ -153,7 +160,9 @@ func FileHash(file string) ([HashSize]byte, error) {
 		}
 		return [HashSize]byte{}, err
 	}
-	_, err = io.Copy(h, f)
+	bufp := fileHashBufPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(h, f, *bufp)
+	fileHashBufPool.Put(bufp)
 	f.Close()
 	if err != nil {
 		if debugHash {

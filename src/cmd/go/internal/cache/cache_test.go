@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"internal/testenv"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -175,15 +176,24 @@ func testCacheTrim(t *testing.T, trimBuildCache bool) {
 		return time.Unix(sec, 0).Truncate(time.Minute).Add(-30 * time.Second).Unix()
 	}
 
-	checkTime := func(name string, mtime int64) {
+	checkActionTime := func(id ActionID, mtime int64) {
 		t.Helper()
-		file := filepath.Join(c.dir, name[:2], name)
-		info, err := os.Stat(file)
-		if err != nil {
-			t.Fatal(err)
+		mt, ok := testActionTime(c, id)
+		if !ok {
+			t.Fatalf("missing action %x", id)
 		}
-		if info.ModTime().Unix() != mtime {
-			t.Fatalf("%s mtime = %d, want %d", name, info.ModTime().Unix(), mtime)
+		if mt.Unix() != mtime {
+			t.Fatalf("action %x time = %d, want %d", id, mt.Unix(), mtime)
+		}
+	}
+	checkOutputTime := func(out OutputID, mtime int64) {
+		t.Helper()
+		mt, ok := testOutputTime(c, out)
+		if !ok {
+			t.Fatalf("missing output %x", out)
+		}
+		if mt.Unix() != mtime {
+			t.Fatalf("output %x time = %d, want %d", out, mt.Unix(), mtime)
 		}
 	}
 
@@ -192,14 +202,14 @@ func testCacheTrim(t *testing.T, trimBuildCache bool) {
 	entry, _ := c.Get(id)
 	PutBytes(c, ActionID(dummyID(2)), []byte("def"))
 	mtime := writeMtime(now)
-	checkTime(fmt.Sprintf("%x-a", id), mtime)
-	checkTime(fmt.Sprintf("%x-d", entry.OutputID), mtime)
+	checkActionTime(id, mtime)
+	checkOutputTime(entry.OutputID, mtime)
 
 	// Get should not change recent mtimes.
 	now = start + 10
 	c.Get(id)
-	checkTime(fmt.Sprintf("%x-a", id), mtime)
-	checkTime(fmt.Sprintf("%x-d", entry.OutputID), mtime)
+	checkActionTime(id, mtime)
+	checkOutputTime(entry.OutputID, mtime)
 
 	// Get should change distant mtimes.
 	now = start + 5000
@@ -208,8 +218,8 @@ func testCacheTrim(t *testing.T, trimBuildCache bool) {
 		t.Fatal(err)
 	}
 	c.OutputFile(entry.OutputID)
-	checkTime(fmt.Sprintf("%x-a", id), mtime2)
-	checkTime(fmt.Sprintf("%x-d", entry.OutputID), mtime2)
+	checkActionTime(id, mtime2)
+	checkOutputTime(entry.OutputID, mtime2)
 
 	// Trim should leave everything alone: it's all too new.
 	if err := c.Trim(); err != nil {
@@ -226,7 +236,7 @@ func testCacheTrim(t *testing.T, trimBuildCache bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkTime(fmt.Sprintf("%x-a", dummyID(2)), writeMtime(start))
+	checkActionTime(ActionID(dummyID(2)), writeMtime(start))
 
 	// Trim less than a day later should not do any work at all.
 	now = start + 80000
@@ -251,7 +261,7 @@ func testCacheTrim(t *testing.T, trimBuildCache bool) {
 	// On the other hand almost a full day has gone by since we wrote dummyID(2)
 	// and we haven't looked at it since, so 5 days later it should be gone.
 	now += 5 * 86400
-	checkTime(fmt.Sprintf("%x-a", dummyID(2)), writeMtime(start))
+	checkActionTime(ActionID(dummyID(2)), writeMtime(start))
 	if err := c.Trim(); err != nil {
 		t.Fatal(err)
 	}
@@ -271,8 +281,8 @@ func testCacheTrim(t *testing.T, trimBuildCache bool) {
 	if err := c.Trim(); err != nil {
 		t.Fatal(err)
 	}
-	checkTime(fmt.Sprintf("%x-a", id), mtime3)
-	checkTime(fmt.Sprintf("%x-d", entry.OutputID), mtime3)
+	checkActionTime(id, mtime3)
+	checkOutputTime(entry.OutputID, mtime3)
 
 	// Half a day later Trim should still be a no-op, because there was a Trim recently.
 	// Even though the entry for id is now old enough to be trimmed,
@@ -281,8 +291,8 @@ func testCacheTrim(t *testing.T, trimBuildCache bool) {
 	if err := c.Trim(); err != nil {
 		t.Fatal(err)
 	}
-	checkTime(fmt.Sprintf("%x-a", id), mtime3)
-	checkTime(fmt.Sprintf("%x-d", entry.OutputID), mtime3)
+	checkActionTime(id, mtime3)
+	checkOutputTime(entry.OutputID, mtime3)
 
 	// Another half a day later, Trim should actually run, and it should remove id.
 	now += 86400/2 + 1
@@ -344,18 +354,150 @@ func payload(n, size int) []byte {
 	return b
 }
 
-// put and putExe store entries of total logical size (output + entrySize).
+func testActionTime(c *DiskCache, id ActionID) (time.Time, bool) {
+	b := id[0]
+	c.idxMu[b].RLock()
+	data, err := os.ReadFile(c.idxPath(b))
+	c.idxMu[b].RUnlock()
+	if err == nil {
+		if _, validLen, ok := parseIdxHeader(data); ok {
+			for off := validLen - idxRecSize; off >= idxHeaderSize; off -= idxRecSize {
+				rec := data[off : off+idxRecSize]
+				if bytes.Equal(rec[0:32], id[:]) {
+					if _, _, _, _, usedNano, _, recOK := decodeIdxRecord(rec); recOK {
+						return time.Unix(0, usedNano), true
+					}
+				}
+			}
+		}
+	}
+	if info, err := os.Stat(c.fileName(id, "a")); err == nil {
+		return info.ModTime(), true
+	}
+	return time.Time{}, false
+}
+
+func testOutputTime(c *DiskCache, out OutputID) (time.Time, bool) {
+	if info, err := os.Stat(c.fileName(out, "d")); err == nil {
+		return info.ModTime(), true
+	}
+	b := out[0]
+	c.packMu[b].RLock()
+	data, err := os.ReadFile(c.packPath(b))
+	c.packMu[b].RUnlock()
+	if err == nil {
+		if _, ok := parsePackFileHeader(data); ok {
+			off := packFileHeaderSize
+			for off+packHeaderSize <= len(data) {
+				hdrOut, psize, usedNano, _, _, hdrOK := decodePackEntryHeader(data[off : off+packHeaderSize])
+				if !hdrOK || off+packHeaderSize+int(psize) > len(data) {
+					break
+				}
+				if hdrOut == out {
+					return time.Unix(0, usedNano), true
+				}
+				off += packHeaderSize + int(psize)
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+func setTestActionTime(t *testing.T, c *DiskCache, id ActionID, mt time.Time) {
+	t.Helper()
+	b := id[0]
+	c.idxMu[b].Lock()
+	f, err := lockedfile.Edit(c.idxPath(b))
+	if err == nil {
+		data, rerr := io.ReadAll(f)
+		if rerr == nil {
+			if gen, validLen, ok := parseIdxHeader(data); ok {
+				for off := validLen - idxRecSize; off >= idxHeaderSize; off -= idxRecSize {
+					rec := data[off : off+idxRecSize]
+					if bytes.Equal(rec[0:32], id[:]) {
+						if _, out, size, tm, _, flags, recOK := decodeIdxRecord(rec); recOK {
+							var updated [idxRecSize]byte
+							encodeIdxRecord(updated[:], id, out, size, tm, mt.UnixNano(), flags)
+							if werr := writeAllAt(f, updated[:], int64(off)); werr != nil {
+								t.Fatal(werr)
+							}
+							var genBuf [8]byte
+							binary.LittleEndian.PutUint64(genBuf[:], gen+1)
+							_ = writeAllAt(f, genBuf[:], 8)
+							f.Close()
+							c.idxMu[b].Unlock()
+							return
+						}
+					}
+				}
+			}
+		}
+		f.Close()
+	}
+	c.idxMu[b].Unlock()
+	if err := os.Chtimes(c.fileName(id, "a"), mt, mt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setTestOutputTime(t *testing.T, c *DiskCache, out OutputID, mt time.Time) {
+	t.Helper()
+	if _, err := os.Stat(c.fileName(out, "d")); err == nil {
+		if err := os.Chtimes(c.fileName(out, "d"), mt, mt); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	b := out[0]
+	c.packMu[b].Lock()
+	defer c.packMu[b].Unlock()
+	f, err := lockedfile.Edit(c.packPath(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, ok := parsePackFileHeader(data)
+	if !ok {
+		t.Fatalf("missing pack header for %x", out)
+	}
+	off := packFileHeaderSize
+	for off+packHeaderSize <= len(data) {
+		hdrOut, psize, _, flags, pcrc, hdrOK := decodePackEntryHeader(data[off : off+packHeaderSize])
+		if !hdrOK || off+packHeaderSize+int(psize) > len(data) {
+			break
+		}
+		if hdrOut == out {
+			var hdr [packHeaderSize]byte
+			encodePackEntryHeader(hdr[:], hdrOut, psize, mt.UnixNano(), flags, pcrc)
+			if err := writeAllAt(f, hdr[:], int64(off)); err != nil {
+				t.Fatal(err)
+			}
+			var genBuf [8]byte
+			binary.LittleEndian.PutUint64(genBuf[:], gen+1)
+			_ = writeAllAt(f, genBuf[:], 8)
+			return
+		}
+		off += packHeaderSize + int(psize)
+	}
+	t.Fatalf("missing pack entry for %x", out)
+}
+
+// put and putExe store entries of total logical size (output + metadata).
 // A total of 0 stores an empty output.
 func (c *testCache) put(n, total int) {
 	c.t.Helper()
-	out, _, err := c.Put(dummyID(n), bytes.NewReader(payload(n, max(0, total-entrySize))))
+	out, _, err := c.Put(dummyID(n), bytes.NewReader(payload(n, max(0, total-idxRecSize-packHeaderSize))))
 	c.must(err)
 	c.outs[n] = out
 }
 
 func (c *testCache) putExe(n, total int) {
 	c.t.Helper()
-	out, _, err := c.PutExecutable(dummyID(n), "prog", bytes.NewReader(payload(n, max(0, total-entrySize))))
+	out, _, err := c.PutExecutable(dummyID(n), "prog", bytes.NewReader(payload(n, max(0, total-idxRecSize))))
 	c.must(err)
 	c.outs[n] = out
 }
@@ -384,11 +526,13 @@ func (c *testCache) wantEntries(present ...int) {
 		live[c.outs[n]] = true
 	}
 	for n, out := range c.outs {
-		if _, err := os.Stat(c.fileName(dummyID(n), "a")); (err == nil) != slices.Contains(present, n) {
-			c.t.Errorf("entry %d (-a): err=%v, want %v", n, err, slices.Contains(present, n))
+		_, hasA := testActionTime(c.DiskCache, dummyID(n))
+		if hasA != slices.Contains(present, n) {
+			c.t.Errorf("entry %d (-a): present=%v, want %v", n, hasA, slices.Contains(present, n))
 		}
-		if _, err := os.Stat(c.fileName(out, "d")); (err == nil) != live[out] {
-			c.t.Errorf("entry %d (-d): err=%v, want %v", n, err, live[out])
+		_, hasD := testOutputTime(c.DiskCache, out)
+		if hasD != live[out] {
+			c.t.Errorf("entry %d (-d): present=%v, want %v", n, hasD, live[out])
 		}
 	}
 }
@@ -418,19 +562,43 @@ func wantNoFiles(t *testing.T, dir string, names ...string) {
 
 func (c *testCache) use(n int) {
 	c.t.Helper()
-	e, err := c.Get(dummyID(n))
+	_, _, err := GetBytes(c.DiskCache, dummyID(n))
 	c.must(err)
-	c.OutputFile(e.OutputID)
 }
 
-func (c *testCache) wantMtime(want time.Time, paths ...string) {
+func (c *testCache) wantActionTime(want time.Time, ids ...ActionID) {
 	c.t.Helper()
-	for _, p := range paths {
-		info, err := os.Stat(p)
-		c.must(err)
-		if !info.ModTime().Equal(want) {
-			c.t.Errorf("%s: mtime=%v, want %v", filepath.Base(p), info.ModTime(), want)
+	for _, id := range ids {
+		mt, ok := testActionTime(c.DiskCache, id)
+		if !ok {
+			c.t.Errorf("missing action %x", id)
+			continue
 		}
+		if !mt.Equal(want) {
+			c.t.Errorf("action %x: time=%v, want %v", id, mt, want)
+		}
+	}
+}
+
+func (c *testCache) wantOutputTime(want time.Time, outs ...OutputID) {
+	c.t.Helper()
+	for _, out := range outs {
+		mt, ok := testOutputTime(c.DiskCache, out)
+		if !ok {
+			c.t.Errorf("missing output %x", out)
+			continue
+		}
+		if !mt.Equal(want) {
+			c.t.Errorf("output %x: time=%v, want %v", out, mt, want)
+		}
+	}
+}
+
+func (c *testCache) wantEntryTimes(want time.Time, nums ...int) {
+	c.t.Helper()
+	for _, n := range nums {
+		c.wantActionTime(want, dummyID(n))
+		c.wantOutputTime(want, c.outs[n])
 	}
 }
 
@@ -468,12 +636,12 @@ func TestCacheSize(t *testing.T) {
 		}
 	}
 	delta(0, func() { c.put(2, 600) })
-	delta(entrySize, func() {
-		out, _, err := c.Put(dummyID(3), bytes.NewReader(payload(2, 600-entrySize)))
+	delta(idxRecSize, func() {
+		out, _, err := c.Put(dummyID(3), bytes.NewReader(payload(2, 600-idxRecSize-packHeaderSize)))
 		c.must(err)
 		c.outs[3] = out
 	})
-	delta(600-entrySize-50, func() {
+	delta(600-idxRecSize-packHeaderSize-50, func() {
 		c.must(os.WriteFile(c.fileName(c.outs[2], "d"), payload(0, 50), 0o666))
 		c.put(2, 600)
 	})
@@ -861,28 +1029,27 @@ func TestCacheGenerations(t *testing.T) {
 			c := newTestCache(t, t.TempDir(), 1<<40, 0)
 			c.clock = c.start.Add(45 * time.Second)
 			tc.put(c)
-			f := []string{c.fileName(dummyID(1), "a"), c.fileName(c.outs[1], "d")}
-			c.wantMtime(c.start, f...)
+			c.wantEntryTimes(c.start, 1)
 
 			// Reuse before 30m keeps the young generation mark unchanged.
 			c.clock = c.start.Add(29*time.Minute + 59*time.Second)
 			c.use(1)
-			c.wantMtime(c.start, f...)
+			c.wantEntryTimes(c.start, 1)
 
 			// Reuse at or after 30m promotes to tenured30m (:30).
 			c.clock = c.start.Add(30*time.Minute + 20*time.Second)
 			c.use(1)
 			t1 := c.start.Add(29*time.Minute + 30*time.Second)
-			c.wantMtime(t1, f...)
+			c.wantEntryTimes(t1, 1)
 
 			// Tenured entries refresh at most once per hour.
 			c.clock = t1.Add(59*time.Minute + 59*time.Second)
 			c.use(1)
-			c.wantMtime(t1, f...)
+			c.wantEntryTimes(t1, 1)
 
 			c.clock = t1.Add(time.Hour)
 			c.use(1)
-			c.wantMtime(c.clock.Truncate(time.Minute).Add(-30*time.Second), f...)
+			c.wantEntryTimes(c.clock.Truncate(time.Minute).Add(-30*time.Second), 1)
 		})
 	}
 
@@ -891,31 +1058,29 @@ func TestCacheGenerations(t *testing.T) {
 	c := newTestCache(t, t.TempDir(), 1<<40, 0)
 	c.clock = c.start.Add(40 * time.Second)
 	c.put(1, 500)
-	f1 := []string{c.fileName(dummyID(1), "a"), c.fileName(c.outs[1], "d")}
 
 	c.clock = c.start.Add(20 * time.Minute)
 	c.put(1, 500)
-	c.wantMtime(c.start, f1...)
+	c.wantEntryTimes(c.start, 1)
 
 	c.clock = c.start.Add(40*time.Minute + 15*time.Second)
 	c.put(1, 500)
-	c.wantMtime(c.clock.Truncate(time.Minute).Add(-30*time.Second), f1...)
+	c.wantEntryTimes(c.clock.Truncate(time.Minute).Add(-30*time.Second), 1)
 
 	// A new action sharing an existing output marks the new index entry young
 	// and refreshes the shared output as tenured30m.
 	c.clock = c.start.Add(2*time.Hour + 15*time.Second)
 	m2 := c.clock.Truncate(time.Minute)
-	_, _, err := c.Put(dummyID(2), bytes.NewReader(payload(1, 500-entrySize)))
+	_, _, err := c.Put(dummyID(2), bytes.NewReader(payload(1, 500-idxRecSize-packHeaderSize)))
 	c.must(err)
-	c.wantMtime(m2, c.fileName(dummyID(2), "a"))
-	c.wantMtime(m2.Add(-30*time.Second), c.fileName(c.outs[1], "d"))
+	c.wantActionTime(m2, dummyID(2))
+	c.wantOutputTime(m2.Add(-30*time.Second), c.outs[1])
 
 	// An index file whose raw OS mtime is newer than tenured stays young on rewrite.
 	c.put(3, 500)
-	a3 := c.fileName(dummyID(3), "a")
-	c.must(os.Chtimes(a3, m2.Add(10*time.Second), m2.Add(10*time.Second)))
+	setTestActionTime(t, c.DiskCache, dummyID(3), m2.Add(10*time.Second))
 	c.put(3, 500)
-	c.wantMtime(m2, a3)
+	c.wantActionTime(m2, dummyID(3))
 }
 
 func TestCacheTrimYoungGen(t *testing.T) {
@@ -950,7 +1115,7 @@ func TestCacheTrimYoungGen(t *testing.T) {
 	seedOver()
 	c.must(c.Trim())
 	c.wantEntries(1, 2, 3, 4)
-	wantFile(t, dir, "size.txt", fmt.Sprintf("base %d\nestimated %[1]d\n", 400+500+entrySize+300))
+	wantFile(t, dir, "size.txt", fmt.Sprintf("base %d\nestimated %[1]d\n", 400+500+idxRecSize+packHeaderSize+300))
 
 	// At 90m, a size triggered trim removes young entries 1 to 3 and keeps tenured entry 4.
 	c.clock = c.start.Add(90 * time.Minute)
@@ -974,8 +1139,8 @@ func TestCacheTrimYoungGen(t *testing.T) {
 	}
 	for i, mt := range mtimes {
 		c2.put(i+1, 400+(i/2)*100)
-		c2.must(os.Chtimes(c2.fileName(dummyID(i+1), "a"), mt, mt))
-		c2.must(os.Chtimes(c2.fileName(c2.outs[i+1], "d"), mt, mt))
+		setTestActionTime(t, c2.DiskCache, dummyID(i+1), mt)
+		setTestOutputTime(t, c2.DiskCache, c2.outs[i+1], mt)
 	}
 	writeFile(t, dir2, "trim.txt", fmt.Sprint(now.Add(-24*time.Hour).Unix()))
 	writeFile(t, dir2, "size.txt", "base 100\nestimated 99999\n")
@@ -1140,12 +1305,12 @@ func TestCacheTrimLowDisk(t *testing.T) {
 		now.Add(-89*time.Minute - 30*time.Second), // tenured, 89m30s: kept in base
 		now.Add(-3*time.Hour + 16*time.Second),    // plain mtime (tenured), ~3h: removed
 	} {
-		c.put(i+1, 100*(i+1))
-		c.must(os.Chtimes(c.fileName(dummyID(i+1), "a"), mt, mt))
-		c.must(os.Chtimes(c.fileName(c.outs[i+1], "d"), mt, mt))
+		c.put(i+1, 200*(i+1))
+		setTestActionTime(t, c.DiskCache, dummyID(i+1), mt)
+		setTestOutputTime(t, c.DiskCache, c.outs[i+1], mt)
 	}
 	c.sampleAcc.Store(0)
-	writeFile(t, dir, "size.txt", "base 0\nestimated 1500\n")
+	writeFile(t, dir, "size.txt", "base 0\nestimated 3000\n")
 
 	// A low disk trim waits for minTrimSpacing (with or without sampled bytes),
 	// and a disk with space left does not trim.
@@ -1164,7 +1329,7 @@ func TestCacheTrimLowDisk(t *testing.T) {
 	low = true
 	c.must(c.Trim())
 	c.wantEntries(2, 4)
-	wantFile(t, dir, "size.txt", "base 600\nestimated 600\n")
+	wantFile(t, dir, "size.txt", "base 1200\nestimated 1200\n")
 	wantFile(t, dir, "cache.log", now.Format(logTimeFormat)+
 		" trim: low disk trigger: 0.000 GiB -> 0.000 GiB in 0s, removed 6 of 10 files,"+
 		" base=0.000 GiB next=5.000 GiB free=0.001 GiB (consider providing more space)\n")
@@ -1173,11 +1338,11 @@ func TestCacheTrimLowDisk(t *testing.T) {
 	// (over 90m old now but not at openTime) and the new entry 7 it just wrote.
 	c.clock = now.Add(minTrimSpacing)
 	c.openTime = c.clock.Add(-30 * time.Minute)
-	c.put(6, 100)
+	c.put(6, 200)
 	mt := c.clock.Add(-100*time.Minute - 30*time.Second)
-	c.must(os.Chtimes(c.fileName(dummyID(6), "a"), mt, mt))
-	c.must(os.Chtimes(c.fileName(c.outs[6], "d"), mt, mt))
-	c.put(7, 100)
+	setTestActionTime(t, c.DiskCache, dummyID(6), mt)
+	setTestOutputTime(t, c.DiskCache, c.outs[6], mt)
+	c.put(7, 200)
 	c.must(c.Close())
 	c.wantEntries(6, 7)
 }
@@ -1199,12 +1364,12 @@ func TestCacheTrimBuildCacheDisabled(t *testing.T) {
 		t.Errorf("sampleAcc = %d, want 0", got)
 	}
 	wantNoFiles(t, dir, "size.txt", "trim.txt", "cache.log")
-	c.wantMtime(c.clock, c.fileName(dummyID(2), "a"), c.fileName(c.outs[2], "d"))
+	c.wantEntryTimes(c.clock, 2)
 
 	// Use at 35m does not trigger 30m promotion (legacy uses 1h).
 	c.clock = c.start.Add(35 * time.Minute)
 	c.use(1)
-	c.wantMtime(c.start, c.fileName(dummyID(1), "a"), c.fileName(c.outs[1], "d"))
+	c.wantEntryTimes(c.start, 1)
 
 	// Trim uses the 5 day legacy rule and does not delete young entries early at 2h.
 	c.clock = c.start.Add(2 * time.Hour)
@@ -1232,11 +1397,6 @@ func TestCacheRefreshUsed(t *testing.T) {
 	other.putExe(2, 500)
 	other.put(3, 400)
 	other.put(5, 400)
-	f12 := []string{
-		other.fileName(dummyID(1), "a"), other.fileName(other.outs[1], "d"),
-		other.fileName(dummyID(2), "a"), other.fileName(other.outs[2], "d"),
-	}
-	f5 := []string{other.fileName(dummyID(5), "a"), other.fileName(other.outs[5], "d")}
 
 	// Worst case young hit at 29m59s (not promoted on access), including a Get-only
 	// executable entry whose -d directory must be protected without OutputFile.
@@ -1245,41 +1405,40 @@ func TestCacheRefreshUsed(t *testing.T) {
 	if _, err := long.Get(dummyID(2)); err != nil {
 		t.Fatal(err)
 	}
-	long.wantMtime(long.start, f12...)
+	other.wantEntryTimes(long.start, 1, 2)
 
 	// Entry 5 is tenured by reuse at 30m and then accessed by the long command at 35m.
 	other.clock = other.start.Add(30 * time.Minute)
 	other.use(5)
 	long.clock = long.start.Add(35 * time.Minute)
 	long.use(5)
-	long.wantMtime(long.start.Add(29*time.Minute+30*time.Second), f5...)
+	other.wantEntryTimes(long.start.Add(29*time.Minute+30*time.Second), 5)
 
 	// Fresh Put 1m before tick 1 stays young and is refreshed once mtime reaches 60m (before 80m).
 	long.clock = long.start.Add(48*time.Minute + 59*time.Second)
 	long.put(4, 400)
-	f4 := []string{long.fileName(dummyID(4), "a"), long.fileName(long.outs[4], "d")}
 
 	// Tick 1 (49m59s): young entries under 60m are left alone so reuse in [30m, 60m) still tenures.
 	long.clock = long.start.Add(49*time.Minute + 59*time.Second)
 	long.refreshUsed()
-	long.wantMtime(long.start, f12...)
-	long.wantMtime(long.start.Add(48*time.Minute), f4...)
+	other.wantEntryTimes(long.start, 1, 2)
+	long.wantEntryTimes(long.start.Add(48*time.Minute), 4)
 
 	// Tick 2 (69m59s): f12 refreshes to :00 (stays young). Tick 3 (89m59s): tenured f5 refreshes to :30.
 	long.clock = long.start.Add(69*time.Minute + 59*time.Second)
 	long.refreshUsed()
-	long.wantMtime(long.start.Add(69*time.Minute), f12...)
-	long.wantMtime(long.start.Add(48*time.Minute), f4...)
+	other.wantEntryTimes(long.start.Add(69*time.Minute), 1, 2)
+	long.wantEntryTimes(long.start.Add(48*time.Minute), 4)
 
 	long.clock = long.start.Add(89*time.Minute + 59*time.Second)
 	long.refreshUsed()
-	long.wantMtime(long.start.Add(88*time.Minute+30*time.Second), f5...)
-	long.wantMtime(long.start.Add(48*time.Minute), f4...)
+	other.wantEntryTimes(long.start.Add(88*time.Minute+30*time.Second), 5)
+	long.wantEntryTimes(long.start.Add(48*time.Minute), 4)
 
 	// Tick 4 (109m59s): fresh entry 4 reaches 60m and refreshes to :00 (stays young).
 	long.clock = long.start.Add(109*time.Minute + 59*time.Second)
 	long.refreshUsed()
-	long.wantMtime(long.start.Add(109*time.Minute), f4...)
+	long.wantEntryTimes(long.start.Add(109*time.Minute), 4)
 
 	// A concurrent size triggered trim past 90m removes unused entry 3 while keeping
 	// all entries accessed by the long running command.
@@ -1322,7 +1481,7 @@ func TestCacheRefreshUsed(t *testing.T) {
 	})
 	off.clock = off.start.Add(70 * time.Minute)
 	off.refreshUsed()
-	off.wantMtime(off.start, off.fileName(dummyID(1), "a"), off.fileName(off.outs[1], "d"))
+	off.wantEntryTimes(off.start, 1)
 }
 
 func TestCacheTrimParallel(t *testing.T) {

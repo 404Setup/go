@@ -20,7 +20,11 @@ package foo
 package main
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"hash/crc32"
 	"log"
 	"os"
 	"path/filepath"
@@ -35,11 +39,7 @@ func main() {
 
 	// Read the top level cache directory. The cache directory contains directories with
 	// each of the possible two hex digit prefixes (00-FF) of a cache entry's id.
-	// Those directories in turn contain files with the hex id followed by either
-	// "-a" for the action entries or "-d" for the object entries. We want to check
-	// if two action entries point to the same object entry so we'll iterate through
-	// all the "-a" files and see if any two of them refer to the same object id
-	// (corresponding to a "-d" file).
+	// Those directories contain either a sharded "idx" index file or legacy "-a" files.
 	dirs, err := os.ReadDir(cachedir)
 	if err != nil {
 		log.Fatal(err)
@@ -56,6 +56,20 @@ func main() {
 			}
 
 			for _, entry := range entries {
+				if entry.Name() == "idx" {
+					recs, err := readIdxFile(filepath.Join(prefixdir, entry.Name()))
+					if err != nil {
+						log.Fatal(err)
+					}
+					for actionID, objid := range recs {
+						if other, ok := seen[objid]; ok {
+							log.Printf("found two action entries (%s, %s) pointing to the same object id: %s", other, actionID, objid)
+							os.Exit(1)
+						}
+						seen[objid] = actionID
+					}
+					continue
+				}
 				if !strings.HasSuffix(entry.Name(), "-a") {
 					// not an action id entry
 					continue
@@ -73,6 +87,35 @@ func main() {
 			}
 		}
 	}
+}
+
+func readIdxFile(path string) (map[string]string, error) {
+	const (
+		idxHeaderSize = 16
+		idxRecSize    = 96
+	)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < idxHeaderSize || string(data[:8]) != "GOIDX01\n" {
+		return nil, errors.New("invalid idx header")
+	}
+	validLen := idxHeaderSize + ((len(data)-idxHeaderSize)/idxRecSize)*idxRecSize
+	res := make(map[string]string)
+	for off := idxHeaderSize; off < validLen; off += idxRecSize {
+		rec := data[off : off+idxRecSize]
+		if crc32.ChecksumIEEE(rec[:92]) != binary.LittleEndian.Uint32(rec[92:96]) {
+			continue
+		}
+		aid := hex.EncodeToString(rec[0:32])
+		oid := hex.EncodeToString(rec[32:64])
+		if _, ok := res[aid]; ok {
+			return nil, fmt.Errorf("duplicate action id %s in idx", aid)
+		}
+		res[aid] = oid
+	}
+	return res, nil
 }
 
 // objectid returns the object id that the given actionEntryFile points to.

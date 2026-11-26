@@ -19,6 +19,7 @@
 package goobj
 
 import (
+	"bytes"
 	"cmd/internal/bio"
 	"encoding/binary"
 	"errors"
@@ -226,7 +227,24 @@ func (h *Header) Write(w *Writer) {
 	}
 }
 
+// Put writes the header directly into dst, which must be at least h.Size() bytes.
+func (h *Header) Put(dst []byte) {
+	copy(dst[:len(Magic)], h.Magic)
+	off := len(Magic)
+	copy(dst[off:off+len(h.Fingerprint)], h.Fingerprint[:])
+	off += len(h.Fingerprint)
+	binary.LittleEndian.PutUint32(dst[off:off+4], h.Flags)
+	off += 4
+	for _, x := range h.Offsets {
+		binary.LittleEndian.PutUint32(dst[off:off+4], x)
+		off += 4
+	}
+}
+
 func (h *Header) Read(r *Reader) error {
+	if len(r.b) < len(Magic)+len(h.Fingerprint)+4+4*len(h.Offsets) {
+		return errors.New("truncated Go object header")
+	}
 	b := r.BytesAt(0, len(Magic))
 	h.Magic = string(b)
 	if h.Magic != Magic {
@@ -539,8 +557,14 @@ func (n *RefName) SetName(x string, w *Writer) {
 
 func (n *RefName) Write(w *Writer) { w.Bytes(n[:]) }
 
+type byteWriter interface {
+	Write([]byte) (int, error)
+	WriteString(string) (int, error)
+	WriteByte(byte) error
+}
+
 type Writer struct {
-	wr        *bio.Writer
+	wr        byteWriter
 	stringMap map[string]uint32
 	off       uint32 // running offset
 
@@ -549,6 +573,12 @@ type Writer struct {
 
 func NewWriter(wr *bio.Writer) *Writer {
 	return &Writer{wr: wr, stringMap: make(map[string]uint32)}
+}
+
+// NewBufferWriter returns a Writer backed by an in-memory bytes.Buffer.
+func NewBufferWriter() (*Writer, *bytes.Buffer) {
+	buf := new(bytes.Buffer)
+	return &Writer{wr: buf, stringMap: make(map[string]uint32)}, buf
 }
 
 func (w *Writer) AddString(s string) {
@@ -618,6 +648,19 @@ type Reader struct {
 }
 
 func NewReaderFromBytes(b []byte, readonly bool) *Reader {
+	if len(b) >= len(MagicLZ4)+4 && string(b[:len(MagicLZ4)]) == MagicLZ4 {
+		rawLen := binary.LittleEndian.Uint32(b[len(MagicLZ4) : len(MagicLZ4)+4])
+		src := b[len(MagicLZ4)+4:]
+		if rawLen == 0 || rawLen > lz4MaxRawLen || uint64(rawLen) > uint64(len(src))*256+32 {
+			return nil
+		}
+		dec, err := LZ4Decompress(src, int(rawLen))
+		if err != nil {
+			return nil
+		}
+		b = dec
+		readonly = true
+	}
 	r := &Reader{b: b, readonly: readonly, start: 0}
 	err := r.h.Read(r)
 	if err != nil {

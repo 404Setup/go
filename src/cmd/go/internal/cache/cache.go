@@ -94,8 +94,10 @@ type DiskCache struct {
 	sizeSample     int64        // sampling stride (defaultSizeSample outside tests)
 	sizeMinTarget  int64        // min size trim target (defaultMinTarget outside tests)
 	sampleAcc      atomic.Int64 // random offset in [0, sizeSample) plus bytes added
-	used           sync.Map     // map[usedKey]struct{} of entries accessed by this process
-	refreshOnce    sync.Once    // starts the background keepalive goroutine on first access
+	used           sync.Map          // map[usedKey]struct{} of entries accessed by this process
+	refreshOnce    sync.Once         // starts the background keepalive goroutine on first access
+	idxMu          [256]sync.RWMutex // serializes per-bucket idx reads/writes in-process
+	packMu         [256]sync.RWMutex // serializes per-bucket pack reads/writes in-process
 }
 
 // Open opens and returns the cache in the given directory.
@@ -117,9 +119,12 @@ func Open(dir string) (*DiskCache, error) {
 	if !info.IsDir() {
 		return nil, &fs.PathError{Op: "open", Path: dir, Err: fmt.Errorf("not a directory")}
 	}
-	for i := 0; i < 256; i++ {
-		name := filepath.Join(dir, fmt.Sprintf("%02x", i))
-		if err := os.MkdirAll(name, 0o777); err != nil {
+	if fi0, err0 := os.Stat(filepath.Join(dir, "00")); err0 != nil || !fi0.IsDir() {
+		if err := ensureSubdirs(dir); err != nil {
+			return nil, err
+		}
+	} else if fi1, err1 := os.Stat(filepath.Join(dir, "ff")); err1 != nil || !fi1.IsDir() {
+		if err := ensureSubdirs(dir); err != nil {
 			return nil, err
 		}
 	}
@@ -136,6 +141,16 @@ func Open(dir string) (*DiskCache, error) {
 		c.sampleAcc.Store(rand.Int64N(c.sizeSample))
 	}
 	return c, nil
+}
+
+func ensureSubdirs(dir string) error {
+	for i := 0; i < 256; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("%02x", i))
+		if err := os.MkdirAll(name, 0o777); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // fileName returns the name of the file corresponding to the given id.
@@ -224,6 +239,9 @@ type Entry struct {
 
 // get is Get but does not respect verify mode, so that Put can use it.
 func (c *DiskCache) get(id ActionID) (Entry, error) {
+	if e, found, unsupported := c.getIdxEntry(id); found && !unsupported {
+		return e, nil
+	}
 	missing := func(reason error) (Entry, error) {
 		return Entry{}, &entryNotFoundError{Err: reason}
 	}
@@ -313,7 +331,18 @@ func GetBytes(c Cache, id ActionID) ([]byte, Entry, error) {
 	if err != nil {
 		return nil, entry, err
 	}
-	data, _ := os.ReadFile(c.OutputFile(entry.OutputID))
+	if dc, ok := c.(*DiskCache); ok {
+		if data, found, perr := dc.getPackedBytes(entry.OutputID, entry.Size); perr == nil && found {
+			if sha256.Sum256(data) != entry.OutputID {
+				return nil, entry, &entryNotFoundError{Err: errors.New("bad checksum")}
+			}
+			return data, entry, nil
+		}
+	}
+	data, err := os.ReadFile(c.OutputFile(entry.OutputID))
+	if err != nil {
+		return nil, entry, &entryNotFoundError{Err: err}
+	}
 	if sha256.Sum256(data) != entry.OutputID {
 		return nil, entry, &entryNotFoundError{Err: errors.New("bad checksum")}
 	}
@@ -332,6 +361,11 @@ func GetMmap(c Cache, id ActionID) ([]byte, Entry, bool, error) {
 	if err != nil {
 		return nil, entry, false, err
 	}
+	if dc, ok := c.(*DiskCache); ok {
+		if data, found, perr := dc.getPackedBytes(entry.OutputID, entry.Size); perr == nil && found {
+			return data, entry, false, nil
+		}
+	}
 	md, opened, err := mmap.Mmap(c.OutputFile(entry.OutputID))
 	if err != nil {
 		return nil, Entry{}, opened, err
@@ -345,7 +379,17 @@ func GetMmap(c Cache, id ActionID) ([]byte, Entry, bool, error) {
 // OutputFile returns the name of the cache file storing output with the given OutputID.
 func (c *DiskCache) OutputFile(out OutputID) string {
 	file := c.fileName(out, "d")
-	isDir := c.markUsed(file)
+	_, err := os.Stat(file)
+	if err != nil && os.IsNotExist(err) {
+		if c.materializePacked(out, file) {
+			return file
+		}
+		_, err = os.Stat(file)
+	}
+	var isDir bool
+	if err == nil {
+		isDir = c.markUsed(file)
+	}
 	c.noteUsed(out, 'd')
 	if isDir { // => cached executable
 		entries, err := os.ReadDir(file)
@@ -747,6 +791,14 @@ func (c *DiskCache) refreshUsed() {
 		file := c.fileName(u.id, string(u.kind))
 		info, err := os.Stat(file)
 		if err != nil {
+			if os.IsNotExist(err) {
+				switch u.kind {
+				case 'a':
+					c.touchIdxTime(u.id, true)
+				case 'd':
+					c.touchPackTime(u.id, true)
+				}
+			}
 			return true
 		}
 		if mt := info.ModTime(); isYoungGen(mt) {
@@ -1064,6 +1116,11 @@ func (c *DiskCache) trimSubdir(subdir string, classify func(mt time.Time) (remov
 			}
 		}
 	}
+
+	if b, err := strconv.ParseUint(filepath.Base(subdir), 16, 8); err == nil {
+		c.trimIdxBucket(byte(b), classify, stats)
+		c.trimPackBucket(byte(b), classify, stats)
+	}
 }
 
 // dirFilesSize returns the size of regular files directly in dir (for cached executables).
@@ -1092,7 +1149,6 @@ func (c *DiskCache) putIndexEntry(id ActionID, out OutputID, size int64, allowVe
 	// in verify mode we are double-checking that the cache entries
 	// are entirely reproducible. As just noted, this may be unrealistic
 	// in some cases but the check is also useful for shaking out real bugs.
-	entry := fmt.Sprintf("v1 %x %x %20d %20d\n", id, out, size, time.Now().UnixNano())
 	if verify && allowVerify {
 		old, err := c.get(id)
 		if err == nil && (old.OutputID != out || old.Size != size) {
@@ -1101,6 +1157,10 @@ func (c *DiskCache) putIndexEntry(id ActionID, out OutputID, size int64, allowVe
 			panic(msg)
 		}
 	}
+	if unsupported, err := c.putIdxEntry(id, out, size); !unsupported {
+		return err
+	}
+	entry := fmt.Sprintf("v1 %x %x %20d %20d\n", id, out, size, time.Now().UnixNano())
 	file := c.fileName(id, "a")
 	var prev fs.FileInfo
 	if c.trimBuildCache {
@@ -1180,12 +1240,24 @@ func (c *DiskCache) Put(id ActionID, file io.ReadSeeker) (OutputID, int64, error
 	return c.put(id, "", file, !isNoVerify)
 }
 
+var copyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 64<<10)
+		return &buf
+	},
+}
+
+var emptyOutputID = sha256.Sum256(nil)
+
 // PutExecutable is used to store the output as the output for the action ID into a
 // file with the given base name, with the executable mode bit set.
 // It may read file twice. The content of file must not change between the two passes.
 func (c *DiskCache) PutExecutable(id ActionID, name string, file io.ReadSeeker) (OutputID, int64, error) {
 	if name == "" {
 		panic("PutExecutable called without a name")
+	}
+	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) || filepath.Base(name) != name {
+		return OutputID{}, 0, fmt.Errorf("invalid executable name %q", name)
 	}
 	wrapper, isNoVerify := file.(noVerifyReadSeeker)
 	if isNoVerify {
@@ -1202,25 +1274,145 @@ func PutNoVerify(c Cache, id ActionID, file io.ReadSeeker) (OutputID, int64, err
 	return c.Put(id, noVerifyReadSeeker{file})
 }
 
-func (c *DiskCache) put(id ActionID, executableName string, file io.ReadSeeker, allowVerify bool) (OutputID, int64, error) {
-	// Compute output ID.
-	h := sha256.New()
-	if _, err := file.Seek(0, 0); err != nil {
-		return OutputID{}, 0, err
+func (c *DiskCache) createTempFile(perm fs.FileMode) (*os.File, string, error) {
+	for range 16 {
+		tmpName := filepath.Join(c.dir, "tmp-"+strconv.FormatUint(rand.Uint64(), 36))
+		f, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+		if err == nil {
+			return f, tmpName, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
 	}
-	size, err := io.Copy(h, file)
-	if err != nil {
-		return OutputID{}, 0, err
-	}
-	var out OutputID
-	h.Sum(out[:0])
+	return nil, "", fmt.Errorf("failed to create temporary cache file in %s", c.dir)
+}
 
-	// Copy to cached output file (if not already present).
+func (c *DiskCache) put(id ActionID, executableName string, file io.ReadSeeker, allowVerify bool) (OutputID, int64, error) {
 	fileMode := fs.FileMode(0o666)
 	if executableName != "" {
 		fileMode = 0o777
 	}
-	if err := c.copyFile(file, executableName, out, size, fileMode); err != nil {
+
+	var (
+		out  OutputID
+		size int64
+		err  error
+	)
+
+	if br, ok := file.(*bytes.Reader); ok {
+		size = br.Size()
+		var smallData []byte
+		var bufPtr *[]byte
+		if size == 0 {
+			out = emptyOutputID
+			if executableName == "" {
+				smallData = []byte{}
+			}
+		} else if size <= maxPackPayloadSize && executableName == "" {
+			if _, err = br.Seek(0, 0); err != nil {
+				return OutputID{}, 0, err
+			}
+			bufPtr = copyBufPool.Get().(*[]byte)
+			buf := (*bufPtr)[:size]
+			if _, err = io.ReadFull(br, buf); err != nil {
+				copyBufPool.Put(bufPtr)
+				return OutputID{}, 0, err
+			}
+			out = sha256.Sum256(buf)
+			smallData = buf
+		} else {
+			if _, err = br.Seek(0, 0); err != nil {
+				return OutputID{}, 0, err
+			}
+			h := sha256.New()
+			bp := copyBufPool.Get().(*[]byte)
+			_, err = io.CopyBuffer(h, br, *bp)
+			copyBufPool.Put(bp)
+			if err != nil {
+				return OutputID{}, 0, err
+			}
+			h.Sum(out[:0])
+		}
+		err = c.installData(out, size, executableName, fileMode, "", smallData, func(w io.Writer) error {
+			if size == 0 {
+				return nil
+			}
+			if smallData != nil {
+				_, err := w.Write(smallData)
+				return err
+			}
+			if _, err := br.Seek(0, 0); err != nil {
+				return err
+			}
+			_, err := br.WriteTo(w)
+			return err
+		})
+		if bufPtr != nil {
+			copyBufPool.Put(bufPtr)
+		}
+	} else {
+		if _, err = file.Seek(0, 0); err != nil {
+			return OutputID{}, 0, err
+		}
+		bufPtr := copyBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		n, rerr := io.ReadFull(file, buf)
+		switch {
+		case rerr == io.EOF || rerr == io.ErrUnexpectedEOF:
+			size = int64(n)
+			if size == 0 {
+				out = emptyOutputID
+			} else {
+				out = sha256.Sum256(buf[:n])
+			}
+			var smallData []byte
+			if executableName == "" && n <= maxPackPayloadSize {
+				smallData = buf[:n]
+			}
+			err = c.installData(out, size, executableName, fileMode, "", smallData, func(w io.Writer) error {
+				if n == 0 {
+					return nil
+				}
+				_, err := w.Write(buf[:n])
+				return err
+			})
+			copyBufPool.Put(bufPtr)
+		case rerr == nil:
+			tmp, tmpName, terr := c.createTempFile(fileMode)
+			if terr != nil {
+				copyBufPool.Put(bufPtr)
+				return OutputID{}, 0, terr
+			}
+			h := sha256.New()
+			h.Write(buf[:n])
+			if _, werr := tmp.Write(buf[:n]); werr != nil {
+				copyBufPool.Put(bufPtr)
+				tmp.Close()
+				os.Remove(tmpName)
+				return OutputID{}, 0, werr
+			}
+			copied, cerr := io.CopyBuffer(io.MultiWriter(tmp, h), file, buf)
+			copyBufPool.Put(bufPtr)
+			if cerr != nil {
+				tmp.Close()
+				os.Remove(tmpName)
+				return OutputID{}, 0, cerr
+			}
+			if cerr := tmp.Close(); cerr != nil {
+				os.Remove(tmpName)
+				return OutputID{}, 0, cerr
+			}
+			size = int64(n) + copied
+			h.Sum(out[:0])
+			err = c.installData(out, size, executableName, fileMode, tmpName, nil, nil)
+		default:
+			copyBufPool.Put(bufPtr)
+			return OutputID{}, 0, rerr
+		}
+	}
+
+	if err != nil {
 		return out, size, err
 	}
 
@@ -1234,9 +1426,15 @@ func PutBytes(c Cache, id ActionID, data []byte) error {
 	return err
 }
 
-// copyFile copies file into the cache, expecting it to have the given
-// output ID and size, if that file is not present already.
-func (c *DiskCache) copyFile(file io.ReadSeeker, executableName string, out OutputID, size int64, perm os.FileMode) error {
+// installData stores the output payload at its content-addressed cache location
+// if not already present with matching size and SHA-256.
+func (c *DiskCache) installData(out OutputID, size int64, executableName string, perm os.FileMode, tmpName string, smallData []byte, writeFn func(io.Writer) error) error {
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+
 	name := c.fileName(out, "d") // TODO(matloob): use a different suffix for the executable cache?
 	entry := name
 	info, err := os.Stat(name)
@@ -1249,7 +1447,7 @@ func (c *DiskCache) copyFile(file io.ReadSeeker, executableName string, out Outp
 			if !os.IsNotExist(err) {
 				return err
 			}
-			if err := os.Mkdir(name, 0o777); err != nil {
+			if err := os.Mkdir(name, 0o777); err != nil && !os.IsExist(err) {
 				return err
 			}
 			if info, err = os.Stat(name); err != nil {
@@ -1263,36 +1461,63 @@ func (c *DiskCache) copyFile(file io.ReadSeeker, executableName string, out Outp
 		// directory exists. now set name to the inner file
 		name = filepath.Join(name, executableName)
 		info, err = os.Stat(name)
+	} else if err != nil && os.IsNotExist(err) && smallData != nil && !isArchivePrefix(smallData) {
+		if unsupported, perr := c.putPacked(out, smallData); !unsupported {
+			return perr
+		}
 	}
 	var oldSize int64 // logical bytes already in the file, not counted again
 	if err == nil {
 		oldSize = info.Size()
 	}
 	if err == nil && info.Size() == size {
+		if size == 0 {
+			if c.trimBuildCache {
+				c.markUsed(entry) // rewriting counts as a use
+			}
+			return nil
+		}
 		// Check hash.
 		if f, err := os.Open(name); err == nil {
 			h := sha256.New()
-			io.Copy(h, f)
+			bufPtr := copyBufPool.Get().(*[]byte)
+			_, copyErr := io.CopyBuffer(h, f, *bufPtr)
+			copyBufPool.Put(bufPtr)
 			f.Close()
-			var out2 OutputID
-			h.Sum(out2[:0])
-			if out == out2 {
-				if c.trimBuildCache {
-					c.markUsed(entry) // rewriting counts as a use
+			if copyErr == nil {
+				var out2 OutputID
+				h.Sum(out2[:0])
+				if out == out2 {
+					if c.trimBuildCache {
+						c.markUsed(entry) // rewriting counts as a use
+					}
+					return nil
 				}
-				return nil
 			}
 		}
 		// Hash did not match. Fall through and rewrite file.
 	}
 
-	// Copy file to cache directory.
-	mode := os.O_RDWR | os.O_CREATE
-	if err == nil && info.Size() > size { // shouldn't happen but fix in case
-		mode |= os.O_TRUNC
+	if tmpName == "" {
+		tmp, tn, err := c.createTempFile(perm)
+		if err != nil {
+			return err
+		}
+		tmpName = tn
+		if size > 0 {
+			if err := writeFn(tmp); err != nil {
+				tmp.Close()
+				return err
+			}
+		}
+		if err := tmp.Close(); err != nil {
+			return err
+		}
 	}
-	f, err := os.OpenFile(name, mode, perm)
-	if err != nil {
+
+	now := c.writeTime()
+	os.Chtimes(tmpName, now, now) // sets young generation mark (and used by tests)
+	if err := os.Rename(tmpName, name); err != nil {
 		if base.IsETXTBSY(err) {
 			// This file is being used by an executable. It must have
 			// already been written by another go process and then run.
@@ -1304,70 +1529,7 @@ func (c *DiskCache) copyFile(file io.ReadSeeker, executableName string, out Outp
 		}
 		return err
 	}
-	defer f.Close()
-	if size == 0 {
-		// File now exists with correct size.
-		// Only one possible zero-length file, so contents are OK too.
-		// Early return here makes sure there's a "last byte" for code below.
-		if c.trimBuildCache {
-			if err := f.Close(); err != nil {
-				os.Remove(name)
-				return err
-			}
-			now := c.writeTime()
-			os.Chtimes(name, now, now)
-			if executableName != "" {
-				// trimSubdir and markUsed check the entry directory's mtime.
-				os.Chtimes(entry, now, now)
-			}
-		}
-		return nil
-	}
-
-	// From here on, if any of the I/O writing the file fails,
-	// we make a best-effort attempt to truncate the file f
-	// before returning, to avoid leaving bad bytes in the file.
-
-	// Copy file to f, but also into h to double-check hash.
-	if _, err := file.Seek(0, 0); err != nil {
-		f.Truncate(0)
-		return err
-	}
-	h := sha256.New()
-	w := io.MultiWriter(f, h)
-	if _, err := io.CopyN(w, file, size-1); err != nil {
-		f.Truncate(0)
-		return err
-	}
-	// Check last byte before writing it; writing it will make the size match
-	// what other processes expect to find and might cause them to start
-	// using the file.
-	buf := make([]byte, 1)
-	if _, err := file.Read(buf); err != nil {
-		f.Truncate(0)
-		return err
-	}
-	h.Write(buf)
-	sum := h.Sum(nil)
-	if !bytes.Equal(sum, out[:]) {
-		f.Truncate(0)
-		return fmt.Errorf("file content changed underfoot")
-	}
-
-	// Commit cache file entry.
-	if _, err := f.Write(buf); err != nil {
-		f.Truncate(0)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		// Data might not have been written,
-		// but file may look like it is the right size.
-		// To be extra careful, remove cached file.
-		os.Remove(name)
-		return err
-	}
-	now := c.writeTime()
-	os.Chtimes(name, now, now) // sets young generation mark (and used by tests)
+	tmpName = "" // ownership transferred to name
 	if c.trimBuildCache && executableName != "" {
 		// trimSubdir and markUsed check the entry directory's mtime.
 		os.Chtimes(entry, now, now)

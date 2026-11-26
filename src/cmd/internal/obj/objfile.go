@@ -36,13 +36,13 @@ func WriteObjFile(ctxt *Link, b *bio.Writer) {
 
 	genFuncInfoSyms(ctxt)
 
+	bufw, objBuf := goobj.NewBufferWriter()
 	w := writer{
-		Writer:  goobj.NewWriter(b),
+		Writer:  bufw,
 		ctxt:    ctxt,
 		pkgpath: objabi.PathToPrefix(ctxt.Pkgpath),
 	}
 
-	start := b.Offset()
 	w.init()
 
 	// Header
@@ -214,11 +214,18 @@ func WriteObjFile(ctxt *Link, b *bio.Writer) {
 
 	h.Offsets[goobj.BlkEnd] = w.Offset()
 
-	// Fix up block offsets in the header
-	end := start + int64(w.Offset())
-	b.MustSeek(start, 0)
-	h.Write(w.Writer)
-	b.MustSeek(end, 0)
+	// Fix up block offsets in the header and emit (LZ4-compressed if worthwhile).
+	raw := objBuf.Bytes()
+	h.Put(raw[:h.Size()])
+	if comp, ok := goobj.LZ4CompressIfSmaller(raw); ok {
+		b.WriteString(goobj.MagicLZ4)
+		var lenBuf [4]byte
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(raw)))
+		b.Write(lenBuf[:])
+		b.Write(comp)
+		return
+	}
+	b.Write(raw)
 }
 
 type writer struct {

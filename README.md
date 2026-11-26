@@ -13,6 +13,7 @@ Preserves Go syntax and standard library API compatibility.
 - **`cmd/compile`**: `-ldflags="-o2"` (loop unrolling, post-prove DCE), `-ldflags="-o3"` (cost-based inlining, loop interchange/tiling, cross-loop BCE, reflection/interface DCE), `-ldflags="-fmth"` (fast-math SSA), and stack SBO for non-escaping slices/strings (`all=` applies flags across dependencies).
 - **`//go:immutable`**: compile-time and runtime immutability for slices, arrays, maps, `*list.List`, `*ring.Ring`, and `sync/v2/container` maps. Applies to variable declarations (`var`, `:=`) and named functions/methods (`//go:immutable [args<N>...] [r|r<N>...]`; bare `//go:immutable` constrains all supported non-variadic parameters, `r` aliases `r0` for single-result functions, verified at compile time across call and return sites).
 - **`runtime`, `slices`, `maps`, `container/list`, `container/ring`**: span/stack/GC sweep optimizations, write-barrier deduplication, and `ToImmutable` / `IsImmutable`.
+- **`cmd/go`, `cmd/internal/{archive,bio,buildid,goobj,obj}`**: sharded per-bucket cache indexes (`idx`) and small-blob packing (`pack`), single-pass pooled `GOCACHE` writes, 64 KiB `bio`/copy/hash buffers, skipped empty stdout and unmodified source caching, and bounds-checked LZ4 object compression (`\x00go120lz`; `__.PKGDEF` remains uncompressed).
 
 ### Standard Library
 - **`sync/v2`, `sync/v2/container`, `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, and `LinkedHashMap`, `OrderedMap`, `TreeMap`, `ConcurrentSkipListMap` (`ToImmutable`, `IsImmutable`).
@@ -38,6 +39,9 @@ Measured on `linux/amd64` (Intel Xeon, `-cpu=2`) against upstream Go / pre-optim
 | Binary Size (`-o3`) | Service + Reflect + Crypto | 8.59 MB | **5.29 MB** | **-38.4%** |
 | Stack SBO | `make([]byte, 128)` / `[]byte(s)` (48 B) | 37.86 / 22.53 ns | **3.71 / 1.88 ns** | **1 → 0 allocs** |
 | Runtime / `reflect` | `GCSpanSetResetEmpty` / `reflect.Comparable` | 3,424 / 170.8 ns | **468.7 / 16.36 ns** | **7.31× / 10.44×** |
+| Build (`2 vCPU`) | Cold `go build std` / `go test fmt encoding/{json,hex}` | 66.73 / 20.83 s | **62.29 / 20.12 s** | **-6.7% / -3.4%** |
+| Build Cache Size | `GOCACHE` (`std` + `cmd/go` + tests) | 377.3 MB | **154.9 MB** | **-58.9%** |
+| Build Cache Files | `GOCACHE` total files (`-a` / `-d` / `idx`+`pack`) | 5,085 | **1,395** | **-72.6%** |
 
 ### Concurrency (`sync/v2`, `sync/atomic/v2`)
 

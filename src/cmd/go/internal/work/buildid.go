@@ -713,20 +713,22 @@ func (b *Builder) updateBuildID(a *Action, target string) error {
 
 	c := cache.Default()
 
-	// Cache output from compile/link, even if we don't do the rest.
-	switch a.Mode {
-	case "build":
-		cache.PutBytes(c, cache.Subkey(a.actionID, "stdout"), a.output)
-	case "link":
-		// Even though we don't cache the binary, cache the linker text output.
-		// We might notice that an installed binary is up-to-date but still
-		// want to pretend to have run the linker.
-		// Store it under the main package's action ID
-		// to make it easier to find when that's all we have.
-		for _, a1 := range a.Deps {
-			if p1 := a1.Package; p1 != nil && p1.Name == "main" {
-				cache.PutBytes(c, cache.Subkey(a1.actionID, "link-stdout"), a.output)
-				break
+	// Cache non-empty output from compile/link, even if we don't do the rest.
+	if len(a.output) > 0 {
+		switch a.Mode {
+		case "build":
+			cache.PutBytes(c, cache.Subkey(a.actionID, "stdout"), a.output)
+		case "link":
+			// Even though we don't cache the binary, cache the linker text output.
+			// We might notice that an installed binary is up-to-date but still
+			// want to pretend to have run the linker.
+			// Store it under the main package's action ID
+			// to make it easier to find when that's all we have.
+			for _, a1 := range a.Deps {
+				if p1 := a1.Package; p1 != nil && p1.Name == "main" {
+					cache.PutBytes(c, cache.Subkey(a1.actionID, "link-stdout"), a.output)
+					break
+				}
 			}
 		}
 	}

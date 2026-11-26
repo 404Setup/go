@@ -6,6 +6,7 @@ package archive
 
 import (
 	"bytes"
+	"cmd/internal/goobj"
 	"debug/elf"
 	"debug/macho"
 	"debug/pe"
@@ -390,5 +391,60 @@ func TestExactly16Bytes(t *testing.T) {
 		if strings.HasSuffix(str, ".syso") && !strings.HasSuffix(strings.TrimRight(got, " "), ".syso") {
 			t.Errorf("exactly16Bytes(%q) is %q, did not preserve .syso suffix", str, got)
 		}
+	}
+}
+
+func makeTestArchive(t *testing.T, name string, payload []byte) *os.File {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.a")
+	var buf bytes.Buffer
+	buf.WriteString("!<arch>\n")
+	fmt.Fprintf(&buf, entryHeader, exactly16Bytes(name), 0, 0, 0, 0o644, len(payload))
+	buf.Write(payload)
+	if len(payload)&1 != 0 {
+		buf.WriteByte(0)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func TestParseLZ4GoObjAndMalformed(t *testing.T) {
+	// Valid LZ4-compressed Go object inside an archive.
+	lz4Payload := append([]byte("go object linux amd64 devel \n!\n"), []byte(goobj.MagicLZ4)...)
+	lz4Payload = append(lz4Payload, 0x20, 0, 0, 0, 0x10, 'x')
+	a, err := Parse(makeTestArchive(t, "_go_.o", lz4Payload), false)
+	if err != nil {
+		t.Fatalf("Parse(LZ4 _go_.o) failed: %v", err)
+	}
+	if len(a.Entries) != 1 || a.Entries[0].Type != EntryGoObj || a.Entries[0].Obj.Arch != "amd64" {
+		t.Fatalf("unexpected parsed LZ4 entry: %+v", a.Entries)
+	}
+
+	// Malformed archives must return errors cleanly without panicking (e.g. negative skip).
+	malformed := []struct {
+		name    string
+		content []byte
+	}{
+		{"negative_obj_size_after_text_hdr", func() []byte {
+			// Text header is longer than ar member size? Text header consumes entire member and leaves < 0?
+			// Put exactly text header with no magic, or truncated text header inside a tiny member:
+			return []byte("go object linux amd64\n!\n")
+		}()},
+		{"corrupt_magic", []byte("go object linux amd64 devel \n!\n\x00go120xx1234")},
+		{"truncated_magic", []byte("go object linux amd64 devel \n!\n\x00go")},
+	}
+	for _, tc := range malformed {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Parse(makeTestArchive(t, "_go_.o", tc.content), false); err == nil {
+				t.Fatalf("Parse(%s) unexpectedly succeeded", tc.name)
+			}
+		})
 	}
 }

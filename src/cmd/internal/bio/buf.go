@@ -24,6 +24,8 @@ type Writer struct {
 	*bufio.Writer
 }
 
+const bioBufSize = 64 << 10
+
 // Create creates the file named name and returns a Writer
 // for that file.
 func Create(name string) (*Writer, error) {
@@ -31,7 +33,7 @@ func Create(name string) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Writer{f: f, Writer: bufio.NewWriter(f)}, nil
+	return &Writer{f: f, Writer: bufio.NewWriterSize(f, bioBufSize)}, nil
 }
 
 // Open returns a Reader for the file named name.
@@ -45,7 +47,7 @@ func Open(name string) (*Reader, error) {
 
 // NewReader returns a Reader from an open file.
 func NewReader(f *os.File) *Reader {
-	return &Reader{f: f, Reader: bufio.NewReader(f)}
+	return &Reader{f: f, Reader: bufio.NewReaderSize(f, bioBufSize)}
 }
 
 func (r *Reader) MustSeek(offset int64, whence int) int64 {

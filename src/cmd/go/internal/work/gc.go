@@ -561,13 +561,22 @@ func (gcToolchain) pack(b *Builder, a *Action, afile string, ofiles []string) er
 	return nil
 }
 
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64<<10)
+		return &b
+	},
+}
+
 func packInternal(afile string, ofiles []string) error {
 	dst, err := os.OpenFile(afile, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		return err
 	}
 	defer dst.Close() // only for error returns or panics
-	w := bufio.NewWriter(dst)
+	w := bufio.NewWriterSize(dst, 64<<10)
+	bufp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufp)
 
 	for _, ofile := range ofiles {
 		src, err := os.Open(ofile)
@@ -584,7 +593,7 @@ func packInternal(afile string, ofiles []string) error {
 			b := make([]byte, len(header))
 			// If this is an archive, copy the inner entries over.
 			if _, err := io.ReadFull(src, b[:]); err == nil && bytes.Equal(header, b) {
-				_, err := io.Copy(w, src)
+				_, err := io.CopyBuffer(w, src, *bufp)
 				src.Close()
 				if err != nil {
 					return fmt.Errorf("copying %s to %s: %v", ofile, afile, err)
@@ -610,7 +619,7 @@ func packInternal(afile string, ofiles []string) error {
 		size := fi.Size()
 		fmt.Fprintf(w, "%s%-12d%-6d%-6d%-8o%-10d`\n",
 			name, 0, 0, 0, 0644, size)
-		n, err := io.Copy(w, src)
+		n, err := io.CopyBuffer(w, src, *bufp)
 		src.Close()
 		if err == nil && n < size {
 			err = io.ErrUnexpectedEOF

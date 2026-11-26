@@ -226,7 +226,9 @@ func (sh *Shell) CopyFile(dst, src string, perm fs.FileMode, force bool) error {
 		return fmt.Errorf("copying %s: %w", src, err) // err should already refer to dst
 	}
 
-	_, err = io.Copy(df, sf)
+	bufp := copyBufPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(df, sf, *bufp)
+	copyBufPool.Put(bufp)
 	df.Close()
 	if err != nil {
 		mayberemovefile(dst)

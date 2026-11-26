@@ -22,7 +22,7 @@ import (
 // If bufSize == 0, FindAndHash uses a reasonable default.
 func FindAndHash(r io.Reader, id string, bufSize int) (matches []int64, hash [32]byte, err error) {
 	if bufSize == 0 {
-		bufSize = 31 * 1024 // bufSize+little will likely fit in 32 kB
+		bufSize = 64*1024 - 128 // fits cleanly with tiny fringe
 	}
 	if len(id) == 0 {
 		return nil, [32]byte{}, fmt.Errorf("buildid.FindAndHash: no id specified")
@@ -161,8 +161,7 @@ func (r *excludedReader) Read(p []byte) (int, error) {
 		if cend > int64(n) {
 			cend = int64(n)
 		}
-		zeros := make([]byte, cend-cstart)
-		copy(p[cstart:cend], zeros)
+		clear(p[cstart:cend])
 	}
 	r.off += int64(n)
 	return n, err

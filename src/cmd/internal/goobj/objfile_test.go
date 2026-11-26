@@ -50,7 +50,9 @@ func TestReadWrite(t *testing.T) {
 	a.SetSym(SymRef{33, 44})
 	a.Write(w)
 
-	w.wr.Flush()
+	if bw, ok := w.wr.(*bio.Writer); ok {
+		bw.Flush()
+	}
 
 	// Read them back and check.
 	b := buf.Bytes()

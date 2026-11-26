@@ -213,6 +213,7 @@ func (r *objReader) readFull(b []byte) error {
 func (r *objReader) skip(n int64) {
 	if n < 0 {
 		r.error(fmt.Errorf("debug/goobj: internal error: misuse of skip"))
+		return
 	}
 	if n < int64(len(r.tmp)) {
 		// Since the data is so small, a just reading from the buffered
@@ -439,12 +440,15 @@ func (r *objReader) parseObject(o *GoObj, size int64) error {
 	}
 	o.Offset = r.offset
 	o.Size = size - int64(len(h))
+	if o.Size < 0 {
+		return r.error(errCorruptObject)
+	}
 
 	p, err := r.peek(8)
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(p, []byte(goobj.Magic)) {
+	if !bytes.Equal(p, []byte(goobj.Magic)) && !bytes.Equal(p, []byte(goobj.MagicLZ4)) {
 		if bytes.HasPrefix(p, []byte("\x00go1")) && bytes.HasSuffix(p, []byte("ld")) {
 			return r.error(ErrGoObjOtherVersion{p[1:]}) // strip the \x00 byte
 		}
@@ -464,8 +468,8 @@ func (a *Archive) AddEntry(typ EntryType, name string, mtime int64, uid, gid int
 	if err != nil || n != entryLen {
 		log.Fatal("writing entry header: ", err)
 	}
-	n1, _ := io.CopyN(a.f, r, size)
-	if n1 != size {
+	n1, err := io.CopyN(a.f, r, size)
+	if err != nil || n1 != size {
 		log.Fatal(err)
 	}
 	if (off+size)&1 != 0 {
