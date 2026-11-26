@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -157,6 +158,104 @@ func BenchmarkValidHeaderValueBytes(b *testing.B) {
 			if !validHeaderValueBytes(v) {
 				b.Fatal("unexpected invalid header value")
 			}
+		}
+	}
+}
+
+func TestInternHeaderValueNumericAndDateCache(t *testing.T) {
+	// 1. Single and two-digit decimal values without leading zero.
+	for i := range 100 {
+		s := string(rune('0'+i/10)) + string(rune('0'+i%10))
+		if i < 10 {
+			s = string(rune('0' + i))
+		}
+		b := []byte(s)
+		got, ok := internHeaderValue(b)
+		if !ok || got != s {
+			t.Fatalf("internHeaderValue(%q) = (%q, %v), want (%q, true)", s, got, ok, s)
+		}
+		b[0] = 'X'
+		if got != s {
+			t.Fatalf("interned numeric string aliased caller slice: got %q, want %q", got, s)
+		}
+	}
+	for _, leadingZero := range []string{"00", "01", "09"} {
+		if _, ok := internHeaderValue([]byte(leadingZero)); ok {
+			t.Fatalf("leading zero %q should not hit two-digit intern table", leadingZero)
+		}
+	}
+
+	// 2. Date header caching must copy bytes (no aliasing) and reject non-GMT.
+	dateBuf := []byte("Thu, 26 Nov 2026 15:00:01 GMT")
+	got1, ok := internHeaderValue(dateBuf)
+	if !ok || got1 != "Thu, 26 Nov 2026 15:00:01 GMT" {
+		t.Fatalf("first date intern = (%q, %v)", got1, ok)
+	}
+	dateBuf[24] = '9' // mutate caller slice
+	if got1 != "Thu, 26 Nov 2026 15:00:01 GMT" {
+		t.Fatalf("date cache aliased caller buffer: %q", got1)
+	}
+	dateBuf[24] = '1'
+	if allocs := testing.AllocsPerRun(100, func() {
+		v, ok := internHeaderValue(dateBuf)
+		if !ok || v != "Thu, 26 Nov 2026 15:00:01 GMT" {
+			t.Fatalf("cached date mismatch: %q %v", v, ok)
+		}
+	}); allocs != 0 {
+		t.Fatalf("cached Date intern allocs = %v, want 0", allocs)
+	}
+	if _, ok := internHeaderValue([]byte("Thu, 26 Nov 2026 15:00:01 UTC")); ok {
+		t.Fatal("non-GMT 29-byte header unexpectedly cached")
+	}
+
+	// 3. CRLF/NUL injection inside Date-shaped header must still be rejected by readMIMEHeaderBuffered.
+	badDate := "Date: Thu, 26 Nov 2026 15:00:\x001 GMT\r\n\r\n"
+	br := bufio.NewReader(strings.NewReader(badDate))
+	if _, _, _, _, handled, err := readMIMEHeaderFast(br, 1<<20, 100, false); !handled || err == nil {
+		t.Fatalf("invalid Date header with NUL not rejected: handled=%v err=%v", handled, err)
+	}
+
+	// 4. Concurrent cache updates and reads under -race.
+	d1 := "Thu, 26 Nov 2026 15:00:02 GMT"
+	d2 := "Thu, 26 Nov 2026 15:00:03 GMT"
+	var wg sync.WaitGroup
+	for g := range 6 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			want := d1
+			if id%2 == 1 {
+				want = d2
+			}
+			buf := []byte(want)
+			for range 200 {
+				got, ok := internHeaderValue(buf)
+				if !ok || got != want {
+					t.Errorf("concurrent internHeaderValue got (%q, %v), want (%q, true)", got, ok, want)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+func BenchmarkReadMIMEHeaderResponse(b *testing.B) {
+	raw := []byte("Date: Thu, 26 Nov 2026 15:00:01 GMT\r\nContent-Length: 42\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n")
+	// Warm Date cache.
+	brWarm := bufio.NewReader(bytes.NewReader(raw))
+	_, _, _, _, _, _ = readMIMEHeaderFast(brWarm, 1<<20, 100, false)
+
+	rd := bytes.NewReader(raw)
+	br := bufio.NewReaderSize(rd, 4096)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		rd.Reset(raw)
+		br.Reset(rd)
+		m, _, _, _, handled, err := readMIMEHeaderFast(br, 1<<20, 100, false)
+		if !handled || err != nil || len(m) != 3 {
+			b.Fatalf("readMIMEHeaderFast failed: handled=%v err=%v len=%d", handled, err, len(m))
 		}
 	}
 }

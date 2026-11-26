@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe" // for linkname and string slicing
 )
 
@@ -1621,24 +1622,48 @@ func lookupCommonHeader(a []byte) string {
 	return ""
 }
 
+const (
+	oneDigitHeaderVals = "0123456789"
+	twoDigitHeaderVals = "10111213141516171819" +
+		"20212223242526272829" +
+		"30313233343536373839" +
+		"40414243444546474849" +
+		"50515253545556575859" +
+		"60616263646566676869" +
+		"70717273747576777879" +
+		"80818283848586878889" +
+		"90919293949596979899"
+)
+
+var cachedDateHeader atomic.Pointer[string]
+
 func internHeaderValue(v []byte) (string, bool) {
 	switch len(v) {
 	case 0:
 		return "", true
 	case 1:
-		switch v[0] {
-		case '0':
-			return "0", true
-		case '1':
-			return "1", true
+		if v[0] >= '0' && v[0] <= '9' {
+			d := v[0] - '0'
+			return oneDigitHeaderVals[d : d+1], true
+		}
+	case 2:
+		if v[0] >= '1' && v[0] <= '9' && v[1] >= '0' && v[1] <= '9' {
+			off := (int(v[0]-'1')*10 + int(v[1]-'0')) * 2
+			return twoDigitHeaderVals[off : off+2], true
+		}
+		if string(v) == "br" {
+			return "br", true
 		}
 	case 3:
 		if string(v) == "*/*" {
 			return "*/*", true
 		}
 	case 4:
-		if string(v) == "gzip" {
+		switch string(v) {
+		case "gzip":
 			return "gzip", true
+		case "zstd":
+			return "zstd", true
 		}
 	case 5:
 		switch string(v) {
@@ -1720,6 +1745,14 @@ func internHeaderValue(v []byte) (string, bool) {
 		case "Go-http-client/2.0":
 			return "Go-http-client/2.0", true
 		}
+	case 19:
+		if string(v) == "gzip, deflate, zstd" {
+			return "gzip, deflate, zstd", true
+		}
+	case 23:
+		if string(v) == "gzip, deflate, br, zstd" {
+			return "gzip, deflate, br, zstd", true
+		}
 	case 24:
 		if string(v) == "text/html; charset=utf-8" {
 			return "text/html; charset=utf-8", true
@@ -1727,6 +1760,15 @@ func internHeaderValue(v []byte) (string, bool) {
 	case 25:
 		if string(v) == "text/plain; charset=utf-8" {
 			return "text/plain; charset=utf-8", true
+		}
+	case 29:
+		if v[3] == ',' && v[4] == ' ' && v[25] == ' ' && v[26] == 'G' && v[27] == 'M' && v[28] == 'T' {
+			if p := cachedDateHeader.Load(); p != nil && *p == string(v) {
+				return *p, true
+			}
+			s := string(v)
+			cachedDateHeader.Store(&s)
+			return s, true
 		}
 	case 31:
 		if string(v) == "application/json; charset=utf-8" {
