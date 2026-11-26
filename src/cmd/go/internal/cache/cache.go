@@ -53,11 +53,15 @@ type Cache interface {
 	// The seeker is only used to seek to the beginning. After a call to Put,
 	// the seek position is not guaranteed to be in any particular state.
 	//
-	// As a special case, if the ReadSeeker is of type noVerifyReadSeeker,
-	// the verification from GODEBUG=gocacheverify=1 is skipped.
+	// There are two special cases:
+	//   - If the ReadSeeker is of type noVerifyReadSeeker, the verification
+	//     from GODEBUG=gocacheverify=1 is skipped.
+	//   - If the ReadSeeker is of type optionalReadSeeker (see PutOptional),
+	//     a DiskCache may skip writing the entry when the disk is nearly full.
 	//
 	// After a successful call to Put, OutputFile(OutputID) must
-	// exist on disk until Close is called (at the end of the process).
+	// exist on disk until Close is called (at the end of the process),
+	// unless the write was skipped for an optionalReadSeeker.
 	Put(ActionID, io.ReadSeeker) (_ OutputID, size int64, _ error)
 
 	// Close is called at the end of the go process. Implementations can do
@@ -98,6 +102,8 @@ type DiskCache struct {
 	refreshOnce    sync.Once         // starts the background keepalive goroutine on first access
 	idxMu          [256]sync.RWMutex // serializes per-bucket idx reads/writes in-process
 	packMu         [256]sync.RWMutex // serializes per-bucket pack reads/writes in-process
+	lowDiskOnce    sync.Once         // checks lowDiskFree on the first optional put
+	lowDisk        bool              // disk was nearly full, so skip optional puts
 }
 
 // Open opens and returns the cache in the given directory.
@@ -1230,6 +1236,12 @@ type noVerifyReadSeeker struct {
 	io.ReadSeeker
 }
 
+// optionalReadSeeker is an io.ReadSeeker wrapper sentinel type
+// that says that Cache.Put may skip writing the entry on a nearly full disk.
+type optionalReadSeeker struct {
+	io.ReadSeeker
+}
+
 // Put stores the given output in the cache as the output for the action ID.
 // It may read file twice. The content of file must not change between the two passes.
 func (c *DiskCache) Put(id ActionID, file io.ReadSeeker) (OutputID, int64, error) {
@@ -1237,7 +1249,11 @@ func (c *DiskCache) Put(id ActionID, file io.ReadSeeker) (OutputID, int64, error
 	if isNoVerify {
 		file = wrapper.ReadSeeker
 	}
-	return c.put(id, "", file, !isNoVerify)
+	optional, isOptional := file.(optionalReadSeeker)
+	if isOptional {
+		file = optional.ReadSeeker
+	}
+	return c.put(id, "", file, !isNoVerify, isOptional)
 }
 
 var copyBufPool = sync.Pool{
@@ -1263,7 +1279,7 @@ func (c *DiskCache) PutExecutable(id ActionID, name string, file io.ReadSeeker) 
 	if isNoVerify {
 		file = wrapper.ReadSeeker
 	}
-	return c.put(id, name, file, !isNoVerify)
+	return c.put(id, name, file, !isNoVerify, false)
 }
 
 // PutNoVerify is like Put but disables the verify check
@@ -1288,7 +1304,36 @@ func (c *DiskCache) createTempFile(perm fs.FileMode) (*os.File, string, error) {
 	return nil, "", fmt.Errorf("failed to create temporary cache file in %s", c.dir)
 }
 
-func (c *DiskCache) put(id ActionID, executableName string, file io.ReadSeeker, allowVerify bool) (OutputID, int64, error) {
+// PutOptional is like Put, but a DiskCache may skip writing the entry
+// when the disk is nearly full. Callers must not assume OutputFile exists afterward.
+func PutOptional(c Cache, id ActionID, file io.ReadSeeker) (OutputID, int64, error) {
+	return c.Put(id, optionalReadSeeker{file})
+}
+
+func (c *DiskCache) put(id ActionID, executableName string, file io.ReadSeeker, allowVerify, optional bool) (OutputID, int64, error) {
+	// On a nearly full disk, skip optional writes for the rest of the command.
+	if optional && c.trimBuildCache { // GOEXPERIMENT=trimbuildcache enabled
+		// TODO(thepudds): we could consider doing this elsewhere and more than once,
+		// but be more conservative for now.
+		c.lowDiskOnce.Do(func() { _, c.lowDisk = c.lowDiskFree() })
+		if c.lowDisk {
+			if _, err := file.Seek(0, 0); err != nil {
+				return OutputID{}, 0, err
+			}
+			h := sha256.New()
+			bp := copyBufPool.Get().(*[]byte)
+			size, err := io.CopyBuffer(h, file, *bp)
+			copyBufPool.Put(bp)
+			if err != nil {
+				return OutputID{}, 0, err
+			}
+			var out OutputID
+			h.Sum(out[:0])
+			return out, size, nil
+		}
+	}
+
+	// Copy to cached output file (if not already present).
 	fileMode := fs.FileMode(0o666)
 	if executableName != "" {
 		fileMode = 0o777

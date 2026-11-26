@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build darwin || linux
+//go:build darwin
 
 package contraire
 
@@ -50,17 +50,15 @@ func runWorker(trials int, cfgPath, outPath, lockPath string, std bool) error {
 	write := func(out *output) error {
 		data, err := json.Marshal(out)
 		if err != nil {
-			return fmt.Errorf("couldn't marshal output: %v", err)
+			return fmt.Errorf("couldn't encode output: %v", err)
 		}
 		// Hold the lock while writing so the driver never observes a partial write.
 		if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
 			return fmt.Errorf("couldn't acquire lock file %q: %v", lockPath, err)
 		}
-		if err := os.WriteFile(outPath, data, 0o644); err != nil {
+		defer syscall.Flock(fd, syscall.LOCK_UN)
+		if err := os.WriteFile(outPath, data, 0644); err != nil {
 			return fmt.Errorf("couldn't write output to %q: %v", outPath, err)
-		}
-		if err := syscall.Flock(fd, syscall.LOCK_UN); err != nil {
-			return fmt.Errorf("couldn't release lock file %q: %v", lockPath, err)
 		}
 		return nil
 	}
@@ -78,8 +76,7 @@ func runWorker(trials int, cfgPath, outPath, lockPath string, std bool) error {
 
 	// Populate the WAL to signal to the driver that startup is complete.
 	// We are about to enter the main loop and the driver can begin to
-	// monitor the worker's progress. The driver should have ensured
-	// that outPath doesn't exist yet.
+	// monitor the worker's progress.
 	if err := write(&output{Next: next}); err != nil {
 		return err
 	}
@@ -101,7 +98,7 @@ func runWorker(trials int, cfgPath, outPath, lockPath string, std bool) error {
 		case success:
 			successes++
 		case panik:
-			minPanic = min(minPanic, next)
+			minPanic = minProg(minPanic, next)
 		}
 		trialsDone++
 
