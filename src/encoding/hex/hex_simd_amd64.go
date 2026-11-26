@@ -15,13 +15,14 @@ var (
 	haveAVX2         = cpu.X86.HasAVX2
 	haveSSSE3        = cpu.X86.HasSSSE3
 	haveSIMD         = haveAVX2 || haveSSSE3
-	minSIMDEncode    = 16
+	minSIMDEncode    = 32
 	minSIMDDecode    = 32
 	minSIMDDecodeOut = 16
 )
 
 func init() {
 	if !haveAVX2 && haveSSSE3 {
+		minSIMDEncode = 16
 		minSIMDDecode = 16
 		minSIMDDecodeOut = 8
 	}
@@ -59,7 +60,7 @@ func encodeSIMD(dst, src []byte) (si, di int) {
 	if n == 0 {
 		return 0, 0
 	}
-	if hasUnsafeForwardOverlap(dst, src, n*2, n) {
+	if hasUnsafeEncodeOverlap(dst, src, n*2, n) {
 		return 0, 0
 	}
 	if haveAVX2 && n >= 32 {
@@ -89,8 +90,21 @@ func decodeSIMD(dst, src []byte) (si, di int) {
 	return 0, 0
 }
 
-// hasUnsafeForwardOverlap reports whether dst and src overlap with &dst[0] > &src[0],
-// or in Encode when dst overlaps src in a direction that SIMD batching would clobber.
+// hasUnsafeEncodeOverlap reports whether dst and src overlap in a direction
+// that SIMD batching would clobber unread src bytes.
+// Disjoint slices and in-place half encoding (dst[:2n], src[n:2n]) are safe.
+func hasUnsafeEncodeOverlap(dst, src []byte, dstLen, srcLen int) bool {
+	if dstLen == 0 || srcLen == 0 {
+		return false
+	}
+	d0 := uintptr(unsafe.Pointer(&dst[0]))
+	s0 := uintptr(unsafe.Pointer(&src[0]))
+	d1 := d0 + uintptr(dstLen)
+	s1 := s0 + uintptr(srcLen)
+	return d0 < s1 && s0 < d1 && d0+uintptr(srcLen) > s0
+}
+
+// hasUnsafeForwardOverlap reports whether dst and src overlap with &dst[0] > &src[0].
 func hasUnsafeForwardOverlap(dst, src []byte, dstLen, srcLen int) bool {
 	if dstLen == 0 || srcLen == 0 {
 		return false

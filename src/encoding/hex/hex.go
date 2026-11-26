@@ -112,7 +112,22 @@ func Encode(dst, src []byte) int {
 		dst = dst[di:]
 	}
 
-	for len(src) >= 4 {
+	for len(src) >= 8 {
+		_ = dst[15]
+		v0 := uint64(hexEncodeLUT16[src[0]]) |
+			uint64(hexEncodeLUT16[src[1]])<<16 |
+			uint64(hexEncodeLUT16[src[2]])<<32 |
+			uint64(hexEncodeLUT16[src[3]])<<48
+		v1 := uint64(hexEncodeLUT16[src[4]]) |
+			uint64(hexEncodeLUT16[src[5]])<<16 |
+			uint64(hexEncodeLUT16[src[6]])<<32 |
+			uint64(hexEncodeLUT16[src[7]])<<48
+		byteorder.LEPutUint64(dst, v0)
+		byteorder.LEPutUint64(dst[8:], v1)
+		src = src[8:]
+		dst = dst[16:]
+	}
+	if len(src) >= 4 {
 		_ = dst[7]
 		v := uint64(hexEncodeLUT16[src[0]]) |
 			uint64(hexEncodeLUT16[src[1]])<<16 |
@@ -240,11 +255,6 @@ func EncodeToString(src []byte) string {
 	if len(src) == 0 {
 		return ""
 	}
-	if len(src) <= 7 {
-		var buf [14]byte
-		n := Encode(buf[:], src)
-		return string(buf[:n])
-	}
 	n := EncodedLen(len(src))
 	b := bytealg.MakeNoZero(n)
 	Encode(b, src)
@@ -343,17 +353,10 @@ func formatDumpLine(line *[79]byte, offset uint32, chunk []byte) int {
 	return pos + 2
 }
 
-func dumpSmall(data []byte, totalLen int) string {
-	var stackBuf [256]byte
-	out := stackBuf[:totalLen]
-	fillDump(out, data)
-	return string(out)
-}
-
 func fillDump(out, data []byte) {
 	pos := 0
 	var offset uint32
-	if haveSIMD && len(data) >= 32 {
+	if len(data) >= 32 && haveSIMD {
 		if lines := dumpLinesSIMD(out, data, 0); lines > 0 {
 			pos = lines * 79
 			offset = uint32(lines * 16)
@@ -386,9 +389,6 @@ func Dump(data []byte) string {
 		totalLen += 63 + rem
 	}
 
-	if totalLen <= 256 {
-		return dumpSmall(data, totalLen)
-	}
 	out := bytealg.MakeNoZero(totalLen)
 	fillDump(out, data)
 	return unsafe.String(unsafe.SliceData(out), totalLen)
@@ -523,11 +523,12 @@ func Dumper(w io.Writer) io.WriteCloser {
 	return &dumper{w: w}
 }
 
+const dumperBatchLines = 16
+
 type dumper struct {
 	w          io.Writer
 	rightChars [18]byte
-	buf        [14]byte
-	line       [79]byte
+	batch      [dumperBatchLines * 79]byte
 	used       int  // number of bytes in the current line
 	n          uint // number of bytes, total
 	closed     bool
@@ -548,63 +549,71 @@ func (h *dumper) Write(data []byte) (n int, err error) {
 	i := 0
 	for i < len(data) {
 		if h.used == 0 && len(data)-i >= 16 {
-			formatDumpLine(&h.line, uint32(h.n), data[i:i+16])
-			_, err = h.w.Write(h.line[:])
+			lines := min((len(data)-i)/16, dumperBatchLines)
+			done := 0
+			if lines >= 2 && haveSIMD {
+				done = dumpLinesSIMD(h.batch[:lines*79], data[i:i+lines*16], uint32(h.n))
+			}
+			for j := done; j < lines; j++ {
+				off := j * 79
+				srcOff := i + j*16
+				formatDumpLine((*[79]byte)(h.batch[off:off+79]), uint32(h.n)+uint32(j*16), data[srcOff:srcOff+16])
+			}
+			_, err = h.w.Write(h.batch[:lines*79])
 			if err != nil {
 				return n, err
 			}
-			n += 16
-			h.n += 16
-			i += 16
+			consumed := lines * 16
+			n += consumed
+			h.n += uint(consumed)
+			i += consumed
 			continue
 		}
+
+		take := min(16-h.used, len(data)-i)
+		pos := 0
 		if h.used == 0 {
-			// At the beginning of a line we print the current
-			// offset in hex.
-			byteorder.LEPutUint16(h.buf[4:6], hexEncodeLUT16[byte(h.n>>24)])
-			byteorder.LEPutUint16(h.buf[6:8], hexEncodeLUT16[byte(h.n>>16)])
-			byteorder.LEPutUint16(h.buf[8:10], hexEncodeLUT16[byte(h.n>>8)])
-			byteorder.LEPutUint16(h.buf[10:12], hexEncodeLUT16[byte(h.n)])
-			h.buf[12] = ' '
-			h.buf[13] = ' '
-			_, err = h.w.Write(h.buf[4:])
-			if err != nil {
-				return
+			byteorder.LEPutUint64(h.batch[0:8],
+				uint64(hexEncodeLUT16[byte(h.n>>24)])|
+					uint64(hexEncodeLUT16[byte(h.n>>16)])<<16|
+					uint64(hexEncodeLUT16[byte(h.n>>8)])<<32|
+					uint64(hexEncodeLUT16[byte(h.n)])<<48)
+			byteorder.LEPutUint16(h.batch[8:10], 0x2020)
+			pos = 10
+		}
+		for k := range take {
+			b := data[i+k]
+			u := h.used + k
+			byteorder.LEPutUint16(h.batch[pos:pos+2], hexEncodeLUT16[b])
+			h.batch[pos+2] = ' '
+			pos += 3
+			if u == 7 {
+				h.batch[pos] = ' '
+				pos++
+			} else if u == 15 {
+				h.batch[pos] = ' '
+				h.batch[pos+1] = '|'
+				pos += 2
 			}
+			h.rightChars[u] = dumpCharTable[b]
 		}
-		b := data[i]
-		byteorder.LEPutUint16(h.buf[:2], hexEncodeLUT16[b])
-		h.buf[2] = ' '
-		l := 3
-		if h.used == 7 {
-			// There's an additional space after the 8th byte.
-			h.buf[3] = ' '
-			l = 4
-		} else if h.used == 15 {
-			// At the end of the line there's an extra space and
-			// the bar for the right column.
-			h.buf[3] = ' '
-			h.buf[4] = '|'
-			l = 5
-		}
-		_, err = h.w.Write(h.buf[:l])
-		if err != nil {
-			return
-		}
-		n++
-		h.rightChars[h.used] = dumpCharTable[b]
-		h.used++
-		h.n++
-		if h.used == 16 {
+		if h.used+take == 16 {
 			h.rightChars[16] = '|'
 			h.rightChars[17] = '\n'
-			_, err = h.w.Write(h.rightChars[:])
-			if err != nil {
-				return
-			}
+			copy(h.batch[pos:pos+18], h.rightChars[:])
+			pos += 18
+		}
+		_, err = h.w.Write(h.batch[:pos])
+		if err != nil {
+			return n, err
+		}
+		n += take
+		h.n += uint(take)
+		h.used += take
+		i += take
+		if h.used == 16 {
 			h.used = 0
 		}
-		i++
 	}
 	return
 }
@@ -618,27 +627,17 @@ func (h *dumper) Close() (err error) {
 	if h.used == 0 {
 		return
 	}
-	h.buf[0] = ' '
-	h.buf[1] = ' '
-	h.buf[2] = ' '
-	h.buf[3] = ' '
-	h.buf[4] = '|'
 	nBytes := h.used
-	for h.used < 16 {
-		l := 3
-		if h.used == 7 {
-			l = 4
-		} else if h.used == 15 {
-			l = 5
-		}
-		_, err = h.w.Write(h.buf[:l])
-		if err != nil {
-			return
-		}
-		h.used++
+	h.used = 16
+	spaces := (16-nBytes)*3 + 1
+	if nBytes <= 7 {
+		spaces++
 	}
-	h.rightChars[nBytes] = '|'
-	h.rightChars[nBytes+1] = '\n'
-	_, err = h.w.Write(h.rightChars[:nBytes+2])
+	copy(h.batch[:spaces], spaces50)
+	h.batch[spaces] = '|'
+	copy(h.batch[spaces+1:], h.rightChars[:nBytes])
+	h.batch[spaces+1+nBytes] = '|'
+	h.batch[spaces+2+nBytes] = '\n'
+	_, err = h.w.Write(h.batch[:spaces+3+nBytes])
 	return
 }

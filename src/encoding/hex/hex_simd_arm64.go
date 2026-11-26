@@ -59,7 +59,7 @@ func dumpLinesSIMD(out, data []byte, offset uint32) int {
 
 func encodeSIMD(dst, src []byte) (si, di int) {
 	n := len(src) &^ 15
-	if n == 0 || hasUnsafeForwardOverlap(dst, src, n*2, n) {
+	if n == 0 || hasUnsafeEncodeOverlap(dst, src, n*2, n) {
 		return 0, 0
 	}
 	encodeNEON(&dst[0], &src[0], n, &neonEncLUT[0])
@@ -79,6 +79,17 @@ func decodeSIMD(dst, src []byte) (si, di int) {
 	}
 	consumed := decodeNEON(&dst[0], &src[0], n, &neonDecLUT[0])
 	return consumed, consumed / 2
+}
+
+func hasUnsafeEncodeOverlap(dst, src []byte, dstLen, srcLen int) bool {
+	if dstLen == 0 || srcLen == 0 {
+		return false
+	}
+	d0 := uintptr(unsafe.Pointer(&dst[0]))
+	s0 := uintptr(unsafe.Pointer(&src[0]))
+	d1 := d0 + uintptr(dstLen)
+	s1 := s0 + uintptr(srcLen)
+	return d0 < s1 && s0 < d1 && d0+uintptr(srcLen) > s0
 }
 
 func hasUnsafeForwardOverlap(dst, src []byte, dstLen, srcLen int) bool {

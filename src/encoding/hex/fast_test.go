@@ -616,6 +616,158 @@ func TestFastDecoderEdgeCases(t *testing.T) {
 	}
 }
 
+type failNthWriter struct {
+	failAt int
+	calls  int
+	err    error
+}
+
+func (w *failNthWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls >= w.failAt {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+func TestFastDumperPartialAndBatch(t *testing.T) {
+	// Test all partial-line Close() lengths (0..15) and batching boundaries.
+	for _, n := range []int{0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 255, 256, 257, 511, 512, 513, 1024, 1500} {
+		raw := makeDeterministicBytes(n, byte(n))
+		want := refDump(raw)
+
+		var out bytes.Buffer
+		dw := Dumper(&out)
+		if wn, err := dw.Write(raw); err != nil || wn != n {
+			t.Fatalf("n=%d single Write = (%d, %v)", n, wn, err)
+		}
+		if err := dw.Close(); err != nil {
+			t.Fatalf("n=%d Close = %v", n, err)
+		}
+		if out.String() != want {
+			t.Fatalf("n=%d single Write Dumper mismatch:\ngot:\n%s\nwant:\n%s", n, out.String(), want)
+		}
+
+		// Alternating odd-sized writes crossing h.used=0..15 and SIMD batch boundaries.
+		out.Reset()
+		dw = Dumper(&out)
+		chunks := []int{1, 7, 1, 8, 15, 256, 3, 513, 9, 32, 5}
+		pos := 0
+		ci := 0
+		for pos < len(raw) {
+			step := chunks[ci%len(chunks)]
+			ci++
+			end := min(pos+step, len(raw))
+			wn, err := dw.Write(raw[pos:end])
+			if err != nil || wn != end-pos {
+				t.Fatalf("n=%d chunked Write = (%d, %v)", n, wn, err)
+			}
+			pos = end
+		}
+		if err := dw.Close(); err != nil {
+			t.Fatalf("n=%d chunked Close = %v", n, err)
+		}
+		if out.String() != want {
+			t.Fatalf("n=%d chunked Dumper mismatch:\ngot:\n%s\nwant:\n%s", n, out.String(), want)
+		}
+	}
+
+	// Write after Close and underlying writer error propagation.
+	var okBuf bytes.Buffer
+	dw := Dumper(&okBuf)
+	if _, err := dw.Write([]byte("abc")); err != nil {
+		t.Fatalf("Write before Close: %v", err)
+	}
+	if err := dw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if n, err := dw.Write([]byte("def")); err == nil || n != 0 {
+		t.Fatalf("Write after Close = (%d, %v), want (0, err)", n, err)
+	}
+
+	writeErr := errors.New("disk full")
+	for failAt := 1; failAt <= 3; failAt++ {
+		fw := &failNthWriter{failAt: failAt, err: writeErr}
+		dwErr := Dumper(fw)
+		_, err := dwErr.Write(makeDeterministicBytes(600, 3))
+		if !errors.Is(err, writeErr) {
+			t.Fatalf("failAt=%d Write err = %v, want %v", failAt, err, writeErr)
+		}
+	}
+}
+
+func TestFastDecodeErrorEveryOffsetAndAppend(t *testing.T) {
+	// Invalid character at every position 0..135 with both exact and minimal dst.
+	base := refEncode(makeDeterministicBytes(68, 42))
+	for pos := range base {
+		corrupt := slices.Clone(base)
+		corrupt[pos] = 'x'
+		wantOut := make([]byte, DecodedLen(len(corrupt)))
+		wantN, wantErr := refDecode(wantOut, corrupt)
+
+		gotOut := make([]byte, DecodedLen(len(corrupt)))
+		gotN, gotErr := Decode(gotOut, corrupt)
+		if gotN != wantN || !errors.Is(gotErr, wantErr) || !bytes.Equal(gotOut[:gotN], wantOut[:wantN]) {
+			t.Fatalf("pos=%d exact dst: got (%d, %v), want (%d, %v)", pos, gotN, gotErr, wantN, wantErr)
+		}
+
+		// Minimal dst that only has space for the valid prefix before pos.
+		minDst := make([]byte, wantN)
+		gotN2, gotErr2 := Decode(minDst, corrupt)
+		if gotN2 != wantN || !errors.Is(gotErr2, wantErr) || !bytes.Equal(minDst[:gotN2], wantOut[:wantN]) {
+			t.Fatalf("pos=%d minimal dst: got (%d, %v), want (%d, %v)", pos, gotN2, gotErr2, wantN, wantErr)
+		}
+	}
+
+	// AppendEncode / AppendDecode with prefix, preallocated capacity, and error cases.
+	raw := makeDeterministicBytes(73, 19)
+	wantEnc := refEncode(raw)
+	pre := []byte("hdr:")
+	gotAppEnc := AppendEncode(slices.Clone(pre), raw)
+	if string(gotAppEnc[:4]) != "hdr:" || !bytes.Equal(gotAppEnc[4:], wantEnc) {
+		t.Fatalf("AppendEncode grow mismatch")
+	}
+	preCap := make([]byte, 4, 4+len(wantEnc))
+	copy(preCap, pre)
+	gotAppEnc2 := AppendEncode(preCap, raw)
+	if string(gotAppEnc2[:4]) != "hdr:" || !bytes.Equal(gotAppEnc2[4:], wantEnc) {
+		t.Fatalf("AppendEncode cap mismatch")
+	}
+
+	corrupt := append(slices.Clone(wantEnc[:20]), 'g', '0', '1')
+	gotAppDec, appErr := AppendDecode(slices.Clone(pre), corrupt)
+	if !errors.Is(appErr, InvalidByteError('g')) || string(gotAppDec[:4]) != "hdr:" || !bytes.Equal(gotAppDec[4:], raw[:10]) {
+		t.Fatalf("AppendDecode error mismatch: got (%q, %v)", gotAppDec, appErr)
+	}
+}
+
+func TestFastInPlaceEncodeOverlap(t *testing.T) {
+	// Partial backward overlap (dst starts at buf[0], src starts at buf[off] with 0 < off < n)
+	// must not fail due to SIMD clobbering unread src bytes when off >= n-1 or exact half.
+	for _, n := range []int{0, 1, 7, 15, 16, 17, 31, 32, 33, 64, 128, 256} {
+		raw := makeDeterministicBytes(n, byte(n))
+		want := refEncode(raw)
+		buf := make([]byte, 2*n+16)
+		copy(buf[n:2*n], raw)
+		if got := Encode(buf[:2*n], buf[n:2*n]); got != 2*n || !bytes.Equal(buf[:2*n], want) {
+			t.Fatalf("in-place half Encode(%d) mismatch", n)
+		}
+	}
+
+	// Overlapping where off == n-1 (requires scalar safety, not 64-byte SIMD clobber).
+	for _, n := range []int{16, 32, 64, 128} {
+		raw := makeDeterministicBytes(n, 88)
+		want := refEncode(raw)
+		buf := make([]byte, 2*n+16)
+		off := n - 1
+		copy(buf[off:off+n], raw)
+		Encode(buf[:2*n], buf[off:off+n])
+		if !bytes.Equal(buf[:2*n], want) {
+			t.Fatalf("near-half overlap Encode(%d, off=%d) mismatch", n, off)
+		}
+	}
+}
+
 func FuzzEncodeDecode(f *testing.F) {
 	f.Add([]byte{}, []byte{})
 	f.Add([]byte{0x00, 0xff, 0x7f, 0x80}, []byte("00ff7f80"))

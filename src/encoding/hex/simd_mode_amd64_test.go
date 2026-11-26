@@ -35,11 +35,11 @@ func TestSSSE3OnlyMode(t *testing.T) {
 	minSIMDDecode = 16
 	minSIMDDecodeOut = 8
 
-	var raw [135]byte
+	var raw [300]byte
 	for i := range raw {
 		raw[i] = byte(i*7 + 5)
 	}
-	for _, n := range []int{0, 1, 15, 16, 17, 31, 32, 33, 64, 135} {
+	for _, n := range []int{0, 1, 15, 16, 17, 24, 31, 32, 33, 64, 135, 300} {
 		src := raw[:n]
 		enc := make([]byte, EncodedLen(n))
 		Encode(enc, src)
@@ -65,11 +65,11 @@ func TestScalarFallbackMode(t *testing.T) {
 	haveSIMD = false
 	defer func() { haveSIMD = origSIMD }()
 
-	var raw [129]byte
+	var raw [300]byte
 	for i := range raw {
 		raw[i] = byte(i*3 + 1)
 	}
-	for _, n := range []int{0, 1, 7, 15, 16, 17, 31, 32, 33, 64, 129} {
+	for _, n := range []int{0, 1, 7, 15, 16, 17, 24, 31, 32, 33, 64, 129, 300} {
 		src := raw[:n]
 		enc := make([]byte, EncodedLen(n))
 		if en := Encode(enc, src); en != len(enc) {
@@ -80,8 +80,20 @@ func TestScalarFallbackMode(t *testing.T) {
 		if err != nil || dn != n || !bytes.Equal(dec, src) {
 			t.Fatalf("scalar Decode(%d) = (%d, %v)", n, dn, err)
 		}
-		if d := Dump(src); d == "" && n > 0 {
+		d := Dump(src)
+		if d == "" && n > 0 {
 			t.Fatalf("scalar Dump(%d) empty", n)
+		}
+		var out bytes.Buffer
+		dw := Dumper(&out)
+		if _, err := dw.Write(src); err != nil {
+			t.Fatalf("scalar Dumper.Write(%d) err=%v", n, err)
+		}
+		if err := dw.Close(); err != nil {
+			t.Fatalf("scalar Dumper.Close(%d) err=%v", n, err)
+		}
+		if out.String() != d {
+			t.Fatalf("scalar Dumper(%d) != Dump(%d)", n, n)
 		}
 	}
 }
