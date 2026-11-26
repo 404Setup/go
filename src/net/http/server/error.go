@@ -24,6 +24,10 @@ var (
 	// ErrInvalidJSON is wrapped when a request body contains malformed or
 	// unexpected JSON.
 	ErrInvalidJSON = errors.New("invalid JSON payload")
+
+	// ErrInvalidCompressedBody is wrapped when automatic request decompression
+	// encounters malformed compressed data or an invalid encoding header.
+	ErrInvalidCompressedBody = errors.New("invalid compressed request body")
 )
 
 // HTTPError represents an HTTP error with a status code, a safe public message

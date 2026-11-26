@@ -99,6 +99,10 @@ type Config struct {
 	// DisablePathCleaning disables automatic canonicalization of paths
 	// containing "..", ".", or repeated slashes. Default is false.
 	DisablePathCleaning bool
+
+	// Compression configures automatic request decompression and response
+	// compression. Zero values enable gzip and deflate codecs with safe defaults.
+	Compression CompressionConfig
 }
 
 // DefaultConfig returns a [Config] populated with secure defaults.
@@ -127,6 +131,7 @@ type Server struct {
 	notFound       HandlerFunc
 	methodNotAllow HandlerFunc
 	snap           atomic.Pointer[routerSnapshot]
+	compSnap       atomic.Pointer[compressionSnapshot]
 	httpSrv        *http.Server
 	staticRoots    []staticRootCloser
 }
@@ -186,6 +191,8 @@ func NewWithConfig(cfg Config) *Server {
 		}
 	}
 
+	compSnap := newCompressionSnapshot(cfg.Compression)
+
 	s := &Server{
 		cfg:            cfg,
 		maxBodyBytes:   cfg.MaxBodyBytes,
@@ -202,7 +209,78 @@ func NewWithConfig(cfg Config) *Server {
 		methodNotAllowed: []HandlerFunc{s.methodNotAllow},
 	}
 	s.snap.Store(initial)
+	s.compSnap.Store(compSnap)
 	return s
+}
+
+// SetCompressor registers or replaces the response compressor for enc
+// ([EncodingGzip], [EncodingDeflate], [EncodingZstd], or [EncodingBrotli]).
+// Passing a nil Compressor disables response compression for enc.
+// It panics if enc is not one of the supported content codings.
+func (s *Server) SetCompressor(enc Encoding, c Compressor) {
+	idx, _, ok := encodingIndex(enc)
+	if !ok {
+		panic(fmt.Sprintf("server: unsupported compression encoding %q", enc))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.compSnap.Load().clone()
+	next.compressors[idx] = newCodecHolder(c)
+	next.recomputeFlags()
+	s.compSnap.Store(next)
+}
+
+// SetDecompressor registers or replaces the request decompressor for enc
+// ([EncodingGzip], [EncodingDeflate], [EncodingZstd], or [EncodingBrotli]).
+// Passing a nil Decompressor disables automatic request decompression for enc.
+// It panics if enc is not one of the supported content codings.
+func (s *Server) SetDecompressor(enc Encoding, d Decompressor) {
+	idx, _, ok := encodingIndex(enc)
+	if !ok {
+		panic(fmt.Sprintf("server: unsupported decompression encoding %q", enc))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.compSnap.Load().clone()
+	next.decompressors[idx] = newDecompressorHolder(d)
+	next.recomputeFlags()
+	s.compSnap.Store(next)
+}
+
+// SetCompression enables or disables automatic response compression on the server.
+func (s *Server) SetCompression(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.compSnap.Load().clone()
+	next.disabled = !enabled
+	s.compSnap.Store(next)
+}
+
+// SetDecompression enables or disables automatic request body decompression on
+// the server.
+func (s *Server) SetDecompression(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.compSnap.Load().clone()
+	next.disableDecompression = !enabled
+	s.compSnap.Store(next)
+}
+
+// SetCompressionOrder sets the server's preferred response encodings in
+// priority order. Calling SetCompressionOrder() with no arguments resets the
+// default priority (zstd, br, gzip, deflate). Passing only [EncodingNone]
+// disables response compression until an encoding is re-added.
+func (s *Server) SetCompressionOrder(encodings ...Encoding) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.compSnap.Load().clone()
+	if len(encodings) == 0 {
+		next.order = defaultEncodingOrder
+	} else {
+		next.order = normalizeEncodingOrder(encodings)
+	}
+	next.recomputeFlags()
+	s.compSnap.Store(next)
 }
 
 func defaultNotFoundHandler(c *Context) error {
@@ -636,6 +714,79 @@ func joinPattern(prefix, pattern string) string {
 	return prefix + pattern
 }
 
+func (s *Server) execChain(c *Context, chain []HandlerFunc) {
+	cs := s.compSnap.Load()
+	if (c.req.Body != nil && c.req.Body != http.NoBody) ||
+		(!cs.disabled && cs.hasAnyCompressor && c.req.Method != http.MethodHead && len(c.req.Header["Accept-Encoding"]) > 0) {
+		s.execChainWithCompression(c, chain, cs)
+		return
+	}
+	var err error
+	if len(chain) == 1 {
+		err = chain[0](c)
+	} else {
+		c.handlers = chain
+		err = c.Next()
+	}
+	if err != nil {
+		c.HandleError(err)
+	}
+}
+
+//go:noinline
+func (s *Server) execChainWithCompression(c *Context, chain []HandlerFunc, cs *compressionSnapshot) {
+	var cw *compressResponseWriter
+	if !cs.disabled && cs.hasAnyCompressor && c.req.Method != http.MethodHead && !c.noCompress {
+		if ae := c.req.Header["Accept-Encoding"]; len(ae) > 0 && (cs.skip == nil || !cs.skip(c)) {
+			if enc, holder := negotiateEncoding(ae, cs); holder != nil {
+				cw = cwPool.Get()
+				cw.reset(c.ResponseWriter(), holder, enc, cs.minLength, c.req.URL.Path)
+				c.writer = cw
+				c.cw = cw
+			}
+		}
+	}
+
+	if decompErr := prepareRequestDecompression(c, cs); decompErr != nil {
+		if cw != nil {
+			c.HandleError(decompErr)
+			c.writer = nil
+			c.cw = nil
+			cw.release(false)
+			return
+		}
+		c.HandleError(decompErr)
+		return
+	}
+
+	panicked := true
+	if cw != nil || c.decomp != nil {
+		defer func() {
+			if c.decomp != nil {
+				c.decomp.finish(panicked)
+				c.decomp = nil
+			}
+			if cw != nil {
+				c.writer = nil
+				c.cw = nil
+				cw.release(panicked)
+			}
+		}()
+	}
+
+	var err error
+	if len(chain) == 1 {
+		err = chain[0](c)
+	} else {
+		c.handlers = chain
+		err = c.Next()
+	}
+	if err != nil {
+		c.HandleError(err)
+	}
+	panicked = false
+}
+
 // ServeHTTP implements [http.Handler].
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqPath := r.URL.Path
@@ -651,16 +802,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if entry := mr.static.lookup(reqPath); entry != nil {
 					c := acquireContext(s, w, r)
 					c.entry = entry
-					var err error
-					if len(entry.chain) == 1 {
-						err = entry.chain[0](c)
-					} else {
-						c.handlers = entry.chain
-						err = c.Next()
-					}
-					if err != nil {
-						c.HandleError(err)
-					}
+					s.execChain(c, entry.chain)
 					releaseContext(c)
 					return
 				}
@@ -673,16 +815,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					if entry := mr.dynTree.matchUnescaped(reqPath, &pc); entry != nil {
 						c.nParams = pc.n
 						c.entry = entry
-						var err error
-						if len(entry.chain) == 1 {
-							err = entry.chain[0](c)
-						} else {
-							c.handlers = entry.chain
-							err = c.Next()
-						}
-						if err != nil {
-							c.HandleError(err)
-						}
+						s.execChain(c, entry.chain)
 						releaseContext(c)
 						return
 					}
@@ -701,16 +834,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if entry := snap.matchStaticSlow(r.Method, reqPath); entry != nil {
 				c := acquireContext(s, w, r)
 				c.entry = entry
-				var err error
-				if len(entry.chain) == 1 {
-					err = entry.chain[0](c)
-				} else {
-					c.handlers = entry.chain
-					err = c.Next()
-				}
-				if err != nil {
-					c.HandleError(err)
-				}
+				s.execChain(c, entry.chain)
 				releaseContext(c)
 				return
 			}
@@ -724,16 +848,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if entry := snap.matchAfterStaticIdx(mIdx, r.Method, reqPath, &pc); entry != nil {
 					c.nParams = pc.n
 					c.entry = entry
-					var err error
-					if len(entry.chain) == 1 {
-						err = entry.chain[0](c)
-					} else {
-						c.handlers = entry.chain
-						err = c.Next()
-					}
-					if err != nil {
-						c.HandleError(err)
-					}
+					s.execChain(c, entry.chain)
 					releaseContext(c)
 					return
 				}
@@ -758,16 +873,7 @@ func (s *Server) tryServeUnescapedAny(snap *routerSnapshot, w http.ResponseWrite
 	if entry := snap.anyMethod.match(reqPath, false, &pc); entry != nil {
 		c.nParams = pc.n
 		c.entry = entry
-		var err error
-		if len(entry.chain) == 1 {
-			err = entry.chain[0](c)
-		} else {
-			c.handlers = entry.chain
-			err = c.Next()
-		}
-		if err != nil {
-			c.HandleError(err)
-		}
+		s.execChain(c, entry.chain)
 		releaseContext(c)
 		return true
 	}
@@ -817,16 +923,7 @@ func (s *Server) serveSlow(snap *routerSnapshot, w http.ResponseWriter, r *http.
 		if entry := snap.matchIdx(mIdx, r.Method, matchPath, true, &pc); entry != nil {
 			c.nParams = pc.n
 			c.entry = entry
-			var err error
-			if len(entry.chain) == 1 {
-				err = entry.chain[0](c)
-			} else {
-				c.handlers = entry.chain
-				err = c.Next()
-			}
-			if err != nil {
-				c.HandleError(err)
-			}
+			s.execChain(c, entry.chain)
 			releaseContext(c)
 			return
 		}
@@ -858,20 +955,14 @@ func (s *Server) serveSlow(snap *routerSnapshot, w http.ResponseWriter, r *http.
 		allowed := snap.allowedMethods(matchPath, escaped, allowBuf[:0])
 		if len(allowed) > 0 {
 			c.respHeader()["Allow"] = []string{strings.Join(allowed, ", ")}
-			c.handlers = snap.methodNotAllowed
-			if err := c.Next(); err != nil {
-				c.HandleError(err)
-			}
+			s.execChain(c, snap.methodNotAllowed)
 			releaseContext(c)
 			return
 		}
 	}
 
 	// 404 Not Found.
-	c.handlers = snap.notFoundChain
-	if err := c.Next(); err != nil {
-		c.HandleError(err)
-	}
+	s.execChain(c, snap.notFoundChain)
 	releaseContext(c)
 }
 

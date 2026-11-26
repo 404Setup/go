@@ -15,6 +15,16 @@ pkg encoding/json/v2, func MarshalWriteOf[$0 interface{}](io.Writer, $0, ...json
 pkg encoding/json/v2, func UnmarshalDecodeOf[$0 interface{}](*jsontext.Decoder, *$0, ...jsonopts.Options) error #80000
 pkg encoding/json/v2, func UnmarshalOf[$0 interface{}]([]uint8, *$0, ...jsonopts.Options) error #80000
 pkg encoding/json/v2, func UnmarshalReadOf[$0 interface{}](io.Reader, *$0, ...jsonopts.Options) error #80000
+pkg net/http/server, const EncodingBrotli = "br" #80000
+pkg net/http/server, const EncodingBrotli Encoding #80000
+pkg net/http/server, const EncodingDeflate = "deflate" #80000
+pkg net/http/server, const EncodingDeflate Encoding #80000
+pkg net/http/server, const EncodingGzip = "gzip" #80000
+pkg net/http/server, const EncodingGzip Encoding #80000
+pkg net/http/server, const EncodingNone = "" #80000
+pkg net/http/server, const EncodingNone Encoding #80000
+pkg net/http/server, const EncodingZstd = "zstd" #80000
+pkg net/http/server, const EncodingZstd Encoding #80000
 pkg net/http/server, const RequestIDKey = "server.request_id" #80000
 pkg net/http/server, const RequestIDKey ideal-string #80000
 pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80000
@@ -33,7 +43,9 @@ pkg net/http/server, func Logger(*slog.Logger) HandlerFunc #80000
 pkg net/http/server, func LoggerWithConfig(LoggerConfig) HandlerFunc #80000
 pkg net/http/server, func MaxInFlight(int) HandlerFunc #80000
 pkg net/http/server, func New() *Server #80000
+pkg net/http/server, func NewDeflateCompressor(int) Compressor #80000
 pkg net/http/server, func NewError(int, string) *HTTPError #80000
+pkg net/http/server, func NewGzipCompressor(int) Compressor #80000
 pkg net/http/server, func NewWithConfig(Config) *Server #80000
 pkg net/http/server, func Recover() HandlerFunc #80000
 pkg net/http/server, func RecoverWithConfig(RecoverConfig) HandlerFunc #80000
@@ -52,11 +64,13 @@ pkg net/http/server, method (*Context) BodyBytes() ([]uint8, error) #80000
 pkg net/http/server, method (*Context) Bytes(int, string, []uint8) error #80000
 pkg net/http/server, method (*Context) BytesWritten() int64 #80000
 pkg net/http/server, method (*Context) ClientIP() string #80000
+pkg net/http/server, method (*Context) CompressionDisabled() bool #80000
 pkg net/http/server, method (*Context) ContentType() string #80000
 pkg net/http/server, method (*Context) Context() context.Context #80000
 pkg net/http/server, method (*Context) Cookie(string) (*http.Cookie, error) #80000
 pkg net/http/server, method (*Context) DelHeader(string) #80000
 pkg net/http/server, method (*Context) Delete(string) #80000
+pkg net/http/server, method (*Context) DisableCompression() #80000
 pkg net/http/server, method (*Context) File(string) error #80000
 pkg net/http/server, method (*Context) FileFS(fs.FS, string) error #80000
 pkg net/http/server, method (*Context) Flush() error #80000
@@ -146,10 +160,17 @@ pkg net/http/server, method (*Server) ServeContext(context.Context, net.Listener
 pkg net/http/server, method (*Server) ServeHTTP(http.ResponseWriter, *http.Request) #80000
 pkg net/http/server, method (*Server) ServeTLS(net.Listener, string, string) error #80000
 pkg net/http/server, method (*Server) ServeTLSContext(context.Context, net.Listener, string, string) error #80000
+pkg net/http/server, method (*Server) SetCompression(bool) #80000
+pkg net/http/server, method (*Server) SetCompressionOrder(...Encoding) #80000
+pkg net/http/server, method (*Server) SetCompressor(Encoding, Compressor) #80000
+pkg net/http/server, method (*Server) SetDecompression(bool) #80000
+pkg net/http/server, method (*Server) SetDecompressor(Encoding, Decompressor) #80000
 pkg net/http/server, method (*Server) Shutdown(context.Context) error #80000
 pkg net/http/server, method (*Server) StaticDir(string, string, ...StaticConfig) error #80000
 pkg net/http/server, method (*Server) StaticFS(string, fs.FS, ...StaticConfig) #80000
 pkg net/http/server, method (*Server) Use(...HandlerFunc) #80000
+pkg net/http/server, method (CompressorFunc) NewWriter(io.Writer) (io.WriteCloser, error) #80000
+pkg net/http/server, method (DecompressorFunc) NewReader(io.Reader) (io.ReadCloser, error) #80000
 pkg net/http/server, type CORSConfig struct #80000
 pkg net/http/server, type CORSConfig struct, AllowCredentials bool #80000
 pkg net/http/server, type CORSConfig struct, AllowHeaders []string #80000
@@ -162,8 +183,21 @@ pkg net/http/server, type CompressConfig struct #80000
 pkg net/http/server, type CompressConfig struct, Level int #80000
 pkg net/http/server, type CompressConfig struct, MinLength int #80000
 pkg net/http/server, type CompressConfig struct, Skip func(*Context) bool #80000
+pkg net/http/server, type CompressionConfig struct #80000
+pkg net/http/server, type CompressionConfig struct, Compressors map[Encoding]Compressor #80000
+pkg net/http/server, type CompressionConfig struct, Decompressors map[Encoding]Decompressor #80000
+pkg net/http/server, type CompressionConfig struct, DisableDecompression bool #80000
+pkg net/http/server, type CompressionConfig struct, Disabled bool #80000
+pkg net/http/server, type CompressionConfig struct, Encodings []Encoding #80000
+pkg net/http/server, type CompressionConfig struct, MaxDecompressedBytes int64 #80000
+pkg net/http/server, type CompressionConfig struct, MinLength int #80000
+pkg net/http/server, type CompressionConfig struct, Skip func(*Context) bool #80000
+pkg net/http/server, type Compressor interface { NewWriter } #80000
+pkg net/http/server, type Compressor interface, NewWriter(io.Writer) (io.WriteCloser, error) #80000
+pkg net/http/server, type CompressorFunc func(io.Writer) (io.WriteCloser, error) #80000
 pkg net/http/server, type Config struct #80000
 pkg net/http/server, type Config struct, BaseContext func(net.Listener) context.Context #80000
+pkg net/http/server, type Config struct, Compression CompressionConfig #80000
 pkg net/http/server, type Config struct, DisablePathCleaning bool #80000
 pkg net/http/server, type Config struct, ErrorHandler ErrorHandler #80000
 pkg net/http/server, type Config struct, IdleTimeout time.Duration #80000
@@ -178,6 +212,10 @@ pkg net/http/server, type Config struct, TLSConfig *tls.Config #80000
 pkg net/http/server, type Config struct, TrustedProxies []netip.Prefix #80000
 pkg net/http/server, type Config struct, WriteTimeout time.Duration #80000
 pkg net/http/server, type Context struct #80000
+pkg net/http/server, type Decompressor interface { NewReader } #80000
+pkg net/http/server, type Decompressor interface, NewReader(io.Reader) (io.ReadCloser, error) #80000
+pkg net/http/server, type DecompressorFunc func(io.Reader) (io.ReadCloser, error) #80000
+pkg net/http/server, type Encoding string #80000
 pkg net/http/server, type ErrorHandler func(*Context, error) #80000
 pkg net/http/server, type Group struct #80000
 pkg net/http/server, type HTTPError struct #80000
@@ -212,6 +250,7 @@ pkg net/http/server, type StaticConfig struct, Browse bool #80000
 pkg net/http/server, type StaticConfig struct, CacheControl string #80000
 pkg net/http/server, type StaticConfig struct, Index string #80000
 pkg net/http/server, var ErrBodyTooLarge error #80000
+pkg net/http/server, var ErrInvalidCompressedBody error #80000
 pkg net/http/server, var ErrInvalidJSON error #80000
 pkg net/http/server, var ErrUnsupportedMediaType error #80000
 pkg sync/atomic/v2, method (*Value[$0]) CompareAndSwap($0, $0) bool #80000

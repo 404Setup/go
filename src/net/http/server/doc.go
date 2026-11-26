@@ -60,4 +60,18 @@
 //     Config.TrustedProxies.
 //   - [Server.StaticDir] confines filesystem access using [os.OpenRoot] and
 //     disables directory listing by default.
+//
+// # Compression
+//
+// By default, [*Server] provides built-in gzip and deflate codecs and
+// automatically decompresses incoming request bodies (bounded to protect against
+// decompression bombs) and negotiates compressed responses per RFC 9110.
+// Already-compressed responses and files are skipped automatically.
+//
+// Use [Server.SetCompressor], [Server.SetDecompressor],
+// [Server.SetCompression], [Server.SetDecompression],
+// [Server.SetCompressionOrder], or [CompressionConfig] to customize, replace,
+// or disable encodings (including zstd and brotli). Call
+// [Context.DisableCompression] inside a handler or middleware to disable
+// compression for a single response.
 package server

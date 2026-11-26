@@ -142,6 +142,7 @@ type Context struct {
 	rw     responseWriter
 	writer http.ResponseWriter
 	cw     *compressResponseWriter
+	decomp *decompressReadCloser
 
 	handlers []HandlerFunc
 	index    int
@@ -154,6 +155,7 @@ type Context struct {
 	bodyLimitApplied int64
 	queryParsed      bool
 	errHandled       bool
+	noCompress       bool
 
 	// Large inline buffers and cold fields sit after the hot control fields so
 	// static routes without params/values never touch these cache lines.
@@ -218,6 +220,10 @@ func releaseContext(c *Context) {
 			clear(c.valuesMap)
 		}
 	}
+	if c.decomp != nil {
+		c.decomp.finish(false)
+		c.decomp = nil
+	}
 	c.server = nil
 	c.req = nil
 	c.rw = responseWriter{}
@@ -236,6 +242,7 @@ func releaseContext(c *Context) {
 	c.maxBodyBytes = 0
 	c.bodyLimitApplied = 0
 	c.errHandled = false
+	c.noCompress = false
 	contextPool.Put(c)
 }
 
@@ -950,6 +957,22 @@ func GetValue[T any](c *Context, key string) (T, bool) {
 	return tv, ok
 }
 
+// DisableCompression disables automatic response compression for this request.
+// If compressed response headers have not yet been committed, the response
+// returned to the client will not be compressed.
+func (c *Context) DisableCompression() {
+	c.noCompress = true
+	if c.cw != nil {
+		c.cw.disable()
+	}
+}
+
+// CompressionDisabled reports whether response compression has been disabled
+// for this request.
+func (c *Context) CompressionDisabled() bool {
+	return c.noCompress
+}
+
 // SetMaxBodyBytes overrides the maximum request body size for this request.
 // A negative value disables the limit for this request.
 func (c *Context) SetMaxBodyBytes(limit int64) {
@@ -984,10 +1007,28 @@ func (c *Context) maxBytesTarget() http.ResponseWriter {
 	}
 }
 
+type oneByteReader struct{}
+
+func (oneByteReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	p[0] = 0
+	return 1, nil
+}
+
+func (oneByteReader) Close() error { return nil }
+
 // markRequestTooLarge notifies the underlying net/http server to close the
 // connection after an oversized request body, matching http.MaxBytesReader.
 func (c *Context) markRequestTooLarge() {
 	if c.req.Body == nil || c.req.Body == http.NoBody {
+		return
+	}
+	if c.decomp != nil {
+		mbr := http.MaxBytesReader(c.maxBytesTarget(), oneByteReader{}, 0)
+		var b [1]byte
+		_, _ = mbr.Read(b[:])
 		return
 	}
 	mbr := http.MaxBytesReader(c.maxBytesTarget(), c.req.Body, 0)
