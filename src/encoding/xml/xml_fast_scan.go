@@ -455,7 +455,7 @@ func escapeTextIndex(s []byte) (int, bool) {
 }
 
 func escapeTextFast(w io.Writer, s []byte, escapeNewline bool) error {
-	if p, ok := w.(*printer); ok && p.w == nil {
+	if p, ok := w.(*printer); ok {
 		if p.closed && p.err == nil {
 			p.err = errClosedEncoder
 			return p.err
@@ -463,8 +463,22 @@ func escapeTextFast(w io.Writer, s []byte, escapeNewline bool) error {
 		if p.err != nil {
 			return p.err
 		}
-		p.out = appendEscapeXMLBytes(p.out, s, escapeNewline)
-		return nil
+		if p.w == nil {
+			p.out = appendEscapeXMLBytes(p.out, s, escapeNewline)
+			return nil
+		}
+		if len(s) == 0 {
+			return nil
+		}
+		if i, found := escapeTextIndex(s); found {
+			fb := getXmlFastBuf()
+			fb.b = appendEscapeXMLSlow(fb.b, s, i, escapeNewline)
+			_, err := p.Write(fb.b)
+			putXmlFastBuf(fb)
+			return err
+		}
+		_, err := p.Write(s)
+		return err
 	}
 	if len(s) == 0 {
 		_, err := w.Write(s)
@@ -472,7 +486,7 @@ func escapeTextFast(w io.Writer, s []byte, escapeNewline bool) error {
 	}
 	if bw, ok := w.(*bytes.Buffer); ok {
 		if i, found := escapeTextIndex(s); found {
-			bw.Grow(len(s) + len(s)>>2 + 16)
+			bw.Grow(len(s) + len(s)>>1 + 32)
 			bw.Write(appendEscapeXMLSlow(bw.AvailableBuffer(), s, i, escapeNewline))
 			return nil
 		}
@@ -571,4 +585,49 @@ func escapeTextFastSlow(w io.Writer, s []byte, i int, escapeNewline bool) error 
 	}
 	_, err := w.Write(s[last:])
 	return err
+}
+
+func skipValidUTF8Fast(s []byte, i int) int {
+	c := s[i]
+	if c >= 0xC2 && c <= 0xDF {
+		if i+1 < len(s) && s[i+1]&0xC0 == 0x80 {
+			return i + 2
+		}
+		return i
+	}
+	if c >= 0xE0 && c <= 0xEF {
+		if i+2 < len(s) && s[i+2]&0xC0 == 0x80 {
+			b1 := s[i+1]
+			if c == 0xE0 {
+				if b1 >= 0xA0 && b1 <= 0xBF {
+					return i + 3
+				}
+				return i
+			}
+			if c == 0xED {
+				if b1 >= 0x80 && b1 <= 0x9F {
+					return i + 3
+				}
+				return i
+			}
+			if c == 0xEF && b1 == 0xBF && (s[i+2] == 0xBE || s[i+2] == 0xBF) {
+				return i
+			}
+			if b1&0xC0 == 0x80 {
+				return i + 3
+			}
+		}
+		return i
+	}
+	if c >= 0xF0 && c <= 0xF4 {
+		if i+3 < len(s) && s[i+2]&0xC0 == 0x80 && s[i+3]&0xC0 == 0x80 {
+			b1 := s[i+1]
+			if (c == 0xF0 && b1 >= 0x90 && b1 <= 0xBF) ||
+				(c >= 0xF1 && c <= 0xF3 && b1&0xC0 == 0x80) ||
+				(c == 0xF4 && b1 >= 0x80 && b1 <= 0x8F) {
+				return i + 4
+			}
+		}
+	}
+	return i
 }

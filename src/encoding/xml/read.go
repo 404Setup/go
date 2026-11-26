@@ -148,7 +148,7 @@ func getXmlUnmarshalDecoder(data []byte) *Decoder {
 	d.Strict = true
 	d.err = nil
 	d.readErr = nil
-	d.stk = nil
+	d.stk = d.stk[:0]
 	d.stkDepth = 0
 	d.needClose = false
 	d.toClose = Name{}
@@ -183,12 +183,13 @@ func putXmlUnmarshalDecoder(d *Decoder) {
 	d.Entity = nil
 	d.CharsetReader = nil
 	d.DefaultSpace = ""
-	for d.stk != nil {
-		s := d.stk
-		d.stk = s.next
-		s.name = Name{}
-		s.next = d.free
-		d.free = s
+	if len(d.stk) > 0 {
+		clear(d.stk)
+	}
+	if cap(d.stk) > 256 {
+		d.stk = nil
+	} else {
+		d.stk = d.stk[:0]
 	}
 	d.stkDepth = 0
 	if len(d.ns) > 0 {

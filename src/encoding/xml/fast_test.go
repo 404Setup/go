@@ -1036,3 +1036,445 @@ func TestFastDecodePointerTextAndSliceAttrRegression(t *testing.T) {
 		t.Fatalf("Note = %v, want ok", d.Note)
 	}
 }
+
+func TestFastAutoCloseEmptyNameNoPanic(t *testing.T) {
+	dec := NewDecoder(strings.NewReader("<root><br>text</root>"))
+	dec.Strict = false
+	dec.AutoClose = []string{"", "br", ""}
+
+	var names []string
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Token() failed: %v", err)
+		}
+		switch tok := tok.(type) {
+		case StartElement:
+			names = append(names, "+"+tok.Name.Local)
+		case EndElement:
+			names = append(names, "-"+tok.Name.Local)
+		}
+	}
+	want := []string{"+root", "+br", "-br", "-root"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("tokens = %v, want %v", names, want)
+	}
+}
+
+func TestFastInnerXMLErrorResetsSaved(t *testing.T) {
+	type innerDoc struct {
+		XMLName Name   `xml:"doc"`
+		Raw     string `xml:",innerxml"`
+	}
+	dec := NewDecoder(strings.NewReader("<doc><a>ok</mismatch></doc>"))
+	var bad innerDoc
+	if err := dec.Decode(&bad); err == nil {
+		t.Fatal("expected error for mismatched tag inside innerxml")
+	}
+
+	// Reusing a decoder after innerxml decode must not retain stale saved state.
+	var good innerDoc
+	dec2 := NewDecoder(strings.NewReader("<doc><a>1</a></doc><after/>"))
+	if err := dec2.Decode(&good); err != nil {
+		t.Fatalf("Decode good innerxml failed: %v", err)
+	}
+	if good.Raw != "<a>1</a>" {
+		t.Fatalf("good.Raw = %q, want <a>1</a>", good.Raw)
+	}
+	tok, err := dec2.Token()
+	if err != nil {
+		t.Fatalf("Token after innerxml failed: %v", err)
+	}
+	se, ok := tok.(StartElement)
+	if !ok || se.Name.Local != "after" {
+		t.Fatalf("next token = %#v, want <after>", tok)
+	}
+}
+
+func TestFastUTF8AndBracketsFastPaths(t *testing.T) {
+	type utf8Doc struct {
+		XMLName Name     `xml:"doc"`
+		Attr    string   `xml:"attr,attr"`
+		Text    string   `xml:"text"`
+		Bytes   []byte   `xml:"bytes"`
+		Nested  string   `xml:"sub>val"`
+		Tags    []string `xml:"tag"`
+	}
+	in := utf8Doc{
+		XMLName: Name{Local: "doc"},
+		Attr:    "café-中文-🚀-[ok]",
+		Text:    "héllo 中文 🚀 a[0] & <escaped>",
+		Bytes:   []byte("slice]中文🚀]end"),
+		Nested:  "nested]café🚀",
+		Tags:    []string{"one]two", "中文", "emoji🚀"},
+	}
+	for _, indent := range []bool{false, true} {
+		var raw []byte
+		var err error
+		if indent {
+			raw, err = MarshalIndent(&in, "", "  ")
+		} else {
+			raw, err = Marshal(&in)
+		}
+		if err != nil {
+			t.Fatalf("Marshal(indent=%v): %v", indent, err)
+		}
+		var got utf8Doc
+		if err := Unmarshal(raw, &got); err != nil {
+			t.Fatalf("Unmarshal(indent=%v): %v", indent, err)
+		}
+		if !reflect.DeepEqual(got, in) {
+			t.Fatalf("UTF-8 roundtrip mismatch (indent=%v):\ngot:  %+v\nwant: %+v", indent, got, in)
+		}
+	}
+
+	// Verify Tokenizer fast paths preserve UTF-8, single ']', comments, and PIs.
+	stream := `<root k="v中文🚀"><?pi arg]中文?><!--cmt 中文 🚀--><item>hello]中文🚀world</item></root>`
+	dec := NewDecoder(strings.NewReader(stream))
+	var gotAttr, gotChar, gotComment, gotPI string
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Token(): %v", err)
+		}
+		switch tok := tok.(type) {
+		case StartElement:
+			if len(tok.Attr) > 0 {
+				gotAttr = tok.Attr[0].Value
+			}
+		case CharData:
+			gotChar += string(tok)
+		case Comment:
+			gotComment = string(tok)
+		case ProcInst:
+			gotPI = tok.Target + ":" + string(tok.Inst)
+		}
+	}
+	if gotAttr != "v中文🚀" || gotChar != "hello]中文🚀world" || gotComment != "cmt 中文 🚀" || gotPI != "pi:arg]中文" {
+		t.Fatalf("tokenizer mismatch: attr=%q char=%q comment=%q pi=%q", gotAttr, gotChar, gotComment, gotPI)
+	}
+
+	// Verify strict mode rejects invalid UTF-8, disallowed XML chars, and "]]>" in CharData & Token paths.
+	type singleLeaf struct {
+		V string `xml:"v"`
+	}
+	badInputs := [][]byte{
+		[]byte("<singleLeaf><v>bad\xffutf8</v></singleLeaf>"),
+		[]byte("<singleLeaf><v>surrogate\xed\xa0\x80</v></singleLeaf>"),
+		[]byte("<singleLeaf><v>fffe\xef\xbf\xbe</v></singleLeaf>"),
+		[]byte("<singleLeaf><v>ffff\xef\xbf\xbf</v></singleLeaf>"),
+		[]byte("<singleLeaf><v>bad]]>end</v></singleLeaf>"),
+		[]byte("<singleLeaf><v>nul\x00byte</v></singleLeaf>"),
+	}
+	for _, bad := range badInputs {
+		var dst singleLeaf
+		if err := Unmarshal(bad, &dst); err == nil {
+			t.Fatalf("Unmarshal(%q) succeeded, expected strict error", bad)
+		}
+		d2 := NewDecoder(bytes.NewReader(bad))
+		var tokErr error
+		for {
+			_, err := d2.Token()
+			if err != nil {
+				tokErr = err
+				break
+			}
+		}
+		if tokErr == nil || tokErr == io.EOF {
+			t.Fatalf("Token(%q) succeeded, expected strict error", bad)
+		}
+	}
+}
+
+type testCustomAttrMarshaler struct {
+	K string
+}
+
+func (a testCustomAttrMarshaler) MarshalXMLAttr(name Name) (Attr, error) {
+	return Attr{Name: name, Value: "custom:" + a.K}, nil
+}
+
+func (a *testCustomAttrMarshaler) UnmarshalXMLAttr(attr Attr) error {
+	a.K = strings.TrimPrefix(attr.Value, "custom:")
+	return nil
+}
+
+func TestFastEncoderMarshalerAttrAndSlices(t *testing.T) {
+	type sliceDoc struct {
+		XMLName Name                      `xml:"doc"`
+		AttrVal testCustomAttrMarshaler   `xml:"av,attr"`
+		AttrPtr *testCustomAttrMarshaler  `xml:"ap,attr"`
+		AttrArr []testCustomAttrMarshaler `xml:"al,attr"`
+		Ints    []int                     `xml:"i"`
+		I64s    []int64                   `xml:"i64"`
+		U32s    []uint32                  `xml:"u32"`
+		F64s    []float64                 `xml:"f64"`
+		Bools   []bool                    `xml:"b"`
+		Strs    []string                  `xml:"s"`
+		Times   []time.Time               `xml:"t"`
+		Bytes   [][]byte                  `xml:"bin"`
+	}
+	ts1 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	ts2 := time.Date(2026, 7, 8, 9, 10, 11, 0, time.UTC)
+	in := sliceDoc{
+		AttrVal: testCustomAttrMarshaler{K: "v1"},
+		AttrPtr: &testCustomAttrMarshaler{K: "p1"},
+		AttrArr: []testCustomAttrMarshaler{{K: "a1"}, {K: "a2"}},
+		Ints:    []int{-1, 0, 42},
+		I64s:    []int64{1 << 40, -99},
+		U32s:    []uint32{7, 8},
+		F64s:    []float64{1.5, -2.25},
+		Bools:   []bool{true, false},
+		Strs:    []string{"alpha", "beta&gamma", "中文"},
+		Times:   []time.Time{ts1, ts2},
+		Bytes:   [][]byte{[]byte("raw1"), []byte("raw<2>")},
+	}
+
+	marshaled, err := Marshal(&in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var encBuf bytes.Buffer
+	enc := NewEncoder(&encBuf)
+	if err := enc.Encode(&in); err != nil {
+		t.Fatalf("Encoder.Encode: %v", err)
+	}
+	if encBuf.String() != string(marshaled) {
+		t.Fatalf("Encoder.Encode != Marshal:\nenc: %s\nmar: %s", encBuf.String(), marshaled)
+	}
+
+	marshaledIndent, err := MarshalIndent(&in, ">", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent: %v", err)
+	}
+	var encIndentBuf bytes.Buffer
+	encIndent := NewEncoder(&encIndentBuf)
+	encIndent.Indent(">", "  ")
+	if err := encIndent.Encode(&in); err != nil {
+		t.Fatalf("Encoder.Encode(indent): %v", err)
+	}
+	if encIndentBuf.String() != string(marshaledIndent) {
+		t.Fatalf("Encoder.Encode(indent) != MarshalIndent:\nenc:\n%s\nmar:\n%s", encIndentBuf.String(), marshaledIndent)
+	}
+
+	var decoded sliceDoc
+	if err := NewDecoder(bytes.NewReader(marshaled)).Decode(&decoded); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if !reflect.DeepEqual(decoded.Ints, in.Ints) ||
+		!reflect.DeepEqual(decoded.I64s, in.I64s) ||
+		!reflect.DeepEqual(decoded.U32s, in.U32s) ||
+		!reflect.DeepEqual(decoded.F64s, in.F64s) ||
+		!reflect.DeepEqual(decoded.Bools, in.Bools) ||
+		!reflect.DeepEqual(decoded.Strs, in.Strs) ||
+		!reflect.DeepEqual(decoded.Bytes, in.Bytes) ||
+		decoded.AttrVal != in.AttrVal ||
+		decoded.AttrPtr == nil || *decoded.AttrPtr != *in.AttrPtr ||
+		len(decoded.Times) != 2 || !decoded.Times[0].Equal(ts1) || !decoded.Times[1].Equal(ts2) {
+		t.Fatalf("sliceDoc roundtrip mismatch:\ngot:  %+v\nwant: %+v", decoded, in)
+	}
+}
+
+type chunkReader struct {
+	data []byte
+	step int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.step, len(r.data))
+	copy(p[:n], r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestFastStreamingChunkedAndEncodeToken(t *testing.T) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+	tokens := []Token{
+		ProcInst{Target: "xml", Inst: []byte(`version="1.0" encoding="UTF-8"`)},
+		StartElement{
+			Name: Name{Local: "root"},
+			Attr: []Attr{
+				{Name: Name{Local: "id"}, Value: "123"},
+				{Name: Name{Local: "label"}, Value: "chunked & 中文🚀"},
+			},
+		},
+		Comment("comment across chunks"),
+		StartElement{Name: Name{Local: "msg"}},
+		CharData("hello <world> & 中文🚀 [ok]"),
+		EndElement{Name: Name{Local: "msg"}},
+		EndElement{Name: Name{Local: "root"}},
+	}
+	for _, tok := range tokens {
+		if err := enc.EncodeToken(tok); err != nil {
+			t.Fatalf("EncodeToken(%T): %v", tok, err)
+		}
+	}
+	if err := enc.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	type streamDoc struct {
+		XMLName Name   `xml:"root"`
+		ID      int    `xml:"id,attr"`
+		Label   string `xml:"label,attr"`
+		Msg     string `xml:"msg"`
+	}
+	raw := buf.Bytes()
+	for _, step := range []int{1, 2, 3, 7} {
+		var got streamDoc
+		dec := NewDecoder(&chunkReader{data: raw, step: step})
+		if err := dec.Decode(&got); err != nil {
+			t.Fatalf("chunked Decode(step=%d): %v", step, err)
+		}
+		if got.ID != 123 || got.Label != "chunked & 中文🚀" || got.Msg != "hello <world> & 中文🚀 [ok]" {
+			t.Fatalf("chunked Decode(step=%d) mismatch: %+v", step, got)
+		}
+	}
+}
+
+func BenchmarkFastExtended(b *testing.B) {
+	smallDoc := makeBenchFeedDoc(10)
+	smallXML, err := Marshal(&smallDoc)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	type sliceBenchDoc struct {
+		XMLName Name        `xml:"root"`
+		Ints    []int       `xml:"i"`
+		Strs    []string    `xml:"s"`
+		Times   []time.Time `xml:"t"`
+	}
+	ts := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	sDoc := sliceBenchDoc{
+		Ints:  make([]int, 50),
+		Strs:  make([]string, 50),
+		Times: make([]time.Time, 20),
+	}
+	for i := range sDoc.Ints {
+		sDoc.Ints[i] = i * 17
+		sDoc.Strs[i] = "entry-" + strconv.Itoa(i) + "-value"
+	}
+	for i := range sDoc.Times {
+		sDoc.Times[i] = ts.Add(time.Duration(i) * time.Hour)
+	}
+	sXML, err := Marshal(&sDoc)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	type utf8BenchDoc struct {
+		XMLName Name   `xml:"doc"`
+		Attr    string `xml:"attr,attr"`
+		A       string `xml:"a"`
+		B       string `xml:"b"`
+		C       string `xml:"c"`
+	}
+	uDoc := utf8BenchDoc{
+		Attr: "标签中文🚀",
+		A:    strings.Repeat("中文文本测试内容", 8),
+		B:    strings.Repeat("café résumé naïve ", 8),
+		C:    strings.Repeat("emoji🚀data[0] ", 8),
+	}
+	uXML, err := Marshal(&uDoc)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	plainStr := []byte(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 64))
+
+	b.Run("EncoderFeed10", func(b *testing.B) {
+		var buf bytes.Buffer
+		buf.Grow(len(smallXML) + 64)
+		b.SetBytes(int64(len(smallXML)))
+		b.ReportAllocs()
+		for b.Loop() {
+			buf.Reset()
+			enc := NewEncoder(&buf)
+			if err := enc.Encode(&smallDoc); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("DecoderFeed10", func(b *testing.B) {
+		r := bytes.NewReader(smallXML)
+		b.SetBytes(int64(len(smallXML)))
+		b.ReportAllocs()
+		for b.Loop() {
+			r.Reset(smallXML)
+			dec := NewDecoder(r)
+			var dst benchFeedDoc
+			if err := dec.Decode(&dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("DecoderTokenFeed10", func(b *testing.B) {
+		r := bytes.NewReader(smallXML)
+		b.SetBytes(int64(len(smallXML)))
+		b.ReportAllocs()
+		for b.Loop() {
+			r.Reset(smallXML)
+			dec := NewDecoder(r)
+			for {
+				if _, err := dec.Token(); err != nil {
+					if err == io.EOF {
+						break
+					}
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("MarshalSlices", func(b *testing.B) {
+		b.SetBytes(int64(len(sXML)))
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := Marshal(&sDoc); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("UnmarshalSlices", func(b *testing.B) {
+		b.SetBytes(int64(len(sXML)))
+		b.ReportAllocs()
+		for b.Loop() {
+			var dst sliceBenchDoc
+			if err := Unmarshal(sXML, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("UnmarshalUTF8", func(b *testing.B) {
+		b.SetBytes(int64(len(uXML)))
+		b.ReportAllocs()
+		for b.Loop() {
+			var dst utf8BenchDoc
+			if err := Unmarshal(uXML, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("EscapeTextStringsBuilder", func(b *testing.B) {
+		var sb strings.Builder
+		sb.Grow(len(plainStr) + 64)
+		b.SetBytes(int64(len(plainStr)))
+		b.ReportAllocs()
+		for b.Loop() {
+			sb.Reset()
+			if err := EscapeText(&sb, plainStr); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

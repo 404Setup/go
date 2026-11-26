@@ -199,30 +199,29 @@ type Decoder struct {
 	// the attribute xmlns="DefaultSpace".
 	DefaultSpace string
 
-	r              io.ByteReader
-	rRaw           io.Reader
-	src            []byte
-	pos            int
-	readBuf        []byte
-	readErr        error
-	t              TokenReader
-	buf            bytes.Buffer
-	saved          *bytes.Buffer
-	stk            *stack
-	stkDepth       int
-	free           *stack
-	needClose      bool
-	toClose        Name
-	nextToken      Token
-	nextByte       int
-	ns             map[string]string
-	defaultNS      string
-	hasDefaultNS   bool
-	noCopyText     bool
-	err            error
-	line           int
-	linestart      int64
-	offset         int64
+	r                    io.ByteReader
+	rRaw                 io.Reader
+	src                  []byte
+	pos                  int
+	readBuf              []byte
+	readErr              error
+	t                    TokenReader
+	buf                  bytes.Buffer
+	saved                *bytes.Buffer
+	stk                  []stack
+	stkDepth             int
+	needClose            bool
+	toClose              Name
+	nextToken            Token
+	nextByte             int
+	ns                   map[string]string
+	defaultNS            string
+	hasDefaultNS         bool
+	noCopyText           bool
+	err                  error
+	line                 int
+	linestart            int64
+	offset               int64
 	inUnmarshalXML       bool
 	sawCustomUnmarshaler bool
 	nameCache            [64]string
@@ -287,7 +286,7 @@ func NewTokenDecoder(t TokenReader) *Decoder {
 func (d *Decoder) Token() (Token, error) {
 	var t Token
 	var err error
-	if d.stk != nil && d.stk.kind == stkEOF {
+	if n := len(d.stk); n > 0 && d.stk[n-1].kind == stkEOF {
 		return nil, io.EOF
 	}
 	if d.nextToken != nil {
@@ -295,7 +294,7 @@ func (d *Decoder) Token() (Token, error) {
 		d.nextToken = nil
 	} else {
 		if t, err = d.rawToken(); t == nil && err != nil {
-			if err == io.EOF && d.stk != nil && d.stk.kind != stkEOF {
+			if err == io.EOF && len(d.stk) > 0 && d.stk[len(d.stk)-1].kind != stkEOF {
 				err = d.syntaxError("unexpected EOF")
 			}
 			return nil, err
@@ -407,9 +406,8 @@ func (d *Decoder) switchToReader(r io.Reader) {
 // ending a given tag are *below* it on the stack, which is
 // more work but forced on us by XML.
 type stack struct {
-	next *stack
-	kind int
 	name Name
+	kind uint8
 	ok   bool
 }
 
@@ -420,32 +418,25 @@ const (
 )
 
 func (d *Decoder) push(kind int) *stack {
-	s := d.free
-	if s != nil {
-		d.free = s.next
-	} else {
-		s = new(stack)
-	}
-	s.next = d.stk
-	s.kind = kind
+	d.stk = append(d.stk, stack{kind: uint8(kind)})
 	if kind == stkStart {
 		d.stkDepth++
 	}
-	d.stk = s
-	return s
+	return &d.stk[len(d.stk)-1]
 }
 
-func (d *Decoder) pop() *stack {
-	s := d.stk
-	if s != nil {
-		if s.kind == stkStart {
-			d.stkDepth--
-		}
-		d.stk = s.next
-		s.next = d.free
-		d.free = s
+func (d *Decoder) pop() (stack, bool) {
+	n := len(d.stk)
+	if n == 0 {
+		return stack{}, false
 	}
-	return s
+	s := d.stk[n-1]
+	d.stk[n-1] = stack{}
+	d.stk = d.stk[:n-1]
+	if s.kind == stkStart {
+		d.stkDepth--
+	}
+	return s, true
 }
 
 // Record that after the current element is finished
@@ -455,49 +446,42 @@ func (d *Decoder) pushEOF() {
 	// Walk down stack to find Start.
 	// It might not be the top, because there might be stkNs
 	// entries above it.
-	start := d.stk
-	for start.kind != stkStart {
-		start = start.next
+	i := len(d.stk) - 1
+	for i >= 0 && d.stk[i].kind != stkStart {
+		i--
 	}
 	// The stkNs entries below a start are associated with that
 	// element too; skip over them.
-	for start.next != nil && start.next.kind == stkNs {
-		start = start.next
+	for i > 0 && d.stk[i-1].kind == stkNs {
+		i--
 	}
-	s := d.free
-	if s != nil {
-		d.free = s.next
-	} else {
-		s = new(stack)
-	}
-	s.kind = stkEOF
-	s.next = start.next
-	start.next = s
+	d.stk = append(d.stk, stack{})
+	copy(d.stk[i+1:], d.stk[i:])
+	d.stk[i] = stack{kind: stkEOF}
 }
 
 // Undo a pushEOF.
 // The element must have been finished, so the EOF should be at the top of the stack.
 func (d *Decoder) popEOF() bool {
-	if d.stk == nil || d.stk.kind != stkEOF {
+	n := len(d.stk)
+	if n == 0 || d.stk[n-1].kind != stkEOF {
 		return false
 	}
-	d.pop()
+	d.stk[n-1] = stack{}
+	d.stk = d.stk[:n-1]
 	return true
 }
 
 // Record that we are starting an element with the given name.
 func (d *Decoder) pushElement(name Name) {
-	s := d.push(stkStart)
-	s.name = name
+	d.stk = append(d.stk, stack{kind: stkStart, name: name})
+	d.stkDepth++
 }
 
 // Record that we are changing the value of ns[local].
 // The old value is url, ok.
 func (d *Decoder) pushNs(local string, url string, ok bool) {
-	s := d.push(stkNs)
-	s.name.Local = local
-	s.name.Space = url
-	s.ok = ok
+	d.stk = append(d.stk, stack{kind: stkNs, name: Name{Local: local, Space: url}, ok: ok})
 }
 
 // Creates a SyntaxError with the current line number.
@@ -512,10 +496,10 @@ func (d *Decoder) syntaxError(msg string) error {
 // the stack to restore the name translations that existed
 // before we saw this element.
 func (d *Decoder) popElement(t *EndElement) bool {
-	s := d.pop()
+	s, ok := d.pop()
 	name := t.Name
 	switch {
-	case s == nil || s.kind != stkStart:
+	case !ok || s.kind != stkStart:
 		d.err = d.syntaxError("unexpected end element </" + name.Local + ">")
 		return false
 	case s.name.Local != name.Local:
@@ -541,16 +525,21 @@ func (d *Decoder) popElement(t *EndElement) bool {
 
 	// Pop stack until a Start or EOF is on the top, undoing the
 	// translations that were associated with the element we just closed.
-	for d.stk != nil && d.stk.kind != stkStart && d.stk.kind != stkEOF {
-		s := d.pop()
-		if s.name.Local == "" {
-			d.defaultNS = s.name.Space
-			d.hasDefaultNS = s.ok
-		} else if s.ok {
-			d.ns[s.name.Local] = s.name.Space
-		} else {
-			delete(d.ns, s.name.Local)
+	for len(d.stk) > 0 {
+		top := &d.stk[len(d.stk)-1]
+		if top.kind == stkStart || top.kind == stkEOF {
+			break
 		}
+		if top.name.Local == "" {
+			d.defaultNS = top.name.Space
+			d.hasDefaultNS = top.ok
+		} else if top.ok {
+			d.ns[top.name.Local] = top.name.Space
+		} else {
+			delete(d.ns, top.name.Local)
+		}
+		*top = stack{}
+		d.stk = d.stk[:len(d.stk)-1]
 	}
 
 	return true
@@ -559,16 +548,19 @@ func (d *Decoder) popElement(t *EndElement) bool {
 // If the top element on the stack is autoclosing and
 // t is not the end tag, invent the end tag.
 func (d *Decoder) autoClose(t Token) (Token, bool) {
-	if d.stk == nil || d.stk.kind != stkStart {
+	n := len(d.stk)
+	if n == 0 || d.stk[n-1].kind != stkStart {
 		return nil, false
 	}
-	local := d.stk.name.Local
-	n := len(local)
-	if n == 0 {
+	local := d.stk[n-1].name.Local
+	if len(local) == 0 {
 		return nil, false
 	}
 	c0 := local[0]
 	for _, s := range d.AutoClose {
+		if len(s) == 0 {
+			continue
+		}
 		if c0 < utf8.RuneSelf && s[0] < utf8.RuneSelf && (s[0]^c0)&^0x20 != 0 {
 			continue
 		}
@@ -576,7 +568,7 @@ func (d *Decoder) autoClose(t Token) (Token, bool) {
 			// This one should be auto closed if t doesn't close it.
 			et, ok := t.(EndElement)
 			if !ok || !strings.EqualFold(et.Name.Local, local) {
-				return EndElement{d.stk.name}, true
+				return EndElement{d.stk[n-1].name}, true
 			}
 			break
 		}
@@ -704,7 +696,7 @@ func (d *Decoder) rawToken() (Token, error) {
 }
 
 func (d *Decoder) nextTokenInto(tok *xmlTok) error {
-	if d.stk != nil && d.stk.kind == stkEOF {
+	if n := len(d.stk); n > 0 && d.stk[n-1].kind == stkEOF {
 		return io.EOF
 	}
 	if d.nextToken != nil {
@@ -714,7 +706,7 @@ func (d *Decoder) nextTokenInto(tok *xmlTok) error {
 	} else if d.t != nil {
 		t, err := d.t.Token()
 		if t == nil && err != nil {
-			if err == io.EOF && d.stk != nil && d.stk.kind != stkEOF {
+			if err == io.EOF && len(d.stk) > 0 && d.stk[len(d.stk)-1].kind != stkEOF {
 				err = d.syntaxError("unexpected EOF")
 			}
 			return err
@@ -722,7 +714,7 @@ func (d *Decoder) nextTokenInto(tok *xmlTok) error {
 		tok.fromToken(t)
 	} else {
 		if err := d.rawTokenNative(tok, true); err != nil {
-			if err == io.EOF && d.stk != nil && d.stk.kind != stkEOF {
+			if err == io.EOF && len(d.stk) > 0 && d.stk[len(d.stk)-1].kind != stkEOF {
 				err = d.syntaxError("unexpected EOF")
 			}
 			return err
@@ -924,20 +916,71 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 				return d.err
 			}
 			d.space()
-			d.buf.Reset()
-			var b0 byte
-			for {
-				if b, ok = d.mustgetc(); !ok {
-					return d.err
+			var data []byte
+			if d.err == nil && d.nextByte < 0 && d.pos < len(d.src) {
+				s := d.src
+				start := d.pos
+				cur := start
+				for {
+					idx := bytes.IndexByte(s[cur:], '?')
+					if idx < 0 {
+						cur = -1
+						break
+					}
+					q := cur + idx
+					if q+1 >= len(s) {
+						cur = -1
+						break
+					}
+					if s[q+1] == '>' {
+						cur = q
+						break
+					}
+					cur = q + 1
 				}
-				d.buf.WriteByte(b)
-				if b0 == '?' && b == '>' {
-					break
+				if cur >= 0 {
+					raw := s[start:cur]
+					if bytes.IndexByte(raw, '\n') >= 0 {
+						for j := 0; j < len(raw); j++ {
+							if raw[j] == '\n' {
+								d.line++
+								d.linestart = d.offset + int64(j+1)
+							}
+						}
+					}
+					end := cur + 2
+					if d.saved != nil {
+						d.saved.Write(s[start:end])
+					}
+					d.offset += int64(end - start)
+					d.pos = end
+					if d.noCopyText || d.rRaw == nil {
+						data = raw
+					} else {
+						d.buf.Reset()
+						d.buf.Write(raw)
+						data = d.buf.Bytes()
+					}
+					goto piDone
 				}
-				b0 = b
 			}
-			data := d.buf.Bytes()
-			data = data[0 : len(data)-2] // chop ?>
+			d.buf.Reset()
+			{
+				var b0 byte
+				for {
+					if b, ok = d.mustgetc(); !ok {
+						return d.err
+					}
+					d.buf.WriteByte(b)
+					if b0 == '?' && b == '>' {
+						break
+					}
+					b0 = b
+				}
+				data = d.buf.Bytes()
+				data = data[0 : len(data)-2] // chop ?>
+			}
+		piDone:
 
 			if target == "xml" {
 				content := string(data)
@@ -997,6 +1040,77 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 					return d.err
 				}
 				// Look for terminator.
+				if d.err == nil && d.nextByte < 0 && d.pos < len(d.src) {
+					s := d.src
+					start := d.pos
+					cur := start
+					found := -1
+					badDD := -1
+					for {
+						idx := bytes.IndexByte(s[cur:], '-')
+						if idx < 0 {
+							break
+						}
+						q := cur + idx
+						if q+2 >= len(s) {
+							break
+						}
+						if s[q+1] == '-' {
+							if s[q+2] == '>' {
+								found = q
+							} else {
+								badDD = q + 3
+							}
+							break
+						}
+						cur = q + 1
+					}
+					if badDD >= 0 {
+						raw := s[start:badDD]
+						if bytes.IndexByte(raw, '\n') >= 0 {
+							for j := 0; j < len(raw); j++ {
+								if raw[j] == '\n' {
+									d.line++
+									d.linestart = d.offset + int64(j+1)
+								}
+							}
+						}
+						if d.saved != nil {
+							d.saved.Write(raw)
+						}
+						d.offset += int64(badDD - start)
+						d.pos = badDD
+						d.err = d.syntaxError(`invalid sequence "--" not allowed in comments`)
+						return d.err
+					}
+					if found >= 0 {
+						raw := s[start:found]
+						if bytes.IndexByte(raw, '\n') >= 0 {
+							for j := 0; j < len(raw); j++ {
+								if raw[j] == '\n' {
+									d.line++
+									d.linestart = d.offset + int64(j+1)
+								}
+							}
+						}
+						end := found + 3
+						if d.saved != nil {
+							d.saved.Write(s[start:end])
+						}
+						d.offset += int64(end - start)
+						d.pos = end
+						if d.noCopyText || d.rRaw == nil {
+							tok.data = raw
+						} else {
+							d.buf.Reset()
+							d.buf.Write(raw)
+							tok.data = d.buf.Bytes()
+						}
+						tok.kind = xtComment
+						tok.attr = nil
+						return nil
+					}
+				}
 				d.buf.Reset()
 				var b0, b1 byte
 				for {
@@ -1138,7 +1252,15 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 		attr = []Attr{}
 	}
 	for {
-		d.space()
+		if d.err == nil && d.nextByte < 0 && d.pos+1 < len(d.src) && d.src[d.pos] == ' ' && d.src[d.pos+1] > ' ' {
+			if d.saved != nil {
+				d.saved.WriteByte(' ')
+			}
+			d.pos++
+			d.offset++
+		} else {
+			d.space()
+		}
 		if d.nextByte < 0 && d.pos < len(d.src) {
 			c := d.src[d.pos]
 			if c == '/' || c == '>' {
@@ -1187,28 +1309,60 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 			}
 			return d.err
 		}
-		d.space()
-		if b, ok = d.mustgetc(); !ok {
-			return d.err
-		}
 		var rawVal []byte
-		if b != '=' {
-			if d.Strict {
-				d.err = d.syntaxError("attribute name without = in element")
-				return d.err
+		if d.err == nil && d.nextByte < 0 && d.pos < len(d.src) && d.src[d.pos] == '=' {
+			d.pos++
+			d.offset++
+			if d.saved != nil {
+				d.saved.WriteByte('=')
 			}
-			d.ungetc(b)
-			a.Value = a.Name.Local
-		} else {
+			if d.pos < len(d.src) && (d.src[d.pos] == '"' || d.src[d.pos] == '\'') {
+				if data, zeroCopy, okFast := d.attrvalFast(); okFast {
+					if reuseAttr && d.rRaw == nil && d.r == nil && zeroCopy && len(data) > 0 {
+						rawVal = data
+					} else if len(data) > 0 {
+						a.Value = string(data)
+					}
+					attr = append(attr, a)
+					if reuseAttr {
+						attrRaw = append(attrRaw, rawVal)
+					}
+					continue
+				}
+			}
 			d.space()
-			data := d.attrval()
+			data, zeroCopy := d.attrvalZeroCopy()
 			if data == nil {
 				return d.err
 			}
-			if reuseAttr && d.rRaw == nil && d.r == nil && d.buf.Len() == 0 && len(data) > 0 {
+			if reuseAttr && d.rRaw == nil && d.r == nil && zeroCopy && len(data) > 0 {
 				rawVal = data
 			} else if len(data) > 0 {
 				a.Value = string(data)
+			}
+		} else {
+			d.space()
+			if b, ok = d.mustgetc(); !ok {
+				return d.err
+			}
+			if b != '=' {
+				if d.Strict {
+					d.err = d.syntaxError("attribute name without = in element")
+					return d.err
+				}
+				d.ungetc(b)
+				a.Value = a.Name.Local
+			} else {
+				d.space()
+				data, zeroCopy := d.attrvalZeroCopy()
+				if data == nil {
+					return d.err
+				}
+				if reuseAttr && d.rRaw == nil && d.r == nil && zeroCopy && len(data) > 0 {
+					rawVal = data
+				} else if len(data) > 0 {
+					a.Value = string(data)
+				}
 			}
 		}
 		attr = append(attr, a)
@@ -1232,10 +1386,87 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 	return nil
 }
 
-func (d *Decoder) attrval() []byte {
+func (d *Decoder) attrvalFast() ([]byte, bool, bool) {
+	s := d.src
+	p0 := d.pos
+	qb := s[p0]
+	start := p0 + 1
+	i := start
+	line := d.line
+	linestart := d.linestart
+	q8 := uint64(qb) * xmlSwarLo
+	if len(s)-i >= 8 {
+		if haveXMLSIMD && len(s)-i >= 32 {
+			for len(s)-i >= 32 {
+				i, _ = xmlAttrValIndexSIMD(s, i, qb)
+				if i < len(s) && s[i] == '\n' {
+					i++
+					line++
+					linestart = d.offset + int64(i-p0)
+					continue
+				}
+				break
+			}
+		}
+		for len(s)-i >= 8 {
+			if m := xmlAttrValMask(byteorder.LEUint64(s[i:]), q8); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				c := s[i]
+				if c == qb {
+					goto done
+				}
+				if c == '\n' {
+					i++
+					line++
+					linestart = d.offset + int64(i-p0)
+					continue
+				}
+				if c == '\t' {
+					i++
+					continue
+				}
+				return nil, false, false
+			}
+			i += 8
+		}
+	}
+	for i < len(s) {
+		c := s[i]
+		if c == qb {
+			goto done
+		}
+		if c >= utf8.RuneSelf {
+			if ni := skipValidUTF8Fast(s, i); ni > i {
+				i = ni
+				continue
+			}
+			return nil, false, false
+		}
+		if c == '<' || c == '&' || c == '\r' || (c < ' ' && c != '\t' && c != '\n') {
+			return nil, false, false
+		}
+		i++
+		if c == '\n' {
+			line++
+			linestart = d.offset + int64(i-p0)
+		}
+	}
+	return nil, false, false
+done:
+	if d.saved != nil {
+		d.saved.Write(s[p0 : i+1])
+	}
+	d.line = line
+	d.linestart = linestart
+	d.offset += int64(i + 1 - p0)
+	d.pos = i + 1
+	return s[start:i], true, true
+}
+
+func (d *Decoder) attrvalZeroCopy() ([]byte, bool) {
 	b, ok := d.mustgetc()
 	if !ok {
-		return nil
+		return nil, false
 	}
 	// Handle quoted attribute values
 	if b == '"' || b == '\'' {
@@ -1243,12 +1474,12 @@ func (d *Decoder) attrval() []byte {
 		d.noCopyText = true
 		data := d.text(int(b), false)
 		d.noCopyText = old
-		return data
+		return data, d.buf.Len() == 0
 	}
 	// Handle unquoted attribute values for strict parsers
 	if d.Strict {
 		d.err = d.syntaxError("unquoted or missing attribute value in element")
-		return nil
+		return nil, false
 	}
 	// Handle unquoted attribute values for unstrict parsers
 	d.ungetc(b)
@@ -1256,7 +1487,7 @@ func (d *Decoder) attrval() []byte {
 	for {
 		b, ok = d.mustgetc()
 		if !ok {
-			return nil
+			return nil, false
 		}
 		// https://www.w3.org/TR/REC-html40/intro/sgmltut.html#h-3.2.2
 		if 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z' ||
@@ -1267,7 +1498,12 @@ func (d *Decoder) attrval() []byte {
 			break
 		}
 	}
-	return d.buf.Bytes()
+	return d.buf.Bytes(), false
+}
+
+func (d *Decoder) attrval() []byte {
+	data, _ := d.attrvalZeroCopy()
+	return data
 }
 
 const maxConsecutiveEmptyReads = 100
@@ -1342,7 +1578,7 @@ func (d *Decoder) refill() bool {
 		return false
 	}
 	if d.readBuf == nil {
-		d.readBuf = make([]byte, 4096)
+		d.readBuf = make([]byte, 16384)
 	}
 	for empty := 0; empty < maxConsecutiveEmptyReads; empty++ {
 		n, err := d.rRaw.Read(d.readBuf)
@@ -1535,7 +1771,21 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 			}
 			for i < len(s) {
 				c := s[i]
-				if c == '<' || c == '&' || c == ']' || c == '\r' || c >= utf8.RuneSelf || (c < ' ' && c != '\t' && c != '\n') {
+				if c >= utf8.RuneSelf {
+					if ni := skipValidUTF8Fast(s, i); ni > i {
+						i = ni
+						continue
+					}
+					break
+				}
+				if c == ']' {
+					if i+1 >= len(s) || s[i+1] == ']' {
+						break
+					}
+					i++
+					continue
+				}
+				if c == '<' || c == '&' || c == '\r' || (c < ' ' && c != '\t' && c != '\n') {
 					break
 				}
 				i++
@@ -1611,7 +1861,17 @@ func (d *Decoder) text(quote int, cdata bool) []byte {
 			}
 			for i < len(s) {
 				c := s[i]
-				if c == qb || c == '<' || c == '&' || c == '\r' || c >= utf8.RuneSelf || (c < ' ' && c != '\t' && c != '\n') {
+				if c == qb {
+					break
+				}
+				if c >= utf8.RuneSelf {
+					if ni := skipValidUTF8Fast(s, i); ni > i {
+						i = ni
+						continue
+					}
+					break
+				}
+				if c == '<' || c == '&' || c == '\r' || (c < ' ' && c != '\t' && c != '\n') {
 					break
 				}
 				i++

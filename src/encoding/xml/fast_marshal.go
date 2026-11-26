@@ -259,12 +259,18 @@ type xmlFastElem struct {
 	rt               reflect.Type
 	ptrRT            reflect.Type
 	plan             *xmlMarshalPlan
+	elemKind         xmlFastKind
+	elemSize         uintptr
+	elemRT           reflect.Type
+	elemPlan         *xmlMarshalPlan
 	isInterface      bool
 	isMarshaler      bool
 	ptrMarshaler     bool
 	isTextMarshaler  bool
 	ptrTextMarshaler bool
 	isScalarLeaf     bool
+	isScalarSlice    bool
+	isStructSlice    bool
 }
 
 type xmlMarshalPlan struct {
@@ -551,7 +557,7 @@ func buildXmlMarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Type]*
 				if fa.name.Space != "" || fa.isMarshalerAttr || fa.ptrMarshalerAttr || fa.kind == xkAttr || (fa.isPtr && (fa.elemKind == xkAttr || fa.elemKind == xkInterface)) || fa.kind == xkInterface || fa.isSlice {
 					p.hasAttrSpace = true
 				}
-				if fa.isMarshalerAttr || fa.ptrMarshalerAttr || fa.kind == xkInterface {
+				if fa.kind == xkInterface {
 					p.hasCustom = true
 				}
 				p.attrs = append(p.attrs, fa)
@@ -620,6 +626,18 @@ func buildXmlFastAttr(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xm
 	return fa
 }
 
+func isScalarMarshalKind(k xmlFastKind) bool {
+	switch k {
+	case xkBool, xkString,
+		xkInt, xkInt8, xkInt16, xkInt32, xkInt64,
+		xkUint, xkUint8, xkUint16, xkUint32, xkUint64, xkUintptr,
+		xkFloat32, xkFloat64, xkBytes:
+		return true
+	default:
+		return false
+	}
+}
+
 func buildXmlFastElem(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xmlFieldStep, off uintptr, visiting map[*abi.Type]*xmlMarshalPlan) xmlFastElem {
 	ptrFRT := reflect.PointerTo(frt)
 	fe := xmlFastElem{
@@ -653,17 +671,36 @@ func buildXmlFastElem(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xm
 		fe.closeTag = "</" + fi.name + ">"
 	}
 	if !fe.isMarshaler && !fe.ptrMarshaler && !fe.isTextMarshaler && !fe.ptrTextMarshaler && !fe.isInterface {
-		switch fe.kind {
-		case xkBool, xkString,
-			xkInt, xkInt8, xkInt16, xkInt32, xkInt64,
-			xkUint, xkUint8, xkUint16, xkUint32, xkUint64, xkUintptr,
-			xkFloat32, xkFloat64, xkBytes:
+		if isScalarMarshalKind(fe.kind) {
 			fe.isScalarLeaf = true
 		}
 	}
 	if fe.mode != fElement || !fe.isScalarLeaf {
 		if fe.mode&(fElement|fAny|fInnerXML) != 0 {
 			fe.plan = buildXmlMarshalPlan(frt, fat, visiting)
+		}
+	}
+	if fe.mode == fElement && fe.kind == xkSlice && !fe.isMarshaler && !fe.ptrMarshaler && fe.plan != nil {
+		ert := frt.Elem()
+		eat := xmlAbiTypeOfReflect(ert)
+		ek := classifyXmlKind(ert, eat)
+		ptrERT := reflect.PointerTo(ert)
+		if !ert.Implements(xmlMarshalerType) && !ptrERT.Implements(xmlMarshalerType) {
+			if eat == xmlTimeAbiType {
+				fe.isScalarSlice = true
+				fe.elemKind = xkTime
+				fe.elemSize = ert.Size()
+				fe.elemRT = ert
+			} else if !ert.Implements(xmlTextMarshalerType) && !ptrERT.Implements(xmlTextMarshalerType) && isScalarMarshalKind(ek) {
+				fe.isScalarSlice = true
+				fe.elemKind = ek
+				fe.elemSize = ert.Size()
+				fe.elemRT = ert
+			} else if ep := fe.plan.elemPlan; ep != nil && ep.kind == xkStruct && ep.canFast && !ep.building && !ep.isTextMarshaler && !ep.ptrTextMarshaler && ep.xmlNameMode == xmlNameNone && fe.name.Local != "" {
+				fe.isStructSlice = true
+				fe.elemPlan = ep
+				fe.elemSize = fe.plan.elemSize
+			}
 		}
 	}
 	return fe
@@ -880,12 +917,11 @@ func (p *printer) fastMarshalValue(plan *xmlMarshalPlan, ptr unsafe.Pointer, can
 		if err := p.writeStartFast(&start, false); err != nil {
 			return err
 		}
-		var scratch [64]byte
-		tb, err := (*time.Time)(ptr).AppendText(scratch[:0])
+		var err error
+		p.out, err = (*time.Time)(ptr).AppendText(p.out)
 		if err != nil {
 			return err
 		}
-		p.out = appendEscapeXMLBytes(p.out, tb, true)
 		return p.writeEndFast(start.Name, false)
 	}
 	if plan.isTextMarshaler {
@@ -1148,12 +1184,24 @@ func (p *printer) fastWriteAttr(fa *xmlFastAttr, fptr unsafe.Pointer, canAddr bo
 		return nil
 	}
 	if fa.isTime {
-		var scratch [64]byte
-		tb, err := (*time.Time)(fptr).AppendText(scratch[:0])
+		if fa.escapedPrefix != "" {
+			p.out = append(p.out, fa.escapedPrefix...)
+		} else {
+			p.out = append(p.out, ' ')
+			if fa.name.Space != "" {
+				prefix := p.createAttrPrefix(fa.name.Space)
+				p.out = append(p.out, prefix...)
+				p.out = append(p.out, ':')
+			}
+			p.out = append(p.out, fa.name.Local...)
+			p.out = append(p.out, `="`...)
+		}
+		var err error
+		p.out, err = (*time.Time)(fptr).AppendText(p.out)
 		if err != nil {
 			return err
 		}
-		p.appendAttrBytes(fa, tb)
+		p.out = append(p.out, '"')
 		return nil
 	}
 	if fa.isTextMarshaler && !(fa.isPtr && fa.elemIsTime) {
@@ -1269,12 +1317,24 @@ func (p *printer) fastWriteSliceAttrElem(fa *xmlFastAttr, ep unsafe.Pointer) err
 		return nil
 	}
 	if fa.elemIsTime {
-		var scratch [64]byte
-		tb, err := (*time.Time)(ep).AppendText(scratch[:0])
+		if fa.escapedPrefix != "" {
+			p.out = append(p.out, fa.escapedPrefix...)
+		} else {
+			p.out = append(p.out, ' ')
+			if fa.name.Space != "" {
+				prefix := p.createAttrPrefix(fa.name.Space)
+				p.out = append(p.out, prefix...)
+				p.out = append(p.out, ':')
+			}
+			p.out = append(p.out, fa.name.Local...)
+			p.out = append(p.out, `="`...)
+		}
+		var err error
+		p.out, err = (*time.Time)(ep).AppendText(p.out)
 		if err != nil {
 			return err
 		}
-		p.appendAttrBytes(fa, tb)
+		p.out = append(p.out, '"')
 		return nil
 	}
 	if fa.elemTextMarsh {
@@ -1414,16 +1474,20 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 			}
 			isCDATA := fe.mode == fCDATA
 			if fe.kind == xkTime {
+				if !isCDATA {
+					var err error
+					p.out, err = (*time.Time)(fptr).AppendText(p.out)
+					if err != nil {
+						return err
+					}
+					continue
+				}
 				var scratch [64]byte
 				tb, err := (*time.Time)(fptr).AppendText(scratch[:0])
 				if err != nil {
 					return err
 				}
-				if isCDATA {
-					p.appendCDATA(tb)
-				} else {
-					p.out = appendEscapeXMLBytes(p.out, tb, true)
-				}
+				p.appendCDATA(tb)
 				continue
 			}
 			if fe.isTextMarshaler {
@@ -1636,20 +1700,23 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 		}
 
 		if fe.kind == xkTime && fe.mode == fElement && !fe.isMarshaler && !fe.ptrMarshaler {
-			var scratch [64]byte
-			tb, err := (*time.Time)(fptr).AppendText(scratch[:0])
-			if err != nil {
-				return err
-			}
 			if !hasIndent {
 				p.out = append(p.out, fe.openTag...)
-				p.out = appendEscapeXMLBytes(p.out, tb, true)
+				var err error
+				p.out, err = (*time.Time)(fptr).AppendText(p.out)
+				if err != nil {
+					return err
+				}
 				p.out = append(p.out, fe.closeTag...)
 				continue
 			}
 			p.writeIndent(1)
 			p.out = append(p.out, fe.openTag...)
-			p.out = appendEscapeXMLBytes(p.out, tb, true)
+			var err error
+			p.out, err = (*time.Time)(fptr).AppendText(p.out)
+			if err != nil {
+				return err
+			}
 			p.writeIndent(-1)
 			p.out = append(p.out, fe.closeTag...)
 			continue
@@ -1675,6 +1742,65 @@ func (p *printer) fastMarshalStructBody(plan *xmlMarshalPlan, ptr unsafe.Pointer
 			}
 			p.writeIndent(-1)
 			p.out = append(p.out, fe.closeTag...)
+			continue
+		}
+
+		if fe.isScalarSlice {
+			sh := (*xmlSliceHeader)(fptr)
+			if !hasIndent {
+				for j := 0; j < sh.len; j++ {
+					ep := unsafe.Add(sh.data, uintptr(j)*fe.elemSize)
+					p.out = append(p.out, fe.openTag...)
+					var err error
+					if fe.elemKind == xkTime {
+						p.out, err = (*time.Time)(ep).AppendText(p.out)
+					} else {
+						p.out, err = appendSimpleXML(p.out, fe.elemKind, ep, fe.elemRT)
+					}
+					if err != nil {
+						return err
+					}
+					p.out = append(p.out, fe.closeTag...)
+				}
+				continue
+			}
+			for j := 0; j < sh.len; j++ {
+				ep := unsafe.Add(sh.data, uintptr(j)*fe.elemSize)
+				p.writeIndent(1)
+				p.out = append(p.out, fe.openTag...)
+				var err error
+				if fe.elemKind == xkTime {
+					p.out, err = (*time.Time)(ep).AppendText(p.out)
+				} else {
+					p.out, err = appendSimpleXML(p.out, fe.elemKind, ep, fe.elemRT)
+				}
+				if err != nil {
+					return err
+				}
+				p.writeIndent(-1)
+				p.out = append(p.out, fe.closeTag...)
+			}
+			continue
+		}
+
+		if fe.isStructSlice {
+			if depth+2 > 1000 {
+				return errors.New("xml: nested too deeply")
+			}
+			sh := (*xmlSliceHeader)(fptr)
+			epPlan := fe.elemPlan
+			for j := 0; j < sh.len; j++ {
+				ep := unsafe.Add(sh.data, uintptr(j)*fe.elemSize)
+				if err := p.writeStructStartFast(epPlan, ep, true, fe.name); err != nil {
+					return err
+				}
+				if err := p.fastMarshalStructBody(epPlan, ep, true, depth+2); err != nil {
+					return err
+				}
+				if err := p.writeEndFast(fe.name, epPlan.hasAttrSpace); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 

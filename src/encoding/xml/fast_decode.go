@@ -55,12 +55,20 @@ type xmlDecodeElem struct {
 	kind               xmlFastKind
 	rt                 reflect.Type
 	plan               *xmlDecodePlan
+	openTag            string
+	closeTag           string
+	parentOpen         string
+	parentClose        string
+	elemKind           xmlFastKind
+	elemSize           uintptr
+	elemRT             reflect.Type
 	isUnmarshaler      bool
 	ptrUnmarshaler     bool
 	isTextUnmarshaler  bool
 	ptrTextUnmarshaler bool
 	isTime             bool
 	canFastField       bool
+	isScalarSlice      bool
 }
 
 type xmlDecodePlan struct {
@@ -401,6 +409,18 @@ func buildXmlDecodeAttr(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []
 	return fa
 }
 
+func isScalarDecodeKind(k xmlFastKind) bool {
+	switch k {
+	case xkBool, xkString,
+		xkInt, xkInt8, xkInt16, xkInt32, xkInt64,
+		xkUint, xkUint8, xkUint16, xkUint32, xkUint64, xkUintptr,
+		xkFloat32, xkFloat64, xkBytes:
+		return true
+	default:
+		return false
+	}
+}
+
 func buildXmlDecodeElem(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []xmlDecodeStep, off uintptr, visiting map[*abi.Type]*xmlDecodePlan) xmlDecodeElem {
 	ptrFRT := reflect.PointerTo(frt)
 	fe := xmlDecodeElem{
@@ -419,6 +439,33 @@ func buildXmlDecodeElem(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []
 	}
 	if fe.mode&(fElement|fAny) != 0 {
 		fe.plan = buildXmlDecodePlan(frt, fat, visiting)
+	}
+	if fe.mode == fElement && !fe.isUnmarshaler && !fe.ptrUnmarshaler {
+		if fe.isTime || (!fe.isTextUnmarshaler && !fe.ptrTextUnmarshaler && isScalarDecodeKind(fe.kind)) {
+			fe.canFastField = true
+			if fe.name.Local != "" {
+				fe.openTag = "<" + fe.name.Local + ">"
+				fe.closeTag = "</" + fe.name.Local + ">"
+				if len(fe.parents) == 1 && fe.parents[0] != "" {
+					fe.parentOpen = "<" + fe.parents[0] + ">"
+					fe.parentClose = "</" + fe.parents[0] + ">"
+				}
+			}
+		} else if fe.kind == xkSlice && len(fe.parents) == 0 && fe.name.Local != "" {
+			ert := frt.Elem()
+			eat := xmlAbiTypeOfReflect(ert)
+			ek := classifyXmlKind(ert, eat)
+			ptrERT := reflect.PointerTo(ert)
+			if !ert.Implements(xmlUnmarshalerType) && !ptrERT.Implements(xmlUnmarshalerType) &&
+				(eat == xmlTimeAbiType || (!ert.Implements(xmlTextUnmarshalerType) && !ptrERT.Implements(xmlTextUnmarshalerType) && isScalarDecodeKind(ek))) {
+				fe.isScalarSlice = true
+				fe.elemKind = ek
+				fe.elemSize = ert.Size()
+				fe.elemRT = ert
+				fe.openTag = "<" + fe.name.Local + ">"
+				fe.closeTag = "</" + fe.name.Local + ">"
+			}
+		}
 	}
 	return fe
 }
@@ -542,7 +589,18 @@ func (d *Decoder) fastUnmarshalSlice(plan *xmlDecodePlan, ptr unsafe.Pointer, st
 		sv.SetLen(n + 1)
 		elemPtr = unsafe.Add((*xmlSliceHeader)(ptr).data, uintptr(n)*plan.elemSize)
 	}
-	if err := d.fastUnmarshalStart(plan.elemPlan, elemPtr, startName, startAttr, startAttrRaw); err != nil {
+	ep := plan.elemPlan
+	var err error
+	if ep.kind == xkStruct && ep.canFast && ep.buildErr == nil && !ep.isUnmarshaler && !ep.ptrUnmarshaler && !ep.isTextUnmarshaler && !ep.ptrTextUnmarshaler {
+		if d.stkDepth > maxUnmarshalDepth || runtime.GOARCH == "wasm" && d.stkDepth > maxUnmarshalDepthWasm {
+			sh.len = n
+			return errUnmarshalDepth
+		}
+		err = d.fastUnmarshalStruct(ep, elemPtr, startName, startAttr, startAttrRaw)
+	} else {
+		err = d.fastUnmarshalStart(ep, elemPtr, startName, startAttr, startAttrRaw)
+	}
+	if err != nil {
 		sh.len = n
 		return err
 	}
@@ -576,12 +634,89 @@ func (d *Decoder) fastUnmarshalTextElem(plan *xmlDecodePlan, ptr unsafe.Pointer)
 	return errors.New("xml: internal error: expected TextUnmarshaler")
 }
 
+func scanSimpleLeafEnd(s []byte, start int, baseOff int64, line int, linestart int64) (end int, newLine int, newLinestart int64, ok bool) {
+	i := start
+	for {
+		if len(s)-i >= 8 {
+			if haveXMLSIMD && len(s)-i >= 32 {
+				for len(s)-i >= 32 {
+					i, _ = xmlCharDataIndexSIMD(s, i)
+					if i < len(s) && s[i] == '\n' {
+						i++
+						line++
+						linestart = baseOff + int64(i-start)
+						continue
+					}
+					break
+				}
+			}
+			for len(s)-i >= 8 {
+				if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
+					i += bits.TrailingZeros64(m) >> 3
+					c := s[i]
+					if c == '\n' {
+						i++
+						line++
+						linestart = baseOff + int64(i-start)
+						continue
+					}
+					if c == '\t' {
+						i++
+						continue
+					}
+					break
+				}
+				i += 8
+			}
+		}
+		for i < len(s) {
+			c := s[i]
+			if c < 0x80 {
+				if c == '<' {
+					return i, line, linestart, true
+				}
+				if c == ']' {
+					if i+2 >= len(s) || (s[i+1] == ']' && s[i+2] == '>') {
+						return 0, 0, 0, false
+					}
+					i++
+					continue
+				}
+				if c == '&' || c == '\r' || (c < ' ' && c != '\t' && c != '\n') {
+					return 0, 0, 0, false
+				}
+				i++
+				if c == '\n' {
+					line++
+					linestart = baseOff + int64(i-start)
+				}
+				continue
+			}
+			if ni := skipValidUTF8Fast(s, i); ni > i {
+				i = ni
+				if len(s)-i >= 16 {
+					break
+				}
+				continue
+			}
+			return 0, 0, 0, false
+		}
+		if i >= len(s) {
+			return 0, 0, 0, false
+		}
+	}
+}
+
 func (d *Decoder) fastReadSimpleLeafBytes() ([]byte, bool) {
 	if d.t != nil || !d.Strict || d.err != nil || d.nextByte >= 0 || d.needClose || d.nextToken != nil || d.saved != nil {
 		return nil, false
 	}
-	stk := d.stk
-	if stk == nil || stk.kind != stkStart || stk.name.Space != "" || (stk.next != nil && stk.next.kind == stkNs) {
+	n := len(d.stk)
+	if n == 0 {
+		return nil, false
+	}
+	stk := &d.stk[n-1]
+	if stk.kind != stkStart || stk.name.Space != "" || (n > 1 && d.stk[n-2].kind == stkNs) {
 		return nil, false
 	}
 	s := d.src
@@ -589,81 +724,18 @@ func (d *Decoder) fastReadSimpleLeafBytes() ([]byte, bool) {
 	if start >= len(s) {
 		return nil, false
 	}
-	i := start
-	line := d.line
-	linestart := d.linestart
-	if len(s)-i >= 8 {
-		if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
-			i += bits.TrailingZeros64(m) >> 3
-			c := s[i]
-			if c == '<' {
-				goto checkClose
-			}
-			if c == '\n' {
-				i++
-				line++
-				linestart = d.offset + int64(i-d.pos)
-			} else if c == '\t' {
-				i++
-			} else {
-				return nil, false
-			}
-		} else {
-			i += 8
-		}
-		if haveXMLSIMD && len(s)-i >= 32 {
-			for len(s)-i >= 32 {
-				i, _ = xmlCharDataIndexSIMD(s, i)
-				if i < len(s) && s[i] == '\n' {
-					i++
-					line++
-					linestart = d.offset + int64(i-d.pos)
-					continue
-				}
-				break
-			}
-		}
-		for len(s)-i >= 8 {
-			if m := xmlCharDataMask(byteorder.LEUint64(s[i:])); m != 0 {
-				i += bits.TrailingZeros64(m) >> 3
-				c := s[i]
-				if c == '\n' {
-					i++
-					line++
-					linestart = d.offset + int64(i-d.pos)
-					continue
-				}
-				if c == '\t' {
-					i++
-					continue
-				}
-				break
-			}
-			i += 8
-		}
-	}
-	for i < len(s) {
-		c := s[i]
-		if c == '<' || c == '&' || c == ']' || c == '\r' || c >= 0x80 || (c < ' ' && c != '\t' && c != '\n') {
-			break
-		}
-		i++
-		if c == '\n' {
-			line++
-			linestart = d.offset + int64(i-d.pos)
-		}
-	}
-checkClose:
-	tag := stk.name.Local
-	end := i + 2 + len(tag) + 1
-	if end > len(s) || s[i] != '<' || s[i+1] != '/' || s[end-1] != '>' || string(s[i+2:i+2+len(tag)]) != tag {
+	i, line, linestart, ok := scanSimpleLeafEnd(s, start, d.offset, d.line, d.linestart)
+	if !ok {
 		return nil, false
 	}
-	d.stk = stk.next
+	tag := stk.name.Local
+	end := i + 2 + len(tag) + 1
+	if end > len(s) || s[i+1] != '/' || s[end-1] != '>' || string(s[i+2:i+2+len(tag)]) != tag {
+		return nil, false
+	}
+	*stk = stack{}
+	d.stk = d.stk[:n-1]
 	d.stkDepth--
-	stk.name = Name{}
-	stk.next = d.free
-	d.free = stk
 	d.line = line
 	d.linestart = linestart
 	d.offset += int64(end - d.pos)
@@ -729,6 +801,45 @@ func (d *Decoder) fastUnmarshalLeaf(kind xmlFastKind, ptr unsafe.Pointer) error 
 			return assignScalarBytes(kind, ptr, data)
 		}
 	}
+}
+
+func assignFastScalarOrTime(kind xmlFastKind, ptr unsafe.Pointer, raw []byte) error {
+	if kind == xkTime {
+		return (*time.Time)(ptr).UnmarshalText(raw)
+	}
+	return assignScalarBytes(kind, ptr, raw)
+}
+
+func (d *Decoder) fastUnmarshalLeafField(fe *xmlDecodeElem, fptr unsafe.Pointer) error {
+	if fe.isTime {
+		var timeBuf [64]byte
+		data, err := d.readLeafText(timeBuf[:0])
+		if err != nil {
+			return err
+		}
+		return (*time.Time)(fptr).UnmarshalText(data)
+	}
+	return d.fastUnmarshalLeaf(fe.kind, fptr)
+}
+
+func fastAppendScalarSlice(fe *xmlDecodeElem, fptr unsafe.Pointer, raw []byte) error {
+	sh := (*xmlSliceHeader)(fptr)
+	n := sh.len
+	var elemPtr unsafe.Pointer
+	if n < sh.cap {
+		sh.len = n + 1
+		elemPtr = unsafe.Add(sh.data, uintptr(n)*fe.elemSize)
+	} else {
+		sv := reflect.NewAt(fe.rt, fptr).Elem()
+		sv.Grow(1)
+		sv.SetLen(n + 1)
+		elemPtr = unsafe.Add((*xmlSliceHeader)(fptr).data, uintptr(n)*fe.elemSize)
+	}
+	if err := assignFastScalarOrTime(fe.elemKind, elemPtr, raw); err != nil {
+		sh.len = n
+		return err
+	}
+	return nil
 }
 
 func assignScalarBytes(kind xmlFastKind, ptr unsafe.Pointer, src []byte) error {
@@ -928,6 +1039,13 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 			sv.SetLen(n + 1)
 			elemPtr = unsafe.Add((*xmlSliceHeader)(fptr).data, uintptr(n)*fa.elemSize)
 		}
+		if fa.elemKind == xkTime {
+			if err := (*time.Time)(elemPtr).UnmarshalText(valBytes); err != nil {
+				sh.len = n
+				return err
+			}
+			return nil
+		}
 		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm || fa.elemKind == xkPtr || fa.elemKind == xkSlice {
 			if err := d.unmarshalAttr(reflect.NewAt(fa.elemRT, elemPtr).Elem(), materializeAttrVal(a, raw)); err != nil {
 				sh.len = n
@@ -951,6 +1069,23 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 		return nil
 	}
 	return assignAttrRaw(fa.kind, fptr, fa.rt, a.Value, raw)
+}
+
+func skipInlineXMLWS(s []byte, pos int, baseOff int64, line int, linestart int64) (int, int64, int, int64) {
+	start := pos
+	for pos < len(s) {
+		c := s[pos]
+		if c == ' ' || c == '\t' || c == '\r' {
+			pos++
+		} else if c == '\n' {
+			pos++
+			line++
+			linestart = baseOff + int64(pos-start)
+		} else {
+			break
+		}
+	}
+	return pos, baseOff + int64(pos-start), line, linestart
 }
 
 func (d *Decoder) fastUnmarshalStruct(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) error {
@@ -1046,63 +1181,233 @@ func (d *Decoder) fastUnmarshalStruct(plan *xmlDecodePlan, ptr unsafe.Pointer, s
 	}
 
 	noCopyStruct := saveDataPtr == nil && saveCommPtr == nil && saveXMLPtr == nil
+	canFastInline := noCopyStruct && d.t == nil && d.Strict && d.err == nil && !d.needClose && d.nextToken == nil && d.saved == nil
+	nextIdx := 0
 	var tok xmlTok
 
 Loop:
 	for {
+		if canFastInline && d.nextByte < 0 && d.pos < len(d.src) {
+			s := d.src
+			pos := d.pos
+			off := d.offset
+			line := d.line
+			linestart := d.linestart
+			if s[pos] <= ' ' {
+				pos, off, line, linestart = skipInlineXMLWS(s, pos, off, line, linestart)
+				d.pos = pos
+				d.offset = off
+				d.line = line
+				d.linestart = linestart
+			}
+			for nextIdx < len(plan.elems) && pos < len(s) && s[pos] == '<' {
+				fe := &plan.elems[nextIdx]
+				if fe.openTag == "" {
+					break
+				}
+				if fe.name.Space != "" {
+					var curNS string
+					if d.hasDefaultNS {
+						curNS = d.defaultNS
+					} else {
+						curNS = d.DefaultSpace
+					}
+					if curNS != fe.name.Space {
+						break
+					}
+				}
+				if fe.parentOpen == "" {
+					otLen := len(fe.openTag)
+					ctLen := len(fe.closeTag)
+					if pos+otLen+ctLen > len(s) || string(s[pos:pos+otLen]) != fe.openTag {
+						break
+					}
+					leafStart := pos + otLen
+					leafEnd, nLine, nLinestart, ok := scanSimpleLeafEnd(s, leafStart, off+int64(otLen), line, linestart)
+					if !ok || leafEnd+ctLen > len(s) || string(s[leafEnd:leafEnd+ctLen]) != fe.closeTag {
+						break
+					}
+					newPos := leafEnd + ctLen
+					newOff := off + int64(newPos-pos)
+					d.pos = newPos
+					d.offset = newOff
+					d.line = nLine
+					d.linestart = nLinestart
+
+					fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+					if fe.isScalarSlice {
+						if err := fastAppendScalarSlice(fe, fptr, s[leafStart:leafEnd]); err != nil {
+							return err
+						}
+					} else {
+						if err := assignFastScalarOrTime(fe.kind, fptr, s[leafStart:leafEnd]); err != nil {
+							return err
+						}
+						nextIdx++
+					}
+					pos, off, line, linestart = newPos, newOff, nLine, nLinestart
+					if pos < len(s) && s[pos] <= ' ' {
+						pos, off, line, linestart = skipInlineXMLWS(s, pos, off, line, linestart)
+						d.pos = pos
+						d.offset = off
+						d.line = line
+						d.linestart = linestart
+					}
+					continue
+				}
+				poLen := len(fe.parentOpen)
+				pcLen := len(fe.parentClose)
+				otLen := len(fe.openTag)
+				ctLen := len(fe.closeTag)
+				if pos+poLen+otLen+ctLen+pcLen > len(s) || string(s[pos:pos+poLen]) != fe.parentOpen {
+					break
+				}
+				curPos := pos + poLen
+				curOff := off + int64(poLen)
+				curLine := line
+				curLinestart := linestart
+				if s[curPos] <= ' ' {
+					curPos, curOff, curLine, curLinestart = skipInlineXMLWS(s, curPos, curOff, curLine, curLinestart)
+				}
+				if curPos+otLen+ctLen+pcLen > len(s) || string(s[curPos:curPos+otLen]) != fe.openTag {
+					break
+				}
+				leafStart := curPos + otLen
+				leafEnd, nLine, nLinestart, ok := scanSimpleLeafEnd(s, leafStart, curOff+int64(otLen), curLine, curLinestart)
+				if !ok || leafEnd+ctLen+pcLen > len(s) || string(s[leafEnd:leafEnd+ctLen]) != fe.closeTag {
+					break
+				}
+				afterChild := leafEnd + ctLen
+				afterOff := curOff + int64(afterChild-curPos)
+				if afterChild < len(s) && s[afterChild] <= ' ' {
+					afterChild, afterOff, nLine, nLinestart = skipInlineXMLWS(s, afterChild, afterOff, nLine, nLinestart)
+				}
+				if afterChild+pcLen > len(s) || string(s[afterChild:afterChild+pcLen]) != fe.parentClose {
+					break
+				}
+				newPos := afterChild + pcLen
+				newOff := afterOff + int64(pcLen)
+				d.pos = newPos
+				d.offset = newOff
+				d.line = nLine
+				d.linestart = nLinestart
+
+				fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+				if err := assignFastScalarOrTime(fe.kind, fptr, s[leafStart:leafEnd]); err != nil {
+					return err
+				}
+				nextIdx++
+				pos, off, line, linestart = newPos, newOff, nLine, nLinestart
+				if pos < len(s) && s[pos] <= ' ' {
+					pos, off, line, linestart = skipInlineXMLWS(s, pos, off, line, linestart)
+					d.pos = pos
+					d.offset = off
+					d.line = line
+					d.linestart = linestart
+				}
+			}
+		}
+
 		var savedOffset int
 		if saveXMLPtr != nil {
 			savedOffset = d.savedOffset()
 		}
 		oldNoCopy := d.noCopyText
-		if noCopyStruct {
-			d.noCopyText = true
-		}
+		d.noCopyText = true
 		err := d.nextTokenInto(&tok)
 		d.noCopyText = oldNoCopy
 		if err != nil {
+			if saveXMLPtr != nil && saveXMLIndex == 0 {
+				d.saved = nil
+			}
 			return err
 		}
 		switch tok.kind {
 		case xtStartElement:
 			var consumed bool
-			if plan.elemByLocal != nil {
-				idx, ok := plan.elemByLocal[tok.name.Local]
-				if ok {
-					if idx >= 0 {
-						fe := &plan.elems[idx]
-						if fe.name.Space == "" || fe.name.Space == tok.name.Space {
-							fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
-							consumed = true
-							err = d.fastUnmarshalElem(fe, fptr, tok.name, tok.attr, tok.attrRaw)
-						}
-					} else if idx == -2 || plan.hasParents {
-						consumed, err = d.fastUnmarshalPath(plan, ptr, nil, tok.name, tok.attr, tok.attrRaw)
+			if nextIdx < len(plan.elems) {
+				fe := &plan.elems[nextIdx]
+				if fe.mode == fElement && len(fe.parents) == 0 && fe.name.Local == tok.name.Local && (fe.name.Space == "" || fe.name.Space == tok.name.Space) {
+					fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+					consumed = true
+					if fe.canFastField {
+						err = d.fastUnmarshalLeafField(fe, fptr)
 					} else {
-						consumed, err = d.fastMatchFlatElement(plan, ptr, tok.name, tok.attr, tok.attrRaw)
+						err = d.fastUnmarshalElem(fe, fptr, tok.name, tok.attr, tok.attrRaw)
+					}
+					if fe.kind != xkSlice {
+						nextIdx++
 					}
 				}
-			} else if !plan.hasParents {
-				consumed, err = d.fastMatchFlatElement(plan, ptr, tok.name, tok.attr, tok.attrRaw)
-			} else {
-				consumed, err = d.fastUnmarshalPath(plan, ptr, nil, tok.name, tok.attr, tok.attrRaw)
+			}
+			if !consumed {
+				if plan.elemByLocal != nil {
+					idx, ok := plan.elemByLocal[tok.name.Local]
+					if ok {
+						if idx >= 0 {
+							fe := &plan.elems[idx]
+							if fe.name.Space == "" || fe.name.Space == tok.name.Space {
+								fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+								consumed = true
+								if fe.canFastField {
+									err = d.fastUnmarshalLeafField(fe, fptr)
+								} else {
+									err = d.fastUnmarshalElem(fe, fptr, tok.name, tok.attr, tok.attrRaw)
+								}
+								if fe.kind != xkSlice {
+									nextIdx = idx + 1
+								} else {
+									nextIdx = idx
+								}
+							}
+						} else if idx == -2 || plan.hasParents {
+							consumed, err = d.fastUnmarshalPath(plan, ptr, nil, tok.name, tok.attr, tok.attrRaw)
+						} else {
+							consumed, err = d.fastMatchFlatElement(plan, ptr, tok.name, tok.attr, tok.attrRaw)
+						}
+					}
+				} else if !plan.hasParents {
+					var matchedIdx int
+					consumed, matchedIdx, err = d.fastMatchFlatElementIdx(plan, ptr, tok.name, tok.attr, tok.attrRaw)
+					if consumed {
+						if plan.elems[matchedIdx].kind != xkSlice {
+							nextIdx = matchedIdx + 1
+						} else {
+							nextIdx = matchedIdx
+						}
+					}
+				} else {
+					consumed, err = d.fastUnmarshalPath(plan, ptr, nil, tok.name, tok.attr, tok.attrRaw)
+				}
 			}
 			if err != nil {
+				if saveXMLPtr != nil && saveXMLIndex == 0 {
+					d.saved = nil
+				}
 				return err
 			}
 			if !consumed {
 				if saveAnyPtr != nil {
 					if saveAnyElem.plan != nil && saveAnyElem.plan.canFast {
 						if err := d.fastUnmarshalStart(saveAnyElem.plan, saveAnyPtr, tok.name, tok.attr, tok.attrRaw); err != nil {
+							if saveXMLPtr != nil && saveXMLIndex == 0 {
+								d.saved = nil
+							}
 							return err
 						}
 					} else {
 						st := StartElement{Name: tok.name, Attr: cloneAttrs(tok.attr, tok.attrRaw)}
 						if err := d.unmarshal(reflect.NewAt(saveAnyElem.rt, saveAnyPtr).Elem(), &st); err != nil {
+							if saveXMLPtr != nil && saveXMLIndex == 0 {
+								d.saved = nil
+							}
 							return err
 						}
 					}
 				} else if err := d.fastSkip(); err != nil {
+					if saveXMLPtr != nil && saveXMLIndex == 0 {
+						d.saved = nil
+					}
 					return err
 				}
 			}
@@ -1195,9 +1500,30 @@ func (d *Decoder) fastMatchFlatElement(plan *xmlDecodePlan, ptr unsafe.Pointer, 
 			continue
 		}
 		fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+		if fe.canFastField {
+			return true, d.fastUnmarshalLeafField(fe, fptr)
+		}
 		return true, d.fastUnmarshalElem(fe, fptr, startName, startAttr, startAttrRaw)
 	}
 	return false, nil
+}
+
+func (d *Decoder) fastMatchFlatElementIdx(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) (bool, int, error) {
+	for i := range plan.elems {
+		fe := &plan.elems[i]
+		if fe.mode != fElement || fe.name.Local != startName.Local {
+			continue
+		}
+		if fe.name.Space != "" && fe.name.Space != startName.Space {
+			continue
+		}
+		fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+		if fe.canFastField {
+			return true, i, d.fastUnmarshalLeafField(fe, fptr)
+		}
+		return true, i, d.fastUnmarshalElem(fe, fptr, startName, startAttr, startAttrRaw)
+	}
+	return false, -1, nil
 }
 
 func (d *Decoder) fastUnmarshalPath(plan *xmlDecodePlan, ptr unsafe.Pointer, parents []string, startName Name, startAttr []Attr, startAttrRaw [][]byte) (bool, error) {
@@ -1215,6 +1541,9 @@ Loop:
 		}
 		if len(fe.parents) == len(parents) && fe.name.Local == startName.Local {
 			fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
+			if fe.canFastField {
+				return true, d.fastUnmarshalLeafField(fe, fptr)
+			}
 			return true, d.fastUnmarshalElem(fe, fptr, startName, startAttr, startAttrRaw)
 		}
 		if len(fe.parents) > len(parents) && fe.parents[len(parents)] == startName.Local {
@@ -1253,6 +1582,9 @@ Loop:
 }
 
 func (d *Decoder) fastUnmarshalElem(fe *xmlDecodeElem, fptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) error {
+	if fe.canFastField {
+		return d.fastUnmarshalLeafField(fe, fptr)
+	}
 	if fe.plan != nil && fe.plan.canFast {
 		return d.fastUnmarshalStart(fe.plan, fptr, startName, startAttr, startAttrRaw)
 	}

@@ -81,12 +81,11 @@ const (
 //
 // Marshal will return an error if asked to marshal a channel, function, or map.
 func Marshal(v any) ([]byte, error) {
-	eb := getXmlMarshalEncoder()
 	at, ptr := xmlEfacePtr(&v)
 	if at == nil {
-		putXmlMarshalEncoder(eb)
 		return nil, nil
 	}
+	eb := getXmlMarshalEncoder()
 	plan := lookupXmlMarshalPlan(at)
 	if plan.canFast {
 		err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
@@ -166,13 +165,12 @@ type MarshalerAttr interface {
 // indented line that starts with prefix and is followed by one or more
 // copies of indent according to the nesting depth.
 func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
-	eb := getXmlMarshalEncoder()
-	eb.enc.Indent(prefix, indent)
 	at, ptr := xmlEfacePtr(&v)
 	if at == nil {
-		putXmlMarshalEncoder(eb)
 		return nil, nil
 	}
+	eb := getXmlMarshalEncoder()
+	eb.enc.Indent(prefix, indent)
 	plan := lookupXmlMarshalPlan(at)
 	if plan.canFast {
 		err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
