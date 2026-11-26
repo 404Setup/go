@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseSimpleHTTPURLParity(t *testing.T) {
@@ -267,4 +268,114 @@ func BenchmarkReadResponseBodyCoalloc(b *testing.B) {
 		}
 		resp.Body.Close()
 	}
+}
+
+func TestPersistConnTreqReuseConcurrentAndCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srv := &Server{
+		Handler: HandlerFunc(func(w ResponseWriter, r *Request) {
+			switch r.URL.Path {
+			case "/nobody":
+				w.Header().Set("X-Id", r.Header.Get("X-Id"))
+				w.WriteHeader(StatusNoContent)
+			case "/slow":
+				select {
+				case <-r.Context().Done():
+				case <-time.After(2 * time.Second):
+				}
+			default:
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = io.WriteString(w, r.URL.Path+":"+r.Header.Get("X-Id"))
+			}
+		}),
+	}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	tr := &Transport{
+		MaxIdleConnsPerHost: 2,
+		DisableKeepAlives:   false,
+	}
+	defer tr.CloseIdleConnections()
+	client := &Client{Transport: tr}
+	base := "http://" + ln.Addr().String()
+
+	// Reuse keep-alive persistConn with no-body (204) and normal body responses sequentially.
+	for i := range 20 {
+		path := "/ok"
+		if i%2 == 0 {
+			path = "/nobody"
+		}
+		req, err := NewRequest("GET", base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := string(rune('a' + (i % 26)))
+		req.Header.Set("X-Id", id)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("seq iter %d: %v", i, err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("seq iter %d ReadAll: %v", i, err)
+		}
+		if path == "/nobody" {
+			if got := resp.Header.Get("X-Id"); got != id {
+				t.Fatalf("seq iter %d X-Id=%q, want %q", i, got, id)
+			}
+		} else if string(b) != "/ok:"+id {
+			t.Fatalf("seq iter %d body=%q, want %q", i, b, "/ok:"+id)
+		}
+	}
+
+	// Concurrent reuse including canceled Request.Cancel and context cancellation.
+	var wg sync.WaitGroup
+	for g := range 6 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := range 20 {
+				if id == 0 && i%5 == 0 {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+					req, _ := NewRequestWithContext(ctx, "GET", base+"/slow", nil)
+					resp, err := client.Do(req)
+					cancel()
+					if err == nil {
+						resp.Body.Close()
+					}
+					continue
+				}
+				if id == 1 && i%5 == 0 {
+					ch := make(chan struct{})
+					req, _ := NewRequest("GET", base+"/slow", nil)
+					req.Cancel = ch
+					time.AfterFunc(5*time.Millisecond, func() { close(ch) })
+					resp, err := client.Do(req)
+					if err == nil {
+						resp.Body.Close()
+					}
+					continue
+				}
+				path := "/ok"
+				if (id+i)%2 == 0 {
+					path = "/nobody"
+				}
+				resp, err := client.Get(base + path)
+				if err != nil {
+					t.Errorf("conc(%d,%d): %v", id, i, err)
+					return
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}(g)
+	}
+	wg.Wait()
 }

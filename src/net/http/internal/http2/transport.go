@@ -801,7 +801,7 @@ func (cc *ClientConn) roundTrip(req *ClientRequest, streamf func(*clientStream))
 	cc.pendingRequests++
 	cc.mu.Unlock()
 
-	workerPool.Go(h2Task{kind: h2TaskDoRequest, cs: cs, creq: req, streamf: streamf})
+	workerPool.Go(h2Task{kind: h2TaskDoRequest, creq: req, streamf: streamf})
 
 	waitDone := func() error {
 		select {
@@ -2039,6 +2039,7 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		StatusCode: statusCode,
 		Status:     status,
 	}
+	var hasConnHeader bool
 	for _, hf := range regularFields {
 		key := rl.canonicalHeader(hf.Name)
 		if key == "Trailer" {
@@ -2051,6 +2052,10 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 				t[rl.canonicalHeader(v)] = nil
 			})
 		} else {
+			switch key {
+			case "Connection", "Keep-Alive", "Proxy-Connection", "Transfer-Encoding", "Upgrade":
+				hasConnHeader = true
+			}
 			vv := header[key]
 			if vv == nil && len(strs) > 0 {
 				// More than likely this will be a single-element key.
@@ -2127,8 +2132,10 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 	// and any message containing them is malformed. RFC 9113, Section 8.2.2.
 	res.ContentLength = -1
 	if len(res.Header) > 0 {
-		for _, k := range connHeaders {
-			delete(res.Header, k)
+		if hasConnHeader {
+			for _, k := range connHeaders {
+				delete(res.Header, k)
+			}
 		}
 		if clens, ok := res.Header["Content-Length"]; ok {
 			// Repeated Content-Length values may be collapsed into one only if
@@ -2137,9 +2144,12 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 			// extraneous whitespace per RFC 9113 Section 8.2.1.
 			// Non-canonical headers are already rejected by our framer at this
 			// point.
-			conflicting := slices.ContainsFunc(clens[1:], func(clen string) bool {
-				return clen != clens[0]
-			})
+			conflicting := false
+			if len(clens) > 1 {
+				conflicting = slices.ContainsFunc(clens[1:], func(clen string) bool {
+					return clen != clens[0]
+				})
+			}
 			cl, err := strconv.ParseUint(clens[0], 10, 63)
 			if conflicting || err != nil {
 				delete(res.Header, "Content-Length")
@@ -2173,12 +2183,14 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 	cs.bytesRemain = res.ContentLength
 	res.Body = transportResponseBody{cs}
 
-	if cs.requestedGzip && ascii.EqualFold(res.Header.Get("Content-Encoding"), "gzip") {
-		res.Header.Del("Content-Encoding")
-		res.Header.Del("Content-Length")
-		res.ContentLength = -1
-		res.Body = &httpcommon.GzipReader{Body: res.Body}
-		res.Uncompressed = true
+	if cs.requestedGzip {
+		if ce := res.Header["Content-Encoding"]; len(ce) > 0 && ascii.EqualFold(ce[0], "gzip") {
+			delete(res.Header, "Content-Encoding")
+			delete(res.Header, "Content-Length")
+			res.ContentLength = -1
+			res.Body = &httpcommon.GzipReader{Body: res.Body}
+			res.Uncompressed = true
+		}
 	}
 	return res, nil
 }

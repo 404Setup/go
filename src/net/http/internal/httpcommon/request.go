@@ -599,7 +599,39 @@ func parseCleanOriginRequestURI(rawURI string) *url.URL {
 	return &url.URL{Path: rawURI}
 }
 
+func parseCleanOriginRequestURIInto(rawURI string, dst *url.URL) bool {
+	if len(rawURI) == 0 || rawURI[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(rawURI); i++ {
+		c := rawURI[i]
+		if !cleanPathTable[c] {
+			if c == '?' && i > 0 {
+				for j := i + 1; j < len(rawURI); j++ {
+					qc := rawURI[j]
+					if qc < ' ' || qc == 0x7f {
+						return false
+					}
+				}
+				if i == len(rawURI)-1 {
+					*dst = url.URL{Path: rawURI[:i], ForceQuery: true}
+					return true
+				}
+				*dst = url.URL{Path: rawURI[:i], RawQuery: rawURI[i+1:]}
+				return true
+			}
+			return false
+		}
+	}
+	*dst = url.URL{Path: rawURI}
+	return true
+}
+
 func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
+	return NewServerRequestInto(rp, nil)
+}
+
+func NewServerRequestInto(rp ServerRequestParam, urlDst *url.URL) ServerRequestResult {
 	var needsContinue bool
 	var trailer map[string][]string
 	authority := rp.Authority
@@ -674,7 +706,12 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 	var url_ *url.URL
 	var requestURI string
 	if rp.Method == "CONNECT" && rp.Protocol == "" {
-		url_ = &url.URL{Host: authority}
+		if urlDst != nil {
+			*urlDst = url.URL{Host: authority}
+			url_ = urlDst
+		} else {
+			url_ = &url.URL{Host: authority}
+		}
 		requestURI = authority // mimic HTTP/1 server behavior
 	} else {
 		// "[The :path] pseudo-header field MUST NOT be empty [...]"
@@ -685,7 +722,9 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 			}
 		}
 
-		if u := parseCleanOriginRequestURI(rp.Path); u != nil {
+		if urlDst != nil && parseCleanOriginRequestURIInto(rp.Path, urlDst) {
+			url_ = urlDst
+		} else if u := parseCleanOriginRequestURI(rp.Path); u != nil {
 			url_ = u
 		} else {
 			var err error
@@ -694,6 +733,10 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 				return ServerRequestResult{
 					InvalidReason: "bad_path",
 				}
+			}
+			if urlDst != nil {
+				*urlDst = *url_
+				url_ = urlDst
 			}
 		}
 		requestURI = rp.Path

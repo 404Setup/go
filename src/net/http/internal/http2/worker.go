@@ -6,15 +6,15 @@ package http2
 
 import (
 	"internal/synctest"
+	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 const (
-	h2WorkerPoolShards      = 8
-	h2WorkerPoolMaxPerShard = 32
-	h2WorkerIdleTimeout     = 2 * time.Second
+	h2WorkerPoolShards       = 8
+	h2WorkerPoolMaxPerShard  = 32
+	h2WorkerRetainedPerShard = 8
 )
 
 type h2TaskKind uint8
@@ -32,13 +32,10 @@ type h2Task struct {
 	kind          h2TaskKind
 	sc            *serverConn
 	rw            *responseWriter
-	sreq          *ServerRequest
 	handleRequest func(*ResponseWriter, *ServerRequest) error
 	wr            FrameWriteRequest
 	wd            *writeData
-	wrh           *writeResHeaders
 	headerBlock   []byte
-	cs            *clientStream
 	creq          *ClientRequest
 	streamf       func(*clientStream)
 	fn            func()
@@ -47,15 +44,15 @@ type h2Task struct {
 func (t h2Task) run() {
 	switch t.kind {
 	case h2TaskRunHandler:
-		t.sc.runHandler(t.rw, t.sreq, t.handleRequest)
+		t.sc.runHandler(t.rw, &t.rw.rws.req, t.handleRequest)
 	case h2TaskWriteFrameAsync:
 		t.sc.writeFrameAsync(t.wr, t.wd)
 	case h2TaskWriteResHeadersAsync:
-		t.sc.writeResHeadersAsync(t.wr, t.wrh, t.headerBlock)
+		t.sc.writeResHeadersAsync(t.wr, t.wr.write.(*writeResHeaders), t.headerBlock)
 	case h2TaskWriteEmptyEndStreamAsync:
 		t.sc.writeEmptyEndStreamAsync(t.wr, t.wr.StreamID())
 	case h2TaskDoRequest:
-		t.cs.doRequest(t.creq, t.streamf)
+		(&t.creq.stream).doRequest(t.creq, t.streamf)
 	case h2TaskFunc:
 		t.fn()
 	}
@@ -66,8 +63,10 @@ type h2Worker struct {
 }
 
 type h2WorkerShard struct {
-	mu    sync.Mutex
-	ready []*h2Worker
+	mu      sync.Mutex
+	ready   []*h2Worker
+	gcArmed bool
+	_       [32]byte // pad to avoid false sharing across 64-byte cache lines
 }
 
 type h2WorkerPool struct {
@@ -102,47 +101,46 @@ func (p *h2WorkerPool) Go(task h2Task) {
 }
 
 func (p *h2WorkerPool) runWorker(w *h2Worker, task h2Task, shardIdx uint32) {
-	timer := time.NewTimer(h2WorkerIdleTimeout)
-	for {
+	task.run()
+	task = h2Task{}
+	if !p.putWorker(w, shardIdx) {
+		return
+	}
+	for task = range w.ch {
 		task.run()
 		task = h2Task{}
-
-		s := &p.shards[shardIdx]
-		s.mu.Lock()
-		if len(s.ready) >= h2WorkerPoolMaxPerShard {
-			s.mu.Unlock()
-			timer.Stop()
+		if !p.putWorker(w, shardIdx) {
 			return
-		}
-		s.ready = append(s.ready, w)
-		s.mu.Unlock()
-
-		timer.Reset(h2WorkerIdleTimeout)
-		select {
-		case task = <-w.ch:
-			timer.Stop()
-		case <-timer.C:
-			if p.removeIdleWorker(s, w) {
-				return
-			}
-			// A caller popped w right before removeIdleWorker locked s.mu.
-			task = <-w.ch
 		}
 	}
 }
 
-func (p *h2WorkerPool) removeIdleWorker(s *h2WorkerShard, target *h2Worker) bool {
+func (p *h2WorkerPool) putWorker(w *h2Worker, shardIdx uint32) bool {
+	s := &p.shards[shardIdx]
 	s.mu.Lock()
-	for i := len(s.ready) - 1; i >= 0; i-- {
-		if s.ready[i] == target {
-			last := len(s.ready) - 1
-			s.ready[i] = s.ready[last]
-			s.ready[last] = nil
-			s.ready = s.ready[:last]
-			s.mu.Unlock()
-			return true
-		}
+	if len(s.ready) >= h2WorkerPoolMaxPerShard {
+		s.mu.Unlock()
+		return false
+	}
+	s.ready = append(s.ready, w)
+	if len(s.ready) > h2WorkerRetainedPerShard && !s.gcArmed {
+		s.gcArmed = true
+		runtime.AddCleanup(new([16]byte), p.pruneShard, shardIdx)
 	}
 	s.mu.Unlock()
-	return false
+	return true
+}
+
+func (p *h2WorkerPool) pruneShard(shardIdx uint32) {
+	s := &p.shards[shardIdx]
+	s.mu.Lock()
+	s.gcArmed = false
+	for len(s.ready) > h2WorkerRetainedPerShard {
+		n := len(s.ready) - 1
+		w := s.ready[n]
+		s.ready[n] = nil
+		s.ready = s.ready[:n]
+		close(w.ch)
+	}
+	s.mu.Unlock()
 }

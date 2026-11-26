@@ -109,6 +109,7 @@ type ServerRequest struct {
 	ProtoMinor    int    // e.g. 0
 	Method        string
 	URL           *url.URL
+	URLValue      url.URL
 	Header        Header
 	Trailer       Header
 	Body          io.ReadCloser

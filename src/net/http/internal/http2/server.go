@@ -1550,7 +1550,7 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 			sc.wroteFrame(frameWriteResult{wr: wr, err: err})
 		} else {
 			sc.writingFrameAsync = true
-			workerPool.Go(h2Task{kind: h2TaskWriteResHeadersAsync, sc: sc, wr: wr, wrh: wrh, headerBlock: headerBlock})
+			workerPool.Go(h2Task{kind: h2TaskWriteResHeadersAsync, sc: sc, wr: wr, headerBlock: headerBlock})
 		}
 	} else if wd, ok := wr.write.(*writeData); ok {
 		// Encode the frame in the serve goroutine, to ensure we don't have
@@ -1567,6 +1567,7 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 
 func (sc *serverConn) writeEmptyEndStreamAsync(wr FrameWriteRequest, streamID uint32) {
 	err := sc.framer.WriteData(streamID, true, nil)
+	sc.beginServeSend()
 	sc.wroteFrameCh <- frameWriteResult{wr: wr, err: err}
 }
 
@@ -2640,22 +2641,22 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.ServerRequestParam) (*responseWriter, *ServerRequest, error) {
 	sc.serveG.check()
 
-	res := httpcommon.NewServerRequest(rp)
-	if res.InvalidReason != "" {
-		return nil, nil, sc.countError(res.InvalidReason, streamError(st.id, ErrCodeProtocol))
-	}
-
 	st.reqBodyStorage = requestBody{
-		conn:          sc,
-		stream:        st,
-		needsContinue: res.NeedsContinue,
+		conn:   sc,
+		stream: st,
 	}
 	st.reqBody = &st.reqBodyStorage
 	rw := sc.newResponseWriter(st)
+	res := httpcommon.NewServerRequestInto(rp, &rw.rws.req.URLValue)
+	if res.InvalidReason != "" {
+		responseWriterStatePool.Put(rw.rws)
+		return nil, nil, sc.countError(res.InvalidReason, streamError(st.id, ErrCodeProtocol))
+	}
+	st.reqBodyStorage.needsContinue = res.NeedsContinue
 	rw.rws.req = ServerRequest{
 		Context:    st.ctx,
 		Method:     rp.Method,
-		URL:        res.URL,
+		URLValue:   rw.rws.req.URLValue,
 		RemoteAddr: sc.remoteAddrStr,
 		Header:     rp.Header,
 		RequestURI: res.RequestURI,
@@ -2667,6 +2668,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 		Body:       st.reqBody,
 		Trailer:    res.Trailer,
 	}
+	rw.rws.req.URL = &rw.rws.req.URLValue
 	return rw, &rw.rws.req, nil
 }
 
@@ -2693,7 +2695,7 @@ func (sc *serverConn) scheduleHandler(st *stream, rw *responseWriter, req *Serve
 	maxHandlers := sc.advMaxStreams
 	if sc.curHandlers < maxHandlers {
 		sc.curHandlers++
-		workerPool.Go(h2Task{kind: h2TaskRunHandler, sc: sc, rw: rw, sreq: req, handleRequest: handleRequest})
+		workerPool.Go(h2Task{kind: h2TaskRunHandler, sc: sc, rw: rw, handleRequest: handleRequest})
 		return nil
 	}
 	if len(sc.unstartedHandlers) > int(4*sc.advMaxStreams) {
@@ -2728,7 +2730,7 @@ func (sc *serverConn) handlerDone() {
 			break
 		}
 		sc.curHandlers++
-		workerPool.Go(h2Task{kind: h2TaskRunHandler, sc: sc, rw: u.rw, sreq: u.req, handleRequest: u.handleRequest})
+		workerPool.Go(h2Task{kind: h2TaskRunHandler, sc: sc, rw: u.rw, handleRequest: u.handleRequest})
 		sc.unstartedHandlers[i] = unstartedHandler{} // don't retain references
 	}
 	sc.unstartedHandlers = sc.unstartedHandlers[i:]

@@ -424,8 +424,8 @@ func (pc *persistConn) RoundTrip(req *Request) (*Response, error) {
 		go awaitLegacyCancel(ctx, cancel, req)
 	}
 
-	treq := &transportRequest{Request: req, trace: trace, ctx: ctx, cancel: cancel}
-	resp, err := pc.roundTrip(treq)
+	treq := transportRequest{Request: req, trace: trace, ctx: ctx, cancel: cancel}
+	resp, err := pc.roundTrip(&treq)
 	if err != nil {
 		if cancel != nil {
 			cancel(err)

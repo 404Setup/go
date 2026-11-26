@@ -1085,6 +1085,14 @@ func (pc *persistConn) roundTripDone(trace *httptrace.ClientTrace) error {
 		panic("pconn is not in flight")
 	}
 	pc.inFlight = false
+	pc.treq.Request = nil
+	pc.treq.extra = nil
+	pc.treq.trace = nil
+	pc.treq.addedGzip = false
+	pc.treq.addedClose = false
+	pc.treq.ctx = nil
+	pc.treq.cancel = nil
+	pc.treq.err = nil
 	select {
 	case pc.availch <- struct{}{}:
 	default:
@@ -1733,6 +1741,8 @@ type persistConn struct {
 	// headers on each outbound request before it's written. (the
 	// original Request given to RoundTrip is not modified)
 	mutateHeaderFunc func(Header)
+
+	treq transportRequest
 }
 
 func (pc *persistConn) maxHeaderResponseSize() int64 {
@@ -1925,6 +1935,7 @@ func (pc *persistConn) readLoop() {
 
 		rc := <-pc.reqch
 		trace := rc.treq.trace
+		cancel := rc.treq.cancel
 
 		var resp *Response
 		if err == nil {
@@ -2009,8 +2020,8 @@ func (pc *persistConn) readLoop() {
 			if bodyWritable {
 				closeErr = errCallerOwnsConn
 			}
-			if rc.treq.cancel != nil {
-				rc.treq.cancel(errRequestDone)
+			if cancel != nil {
+				cancel(errRequestDone)
 			}
 
 			// Tell roundTrip that we've put the conn back into the pool.
@@ -2037,12 +2048,14 @@ func (pc *persistConn) readLoop() {
 			}
 			drainReader = rawBody
 		}
-		if rc.addedGzip && ascii.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-			resp.Body = &httpcommon.GzipReader{Body: resp.Body}
-			resp.Header.Del("Content-Encoding")
-			resp.Header.Del("Content-Length")
-			resp.ContentLength = -1
-			resp.Uncompressed = true
+		if rc.addedGzip {
+			if ce := resp.Header["Content-Encoding"]; len(ce) > 0 && ascii.EqualFold(ce[0], "gzip") {
+				resp.Body = &httpcommon.GzipReader{Body: resp.Body}
+				delete(resp.Header, "Content-Encoding")
+				delete(resp.Header, "Content-Length")
+				resp.ContentLength = -1
+				resp.Uncompressed = true
+			}
 		}
 
 		select {
@@ -2093,8 +2106,8 @@ func (pc *persistConn) readLoop() {
 			alive = false
 		}
 
-		if rc.treq.cancel != nil {
-			rc.treq.cancel(errRequestDone)
+		if cancel != nil {
+			cancel(errRequestDone)
 		}
 		testHookReadLoopBeforeNextRead()
 	}
@@ -2474,7 +2487,7 @@ func (pc *persistConn) handleResponse(req *transportRequest, startBytesWritten i
 	return re.res, nil
 }
 
-func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+func (pc *persistConn) roundTrip(inReq *transportRequest) (resp *Response, err error) {
 	testHookEnterRoundTrip()
 
 	pc.mu.Lock()
@@ -2483,7 +2496,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 		case <-pc.availch:
 		default:
 			pc.mu.Unlock()
-			if err := pc.waitForAvailability(req.ctx); err != nil {
+			if err := pc.waitForAvailability(inReq.ctx); err != nil {
 				return nil, err
 			}
 			pc.mu.Lock()
@@ -2492,6 +2505,15 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	pc.reserved = false
 	pc.inFlight = true
 	pc.numExpectedResponses++
+	pc.treq.Request = inReq.Request
+	pc.treq.extra = inReq.extra
+	pc.treq.trace = inReq.trace
+	pc.treq.addedGzip = inReq.addedGzip
+	pc.treq.addedClose = inReq.addedClose
+	pc.treq.ctx = inReq.ctx
+	pc.treq.cancel = inReq.cancel
+	pc.treq.err = inReq.err
+	req := &pc.treq
 	headerFn := pc.mutateHeaderFunc
 	pc.mu.Unlock()
 

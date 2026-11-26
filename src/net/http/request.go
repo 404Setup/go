@@ -876,7 +876,7 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, added
 	// :protocol is only valid in HTTP/2 and HTTP/3. Transport allows it through
 	// header validation because it has not selected a connection yet. If the
 	// request reaches this HTTP/1 writer, reject it since it's not allowed.
-	if r.Header.has(":protocol") {
+	if len(r.Header) > 0 && r.Header.has(":protocol") {
 		return errors.New("net/http: :protocol pseudo-header is not allowed in HTTP/1.x")
 	}
 
@@ -895,7 +895,7 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, added
 	}
 
 	method := valueOrDefault(r.Method, "GET")
-	hasUA := r.Header.has("User-Agent")
+	hasUA := len(r.Header) > 0 && r.Header.has("User-Agent")
 	wrotePreamble := false
 	if bufw, ok := w.(*bufio.Writer); ok {
 		need := len(method) + 1 + len(ruri) + len(" HTTP/1.1\r\nHost: ") + len(host) + 2
@@ -963,7 +963,7 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, added
 		}
 	}
 	if hasUA {
-		if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
+		if userAgent := r.Header.get("User-Agent"); userAgent != "" {
 			if strings.IndexByte(userAgent, '\r') >= 0 || strings.IndexByte(userAgent, '\n') >= 0 {
 				userAgent = headerNewlineToSpace.Replace(userAgent)
 			}

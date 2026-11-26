@@ -83,22 +83,26 @@ func (s *Server) serveHTTP2Conn(ctx context.Context, nc net.Conn, h Handler, saw
 	s.h2.ServeConn(nc, &http2.ServeConnOpts{
 		Context: ctx,
 		HandleRequest: func(w *http2.ResponseWriter, req *http2.ServerRequest) error {
-			return s.handleRequest(http2ResponseWriter{w}, &Request{
-				ctx:           req.Context,
-				Proto:         "HTTP/2.0",
-				ProtoMajor:    2,
-				ProtoMinor:    0,
-				Method:        req.Method,
-				URL:           req.URL,
-				Header:        Header(req.Header),
-				RequestURI:    req.RequestURI,
-				Trailer:       Header(req.Trailer),
-				Body:          req.Body,
-				Host:          req.Host,
-				ContentLength: req.ContentLength,
-				RemoteAddr:    req.RemoteAddr,
-				TLS:           req.TLS,
-			}, h)
+			ru := &requestWithURL{
+				req: Request{
+					ctx:           req.Context,
+					Proto:         "HTTP/2.0",
+					ProtoMajor:    2,
+					ProtoMinor:    0,
+					Method:        req.Method,
+					Header:        Header(req.Header),
+					RequestURI:    req.RequestURI,
+					Trailer:       Header(req.Trailer),
+					Body:          req.Body,
+					Host:          req.Host,
+					ContentLength: req.ContentLength,
+					RemoteAddr:    req.RemoteAddr,
+					TLS:           req.TLS,
+				},
+				url: req.URLValue,
+			}
+			ru.req.URL = &ru.url
+			return s.handleRequest(http2ResponseWriter{w}, &ru.req, h)
 		},
 		BaseConfig:       http2ServerConfig{s},
 		SawClientPreface: sawClientPreface,

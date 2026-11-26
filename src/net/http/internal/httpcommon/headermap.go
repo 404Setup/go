@@ -56,6 +56,8 @@ func LowerHeader(v string) (lower string, ascii bool) {
 		return "content-location", true
 	case "Content-Range":
 		return "content-range", true
+	case "Content-Security-Policy":
+		return "content-security-policy", true
 	case "Content-Type":
 		return "content-type", true
 	case "Cookie":
@@ -68,6 +70,8 @@ func LowerHeader(v string) (lower string, ascii bool) {
 		return "expect", true
 	case "Expires":
 		return "expires", true
+	case "Forwarded":
+		return "forwarded", true
 	case "From":
 		return "from", true
 	case "Host":
@@ -78,6 +82,8 @@ func LowerHeader(v string) (lower string, ascii bool) {
 		return "if-modified-since", true
 	case "If-None-Match":
 		return "if-none-match", true
+	case "If-Range":
+		return "if-range", true
 	case "If-Unmodified-Since":
 		return "if-unmodified-since", true
 	case "Last-Modified":
@@ -90,6 +96,8 @@ func LowerHeader(v string) (lower string, ascii bool) {
 		return "max-forwards", true
 	case "Origin":
 		return "origin", true
+	case "Pragma":
+		return "pragma", true
 	case "Proxy-Authenticate":
 		return "proxy-authenticate", true
 	case "Proxy-Authorization":
@@ -108,22 +116,42 @@ func LowerHeader(v string) (lower string, ascii bool) {
 		return "set-cookie", true
 	case "Strict-Transport-Security":
 		return "strict-transport-security", true
+	case "Te":
+		return "te", true
 	case "Trailer":
 		return "trailer", true
 	case "Transfer-Encoding":
 		return "transfer-encoding", true
+	case "Upgrade":
+		return "upgrade", true
 	case "User-Agent":
 		return "user-agent", true
 	case "Vary":
 		return "vary", true
 	case "Via":
 		return "via", true
+	case "Warning":
+		return "warning", true
 	case "Www-Authenticate":
 		return "www-authenticate", true
+	case "X-Content-Type-Options":
+		return "x-content-type-options", true
 	case "X-Forwarded-For":
 		return "x-forwarded-for", true
+	case "X-Forwarded-Host":
+		return "x-forwarded-host", true
 	case "X-Forwarded-Proto":
 		return "x-forwarded-proto", true
+	case "X-Frame-Options":
+		return "x-frame-options", true
+	case "X-Powered-By":
+		return "x-powered-by", true
+	case "X-Real-Ip":
+		return "x-real-ip", true
+	case "X-Request-Id":
+		return "x-request-id", true
+	case "X-Requested-With":
+		return "x-requested-with", true
 	}
 	return asciiToLower(v)
 }
@@ -185,6 +213,8 @@ func CachedCanonicalHeader(v string) (string, bool) {
 		return "Content-Location", true
 	case "content-range":
 		return "Content-Range", true
+	case "content-security-policy":
+		return "Content-Security-Policy", true
 	case "content-type":
 		return "Content-Type", true
 	case "cookie":
@@ -197,6 +227,8 @@ func CachedCanonicalHeader(v string) (string, bool) {
 		return "Expect", true
 	case "expires":
 		return "Expires", true
+	case "forwarded":
+		return "Forwarded", true
 	case "from":
 		return "From", true
 	case "host":
@@ -207,6 +239,8 @@ func CachedCanonicalHeader(v string) (string, bool) {
 		return "If-Modified-Since", true
 	case "if-none-match":
 		return "If-None-Match", true
+	case "if-range":
+		return "If-Range", true
 	case "if-unmodified-since":
 		return "If-Unmodified-Since", true
 	case "last-modified":
@@ -219,6 +253,8 @@ func CachedCanonicalHeader(v string) (string, bool) {
 		return "Max-Forwards", true
 	case "origin":
 		return "Origin", true
+	case "pragma":
+		return "Pragma", true
 	case "proxy-authenticate":
 		return "Proxy-Authenticate", true
 	case "proxy-authorization":
@@ -237,22 +273,42 @@ func CachedCanonicalHeader(v string) (string, bool) {
 		return "Set-Cookie", true
 	case "strict-transport-security":
 		return "Strict-Transport-Security", true
+	case "te":
+		return "Te", true
 	case "trailer":
 		return "Trailer", true
 	case "transfer-encoding":
 		return "Transfer-Encoding", true
+	case "upgrade":
+		return "Upgrade", true
 	case "user-agent":
 		return "User-Agent", true
 	case "vary":
 		return "Vary", true
 	case "via":
 		return "Via", true
+	case "warning":
+		return "Warning", true
 	case "www-authenticate":
 		return "Www-Authenticate", true
+	case "x-content-type-options":
+		return "X-Content-Type-Options", true
 	case "x-forwarded-for":
 		return "X-Forwarded-For", true
+	case "x-forwarded-host":
+		return "X-Forwarded-Host", true
 	case "x-forwarded-proto":
 		return "X-Forwarded-Proto", true
+	case "x-frame-options":
+		return "X-Frame-Options", true
+	case "x-powered-by":
+		return "X-Powered-By", true
+	case "x-real-ip":
+		return "X-Real-Ip", true
+	case "x-request-id":
+		return "X-Request-Id", true
+	case "x-requested-with":
+		return "X-Requested-With", true
 	}
 	return "", false
 }

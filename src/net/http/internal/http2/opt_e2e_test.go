@@ -5,12 +5,15 @@
 package http2_test
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -198,5 +201,92 @@ func TestHTTP2AllInvalidTrailersTerminatesStream(t *testing.T) {
 	}
 	if string(body) != "hello" {
 		t.Fatalf("body = %q, want hello", body)
+	}
+}
+
+func TestHTTP2WriteEmptyEndStreamAsyncParkingBalance(t *testing.T) {
+	ts, client := newH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "chunk")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Returning immediately after Flush triggers writeEmptyEndStreamAsync.
+	}))
+
+	// Repeated requests with Flush exercise sc.beginServeSend/writeEmptyEndStreamAsync
+	// and ensure clean connection parkState shutdown on ts.Close.
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := range 25 {
+				resp, err := client.Get(fmt.Sprintf("%s/flush/%d/%d", ts.URL, id, i))
+				if err != nil {
+					t.Errorf("Get(%d,%d): %v", id, i, err)
+					return
+				}
+				b, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err != nil || string(b) != "chunk" {
+					t.Errorf("Get(%d,%d) body=%q err=%v", id, i, b, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+func TestHTTP2ServerRequestURLCoallocAndResponseHeaders(t *testing.T) {
+	var mu sync.Mutex
+	var savedURLs []*url.URL
+	ts, client := newH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		savedURLs = append(savedURLs, r.URL)
+		mu.Unlock()
+
+		w.Header().Add("Content-Length", "invalid-cl")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("X-Query", r.URL.RawQuery)
+		gz := gzip.NewWriter(w)
+		_, _ = io.WriteString(gz, "path="+r.URL.Path+"&q="+r.URL.RawQuery)
+		_ = gz.Close()
+	}))
+
+	paths := []string{"/alpha?a=1", "/beta/two?b=2&c=3", "/gamma"}
+	for _, p := range paths {
+		resp, err := client.Get(ts.URL + p)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", p, err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("ReadAll(%q): %v", p, err)
+		}
+		if !resp.Uncompressed {
+			t.Fatalf("Get(%q) expected Uncompressed=true", p)
+		}
+		if got := resp.Header.Get("Content-Encoding"); got != "" {
+			t.Fatalf("Get(%q) expected Content-Encoding stripped, got %q", p, got)
+		}
+		u, _ := url.Parse(p)
+		want := "path=" + u.Path + "&q=" + u.RawQuery
+		if string(b) != want {
+			t.Fatalf("Get(%q) body = %q, want %q", p, b, want)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(savedURLs) != len(paths) {
+		t.Fatalf("savedURLs count = %d, want %d", len(savedURLs), len(paths))
+	}
+	for i, p := range paths {
+		u, _ := url.Parse(p)
+		if savedURLs[i].Path != u.Path || savedURLs[i].RawQuery != u.RawQuery {
+			t.Fatalf("retained URL[%d] mutated or wrong: got %+v, want %+v", i, savedURLs[i], u)
+		}
 	}
 }
