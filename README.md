@@ -7,21 +7,21 @@ This fork is a personal Go branch maintained by 404Setup.
 
 ## Features
 
-Preserves Go syntax and standard library API compatibility.
+Compatible with upstream Go syntax and standard library APIs.
 
-### Compiler & Runtime
-- **`cmd/compile`**: `-ldflags="-o2"` (loop unrolling, post-prove DCE), `-ldflags="-o3"` (cost-based inlining, loop interchange/tiling, cross-loop BCE, reflection/interface DCE), `-ldflags="-fmth"` (fast-math SSA), and stack SBO for non-escaping slices/strings (`all=` applies flags across dependencies).
-- **`runtime`**: span/stack/GC sweep optimizations and write-barrier deduplication.
-- **`cmd/go`, `cmd/internal/{archive,bio,buildid,goobj,obj}`**: sharded per-bucket cache indexes (`idx`) and small-blob packing (`pack`), single-pass pooled `GOCACHE` writes, 64 KiB `bio`/copy/hash buffers, skipped empty stdout and unmodified source caching, and bounds-checked LZ4 object compression (`\x00go120lz`; `__.PKGDEF` remains uncompressed).
+### Compiler, Toolchain & Runtime
+- **`cmd/compile`**: `-ldflags="-o2"` / `"-o3"` optimization tiers, `-ldflags="-fmth"` fast math, and stack allocation for non-escaping small slices/strings.
+- **`runtime`**: span and GC sweep improvements and write-barrier deduplication.
+- **`cmd/go`**: packed/sharded build cache (`GOCACHE`), pooled cache writes, 64 KiB I/O buffers, and LZ4 object compression.
 
 ### Standard Library
-- **`sync/v2`, `sync/v2/container`, `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, `LinkedHashMap`, `OrderedMap`, `TreeMap`, and `ConcurrentSkipListMap`.
-- **`encoding/base64`**: AVX2/SSSE3 (`amd64`), NEON/SVE2 (`arm64`) vector codecs, LUT4 scalar decode, and single-alloc `EncodeToString`.
-- **`encoding/hex`**: AVX2/SSSE3 (`amd64`) and NEON (`arm64`) vector encode/decode, LUT16 scalar encode, AVX2/packed `Dump`, zero-copy `DecodeString`, single-alloc `EncodeToString`, and large-buffer `Decoder.Read`.
-- **`encoding/json`, `encoding/json/v2`, `encoding/xml`**: compiled marshal/unmarshal plans, SWAR/SIMD scanning, pooled codecs, and generic `Append*`/`*Of` fast paths (`jsonv2` and `nojsonv2`).
-- **`fmt`, `internal/fmtsort`, `io`**: stack-buffered formatting/append fast paths, specialized `[]T` and map/slice comparators, direct string scanning, and exact-sized `io.ReadAll`.
-- **`net`, `net/http`, `net/textproto`, `net/http/server`, `net/url`**: TTL DNS cache (`GODEBUG=netdnscache=0`), fast `NewRequest` URL parsing and `ReadResponse` body co-allocation, lazy HTTP/2 stream contexts, sharded HTTP/2 worker pool and bounded header caches, `CanonicalMIMEHeaderKey` lowercase lookup with SWAR header value validation, zero-alloc `net/http/server` router, and fast `url.ParseQuery`.
+- **`sync/v2` & `sync/atomic/v2`**: generic `Pool[T]`, `Map[K, V]`, unboxed `atomic/v2.Value[T]`, and ordered/concurrent map containers.
+- **`encoding/json`, `json/v2`, `xml`**: compiled codec plans, pooled encoders/decoders, and fast ASCII/SIMD scanning.
+- **`encoding/base64` & `encoding/hex`**: AVX2/SSSE3 (`amd64`) and NEON/SVE2 (`arm64`) vector codecs with reduced allocations.
+- **`fmt` & `io`**: stack-buffered formatting fast paths and exact-sized `io.ReadAll`.
 - **`reflect`**: fast paths for `Equal`, `DeepEqual`, `Comparable`, `Call`, and `VisibleFields`.
+- **`net` & `net/url`**: TTL DNS cache (`GODEBUG=netdnscache=0`) and fast `url.ParseQuery`.
+- **`net/http`, `net/textproto`, `net/http/server`**: co-allocated request/response structs, reused transport and HTTP/2 stream state, sharded HTTP/2 worker pool, fast header canonicalization/validation, and a zero-alloc `net/http/server` router.
 
 ---
 
@@ -50,18 +50,19 @@ Measured on `linux/amd64` (Intel Xeon, `-cpu=2`) against upstream Go / pre-optim
 | `PoolValue` (32 B struct) | 25.90 ns | **6.23 ns** | **4.16×** | 1 (32 B) → **0 (0 B)** |
 | `atomic.Value` `Load` / `Store` / `CAS Mismatch` (128 B) | 1.03 / 17.18 / 69.03 ns | **0.35 / 5.77 / 9.79 ns** | **2.94× / 2.98× / 7.05×** | 0/1/1 → **0 allocs** |
 
-### Networking & HTTP (`net`, `net/http`, `net/textproto`, `net/http/server`)
+### Networking & HTTP (`net/http`, `net/textproto`, `net/http/server`, `net/http/httputil`)
 
-| Benchmark | Baseline (`Go 1.27.3` / Pre-opt) | Illium | Delta | Allocs |
+| Benchmark | Baseline | Illium | Delta | Allocs |
 | :--- | ---: | ---: | :--- | :---: |
-| `ClientServer/h1` (`1×` / `64×`) | 24.03 / 50.46 µs | **10.02 / 13.63 µs** | **-58.3% / -73.0%** | 65/105 → **20/39** |
-| `ClientServer/h2` (`1×` / `64×`) | 92.35 / 29.13 µs | **48.52 / 26.72 µs** | **-47.5% / -8.3%** | 27/26 → **20/19** |
-| `ClientServerParallel/64` (`https1`) | 818.8 µs | **29.45 µs** | **27.80×** | 795 → **58** |
-| `ServerFakeConn` (`KeepAlive` / `Lite`) | 7,414 / 4,031 ns | **2,374 / 759.4 ns** | **-68.0% / -81.2%** | 22/12 → **6/2** |
-| `NewRequestEmptyBody/Nil` | 655.5 ns | **462.9 ns** | **-29.4%** | 3 → **2** |
-| `textproto.CanonicalKey` (`LowerCommon`) | 93.9 ns | **12.56 ns** | **7.48×** | **0 allocs** |
-| `ReverseProxy.ServeHTTP` / `DNSLookupHost` | 6,124 / 44,548 ns | **602.4 / 1,241 ns** | **10.17× / 35.9×** | 12/74 → **7/1** |
-| `net/http/server` `Param1Route` / `ParallelParamRoute` | 227.0 / 117.0 ns | **83.05 / 41.55 ns** | **2.73× / 2.82×** | 1 → **0 allocs** |
+| `ClientServer/h1` (`1×` / `4×` / `64×`) | 23.50 / 12.50 / 25.30 µs | **21.60 / 10.43 / 23.77 µs** | **-8.1% / -16.6% / -6.0%** | 18/19/48 → **17/18/50** |
+| `ClientServer/https1` (`1×`) | 25.61 µs | **22.57 µs** | **-11.8%** | 18 → **17** |
+| `ClientServer/h2` (`1×` / `4×` / `64×`) | 44.22 / 27.48 / 25.23 µs | **39.75 / 23.25 / 23.93 µs** | **-10.1% / -15.4% / -5.1%** | 20/19/19 → **19/18/18** |
+| `ServerFakeConn` (`NoKeepAlive` / `KeepAlive`) | 15.72 / 3.60 µs | **14.57 / 3.66 µs** | **-7.3% / ~0%** | **24 / 8** |
+| `NewRequestSimpleURL` / `EmptyBody/Nil` | 477.2 / — ns | **451.8 / 424.7 ns** | **-5.3%** | **2** |
+| `ReadResponseBodyCoalloc` | 1,370 ns | **1,283 ns** | **-6.4%** | **5** |
+| `textproto.CanonicalKey` (`LowerCommon` / `CanonicalCommon`) | 11.42 / — ns | **11.06 / 3.40 ns** | **-3.2%** | **0** |
+| `net/http/server` (`Param1Route` / `ParallelParamRoute`) | — | **76.64 / 38.65 ns** | — | **0** |
+| `httputil` (`ReverseProxyStreaming` / `CopyHeader`) | — | **1,777 / 458.5 ns** | — | **15 / 1** |
 
 ### Encoding & Formatting
 
