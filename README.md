@@ -75,10 +75,11 @@ Measured on `linux/amd64` (Intel Xeon, `-cpu=2`) against upstream Go / pre-optim
 | Package | Benchmark | Baseline | Illium | Speedup / Notes |
 | :--- | :--- | ---: | ---: | :--- |
 | `encoding/base64` | `Encode` / `Decode` (32 KB) | 42.42 / 49.04 µs | **3.31 / 4.35 µs** | **12.83× / 11.27×** (9.9 / 10.0 GB/s, 0 allocs) |
-| `encoding/hex` | `Encode` / `Decode` (4 KB) | 5,413 / 3,014 ns | **327.4 / 275.5 ns** | **16.5× / 10.9×** (12.5 / 14.9 GB/s, 0 allocs) |
-| `encoding/hex` | `Encode` / `Decode` (16 KB) | 21,599 / 11,701 ns | **1,283 / 1,091 ns** | **16.8× / 10.7×** (12.8 / 15.0 GB/s, 0 allocs) |
-| `encoding/hex` | `EncodeToString` (8 KB) / `DecodeString` (4 KB) | 24,355 / 4,122 ns | **6,328 / 1,196 ns** | **3.85× / 3.45×** (1 alloc) |
-| `encoding/hex` | `Dump` (1 KB / 16 KB) | 21,879 / 387,694 ns | **2,532 / 33,310 ns** | **8.64× / 11.6×** (3 → **1 alloc**) |
+| `encoding/hex` | `Encode` / `Decode` (4 KB) | 5,413 / 3,014 ns | **271.8 / 272.4 ns** | **19.9× / 11.1×** (15.1 / 15.0 GB/s, 0 allocs) |
+| `encoding/hex` | `Encode` / `Decode` (16 KB) | 21,599 / 11,701 ns | **1,184 / 1,059 ns** | **18.2× / 11.0×** (13.8 / 15.5 GB/s, 0 allocs) |
+| `encoding/hex` | `EncodeToString` (8 KB) / `DecodeString` (4 KB) | 24,355 / 4,122 ns | **7,048 / 1,208 ns** | **3.46× / 3.41×** (1 alloc) |
+| `encoding/hex` | `Dump` (1 KB / 16 KB) | 21,879 / 387,694 ns | **2,462 / 30,950 ns** | **8.89× / 12.5×** (3 → **1 alloc**) |
+| `encoding/hex` | `Dumper` (4 KB) | 9,597 ns | **1,678 ns** | **5.72×** (2.44 GB/s, 1 alloc) |
 | `encoding/xml` | `Marshal` / `Unmarshal` / `EscapeTextPlain` | 7.80 / 21.11 / 12.31 µs | **1.19 / 4.54 / 0.25 µs** | **6.58× / 4.65× / 49.1×** |
 | `fmt` | `SprintfEmpty` / `SprintfInt` / `SprintfSliceInt` | 66.35 / 41.91 / 530.6 ns | **3.27 / 16.59 / 116.9 ns** | **20.3× / 2.53× / 4.54×** |
 
