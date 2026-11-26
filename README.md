@@ -46,13 +46,14 @@ Measured on `linux/amd64` (Intel Xeon, `-cpu=2`) against upstream Go / pre-optim
 
 | Benchmark | Baseline | Illium | Delta | Allocs |
 | :--- | ---: | ---: | :--- | :---: |
-| `ClientServer/h1` (`1×` / `4×` / `64×`) | 23.50 / 12.50 / 25.30 µs | **21.60 / 10.43 / 23.77 µs** | **-8.1% / -16.6% / -6.0%** | 18/19/48 → **17/18/50** |
-| `ClientServer/https1` (`1×`) | 25.61 µs | **22.57 µs** | **-11.8%** | 18 → **17** |
-| `ClientServer/h2` (`1×` / `4×` / `64×`) | 44.22 / 27.48 / 25.23 µs | **39.75 / 23.25 / 23.93 µs** | **-10.1% / -15.4% / -5.1%** | 20/19/19 → **19/18/18** |
-| `ServerFakeConn` (`NoKeepAlive` / `KeepAlive`) | 15.72 / 3.60 µs | **14.57 / 3.66 µs** | **-7.3% / ~0%** | **24 / 8** |
-| `NewRequestSimpleURL` / `EmptyBody/Nil` | 477.2 / — ns | **451.8 / 424.7 ns** | **-5.3%** | **2** |
-| `ReadResponseBodyCoalloc` | 1,370 ns | **1,283 ns** | **-6.4%** | **5** |
-| `textproto.CanonicalKey` (`LowerCommon` / `CanonicalCommon`) | 11.42 / — ns | **11.06 / 3.40 ns** | **-3.2%** | **0** |
+| `ClientServer/h1` (`1×` / `4×` / `64×`) | 23.50 / 12.50 / 25.30 µs | **21.60 / 10.43 / 23.77 µs** | **-8.1% / -16.6% / -6.0%** | 18/19/48 → **16/18/49** |
+| `ClientServer/https1` (`1×`) | 25.61 µs | **22.57 µs** | **-11.8%** | 18 → **16** |
+| `ClientServer/h2` (`1×` / `4×` / `64×`) | 44.22 / 27.48 / 25.23 µs | **39.75 / 23.25 / 23.93 µs** | **-10.1% / -15.4% / -5.1%** | 20/19/19 → **16/15/16** |
+| `ServerFakeConn` (`NoKeepAlive` / `KeepAlive`) | 15.72 / 3.60 µs | **14.57 / 3.44 µs** | **-7.3% / -4.4%** | **24 / 8** |
+| `ServeMux` (`SkipServe` / `Full` / `StaticPrefix`) | 28.10 / 56.97 / — µs | **19.45 / 46.10 / 0.11 µs** | **-30.8% / -19.1%** | **0 / 360 / 0** |
+| `NewRequestSimpleURL` / `EmptyBody/Nil` | 477.2 / — ns | **456.2 / 424.7 ns** | **-4.4%** | **2** |
+| `ReadResponseBodyCoalloc` | 1,370 ns | **1,353 ns** | **-1.2%** | 5 → **4** |
+| `textproto` (`CanonicalKey` / `ReadMIMEHeaderResp`) | 11.42 / — ns | **11.06 / 719.1 ns** | **-3.2%** | **0 / 3** |
 | `net/http/server` (`Param1Route` / `ParallelParamRoute`) | — | **76.64 / 38.65 ns** | — | **0** |
 | `httputil` (`ReverseProxyStreaming` / `CopyHeader`) | — | **1,777 / 458.5 ns** | — | **15 / 1** |
 
