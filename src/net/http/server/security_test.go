@@ -942,3 +942,66 @@ func TestSecurityDecompressOuterBodyCloseRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestSecurityHostHeaderInjectionAndRateLimitKeyFlood verifies that AllowHosts
+// blocks Host header smuggling/injection vectors and RateLimit bounds memory
+// via MaxKeys eviction under key-flooding attacks.
+func TestSecurityHostHeaderInjectionAndRateLimitKeyFlood(t *testing.T) {
+	s := server.New()
+	s.Use(server.AllowHosts("app.example.com", "*.tenant.example.com"))
+	s.Use(server.RateLimitWithConfig(server.RateLimitConfig{
+		Rate:    10,
+		Burst:   2,
+		MaxKeys: 128,
+	}))
+	s.GET("/ping", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "pong")
+	})
+
+	// Host injection vectors must be rejected before reaching handler.
+	for _, badHost := range []string{
+		"evil.com",
+		"tenant.example.com",
+		"eviltenant.example.com",
+		"app.example.com:evil",
+		"app.example.com\r\nX-Injected: 1",
+		"app.example.com@evil.com",
+		"app.example.com/path",
+		"sub..tenant.example.com",
+		"[::1",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://placeholder/ping", nil)
+		req.Host = badHost
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code == http.StatusOK {
+			t.Fatalf("Host %q was unexpectedly allowed", badHost)
+		}
+	}
+
+	// Simulate key-flooding from 500 distinct spoofed/ephemeral IPs with MaxKeys=128.
+	for i := range 500 {
+		req := httptest.NewRequest(http.MethodGet, "http://app.example.com/ping", nil)
+		req.RemoteAddr = fmt.Sprintf("203.0.%d.%d:1234", i/256, i%256)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("distinct IP %d status=%d, want 200", i, rec.Code)
+		}
+	}
+
+	// Victim IP still enforces its burst limit cleanly after key-flood eviction.
+	for i := range 3 {
+		req := httptest.NewRequest(http.MethodGet, "http://sub.tenant.example.com/ping", nil)
+		req.RemoteAddr = "198.51.100.77:5555"
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		want := http.StatusOK
+		if i == 2 {
+			want = http.StatusTooManyRequests
+		}
+		if rec.Code != want {
+			t.Fatalf("victim IP req %d: status=%d, want %d", i, rec.Code, want)
+		}
+	}
+}

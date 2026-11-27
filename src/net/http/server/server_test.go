@@ -606,3 +606,65 @@ func TestServerGroupPrefixValidationAndSentinelErrorHandling(t *testing.T) {
 		}
 	}
 }
+
+func TestServerMatchAtomicityErrorNilGuardsAndContextChecks(t *testing.T) {
+	s := server.New()
+	s.POST("/conflict", func(c *server.Context) error { return c.NoContent() })
+
+	// 1. Match panicking on a conflicting or invalid second method must leave routes unchanged.
+	for _, methods := range [][]string{
+		{http.MethodGet, http.MethodPost}, // POST conflicts with existing route
+		{http.MethodGet, http.MethodGet},  // duplicate method in Match
+		{http.MethodGet, "BAD METHOD"},    // invalid HTTP method
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("expected Match(%v) panic", methods)
+				}
+			}()
+			s.Match(methods, "/conflict", func(c *server.Context) error { return c.NoContent() })
+		}()
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/conflict", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("Match(%v) partially registered GET /conflict: status=%d, want 405", methods, rec.Code)
+		}
+	}
+
+	// 2. Typed-nil *HTTPError and stale Content-Range are handled safely without panicking.
+	s.GET("/typed-nil-err", func(c *server.Context) error {
+		c.SetHeader("Content-Range", "bytes 0-10/100")
+		var he *server.HTTPError
+		return he
+	})
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/typed-nil-err", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("typed-nil *HTTPError status = %d, want 500", rec.Code)
+	}
+	if cr := rec.Header().Get("Content-Range"); cr != "" {
+		t.Fatalf("stale Content-Range leaked on error: %q", cr)
+	}
+
+	// DefaultErrorHandler / JSONErrorHandler with nil context or nil error must not panic.
+	server.DefaultErrorHandler(nil, server.NewError(http.StatusBadRequest, "bad"))
+	server.JSONErrorHandler(nil, server.NewError(http.StatusBadRequest, "bad"))
+
+	// 3. Context lifecycle methods panic cleanly on nil context.
+	for _, fn := range []func(){
+		func() { _ = s.ListenAndServeContext(nil, "127.0.0.1:0") },
+		func() { _ = s.ListenAndServeTLSContext(nil, "127.0.0.1:0", "c", "k") },
+		func() { _ = s.ServeContext(nil, nil) },
+		func() { _ = s.ServeTLSContext(nil, nil, "c", "k") },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic on nil context")
+				}
+			}()
+			fn()
+		}()
+	}
+}

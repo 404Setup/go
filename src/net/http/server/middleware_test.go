@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
@@ -611,5 +612,220 @@ func TestMiddlewareBearerAuthAdaptHandlerAndLoggerFallback(t *testing.T) {
 			}()
 			fn()
 		}()
+	}
+}
+
+func TestMiddlewareAllowHosts(t *testing.T) {
+	s := server.New()
+	s.Use(server.AllowHosts("example.com", "localhost:8080", "*.api.example.com", "::1"))
+	s.GET("/ok", func(c *server.Context) error {
+		return c.Text(http.StatusOK, c.Host())
+	})
+
+	cases := []struct {
+		name   string
+		host   string
+		extra  string
+		status int
+	}{
+		{"exact", "example.com", "", http.StatusOK},
+		{"exact_case_and_any_port", "EXAMPLE.COM:8443", "", http.StatusOK},
+		{"port_specific_match", "localhost:8080", "", http.StatusOK},
+		{"port_specific_mismatch", "localhost:9090", "", http.StatusForbidden},
+		{"port_specific_missing_port", "localhost", "", http.StatusForbidden},
+		{"wildcard_single_label", "v1.api.example.com", "", http.StatusOK},
+		{"wildcard_multi_label", "eu.v2.api.example.com:443", "", http.StatusOK},
+		{"wildcard_apex_rejected", "api.example.com", "", http.StatusForbidden},
+		{"wildcard_prefix_attack_rejected", "evilapi.example.com", "", http.StatusForbidden},
+		{"ipv6_normalized", "[::1]:8080", "", http.StatusOK},
+		{"empty_host", "", "", http.StatusBadRequest},
+		{"malformed_slash", "example.com/evil", "", http.StatusBadRequest},
+		{"malformed_userinfo", "user@example.com", "", http.StatusBadRequest},
+		{"malformed_empty_label", "a..api.example.com", "", http.StatusBadRequest},
+		{"duplicate_host_header", "example.com", "evil.com", http.StatusBadRequest},
+		{"unlisted_host", "evil.com", "", http.StatusForbidden},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://placeholder/ok", nil)
+			req.Host = tc.host
+			if tc.extra != "" {
+				req.Header.Add("Host", tc.host)
+				req.Header.Add("Host", tc.extra)
+			}
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("Host=%q extra=%q: status=%d, want %d (body=%q)", tc.host, tc.extra, rec.Code, tc.status, rec.Body.String())
+			}
+		})
+	}
+
+	// Invalid AllowHosts arguments panic at registration.
+	for _, fn := range []func(){
+		func() { server.AllowHosts() },
+		func() { server.AllowHosts("") },
+		func() { server.AllowHosts("*") },
+		func() { server.AllowHosts("*.") },
+		func() { server.AllowHosts("bad host") },
+		func() { server.AllowHosts("a..b.com") },
+		func() { server.AllowHosts("example.com/path") },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected AllowHosts panic")
+				}
+			}()
+			fn()
+		}()
+	}
+}
+
+func TestMiddlewareRateLimitAndConfigValidation(t *testing.T) {
+	// 1. Burst and refill + Retry-After + Skip + custom OnLimit.
+	s := server.New()
+	s.Use(server.RateLimitWithConfig(server.RateLimitConfig{
+		Rate:  20, // 1 token per 50ms
+		Burst: 2,
+		Skip: func(c *server.Context) bool {
+			return c.Path() == "/health"
+		},
+	}))
+	s.GET("/api", func(c *server.Context) error { return c.NoContent() })
+	s.GET("/health", func(c *server.Context) error { return c.NoContent() })
+
+	for i := range 2 {
+		req := httptest.NewRequest(http.MethodGet, "/api", nil)
+		req.RemoteAddr = "198.51.100.1:1234"
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("burst req %d: status=%d, want 204", i, rec.Code)
+		}
+	}
+
+	// 3rd immediate request from same IP -> 429 with Retry-After >= 1.
+	req := httptest.NewRequest(http.MethodGet, "/api", nil)
+	req.RemoteAddr = "198.51.100.1:1234"
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("rate-limited req: status=%d Retry-After=%q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+
+	// Different IP has independent bucket.
+	req2 := httptest.NewRequest(http.MethodGet, "/api", nil)
+	req2.RemoteAddr = "198.51.100.2:1234"
+	rec2 := httptest.NewRecorder()
+	s.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusNoContent {
+		t.Fatalf("other IP status = %d, want 204", rec2.Code)
+	}
+
+	// Skipped route bypasses limiter.
+	for range 5 {
+		reqH := httptest.NewRequest(http.MethodGet, "/health", nil)
+		reqH.RemoteAddr = "198.51.100.1:1234"
+		recH := httptest.NewRecorder()
+		s.ServeHTTP(recH, reqH)
+		if recH.Code != http.StatusNoContent {
+			t.Fatalf("skipped /health status = %d, want 204", recH.Code)
+		}
+	}
+
+	// Wait for token refill and retry.
+	time.Sleep(70 * time.Millisecond)
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("post-refill status = %d, want 204", rec.Code)
+	}
+
+	// 2. Custom KeyFunc + OnLimit + MaxKeys eviction + concurrency under -race.
+	sConc := server.New()
+	sConc.Use(server.RateLimitWithConfig(server.RateLimitConfig{
+		Rate:    1000,
+		Burst:   5,
+		MaxKeys: 128,
+		KeyFunc: func(c *server.Context) string { return c.Header("X-Key") },
+		OnLimit: func(c *server.Context) error {
+			return c.Text(http.StatusTooManyRequests, "custom-limit:"+c.ResponseWriter().Header().Get("Retry-After"))
+		},
+	}))
+	sConc.GET("/k", func(c *server.Context) error { return c.Text(http.StatusOK, "ok") })
+
+	var wg sync.WaitGroup
+	for w := range 4 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := range 50 {
+				r := httptest.NewRequest(http.MethodGet, "/k", nil)
+				r.Header.Set("X-Key", string(rune('A'+id))+string(rune('0'+i%10)))
+				wrec := httptest.NewRecorder()
+				sConc.ServeHTTP(wrec, r)
+				if wrec.Code != http.StatusOK && wrec.Code != http.StatusTooManyRequests {
+					t.Errorf("unexpected status %d", wrec.Code)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// 3. Invalid RateLimit / RequestID / SecurityHeaders / CORS configs panic.
+	for _, fn := range []func(){
+		func() { server.RateLimit(0, 1) },
+		func() { server.RateLimit(-5, 1) },
+		func() { server.RateLimit(math.NaN(), 1) },
+		func() { server.RateLimit(math.Inf(1), 1) },
+		func() { server.RequestIDWithConfig(server.RequestIDConfig{Header: "Bad Header"}) },
+		func() { server.RequestIDWithConfig(server.RequestIDConfig{Header: "X-Bad\r\n"}) },
+		func() {
+			server.SecurityHeadersWithConfig(server.SecurityHeadersConfig{
+				ContentSecurityPolicy: "default-src 'self'\r\nX-Bad: 1",
+			})
+		},
+		func() { server.CORS(server.CORSConfig{AllowOrigins: []string{"https://a.com\r\n"}}) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected config validation panic")
+				}
+			}()
+			fn()
+		}()
+	}
+
+	// 4. CORS AllowOriginFunc with AllowCredentials=true must still reject Origin: *.
+	sCORS := server.New()
+	sCORS.Use(server.CORS(server.CORSConfig{
+		AllowOriginFunc:  func(origin string) bool { return true },
+		AllowHeaders:     []string{"*"},
+		AllowCredentials: true,
+	}))
+	sCORS.GET("/c", func(c *server.Context) error { return c.NoContent() })
+
+	reqStar := httptest.NewRequest(http.MethodGet, "/c", nil)
+	reqStar.Header.Set("Origin", "*")
+	recStar := httptest.NewRecorder()
+	sCORS.ServeHTTP(recStar, reqStar)
+	if recStar.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("CORS AllowOriginFunc with AllowCredentials allowed '*': %v", recStar.Header())
+	}
+
+	// Multiple Access-Control-Request-Headers lines echoed safely when AllowHeaders=["*"] and AllowCredentials=true.
+	reqPre := httptest.NewRequest(http.MethodOptions, "/c", nil)
+	reqPre.Header.Set("Origin", "https://app.example.com")
+	reqPre.Header.Set("Access-Control-Request-Method", "POST")
+	reqPre.Header.Add("Access-Control-Request-Headers", "X-One")
+	reqPre.Header.Add("Access-Control-Request-Headers", "X-Two")
+	recPre := httptest.NewRecorder()
+	sCORS.ServeHTTP(recPre, reqPre)
+	if recPre.Code != http.StatusNoContent || recPre.Header().Get("Access-Control-Allow-Headers") != "X-One, X-Two" {
+		t.Fatalf("CORS multi ACRH: code=%d allowHeaders=%q", recPre.Code, recPre.Header().Get("Access-Control-Allow-Headers"))
 	}
 }

@@ -11,11 +11,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -171,12 +174,26 @@ func RequestID() HandlerFunc {
 	return RequestIDWithConfig(RequestIDConfig{})
 }
 
+func hasHeaderControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b == 0 || b == '\r' || b == '\n' || (b < 0x20 && b != '\t') || b == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 // RequestIDWithConfig returns request ID middleware configured with cfg.
+// It panics if cfg.Header is non-empty and not a valid HTTP header field name.
 func RequestIDWithConfig(cfg RequestIDConfig) HandlerFunc {
 	header := cfg.Header
 	if header == "" {
 		header = "X-Request-Id"
 	} else {
+		if !isValidHTTPMethod(header) {
+			panic(fmt.Sprintf("server: invalid RequestID header name %q", header))
+		}
 		header = http.CanonicalHeaderKey(header)
 	}
 	gen := cfg.Generator
@@ -225,6 +242,7 @@ var (
 	headerValVaryOrigin = []string{"Origin"}[:1:1]
 	headerValWildcard   = []string{"*"}[:1:1]
 	headerValTrue       = []string{"true"}[:1:1]
+	headerValRetryOne   = []string{"1"}[:1:1]
 )
 
 // BodyLimit returns middleware that enforces a maximum request body size of
@@ -319,6 +337,7 @@ func SecurityHeaders() HandlerFunc {
 }
 
 // SecurityHeadersWithConfig returns security header middleware configured with cfg.
+// It panics if any configured header value contains control characters.
 func SecurityHeadersWithConfig(cfg SecurityHeadersConfig) HandlerFunc {
 	if cfg.ContentTypeOptions == "" {
 		cfg.ContentTypeOptions = "nosniff"
@@ -328,6 +347,19 @@ func SecurityHeadersWithConfig(cfg SecurityHeadersConfig) HandlerFunc {
 	}
 	if cfg.ReferrerPolicy == "" {
 		cfg.ReferrerPolicy = "strict-origin-when-cross-origin"
+	}
+	for _, v := range []string{
+		cfg.ContentTypeOptions,
+		cfg.FrameOptions,
+		cfg.ReferrerPolicy,
+		cfg.ContentSecurityPolicy,
+		cfg.StrictTransportSecurity,
+		cfg.PermissionsPolicy,
+		cfg.CrossOriginOpenerPolicy,
+	} {
+		if hasHeaderControl(v) {
+			panic("server: SecurityHeaders header value contains control character")
+		}
 	}
 	ctoSlice := []string{cfg.ContentTypeOptions}[:1:1]
 	foSlice := []string{cfg.FrameOptions}[:1:1]
@@ -401,11 +433,19 @@ type CORSConfig struct {
 // when no explicit OPTIONS route is registered.
 //
 // It panics if AllowCredentials is true and AllowOrigins contains "*",
-// preventing a common CORS security misconfiguration.
+// preventing a common CORS security misconfiguration, or if any configured
+// header or origin contains control characters.
 func CORS(cfg CORSConfig) HandlerFunc {
 	allowAll := slices.Contains(cfg.AllowOrigins, "*")
 	if cfg.AllowCredentials && allowAll {
 		panic("server: CORS AllowCredentials cannot be combined with wildcard '*' origin")
+	}
+	for _, list := range [][]string{cfg.AllowOrigins, cfg.AllowMethods, cfg.AllowHeaders, cfg.ExposeHeaders} {
+		for _, v := range list {
+			if hasHeaderControl(v) {
+				panic("server: CORS configuration contains control character")
+			}
+		}
 	}
 
 	var allowedSet map[string][]string
@@ -451,7 +491,7 @@ func CORS(cfg CORSConfig) HandlerFunc {
 			return c.Next()
 		}
 		origin := originHeaders[0]
-		if origin == "" || hasASCIIControl(origin) {
+		if origin == "" || hasHeaderControl(origin) {
 			return c.Next()
 		}
 
@@ -463,7 +503,7 @@ func CORS(cfg CORSConfig) HandlerFunc {
 
 		var originSlice []string
 		if cfg.AllowOriginFunc != nil {
-			if !cfg.AllowOriginFunc(origin) {
+			if (cfg.AllowCredentials && origin == "*") || !cfg.AllowOriginFunc(origin) {
 				if isPreflight {
 					return c.WriteStatus(http.StatusForbidden)
 				}
@@ -494,8 +534,14 @@ func CORS(cfg CORSConfig) HandlerFunc {
 		if isPreflight {
 			h["Access-Control-Allow-Methods"] = allowMethodsSlice
 			if allowWildcardHeaders && cfg.AllowCredentials {
-				if reqHdrs := c.canonicalReqHeader("Access-Control-Request-Headers"); reqHdrs != "" && !hasASCIIControl(reqHdrs) {
-					h["Access-Control-Allow-Headers"] = []string{reqHdrs}
+				if reqHdrs := c.req.Header["Access-Control-Request-Headers"]; len(reqHdrs) > 0 {
+					joined := reqHdrs[0]
+					if len(reqHdrs) > 1 {
+						joined = strings.Join(reqHdrs, ", ")
+					}
+					if joined != "" && !hasHeaderControl(joined) {
+						h["Access-Control-Allow-Headers"] = []string{joined}
+					}
 				}
 			} else if allowHeadersSlice != nil {
 				h["Access-Control-Allow-Headers"] = allowHeadersSlice
@@ -546,11 +592,7 @@ func BasicAuth(realm string, validator func(username, password string) bool) Han
 	wwwAuthSlice := []string{`Basic realm="` + safeRealm + `", charset="UTF-8"`}[:1:1]
 
 	return func(c *Context) error {
-		if len(c.req.Header["Authorization"]) != 1 {
-			c.respHeader()["Www-Authenticate"] = wwwAuthSlice
-			return NewError(http.StatusUnauthorized, "unauthorized")
-		}
-		user, pass, ok := c.req.BasicAuth()
+		user, pass, ok := c.BasicAuth()
 		if !ok || !validator(user, pass) {
 			c.respHeader()["Www-Authenticate"] = wwwAuthSlice
 			return NewError(http.StatusUnauthorized, "unauthorized")
@@ -645,4 +687,370 @@ func Adapt(mw func(http.Handler) http.Handler) HandlerFunc {
 		}
 		return nextErr
 	}
+}
+
+type allowedHostRule struct {
+	host     string // exact host or ".suffix" for wildcard subdomains
+	port     string // empty means any port is accepted
+	wildcard bool
+}
+
+// AllowHosts returns middleware that validates the incoming request Host
+// against hosts to protect against Host header injection and DNS rebinding.
+//
+// Each entry may be an exact host ("example.com", "localhost:8080", "[::1]")
+// or a wildcard subdomain ("*.example.com", "*.example.com:8443"). Entries
+// without an explicit port match any port; entries with a port match only that
+// port. Wildcard patterns require at least one subdomain label and do not match
+// the apex domain.
+//
+// Requests with missing, duplicated, or malformed Host headers receive 400 Bad
+// Request; valid hosts not in the allowlist receive 403 Forbidden. It panics if
+// hosts is empty or any entry is invalid.
+func AllowHosts(hosts ...string) HandlerFunc {
+	if len(hosts) == 0 {
+		panic("server: AllowHosts requires at least one host")
+	}
+	rules := make([]allowedHostRule, 0, len(hosts))
+	for _, raw := range hosts {
+		if raw == "" || raw == "*" {
+			panic(fmt.Sprintf("server: invalid AllowHosts entry %q", raw))
+		}
+		norm := raw
+		if strings.IndexByte(norm, '[') < 0 && strings.Count(norm, ":") >= 2 {
+			if addr, err := netip.ParseAddr(norm); err == nil && addr.Is6() && addr.Zone() == "" {
+				norm = "[" + addr.String() + "]"
+			}
+		}
+		h, p, ok := parseHostAuthority(norm)
+		if !ok {
+			panic(fmt.Sprintf("server: invalid AllowHosts entry %q", raw))
+		}
+		if strings.HasPrefix(h, "*.") {
+			suffix := h[1:] // ".example.com"
+			if len(suffix) <= 1 || strings.Contains(suffix, "*") || hasEmptyDotLabel(suffix[1:]) {
+				panic(fmt.Sprintf("server: invalid AllowHosts wildcard %q", raw))
+			}
+			rules = append(rules, allowedHostRule{
+				host:     suffix,
+				port:     p,
+				wildcard: true,
+			})
+			continue
+		}
+		if strings.Contains(h, "*") || hasEmptyDotLabel(h) {
+			panic(fmt.Sprintf("server: invalid AllowHosts entry %q", raw))
+		}
+		rules = append(rules, allowedHostRule{
+			host: h,
+			port: p,
+		})
+	}
+
+	return func(c *Context) error {
+		if len(c.req.Header["Host"]) > 1 {
+			return NewError(http.StatusBadRequest, "invalid host")
+		}
+		rawHost := c.req.Host
+		reqHost, reqPort, ok := parseHostAuthority(rawHost)
+		if !ok || hasEmptyDotLabel(reqHost) {
+			return NewError(http.StatusBadRequest, "invalid host")
+		}
+		for i := range rules {
+			r := &rules[i]
+			if r.port != "" && r.port != reqPort {
+				continue
+			}
+			if r.wildcard {
+				if matchWildcardHost(reqHost, r.host) {
+					return c.Next()
+				}
+			} else if asciiEqualFold(reqHost, r.host) {
+				return c.Next()
+			}
+		}
+		return NewError(http.StatusForbidden, "host not allowed")
+	}
+}
+
+func parseHostAuthority(s string) (host, port string, ok bool) {
+	if s == "" {
+		return "", "", false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b <= 0x20 || b >= 0x7f {
+			return "", "", false
+		}
+		switch b {
+		case '/', '\\', '@', '?', '#', ',':
+			return "", "", false
+		}
+	}
+	if s[0] == '[' {
+		closeIdx := strings.IndexByte(s, ']')
+		if closeIdx <= 1 || strings.IndexByte(s[1:closeIdx], '[') >= 0 {
+			return "", "", false
+		}
+		host = s[:closeIdx+1]
+		rem := s[closeIdx+1:]
+		if rem == "" {
+			return host, "", true
+		}
+		if rem[0] != ':' || len(rem) == 1 {
+			return "", "", false
+		}
+		port = rem[1:]
+		if !isASCIIPort(port) {
+			return "", "", false
+		}
+		return host, port, true
+	}
+	if strings.IndexByte(s, '[') >= 0 || strings.IndexByte(s, ']') >= 0 {
+		return "", "", false
+	}
+	colon := strings.IndexByte(s, ':')
+	if colon < 0 {
+		return s, "", true
+	}
+	if colon == 0 {
+		return "", "", false
+	}
+	port = s[colon+1:]
+	if strings.IndexByte(port, ':') >= 0 || !isASCIIPort(port) {
+		return "", "", false
+	}
+	return s[:colon], port, true
+}
+
+func isASCIIPort(p string) bool {
+	if len(p) == 0 || len(p) > 5 {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < '0' || p[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func hasEmptyDotLabel(s string) bool {
+	if s == "" {
+		return true
+	}
+	if s[0] == '.' || s[len(s)-1] == '.' {
+		return true
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] == '.' && s[i-1] == '.' {
+			return true
+		}
+	}
+	return false
+}
+
+func matchWildcardHost(reqHost, suffix string) bool {
+	if len(reqHost) <= len(suffix) {
+		return false
+	}
+	split := len(reqHost) - len(suffix)
+	if !asciiEqualFold(reqHost[split:], suffix) {
+		return false
+	}
+	return !hasEmptyDotLabel(reqHost[:split])
+}
+
+// RateLimitConfig configures [RateLimitWithConfig] token-bucket rate limiting.
+type RateLimitConfig struct {
+	// Rate is the sustained number of requests allowed per second per key.
+	// Must be positive and finite.
+	Rate float64
+
+	// Burst is the maximum burst size allowed per key.
+	// Default (<= 0) is max(1, int(Rate)).
+	Burst int
+
+	// MaxKeys bounds the number of tracked keys in memory to prevent
+	// unbounded memory growth from spoofed keys. Default (<= 0) is 65536.
+	MaxKeys int
+
+	// KeyFunc extracts the rate-limiting key for each request.
+	// Default is (*Context).ClientIP.
+	KeyFunc func(*Context) string
+
+	// Skip optionally bypasses rate limiting for matching requests.
+	Skip func(*Context) bool
+
+	// OnLimit optionally handles requests that exceed the rate limit after
+	// Retry-After has been populated. Default returns 429 Too Many Requests.
+	OnLimit func(*Context) error
+}
+
+// RateLimit returns per-client-IP token-bucket rate limiting middleware with
+// sustained requestsPerSecond and burst capacity.
+// It panics if requestsPerSecond is not positive and finite.
+func RateLimit(requestsPerSecond float64, burst int) HandlerFunc {
+	return RateLimitWithConfig(RateLimitConfig{
+		Rate:  requestsPerSecond,
+		Burst: burst,
+	})
+}
+
+const (
+	rateLimitShards      = 64
+	defaultRateLimitKeys = 65536
+	rateLimitEvictSample = 16
+)
+
+type rateBucket struct {
+	tokens  float64
+	lastSec float64
+}
+
+type rateLimitShard struct {
+	mu      sync.Mutex
+	buckets map[string]rateBucket
+	_       [64]byte
+}
+
+// RateLimitWithConfig returns token-bucket rate limiting middleware configured
+// with cfg. It panics if cfg.Rate is not positive and finite.
+func RateLimitWithConfig(cfg RateLimitConfig) HandlerFunc {
+	if math.IsNaN(cfg.Rate) || math.IsInf(cfg.Rate, 0) || cfg.Rate <= 0 {
+		panic("server: RateLimit Rate must be positive and finite")
+	}
+	burst := cfg.Burst
+	if burst <= 0 {
+		if cfg.Rate >= float64(math.MaxInt) {
+			burst = math.MaxInt
+		} else {
+			burst = int(cfg.Rate)
+		}
+		if burst < 1 {
+			burst = 1
+		}
+	}
+	maxKeys := cfg.MaxKeys
+	if maxKeys <= 0 {
+		maxKeys = defaultRateLimitKeys
+	}
+	perShard := (maxKeys + rateLimitShards - 1) / rateLimitShards
+	if perShard < 1 {
+		perShard = 1
+	}
+
+	shards := make([]rateLimitShard, rateLimitShards)
+	for i := range shards {
+		shards[i].buckets = make(map[string]rateBucket)
+	}
+
+	keyFn := cfg.KeyFunc
+	if keyFn == nil {
+		keyFn = (*Context).ClientIP
+	}
+	rate := cfg.Rate
+	floatBurst := float64(burst)
+	epoch := time.Now()
+
+	return func(c *Context) error {
+		if cfg.Skip != nil && cfg.Skip(c) {
+			return c.Next()
+		}
+		key := keyFn(c)
+		sh := &shards[fnv64aString(key)&(rateLimitShards-1)]
+		now := time.Since(epoch).Seconds()
+
+		sh.mu.Lock()
+		b, ok := sh.buckets[key]
+		if !ok {
+			if len(sh.buckets) >= perShard {
+				evictRateBucket(sh.buckets, now, rate, floatBurst)
+			}
+			sh.buckets[key] = rateBucket{
+				tokens:  floatBurst - 1,
+				lastSec: now,
+			}
+			sh.mu.Unlock()
+			return c.Next()
+		}
+
+		elapsed := now - b.lastSec
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		tokens := b.tokens + elapsed*rate
+		if tokens > floatBurst {
+			tokens = floatBurst
+		}
+		if tokens < 1.0 {
+			b.tokens = tokens
+			b.lastSec = now
+			sh.buckets[key] = b
+			sh.mu.Unlock()
+
+			waitSec := (1.0 - tokens) / rate
+			retryAfter := int(math.Ceil(waitSec))
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			if retryAfter == 1 {
+				c.respHeader()["Retry-After"] = headerValRetryOne
+			} else {
+				c.respHeader()["Retry-After"] = []string{strconv.Itoa(retryAfter)}
+			}
+			if cfg.OnLimit != nil {
+				return cfg.OnLimit(c)
+			}
+			return NewError(http.StatusTooManyRequests, "too many requests")
+		}
+
+		b.tokens = tokens - 1.0
+		b.lastSec = now
+		sh.buckets[key] = b
+		sh.mu.Unlock()
+		return c.Next()
+	}
+}
+
+func evictRateBucket(buckets map[string]rateBucket, now, rate, floatBurst float64) {
+	var oldestKey string
+	var oldestTime float64
+	hasOldest := false
+	checked := 0
+	for k, b := range buckets {
+		elapsed := now - b.lastSec
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		if b.tokens+elapsed*rate >= floatBurst {
+			delete(buckets, k)
+			return
+		}
+		if !hasOldest || b.lastSec < oldestTime {
+			oldestKey = k
+			oldestTime = b.lastSec
+			hasOldest = true
+		}
+		checked++
+		if checked >= rateLimitEvictSample {
+			break
+		}
+	}
+	if hasOldest {
+		delete(buckets, oldestKey)
+	}
+}
+
+func fnv64aString(s string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	var h uint64 = offset64
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
 }

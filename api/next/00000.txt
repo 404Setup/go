@@ -29,6 +29,7 @@ pkg net/http/server, const RequestIDKey = "server.request_id" #80000
 pkg net/http/server, const RequestIDKey ideal-string #80000
 pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80000
 pkg net/http/server, func AdaptHandler(http.Handler) HandlerFunc #80000
+pkg net/http/server, func AllowHosts(...string) HandlerFunc #80000
 pkg net/http/server, func BasicAuth(string, func(string, string) bool) HandlerFunc #80000
 pkg net/http/server, func BearerAuth(string, func(*Context, string) bool) HandlerFunc #80000
 pkg net/http/server, func BodyLimit(int64) HandlerFunc #80000
@@ -51,6 +52,8 @@ pkg net/http/server, func NewError(int, string) *HTTPError #80000
 pkg net/http/server, func NewGzipCompressor(int) Compressor #80000
 pkg net/http/server, func NewGzipDecompressor() Decompressor #80000
 pkg net/http/server, func NewWithConfig(Config) *Server #80000
+pkg net/http/server, func RateLimit(float64, int) HandlerFunc #80000
+pkg net/http/server, func RateLimitWithConfig(RateLimitConfig) HandlerFunc #80000
 pkg net/http/server, func Recover() HandlerFunc #80000
 pkg net/http/server, func RecoverWithConfig(RecoverConfig) HandlerFunc #80000
 pkg net/http/server, func RequestID() HandlerFunc #80000
@@ -61,6 +64,7 @@ pkg net/http/server, func Timeout(time.Duration) HandlerFunc #80000
 pkg net/http/server, func WrapError(int, string, error) *HTTPError #80000
 pkg net/http/server, method (*Context) Accepts(...string) string #80000
 pkg net/http/server, method (*Context) AddHeader(string, string) #80000
+pkg net/http/server, method (*Context) BasicAuth() (string, string, bool) #80000
 pkg net/http/server, method (*Context) BearerToken() (string, bool) #80000
 pkg net/http/server, method (*Context) BindJSON(interface{}) error #80000
 pkg net/http/server, method (*Context) BindJSONStrict(interface{}) error #80000
@@ -91,6 +95,7 @@ pkg net/http/server, method (*Context) HeaderValues(string) []string #80000
 pkg net/http/server, method (*Context) Host() string #80000
 pkg net/http/server, method (*Context) JSON(int, interface{}) error #80000
 pkg net/http/server, method (*Context) JSONIndented(int, interface{}, string, string) error #80000
+pkg net/http/server, method (*Context) LookupParam(string) (string, bool) #80000
 pkg net/http/server, method (*Context) LookupQuery(string) (string, bool) #80000
 pkg net/http/server, method (*Context) Method() string #80000
 pkg net/http/server, method (*Context) Next() error #80000
@@ -247,6 +252,13 @@ pkg net/http/server, type HandlerFunc func(*Context) error #80000
 pkg net/http/server, type LoggerConfig struct #80000
 pkg net/http/server, type LoggerConfig struct, Logger *slog.Logger #80000
 pkg net/http/server, type LoggerConfig struct, Skip func(*Context) bool #80000
+pkg net/http/server, type RateLimitConfig struct #80000
+pkg net/http/server, type RateLimitConfig struct, Burst int #80000
+pkg net/http/server, type RateLimitConfig struct, KeyFunc func(*Context) string #80000
+pkg net/http/server, type RateLimitConfig struct, MaxKeys int #80000
+pkg net/http/server, type RateLimitConfig struct, OnLimit func(*Context) error #80000
+pkg net/http/server, type RateLimitConfig struct, Rate float64 #80000
+pkg net/http/server, type RateLimitConfig struct, Skip func(*Context) bool #80000
 pkg net/http/server, type RecoverConfig struct #80000
 pkg net/http/server, type RecoverConfig struct, Logger *slog.Logger #80000
 pkg net/http/server, type RecoverConfig struct, OnPanic func(*Context, interface{}, []uint8) #80000

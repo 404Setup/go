@@ -567,14 +567,63 @@ func (g *Group) Handle(method, pattern string, handlers ...HandlerFunc) {
 }
 
 // Match registers handlers on the group for each HTTP method in methods
-// matching pattern. It panics if methods is empty.
+// matching pattern. It panics if methods is empty, any method or handler is
+// invalid, or any route conflicts, leaving existing routes unchanged on panic.
 func (g *Group) Match(methods []string, pattern string, handlers ...HandlerFunc) {
 	if len(methods) == 0 {
 		panic("server: Match requires at least one HTTP method")
 	}
 	for _, m := range methods {
-		g.Handle(m, pattern, handlers...)
+		if m != "" && !isValidHTTPMethod(m) {
+			panic(fmt.Sprintf("server: invalid HTTP method %q", m))
+		}
 	}
+	if len(handlers) == 0 {
+		panic("server: at least one handler is required")
+	}
+	for _, h := range handlers {
+		if h == nil {
+			panic("server: nil handler")
+		}
+	}
+
+	fullPattern := joinPattern(g.prefix, pattern)
+	parsed, err := parsePattern(fullPattern)
+	if err != nil {
+		panic("server: " + err.Error())
+	}
+
+	g.server.mu.Lock()
+	defer g.server.mu.Unlock()
+
+	chain := buildChain(g.middlewares, handlers)
+	cur := g.server.snap.Load()
+	next := cur.cloneShallow()
+	routes := make([]RouteInfo, len(cur.routes), len(cur.routes)+len(methods))
+	copy(routes, cur.routes)
+
+	for _, method := range methods {
+		entry := &routeEntry{
+			method:     method,
+			pattern:    fullPattern,
+			paramNames: parsed.paramNames,
+			chain:      chain,
+		}
+		mr := next.cloneOrCreateMethodRouter(method, parsed.isStatic)
+		if err := mr.add(parsed, entry); err != nil {
+			panic("server: " + err.Error())
+		}
+		displayMethod := method
+		if displayMethod == "" {
+			displayMethod = "*"
+		}
+		routes = append(routes, RouteInfo{
+			Method:  displayMethod,
+			Pattern: fullPattern,
+		})
+	}
+	next.routes = routes
+	g.server.snap.Store(next)
 }
 
 // GET registers handlers for HTTP GET requests matching pattern.
@@ -710,7 +759,7 @@ func joinPattern(prefix, pattern string) string {
 
 func (s *Server) execChain(c *Context, chain []HandlerFunc) {
 	cs := s.compSnap.Load()
-	if (c.req.Body != nil && c.req.Body != http.NoBody) ||
+	if (!cs.disableDecompression && cs.hasAnyDecompressor && c.req.Body != nil && c.req.Body != http.NoBody && len(c.req.Header["Content-Encoding"]) > 0) ||
 		(!cs.disabled && cs.hasAnyCompressor && c.req.Method != http.MethodHead && len(c.req.Header["Accept-Encoding"]) > 0) {
 		s.execChainWithCompression(c, chain, cs)
 		return
@@ -1115,6 +1164,9 @@ func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
 // canceled, then performs a graceful shutdown bounded by Config.ShutdownTimeout.
 // Returns nil when shutdown completes cleanly after ctx cancellation.
 func (s *Server) ListenAndServeContext(ctx context.Context, addr string) error {
+	if ctx == nil {
+		panic("server: nil context")
+	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -1127,6 +1179,9 @@ func (s *Server) ListenAndServeContext(ctx context.Context, addr string) error {
 // is canceled, then performs a graceful shutdown bounded by Config.ShutdownTimeout.
 // Returns nil when shutdown completes cleanly after ctx cancellation.
 func (s *Server) ListenAndServeTLSContext(ctx context.Context, addr, certFile, keyFile string) error {
+	if ctx == nil {
+		panic("server: nil context")
+	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -1154,6 +1209,9 @@ func (s *Server) ServeTLSContext(ctx context.Context, ln net.Listener, certFile,
 }
 
 func (s *Server) serveWithContext(ctx context.Context, serveFn func() error) error {
+	if ctx == nil {
+		panic("server: nil context")
+	}
 	_ = s.HTTPServer()
 	errCh := make(chan error, 1)
 	go func() {

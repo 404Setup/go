@@ -89,7 +89,7 @@ func classifyError(err error) (code int, msg string, internal bool) {
 		return http.StatusOK, "", false
 	}
 	var he *HTTPError
-	if errors.As(err, &he) {
+	if errors.As(err, &he) && he != nil {
 		code = he.Code
 		if code < 400 || code > 599 {
 			code = http.StatusInternalServerError
@@ -101,7 +101,7 @@ func classifyError(err error) (code int, msg string, internal bool) {
 		return code, msg, code >= 500
 	}
 	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
+	if errors.As(err, &maxBytesErr) && maxBytesErr != nil {
 		return http.StatusRequestEntityTooLarge, "request body too large", false
 	}
 	if errors.Is(err, ErrBodyTooLarge) {
@@ -130,6 +130,7 @@ func clearStaleErrorHeaders(h http.Header) {
 	delete(h, "Content-Length")
 	delete(h, "Content-Encoding")
 	delete(h, "Content-Disposition")
+	delete(h, "Content-Range")
 	delete(h, "Etag")
 	delete(h, "Last-Modified")
 	delete(h, "Accept-Ranges")
@@ -140,7 +141,7 @@ func clearStaleErrorHeaders(h http.Header) {
 // does nothing. Internal errors are logged when a server logger is configured
 // and are never exposed to the client.
 func DefaultErrorHandler(c *Context, err error) {
-	if err == nil {
+	if c == nil || err == nil {
 		return
 	}
 	code, msg, internal := classifyError(err)
@@ -177,7 +178,7 @@ type jsonErrorBody struct {
 // it does nothing. Internal errors are logged when a server logger is
 // configured and are never exposed to the client.
 func JSONErrorHandler(c *Context, err error) {
-	if err == nil {
+	if c == nil || err == nil {
 		return
 	}
 	code, msg, internal := classifyError(err)

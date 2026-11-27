@@ -448,3 +448,53 @@ func BenchmarkParamsIter(b *testing.B) {
 		s.ServeHTTP(&w, req)
 	}
 }
+
+func BenchmarkAllowHosts(b *testing.B) {
+	s := server.New()
+	s.Use(server.AllowHosts("api.example.com", "*.tenant.example.com"))
+	s.GET("/ok", func(c *server.Context) error {
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://v1.tenant.example.com/ok", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}
+
+func BenchmarkRateLimit(b *testing.B) {
+	s := server.New()
+	s.Use(server.RateLimit(1e9, 1e9))
+	s.GET("/ok", func(c *server.Context) error {
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.RemoteAddr = "198.51.100.1:1234"
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}
+
+func BenchmarkLookupParam(b *testing.B) {
+	s := server.New()
+	s.GET("/users/{id}", func(c *server.Context) error {
+		_, _ = c.LookupParam("id")
+		_, _ = c.LookupParam("missing")
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/users/42", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}

@@ -371,18 +371,28 @@ func (c *Context) HandleError(err error) {
 
 // Param returns the value of the named path parameter, or "" if not present.
 func (c *Context) Param(name string) string {
+	v, _ := c.LookupParam(name)
+	return v
+}
+
+// LookupParam returns the value of the named path parameter and reports
+// whether that parameter is present on the matched route.
+func (c *Context) LookupParam(name string) (string, bool) {
 	if c.entry == nil {
-		return ""
+		return "", false
 	}
 	for i, k := range c.entry.paramNames {
 		if k == name {
-			if uint(i) < maxInlineParams {
-				return c.paramBuf[i]
+			if i >= c.nParams {
+				return "", false
 			}
-			return c.paramExtra[i-maxInlineParams]
+			if uint(i) < maxInlineParams {
+				return c.paramBuf[i], true
+			}
+			return c.paramExtra[i-maxInlineParams], true
 		}
 	}
-	return ""
+	return "", false
 }
 
 // Params returns an iterator over all matched route parameter name-value pairs
@@ -701,8 +711,8 @@ func (c *Context) ContentType() string {
 }
 
 // BearerToken extracts a bearer token from the Authorization request header
-// per RFC 6750. It returns ("", false) if the header is absent, does not use
-// the Bearer scheme, or contains an empty or malformed token.
+// per RFC 6750. It returns ("", false) if the header is absent, duplicated,
+// does not use the Bearer scheme, or contains an empty or malformed token.
 func (c *Context) BearerToken() (string, bool) {
 	auth := c.canonicalReqHeader("Authorization")
 	if len(auth) <= 7 {
@@ -722,6 +732,16 @@ func (c *Context) BearerToken() (string, bool) {
 		}
 	}
 	return tok, true
+}
+
+// BasicAuth extracts the username and password from the Authorization request
+// header using HTTP Basic Authentication (RFC 7617). It returns ("", "", false)
+// if the header is absent, duplicated, or malformed.
+func (c *Context) BasicAuth() (username, password string, ok bool) {
+	if len(c.req.Header["Authorization"]) != 1 {
+		return "", "", false
+	}
+	return c.req.BasicAuth()
 }
 
 // Scheme returns "https" if the request arrived over TLS or via a configured
@@ -1662,9 +1682,9 @@ func (c *Context) Stream(code int, contentType string, r io.Reader) error {
 }
 
 // Redirect responds with an HTTP redirect to target using the given 3xx status
-// code. Control characters in target are rejected.
+// code (excluding 304 Not Modified). Control characters in target are rejected.
 func (c *Context) Redirect(code int, target string) error {
-	if code < 300 || code > 308 {
+	if code < 300 || code > 308 || code == http.StatusNotModified {
 		return fmt.Errorf("server: invalid redirect status code %d", code)
 	}
 	for i := 0; i < len(target); i++ {

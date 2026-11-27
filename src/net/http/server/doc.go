@@ -58,6 +58,9 @@
 //   - [Context.ClientIP] and [Context.Scheme] ignore X-Forwarded-For,
 //     X-Real-IP, and X-Forwarded-Proto unless the direct peer matches
 //     Config.TrustedProxies.
+//   - [AllowHosts] protects against Host header injection and DNS rebinding,
+//     and [RateLimit]/[RateLimitWithConfig] provide bounded sharded token-bucket
+//     rate limiting.
 //   - [Server.StaticDir] confines filesystem access using [os.OpenRoot] and
 //     disables directory listing by default; use [Context.DownloadFS] with a
 //     confined [fs.FS] when serving user-selected downloads.

@@ -1013,3 +1013,75 @@ func TestContextDownloadAndDownloadFSAndStreamNil(t *testing.T) {
 		t.Fatalf("/nocontent-twice: code=%d, want 202", rec.Code)
 	}
 }
+
+func TestContextLookupParamBasicAuthAndRedirect304(t *testing.T) {
+	s := server.New()
+
+	s.GET("/static", func(c *server.Context) error {
+		v, ok := c.LookupParam("id")
+		return c.Text(http.StatusOK, fmt.Sprintf("%q:%v", v, ok))
+	})
+	s.GET("/wild/{path...}", func(c *server.Context) error {
+		v, ok := c.LookupParam("path")
+		_, otherOK := c.LookupParam("other")
+		return c.Text(http.StatusOK, fmt.Sprintf("%q:%v:%v", v, ok, otherOK))
+	})
+	s.GET("/many/{p1}/{p2}/{p3}/{p4}/{p5}/{p6}/{p7}/{p8}/{p9}", func(c *server.Context) error {
+		v9, ok9 := c.LookupParam("p9")
+		_, miss := c.LookupParam("p10")
+		return c.Text(http.StatusOK, fmt.Sprintf("%s:%v:%v", v9, ok9, miss))
+	})
+	s.GET("/basic-ctx", func(c *server.Context) error {
+		u, p, ok := c.BasicAuth()
+		return c.Text(http.StatusOK, fmt.Sprintf("%s:%s:%v", u, p, ok))
+	})
+	s.GET("/redir-304", func(c *server.Context) error {
+		return c.Redirect(http.StatusNotModified, "/target")
+	})
+
+	// Static route: LookupParam returns ("", false)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != `"":false` {
+		t.Fatalf("/static LookupParam = %q", rec.Body.String())
+	}
+
+	// Empty wildcard match: LookupParam returns ("", true) while unknown param returns false
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/wild/", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != `"":true:false` {
+		t.Fatalf("/wild/ LookupParam = %q", rec.Body.String())
+	}
+
+	// >8 params overflow LookupParam
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/many/1/2/3/4/5/6/7/8/9", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "9:true:false" {
+		t.Fatalf("/many LookupParam = %q", rec.Body.String())
+	}
+
+	// Context.BasicAuth valid, missing, and duplicate header smuggling
+	req := httptest.NewRequest(http.MethodGet, "/basic-ctx", nil)
+	req.SetBasicAuth("alice", "s3cr3t")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "alice:s3cr3t:true" {
+		t.Fatalf("valid BasicAuth: %q", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/basic-ctx", nil)
+	req.SetBasicAuth("alice", "s3cr3t")
+	req.Header.Add("Authorization", "Basic Ym9iOmJhZA==")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "::false" {
+		t.Fatalf("duplicate BasicAuth should fail: %q", rec.Body.String())
+	}
+
+	// Redirect(304) must fail with 500 instead of writing body on 304
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/redir-304", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("Redirect(304) status = %d, want 500", rec.Code)
+	}
+}
