@@ -1445,3 +1445,53 @@ func TestDecompressUnlimitedWithMaxBodyBytesErrorLimit(t *testing.T) {
 		t.Fatalf("MaxBytesError.Limit = %d, want 64", maxErr.Limit)
 	}
 }
+
+func TestStackedGzipDecompressionBombBypass(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.MaxBodyBytes = 1024
+	cfg.Compression.MaxDecompressedBytes = 1024
+	s := server.NewWithConfig(cfg)
+	s.POST("/upload", func(c *server.Context) error {
+		b, err := c.BodyBytes()
+		if err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, fmt.Sprintf("read=%d", len(b)))
+	})
+
+	var emptyMember bytes.Buffer
+	gw := gzip.NewWriter(&emptyMember)
+	_ = gw.Close()
+	inner := bytes.Repeat(emptyMember.Bytes(), 500_000)
+
+	var outer bytes.Buffer
+	gw2 := gzip.NewWriter(&outer)
+	_, _ = gw2.Write(inner)
+	_ = gw2.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/upload", &outer)
+	req.Header.Set("Content-Encoding", "gzip, gzip")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("got status %d (%q), want 413", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDisableCompressionWithCompressMiddleware(t *testing.T) {
+	s := server.New()
+	s.Use(server.Compress())
+	s.GET("/secret", func(c *server.Context) error {
+		c.DisableCompression()
+		return c.Text(http.StatusOK, strings.Repeat("secret-token-", 200))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/secret", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if ce := rec.Header().Get("Content-Encoding"); ce != "" {
+		t.Fatalf("Content-Encoding = %q despite DisableCompression()", ce)
+	}
+}
+

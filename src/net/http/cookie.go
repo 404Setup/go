@@ -273,7 +273,9 @@ func parseSetCookie(line string, c *Cookie) error {
 				continue
 			}
 		}
-		c.Unparsed = append(c.Unparsed, part)
+		if ascii.IsPrint(attr) {
+			c.Unparsed = append(c.Unparsed, part)
+		}
 	}
 	return nil
 }

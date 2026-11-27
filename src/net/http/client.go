@@ -261,8 +261,8 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 	resp, err = rt.RoundTrip(req)
 	if err != nil {
 		stopTimer()
-		if didTimeoutFn != nil {
-			didTimeout = didTimeoutFn()
+		if didTimeoutFn != nil && didTimeoutFn() {
+			didTimeout = true
 		} else if timeoutCtx != nil {
 			didTimeout = timeoutCtx.Err() == context.DeadlineExceeded
 		}
@@ -376,7 +376,8 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 
 	var cancelCtx func()
 	if timeBeforeContextDeadline(deadline, oldCtx) {
-		req.ctx, cancelCtx = context.WithDeadline(oldCtx, deadline)
+		timeoutCtx, cancelCtx = context.WithDeadline(oldCtx, deadline)
+		req.ctx = timeoutCtx
 	}
 
 	cancel := make(chan struct{})
@@ -406,7 +407,7 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 		}
 	}()
 
-	return stopTimer, nil, timedOut.Load
+	return stopTimer, timeoutCtx, timedOut.Load
 }
 
 // See 2 (end of page 4) https://www.ietf.org/rfc/rfc2617.txt
@@ -1042,8 +1043,8 @@ func (b *cancelTimerBody) Read(p []byte) (n int, err error) {
 		return n, err
 	}
 	var timedOut bool
-	if b.reqDidTimeout != nil {
-		timedOut = b.reqDidTimeout()
+	if b.reqDidTimeout != nil && b.reqDidTimeout() {
+		timedOut = true
 	} else if b.timeoutCtx != nil {
 		timedOut = b.timeoutCtx.Err() == context.DeadlineExceeded
 	}

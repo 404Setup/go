@@ -1147,4 +1147,12 @@ func BenchmarkCookieParseAndFormat(b *testing.B) {
 	}
 }
 
-
+func TestParseSetCookieNonASCIIUnparsed(t *testing.T) {
+	c, err := ParseSetCookie("a=b; \x7f=1; \xff=2; Custom=ok")
+	if err != nil {
+		t.Fatalf("ParseSetCookie: %v", err)
+	}
+	if len(c.Unparsed) != 1 || c.Unparsed[0] != "Custom=ok" {
+		t.Fatalf("c.Unparsed = %#v, want [\"Custom=ok\"]", c.Unparsed)
+	}
+}

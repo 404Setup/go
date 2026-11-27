@@ -598,6 +598,7 @@ type decompressReadCloser struct {
 	ctx             *Context
 	rawSrc          io.ReadCloser
 	srcLimit        limitedByteCountReader
+	layerLimits     [maxContentEncodingLayers - 1]limitedByteCountReader
 	layers          [maxContentEncodingLayers]*decompressorHolder
 	opened          [maxContentEncodingLayers]io.ReadCloser
 	openedPooled    [maxContentEncodingLayers]bool
@@ -616,6 +617,18 @@ type decompressReadCloser struct {
 	err             error
 }
 
+func (d *decompressReadCloser) limitExceeded() bool {
+	if d.srcLimit.exceeded {
+		return true
+	}
+	for i := 0; i < d.nLayers-1; i++ {
+		if d.layerLimits[i].exceeded {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *decompressReadCloser) init() error {
 	d.initialized = true
 	limit := d.configuredLimit
@@ -626,8 +639,9 @@ func (d *decompressReadCloser) init() error {
 	d.srcErrLimit = limit
 
 	var cur io.Reader = d.rawSrc
+	var rawLimit int64
 	if limit > 0 {
-		rawLimit := limit
+		rawLimit = limit
 		if rawLimit <= (1<<63-1)-compressedInputHeadroom {
 			rawLimit += compressedInputHeadroom
 		} else {
@@ -638,7 +652,7 @@ func (d *decompressReadCloser) init() error {
 	} else if d.ctx != nil {
 		if bodyLimit := d.ctx.effectiveMaxBodyBytes(); bodyLimit > 0 {
 			d.srcErrLimit = bodyLimit
-			rawLimit := bodyLimit
+			rawLimit = bodyLimit
 			if rawLimit <= (1<<63-1)-compressedInputHeadroom {
 				rawLimit += compressedInputHeadroom
 			} else {
@@ -650,6 +664,10 @@ func (d *decompressReadCloser) init() error {
 	}
 
 	for i := 0; i < d.nLayers; i++ {
+		if rawLimit > 0 && i > 0 {
+			d.layerLimits[i-1] = limitedByteCountReader{r: cur, remaining: rawLimit}
+			cur = &d.layerLimits[i-1]
+		}
 		rc, resettable, err := d.layers[i].acquire(cur)
 		if err != nil {
 			d.failed = true
@@ -679,13 +697,14 @@ func (d *decompressReadCloser) Read(p []byte) (int, error) {
 		// Probe for one more byte to verify whether the stream actually ends at limit.
 		var probe [1]byte
 		n, err := d.reader.Read(probe[:])
-		if d.srcLimit.exceeded || n > 0 {
+		exceeded := d.limitExceeded()
+		if exceeded || n > 0 {
 			d.failed = true
 			if d.ctx != nil {
 				d.ctx.markRequestTooLarge()
 			}
 			errLimit := d.limit
-			if d.srcLimit.exceeded && errLimit <= 0 {
+			if exceeded && errLimit <= 0 {
 				errLimit = d.srcErrLimit
 			}
 			d.err = WrapError(http.StatusRequestEntityTooLarge, "request body too large", fmt.Errorf("%w: %w", ErrBodyTooLarge, &http.MaxBytesError{Limit: errLimit}))
@@ -709,7 +728,7 @@ func (d *decompressReadCloser) Read(p []byte) (int, error) {
 	}
 
 	n, err := d.reader.Read(p)
-	if d.srcLimit.exceeded {
+	if d.limitExceeded() {
 		d.failed = true
 		if d.ctx != nil {
 			d.ctx.markRequestTooLarge()
@@ -771,6 +790,9 @@ func (d *decompressReadCloser) finish(panicked bool) {
 	d.closeOpenedLayers(d.eof && !d.failed && !panicked)
 	for i := 0; i < d.nLayers; i++ {
 		d.layers[i] = nil
+	}
+	for i := range d.layerLimits {
+		d.layerLimits[i] = limitedByteCountReader{}
 	}
 	d.ctx = nil
 	d.rawSrc = nil
@@ -1091,6 +1113,17 @@ func (w *compressResponseWriter) disable() {
 		} else {
 			w.mode = compressBypassed
 		}
+	}
+	for rw := w.rw; rw != nil; {
+		if inner, ok := rw.(*compressResponseWriter); ok {
+			inner.disable()
+			break
+		}
+		u, ok := rw.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		rw = u.Unwrap()
 	}
 }
 
