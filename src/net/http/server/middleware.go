@@ -98,13 +98,18 @@ func Logger(logger *slog.Logger) HandlerFunc {
 // LoggerWithConfig returns structured request logging middleware configured
 // with cfg.
 func LoggerWithConfig(cfg LoggerConfig) HandlerFunc {
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
+	configuredLogger := cfg.Logger
 	return func(c *Context) error {
 		if cfg.Skip != nil && cfg.Skip(c) {
 			return c.Next()
+		}
+		logger := configuredLogger
+		if logger == nil {
+			if c.server != nil && c.server.logger != nil {
+				logger = c.server.logger
+			} else {
+				logger = slog.Default()
+			}
 		}
 		start := time.Now()
 		err := c.Next()
@@ -519,6 +524,15 @@ func CrossOriginProtection(p *http.CrossOriginProtection) HandlerFunc {
 	}
 }
 
+func sanitizeAuthRealm(realm string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '"' || r == '\\' {
+			return -1
+		}
+		return r
+	}, realm)
+}
+
 // BasicAuth returns HTTP Basic Authentication middleware.
 // The validator function should use [ConstantTimeEqual] when comparing secrets.
 func BasicAuth(realm string, validator func(username, password string) bool) HandlerFunc {
@@ -528,13 +542,7 @@ func BasicAuth(realm string, validator func(username, password string) bool) Han
 	if realm == "" {
 		realm = "Restricted"
 	}
-	// Sanitize realm to prevent header/quote injection.
-	safeRealm := strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || r == '"' || r == '\\' {
-			return -1
-		}
-		return r
-	}, realm)
+	safeRealm := sanitizeAuthRealm(realm)
 	wwwAuthSlice := []string{`Basic realm="` + safeRealm + `", charset="UTF-8"`}[:1:1]
 
 	return func(c *Context) error {
@@ -551,10 +559,60 @@ func BasicAuth(realm string, validator func(username, password string) bool) Han
 	}
 }
 
+// BearerAuth returns HTTP Bearer Token Authentication middleware (RFC 6750).
+// It extracts the token using [Context.BearerToken] and passes it to validator.
+// When comparing static tokens, validator should use [ConstantTimeEqual].
+func BearerAuth(realm string, validator func(c *Context, token string) bool) HandlerFunc {
+	if validator == nil {
+		panic("server: nil BearerAuth validator")
+	}
+	var wwwAuthSlice []string
+	if realm != "" {
+		wwwAuthSlice = []string{`Bearer realm="` + sanitizeAuthRealm(realm) + `", charset="UTF-8"`}[:1:1]
+	} else {
+		wwwAuthSlice = []string{"Bearer"}[:1:1]
+	}
+
+	return func(c *Context) error {
+		tok, ok := c.BearerToken()
+		if !ok || !validator(c, tok) {
+			c.respHeader()["Www-Authenticate"] = wwwAuthSlice
+			return NewError(http.StatusUnauthorized, "unauthorized")
+		}
+		return c.Next()
+	}
+}
+
 // ConstantTimeEqual reports whether strings a and b have identical contents
 // without leaking timing information about matching prefixes.
 func ConstantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// AdaptHandler converts a standard [http.Handler] into a [HandlerFunc].
+// Matched path parameters are copied onto Request via [http.Request.SetPathValue].
+// It panics if h is nil.
+func AdaptHandler(h http.Handler) HandlerFunc {
+	if h == nil {
+		panic("server: nil http.Handler")
+	}
+	return func(c *Context) error {
+		if c.entry != nil {
+			for i, name := range c.entry.paramNames {
+				var val string
+				if i < c.nParams {
+					if i < maxInlineParams {
+						val = c.paramBuf[i]
+					} else {
+						val = c.paramExtra[i-maxInlineParams]
+					}
+				}
+				c.req.SetPathValue(name, val)
+			}
+		}
+		h.ServeHTTP(c.ResponseWriter(), c.req)
+		return nil
+	}
 }
 
 // Adapt converts a standard net/http middleware of the form

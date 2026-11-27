@@ -413,3 +413,38 @@ func BenchmarkMaxInFlight(b *testing.B) {
 		s.ServeHTTP(&w, req)
 	}
 }
+
+func BenchmarkLookupQuery(b *testing.B) {
+	s := server.New()
+	s.GET("/search", func(c *server.Context) error {
+		_, _ = c.LookupQuery("page")
+		_, _ = c.LookupQuery("missing")
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/search?q=golang&page=2&sort=desc&limit=50", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}
+
+func BenchmarkParamsIter(b *testing.B) {
+	s := server.New()
+	s.GET("/orgs/{org}/repos/{repo}/issues/{issue}", func(c *server.Context) error {
+		for k, v := range c.Params() {
+			_, _ = k, v
+		}
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/orgs/golang/repos/go/issues/12345", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}

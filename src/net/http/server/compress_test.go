@@ -1495,3 +1495,98 @@ func TestDisableCompressionWithCompressMiddleware(t *testing.T) {
 	}
 }
 
+type failingWriteResetWriter struct {
+	dst        io.Writer
+	failWrites bool
+	reused     *atomic.Bool
+	writes     int
+}
+
+func (w *failingWriteResetWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.failWrites {
+		return 0, errors.New("simulated write failure")
+	}
+	return w.dst.Write(p)
+}
+
+func (w *failingWriteResetWriter) Close() error {
+	// Intentionally returns nil even after Write failed to verify compressResponseWriter
+	// does not rely solely on Close() error when deciding whether to pool.
+	return nil
+}
+
+func (w *failingWriteResetWriter) Reset(dst io.Writer) {
+	w.dst = dst
+	if w.reused != nil {
+		w.reused.Store(true)
+	}
+	w.failWrites = false
+}
+
+func TestDecompressorConstructorsAndWriteErrorPoolIsolation(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.Compression.Decompressors = map[server.Encoding]server.Decompressor{
+		server.EncodingGzip:    server.NewGzipDecompressor(),
+		server.EncodingDeflate: server.NewDeflateDecompressor(),
+	}
+	s := server.NewWithConfig(cfg)
+
+	var created atomic.Int64
+	var reusedAfterErr atomic.Bool
+	s.SetCompressor(server.EncodingZstd, server.CompressorFunc(func(dst io.Writer) (io.WriteCloser, error) {
+		n := created.Add(1)
+		var reusedFlag *atomic.Bool
+		if n == 1 {
+			reusedFlag = &reusedAfterErr
+		}
+		return &failingWriteResetWriter{
+			dst:        dst,
+			failWrites: n == 1, // First writer fails on Write but returns nil on Close
+			reused:     reusedFlag,
+		}, nil
+	}))
+
+	s.POST("/echo", func(c *server.Context) error {
+		b, err := c.BodyBytes()
+		if err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, string(b))
+	})
+	s.GET("/z", func(c *server.Context) error {
+		return c.Text(http.StatusOK, strings.Repeat("compressible-zstd-data-", 80))
+	})
+
+	// Test explicit NewGzipDecompressor & NewDeflateDecompressor.
+	for _, tc := range []struct {
+		ce   string
+		body []byte
+	}{
+		{"gzip", gzipBytes(t, []byte("gz-ctor"))},
+		{"deflate", zlibBytes(t, []byte("def-ctor"))},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/echo", bytes.NewReader(tc.body))
+		req.Header.Set("Content-Encoding", tc.ce)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code=%d body=%q", tc.ce, rec.Code, rec.Body.String())
+		}
+	}
+
+	// First /z write fails inside encWriter.Write (Close returns nil).
+	req := httptest.NewRequest(http.MethodGet, "/z", nil)
+	req.Header.Set("Accept-Encoding", "zstd")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	// Second /z must create a fresh writer rather than reusing the errored one.
+	req = httptest.NewRequest(http.MethodGet, "/z", nil)
+	req.Header.Set("Accept-Encoding", "zstd")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || reusedAfterErr.Load() || created.Load() < 2 {
+		t.Fatalf("errored compressor was unexpectedly pooled: created=%d code=%d", created.Load(), rec.Code)
+	}
+}

@@ -13,12 +13,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"iter"
 	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path"
 	"strconv"
 	"strings"
 	syncv2 "sync/v2"
@@ -260,6 +263,12 @@ func (c *Context) ResponseWriter() http.ResponseWriter {
 	return &c.rw
 }
 
+// ResponseController returns a new [*http.ResponseController] for this request's
+// response writer.
+func (c *Context) ResponseController() *http.ResponseController {
+	return http.NewResponseController(c.ResponseWriter())
+}
+
 func (c *Context) respHeader() http.Header {
 	if c.writer != nil {
 		return c.writer.Header()
@@ -280,6 +289,21 @@ func (c *Context) SetContext(ctx context.Context) {
 // Method returns the HTTP request method.
 func (c *Context) Method() string {
 	return c.req.Method
+}
+
+// Host returns the request's Host header (or host from the request URL).
+func (c *Context) Host() string {
+	return c.req.Host
+}
+
+// UserAgent returns the request's User-Agent header, if sent in the request.
+func (c *Context) UserAgent() string {
+	return c.req.UserAgent()
+}
+
+// Referer returns the referring URL, if sent in the request.
+func (c *Context) Referer() string {
+	return c.req.Referer()
 }
 
 // Path returns the request URL path.
@@ -361,6 +385,29 @@ func (c *Context) Param(name string) string {
 	return ""
 }
 
+// Params returns an iterator over all matched route parameter name-value pairs
+// in pattern order.
+func (c *Context) Params() iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		if c.entry == nil {
+			return
+		}
+		for i, name := range c.entry.paramNames {
+			var val string
+			if i < c.nParams {
+				if uint(i) < maxInlineParams {
+					val = c.paramBuf[i]
+				} else {
+					val = c.paramExtra[i-maxInlineParams]
+				}
+			}
+			if !yield(name, val) {
+				return
+			}
+		}
+	}
+}
+
 // ParamInt returns the named path parameter parsed as an int.
 func (c *Context) ParamInt(name string) (int, error) {
 	v := c.Param(name)
@@ -393,16 +440,31 @@ const maxRawQueryFastScan = 4096
 
 // Query returns the first value associated with the given query key, or "".
 func (c *Context) Query(target string) string {
+	v, _ := c.LookupQuery(target)
+	return v
+}
+
+// LookupQuery returns the first value associated with the given query key and
+// reports whether the key was present in the URL query.
+func (c *Context) LookupQuery(target string) (string, bool) {
 	if c.queryParsed {
-		return c.query.Get(target)
+		vals := c.query[target]
+		if len(vals) == 0 {
+			return "", false
+		}
+		return vals[0], true
 	}
 	raw := c.req.URL.RawQuery
 	n := len(raw)
 	if n == 0 {
-		return ""
+		return "", false
 	}
 	if n > maxRawQueryFastScan {
-		return c.QueryValues().Get(target)
+		vals := c.QueryValues()[target]
+		if len(vals) == 0 {
+			return "", false
+		}
+		return vals[0], true
 	}
 	tlen := len(target)
 	for i := 0; i < n; {
@@ -444,10 +506,10 @@ func (c *Context) Query(target string) string {
 						if !hasSemi {
 							v := raw[valStart:i]
 							if !valEsc {
-								return v
+								return v, true
 							}
 							if u, err := url.QueryUnescape(v); err == nil {
-								return u
+								return u, true
 							}
 						}
 						hasSemi = true
@@ -493,11 +555,11 @@ func (c *Context) Query(target string) string {
 			if err != nil {
 				continue
 			}
-			return u
+			return u, true
 		}
-		return v
+		return v, true
 	}
-	return ""
+	return "", false
 }
 
 // QueryDefault returns the first value for key, or def if key is missing or empty.
@@ -542,6 +604,11 @@ func (c *Context) QueryBool(key string, def bool) (bool, error) {
 // Header returns the first value of the named request header.
 func (c *Context) Header(key string) string {
 	return c.req.Header.Get(key)
+}
+
+// HeaderValues returns all values associated with the named request header.
+func (c *Context) HeaderValues(key string) []string {
+	return c.req.Header.Values(key)
 }
 
 func (c *Context) canonicalReqHeader(canonicalKey string) string {
@@ -874,6 +941,11 @@ func (c *Context) DelHeader(key string) {
 // Cookie returns the named cookie from the request.
 func (c *Context) Cookie(name string) (*http.Cookie, error) {
 	return c.req.Cookie(name)
+}
+
+// Cookies parses and returns the HTTP cookies sent with the request.
+func (c *Context) Cookies() []*http.Cookie {
+	return c.req.Cookies()
 }
 
 // SetCookie adds a Set-Cookie header to the response.
@@ -1456,11 +1528,11 @@ func (c *Context) WriteStatus(code int) error {
 
 // NoContent writes a 204 No Content response.
 func (c *Context) NoContent() error {
+	if c.Written() {
+		return nil
+	}
 	w := c.writer
 	if w == nil {
-		if c.rw.written {
-			return nil
-		}
 		c.rw.status = http.StatusNoContent
 		c.rw.written = true
 		w = c.rw.w
@@ -1575,6 +1647,9 @@ func (c *Context) JSONIndented(code int, v any, prefix, indent string) error {
 // Stream copies data from r to the response with the given status code and
 // content type.
 func (c *Context) Stream(code int, contentType string, r io.Reader) error {
+	if r == nil {
+		return errors.New("server: nil stream reader")
+	}
 	if contentType != "" {
 		c.setDefaultContentType(contentType)
 	}
@@ -1650,6 +1725,75 @@ func (c *Context) FileFS(fsys fs.FS, name string) error {
 	}
 	http.ServeFileFS(c.ResponseWriter(), c.req, fsys, name)
 	return nil
+}
+
+// Download serves the named local file as an attachment with Content-Disposition
+// set to filename (or the file's base name if filename is empty).
+// Unlike calling [Context.SetAttachment] before [Context.File], missing or
+// inaccessible files return an [*HTTPError] without setting Content-Disposition.
+// Do not pass untrusted user input directly to Download; use [Context.DownloadFS]
+// with an [os.Root] or [Server.StaticDir] for user-controlled paths.
+func (c *Context) Download(filePath, filename string) error {
+	if strings.IndexByte(filePath, 0) >= 0 {
+		return NewError(http.StatusBadRequest, "invalid file path")
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return mapFileOpenError(err)
+	}
+	defer f.Close()
+	return c.serveDownloadFile(f, filePath, filename)
+}
+
+// DownloadFS serves the named file from fsys as an attachment with
+// Content-Disposition set to filename (or the file's base name if filename is
+// empty). Missing or inaccessible files return an [*HTTPError] without setting
+// Content-Disposition.
+func (c *Context) DownloadFS(fsys fs.FS, name, filename string) error {
+	if fsys == nil {
+		return errors.New("server: nil fs.FS")
+	}
+	if strings.IndexByte(name, 0) >= 0 {
+		return NewError(http.StatusBadRequest, "invalid file path")
+	}
+	f, err := fsys.Open(name)
+	if err != nil {
+		return mapFileOpenError(err)
+	}
+	defer f.Close()
+	return c.serveDownloadFile(f, name, filename)
+}
+
+func mapFileOpenError(err error) error {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrInvalid) {
+		return WrapError(http.StatusNotFound, "not found", err)
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return WrapError(http.StatusForbidden, "forbidden", err)
+	}
+	return err
+}
+
+func (c *Context) serveDownloadFile(f fs.File, name, filename string) error {
+	info, err := f.Stat()
+	if err != nil {
+		return mapFileOpenError(err)
+	}
+	if info.IsDir() {
+		return NewError(http.StatusNotFound, "not found")
+	}
+	if filename == "" {
+		filename = info.Name()
+		if filename == "" || filename == "." || filename == "/" {
+			filename = path.Base(name)
+		}
+	}
+	c.SetAttachment(filename)
+	if rs, ok := f.(io.ReadSeeker); ok {
+		http.ServeContent(c.ResponseWriter(), c.req, info.Name(), info.ModTime(), rs)
+		return nil
+	}
+	return c.Stream(http.StatusOK, "application/octet-stream", f)
 }
 
 // Flush flushes buffered response data to the client using [http.ResponseController].

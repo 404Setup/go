@@ -453,6 +453,11 @@ type Group struct {
 	middlewares []HandlerFunc
 }
 
+// Prefix returns the group's full URL path prefix.
+func (g *Group) Prefix() string {
+	return g.prefix
+}
+
 // Use appends middleware to the group for subsequently registered routes and
 // child groups.
 func (g *Group) Use(middlewares ...HandlerFunc) {
@@ -474,8 +479,16 @@ func (g *Group) Use(middlewares ...HandlerFunc) {
 func (g *Group) Group(prefix string, middlewares ...HandlerFunc) *Group {
 	g.server.mu.Lock()
 	defer g.server.mu.Unlock()
-	if prefix != "" && prefix[0] != '/' {
-		panic(fmt.Sprintf("server: group prefix %q must start with '/'", prefix))
+	if prefix != "" {
+		if prefix[0] != '/' {
+			panic(fmt.Sprintf("server: group prefix %q must start with '/'", prefix))
+		}
+		if hasASCIIControl(prefix) {
+			panic(fmt.Sprintf("server: group prefix %q contains control character", prefix))
+		}
+		if !isCleanPath(prefix) {
+			panic(fmt.Sprintf("server: group prefix %q is not a clean canonical path", prefix))
+		}
 	}
 	for _, mw := range middlewares {
 		if mw == nil {
@@ -616,26 +629,7 @@ func (g *Group) Any(pattern string, handlers ...HandlerFunc) {
 
 // HandleHTTP registers a standard [http.Handler] for method and pattern.
 func (g *Group) HandleHTTP(method, pattern string, h http.Handler) {
-	if h == nil {
-		panic("server: nil http.Handler")
-	}
-	g.Handle(method, pattern, func(c *Context) error {
-		if c.entry != nil {
-			for i, name := range c.entry.paramNames {
-				var val string
-				if i < c.nParams {
-					if i < maxInlineParams {
-						val = c.paramBuf[i]
-					} else {
-						val = c.paramExtra[i-maxInlineParams]
-					}
-				}
-				c.req.SetPathValue(name, val)
-			}
-		}
-		h.ServeHTTP(c.ResponseWriter(), c.req)
-		return nil
-	})
+	g.Handle(method, pattern, AdaptHandler(h))
 }
 
 // Mount attaches a standard [http.Handler] at prefix, stripping prefix from
@@ -747,6 +741,8 @@ func (s *Server) execChainWithCompression(c *Context, chain []HandlerFunc, cs *c
 		}
 	}
 
+	origReq := c.req
+	origBody := origReq.Body
 	if decompErr := prepareRequestDecompression(c, cs); decompErr != nil {
 		if cw != nil {
 			c.HandleError(decompErr)
@@ -763,6 +759,9 @@ func (s *Server) execChainWithCompression(c *Context, chain []HandlerFunc, cs *c
 	if cw != nil || c.decomp != nil {
 		defer func() {
 			if c.decomp != nil {
+				if origReq.Body == c.decomp || c.bodyLimitApplied > 0 {
+					origReq.Body = origBody
+				}
 				c.decomp.finish(panicked)
 				c.decomp = nil
 			}
@@ -1080,6 +1079,9 @@ func (s *Server) httpServerLocked() *http.Server {
 			MaxHeaderBytes:    s.cfg.MaxHeaderBytes,
 			TLSConfig:         s.cfg.TLSConfig,
 			BaseContext:       s.cfg.BaseContext,
+		}
+		if s.cfg.Logger != nil {
+			s.httpSrv.ErrorLog = slog.NewLogLogger(s.cfg.Logger.Handler(), slog.LevelError)
 		}
 	}
 	return s.httpSrv

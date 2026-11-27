@@ -225,6 +225,17 @@ var (
 	})
 )
 
+// NewGzipDecompressor returns a [Decompressor] using [compress/gzip].
+func NewGzipDecompressor() Decompressor {
+	return defaultGzipDecompressor
+}
+
+// NewDeflateDecompressor returns a [Decompressor] using [compress/zlib]
+// (RFC 1950 zlib-wrapped deflate per RFC 9110 Section 8.4.2).
+func NewDeflateDecompressor() Decompressor {
+	return defaultDeflateDecompressor
+}
+
 type codecHolder struct {
 	comp Compressor
 	pool *syncv2.Pool[io.WriteCloser]
@@ -993,6 +1004,7 @@ type compressResponseWriter struct {
 	writtenBytes int64
 	wroteHeader  bool
 	disabled     bool
+	writeErr     bool
 	mode         compressMode
 }
 
@@ -1008,6 +1020,7 @@ func (w *compressResponseWriter) reset(rw http.ResponseWriter, holder *codecHold
 	w.writtenBytes = 0
 	w.wroteHeader = false
 	w.disabled = false
+	w.writeErr = false
 	w.mode = compressUndecided
 }
 
@@ -1205,6 +1218,7 @@ func (w *compressResponseWriter) startCompress() (bool, error) {
 		_, err := w.encWriter.Write(w.buf)
 		w.buf = w.buf[:0]
 		if err != nil {
+			w.writeErr = true
 			return true, err
 		}
 	}
@@ -1222,6 +1236,9 @@ func (w *compressResponseWriter) Write(p []byte) (int, error) {
 		return n, err
 	case compressEnabled:
 		n, err := w.encWriter.Write(p)
+		if err != nil {
+			w.writeErr = true
+		}
 		w.writtenBytes += int64(n)
 		return n, err
 	}
@@ -1277,6 +1294,9 @@ func (w *compressResponseWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	n, err := w.encWriter.Write(p)
+	if err != nil {
+		w.writeErr = true
+	}
 	w.writtenBytes += int64(n)
 	return n, err
 }
@@ -1293,6 +1313,7 @@ func (w *compressResponseWriter) writeCompressedString(s string) (int, error) {
 		w.buf = w.buf[:0]
 		total += n
 		if err != nil {
+			w.writeErr = true
 			return total, err
 		}
 		s = s[len(chunk):]
@@ -1373,6 +1394,7 @@ func (w *compressResponseWriter) FlushError() error {
 		switch f := w.encWriter.(type) {
 		case interface{ Flush() error }:
 			if err := f.Flush(); err != nil {
+				w.writeErr = true
 				return err
 			}
 		case interface{ Flush() }:
@@ -1410,7 +1432,7 @@ func (w *compressResponseWriter) finish() {
 		if w.encWriter != nil {
 			err := w.encWriter.Close()
 			if w.holder != nil {
-				w.holder.release(w.encWriter, err == nil)
+				w.holder.release(w.encWriter, err == nil && !w.writeErr)
 			}
 			w.encWriter = nil
 		}

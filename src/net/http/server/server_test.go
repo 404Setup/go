@@ -549,3 +549,60 @@ func TestServerJSONErrorHandlerClearsStaleContentType(t *testing.T) {
 		t.Fatalf("missing nosniff header")
 	}
 }
+
+func TestServerGroupPrefixValidationAndSentinelErrorHandling(t *testing.T) {
+	s := server.New()
+	api := s.Group("/api")
+	v1 := api.Group("/v1")
+	if api.Prefix() != "/api" || v1.Prefix() != "/api/v1" {
+		t.Fatalf("Group.Prefix mismatch: api=%q v1=%q", api.Prefix(), v1.Prefix())
+	}
+
+	// Bad group prefixes panic fail-fast.
+	for _, bad := range []string{"no-slash", "/api/../admin", "/api//v1", "/api/\x00"} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("expected panic for bad Group prefix %q", bad)
+				}
+			}()
+			s.Group(bad)
+		}()
+	}
+
+	// Sentinel errors returned directly map to appropriate HTTP status codes,
+	// and stale representation headers (Content-Disposition, ETag) are cleared.
+	s.GET("/sentinel-413", func(c *server.Context) error {
+		c.SetAttachment("secret.pdf")
+		c.SetHeader("ETag", `"stale"`)
+		return server.ErrBodyTooLarge
+	})
+	s.GET("/sentinel-415", func(c *server.Context) error {
+		return server.ErrUnsupportedMediaType
+	})
+	s.GET("/sentinel-400-json", func(c *server.Context) error {
+		return server.ErrInvalidJSON
+	})
+	s.GET("/sentinel-400-comp", func(c *server.Context) error {
+		return server.ErrInvalidCompressedBody
+	})
+
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{"/sentinel-413", http.StatusRequestEntityTooLarge},
+		{"/sentinel-415", http.StatusUnsupportedMediaType},
+		{"/sentinel-400-json", http.StatusBadRequest},
+		{"/sentinel-400-comp", http.StatusBadRequest},
+	} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rec.Code != tc.status {
+			t.Fatalf("%s: status=%d, want %d", tc.path, rec.Code, tc.status)
+		}
+		if rec.Header().Get("Content-Disposition") != "" || rec.Header().Get("ETag") != "" {
+			t.Fatalf("%s: stale representation headers leaked: %v", tc.path, rec.Header())
+		}
+	}
+}

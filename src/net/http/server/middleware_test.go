@@ -517,3 +517,99 @@ func TestMiddlewareMaxInFlight(t *testing.T) {
 		t.Fatalf("post-panic request failed: code=%d body=%q", rec.Code, rec.Body.String())
 	}
 }
+
+func TestMiddlewareBearerAuthAdaptHandlerAndLoggerFallback(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	cfg := server.DefaultConfig()
+	cfg.Logger = logger
+	s := server.NewWithConfig(cfg)
+	// Logger(nil) must fall back to Config.Logger when configured on Server.
+	s.Use(server.Logger(nil))
+
+	s.GET("/api/items/{id}",
+		server.BearerAuth("API \"Realm\"\r\nBad", func(c *server.Context, tok string) bool {
+			if !server.ConstantTimeEqual(tok, "secret-token-123") {
+				return false
+			}
+			c.Set("auth_user", "alice")
+			return true
+		}),
+		func(c *server.Context) error {
+			user, _ := server.GetValue[string](c, "auth_user")
+			return c.Text(http.StatusOK, user+":"+c.Param("id"))
+		},
+	)
+
+	// Empty realm sets plain "Bearer" WWW-Authenticate.
+	s.GET("/api/plain-bearer",
+		server.BearerAuth("", func(c *server.Context, tok string) bool {
+			return false
+		}),
+		func(c *server.Context) error { return c.NoContent() },
+	)
+
+	// AdaptHandler inline with middleware and path parameter propagation.
+	s.GET("/std-inline/{name}",
+		func(c *server.Context) error {
+			c.SetHeader("X-Pre", "1")
+			return c.Next()
+		},
+		server.AdaptHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "hello:"+r.PathValue("name"))
+		})),
+	)
+
+	// Missing token -> 401 + sanitized WWW-Authenticate.
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/items/7", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing bearer status = %d, want 401", rec.Code)
+	}
+	if www := rec.Header().Get("WWW-Authenticate"); strings.ContainsAny(www, "\r\n") || !strings.Contains(www, `Bearer realm="API RealmBad"`) {
+		t.Fatalf("WWW-Authenticate not sanitized: %q", www)
+	}
+	// Logger(nil) logged to Config.Logger!
+	if !strings.Contains(logBuf.String(), `"/api/items/7"`) {
+		t.Fatalf("Logger(nil) did not use Config.Logger: %q", logBuf.String())
+	}
+
+	// Empty realm -> WWW-Authenticate: Bearer.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/plain-bearer", nil))
+	if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") != "Bearer" {
+		t.Fatalf("plain bearer: code=%d www=%q", rec.Code, rec.Header().Get("WWW-Authenticate"))
+	}
+
+	// Valid token succeeds and validator context value is visible downstream.
+	req := httptest.NewRequest(http.MethodGet, "/api/items/99", nil)
+	req.Header.Set("Authorization", "Bearer secret-token-123")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "alice:99" {
+		t.Fatalf("valid bearer: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// AdaptHandler works with middleware and PathValue.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/std-inline/world", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Pre") != "1" || rec.Body.String() != "hello:world" {
+		t.Fatalf("AdaptHandler: code=%d hdr=%v body=%q", rec.Code, rec.Header(), rec.Body.String())
+	}
+
+	// Nil panics.
+	for _, fn := range []func(){
+		func() { server.BearerAuth("r", nil) },
+		func() { server.AdaptHandler(nil) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			fn()
+		}()
+	}
+}

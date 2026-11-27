@@ -5,16 +5,21 @@
 package server_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 // TestSecurityPooledContextIsolation verifies that pooled Context instances
@@ -835,4 +840,105 @@ func TestSecurityMissedRouteParamScrub(t *testing.T) {
 			t.Fatalf("%q: status=%d body=%q, want 404", target, rec.Code, rec.Body.String())
 		}
 	}
+}
+
+// TestSecurityDownloadFSConfinementAndBearerAuthSmuggling verifies that
+// DownloadFS confined with os.Root blocks symlink escapes and traversal without
+// leaking Content-Disposition, and that BearerAuth rejects multi-header
+// Authorization smuggling and sanitizes realms.
+func TestSecurityDownloadFSConfinementAndBearerAuthSmuggling(t *testing.T) {
+	outer := t.TempDir()
+	pubDir := filepath.Join(outer, "pub")
+	if err := os.MkdirAll(pubDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(outer, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOP_SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(pubDir, "escape.txt")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	root, err := os.OpenRoot(pubDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	s := server.New()
+	s.GET("/dl/{name}", func(c *server.Context) error {
+		return c.DownloadFS(root.FS(), c.Param("name"), "out.txt")
+	})
+	s.GET("/bearer", server.BearerAuth("R\"\r\nX-Bad: 1", func(c *server.Context, tok string) bool {
+		return server.ConstantTimeEqual(tok, "good-tok")
+	}), func(c *server.Context) error {
+		return c.NoContent()
+	})
+
+	for _, name := range []string{"escape.txt", "missing.txt"} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dl/"+name, nil))
+		if rec.Code == http.StatusOK || strings.Contains(rec.Body.String(), "TOP_SECRET") || rec.Header().Get("Content-Disposition") != "" {
+			t.Fatalf("DownloadFS(%q) leaked data or header: code=%d cd=%q body=%q", name, rec.Code, rec.Header().Get("Content-Disposition"), rec.Body.String())
+		}
+	}
+
+	// Duplicate Authorization headers must be rejected with 401.
+	req := httptest.NewRequest(http.MethodGet, "/bearer", nil)
+	req.Header.Add("Authorization", "Bearer good-tok")
+	req.Header.Add("Authorization", "Bearer evil-tok")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("duplicate Authorization header status=%d, want 401", rec.Code)
+	}
+	if www := rec.Header().Get("WWW-Authenticate"); strings.ContainsAny(www, "\r\n") {
+		t.Fatalf("WWW-Authenticate header injection: %q", www)
+	}
+}
+
+// TestSecurityDecompressOuterBodyCloseRace verifies that callers wrapping
+// Server.ServeHTTP and calling r.Body.Close() after ServeHTTP returns never
+// touch a pooled decompressReadCloser reused by another concurrent request.
+func TestSecurityDecompressOuterBodyCloseRace(t *testing.T) {
+	s := server.New()
+	s.Use(server.BodyLimit(4096), server.Timeout(time.Second))
+	s.POST("/echo", func(c *server.Context) error {
+		b, err := c.BodyBytes()
+		if err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, string(b))
+	})
+
+	outer := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		s.ServeHTTP(w, r)
+	})
+
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	_, _ = gw.Write([]byte("concurrent-compressed-payload"))
+	_ = gw.Close()
+	payload := gzBuf.Bytes()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				req := httptest.NewRequest(http.MethodPost, "/echo", bytes.NewReader(payload))
+				req.Header.Set("Content-Encoding", "gzip")
+				rec := httptest.NewRecorder()
+				outer.ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK || rec.Body.String() != "concurrent-compressed-payload" {
+					t.Errorf("code=%d body=%q", rec.Code, rec.Body.String())
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

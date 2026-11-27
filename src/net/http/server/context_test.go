@@ -12,13 +12,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/http/server"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"testing/fstest"
+	"time"
 )
 
 func TestContextParamsQueryValuesAndHeaders(t *testing.T) {
@@ -733,5 +739,277 @@ func TestContextHeadAndNoBodyStatusLiveServer(t *testing.T) {
 	// Verify no http.ErrBodyNotAllowed / 500 internal error was logged.
 	if strings.Contains(logBuf.String(), "does not allow body") || strings.Contains(logBuf.String(), `"status":500`) {
 		t.Fatalf("unexpected error logged during HEAD/304 requests: %s", logBuf.String())
+	}
+}
+
+func TestContextRequestHelpersParamsIteratorAndLookupQuery(t *testing.T) {
+	s := server.New()
+
+	s.GET("/inspect/{a}/{b}/{c}/{d}/{e}/{f}/{g}/{h}/{i}", func(c *server.Context) error {
+		var keys, vals []string
+		for k, v := range c.Params() {
+			keys = append(keys, k)
+			vals = append(vals, v)
+		}
+		// Early break from Params iterator must stop cleanly.
+		var first string
+		for k := range c.Params() {
+			first = k
+			break
+		}
+
+		// LookupQuery before QueryValues() (fast path) and after QueryValues().
+		flagVal, flagOK := c.LookupQuery("flag")
+		emptyVal, emptyOK := c.LookupQuery("empty")
+		missVal, missOK := c.LookupQuery("missing")
+		escVal, escOK := c.LookupQuery("a b")
+
+		_ = c.QueryValues()
+		parsedFlagVal, parsedFlagOK := c.LookupQuery("flag")
+		parsedMissVal, parsedMissOK := c.LookupQuery("missing")
+
+		if err := c.ResponseController().Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+
+		var cookieNames []string
+		for _, ck := range c.Cookies() {
+			cookieNames = append(cookieNames, ck.Name+"="+ck.Value)
+		}
+
+		return c.JSON(http.StatusOK, map[string]any{
+			"host":        c.Host(),
+			"ua":          c.UserAgent(),
+			"referer":     c.Referer(),
+			"hdr_vals":    c.HeaderValues("X-Tag"),
+			"cookies":     cookieNames,
+			"param_keys":  keys,
+			"param_vals":  vals,
+			"first_param": first,
+			"flag":        []any{flagVal, flagOK},
+			"empty":       []any{emptyVal, emptyOK},
+			"missing":     []any{missVal, missOK},
+			"esc":         []any{escVal, escOK},
+			"parsed_flag": []any{parsedFlagVal, parsedFlagOK},
+			"parsed_miss": []any{parsedMissVal, parsedMissOK},
+		})
+	})
+
+	s.GET("/long-query", func(c *server.Context) error {
+		v, ok := c.LookupQuery("needle")
+		return c.Text(http.StatusOK, fmt.Sprintf("%s:%v", v, ok))
+	})
+
+	s.NotFound(func(c *server.Context) error {
+		count := 0
+		for range c.Params() {
+			count++
+		}
+		return c.Text(http.StatusNotFound, fmt.Sprintf("params=%d", count))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/inspect/1/2/3/4/5/6/7/8/9?flag&empty=&a+b=c%20d", nil)
+	req.Header.Set("User-Agent", "go-test/1.0")
+	req.Header.Set("Referer", "https://example.com/home")
+	req.Header.Add("X-Tag", "alpha")
+	req.Header.Add("X-Tag", "beta")
+	req.AddCookie(&http.Cookie{Name: "c1", Value: "v1"})
+	req.AddCookie(&http.Cookie{Name: "c2", Value: "v2"})
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["host"] != "api.example.com" || got["ua"] != "go-test/1.0" || got["referer"] != "https://example.com/home" {
+		t.Fatalf("request metadata mismatch: %#v", got)
+	}
+	if got["first_param"] != "a" {
+		t.Fatalf("first_param = %v", got["first_param"])
+	}
+	if !slices.Equal(toStringSlice(got["hdr_vals"]), []string{"alpha", "beta"}) {
+		t.Fatalf("HeaderValues = %v", got["hdr_vals"])
+	}
+	if !slices.Equal(toStringSlice(got["cookies"]), []string{"c1=v1", "c2=v2"}) {
+		t.Fatalf("Cookies = %v", got["cookies"])
+	}
+	if !slices.Equal(toStringSlice(got["param_vals"]), []string{"1", "2", "3", "4", "5", "6", "7", "8", "9"}) {
+		t.Fatalf("Params vals = %v", got["param_vals"])
+	}
+	if fmt.Sprint(got["flag"]) != "[ true]" || fmt.Sprint(got["empty"]) != "[ true]" ||
+		fmt.Sprint(got["missing"]) != "[ false]" || fmt.Sprint(got["esc"]) != "[c d true]" ||
+		fmt.Sprint(got["parsed_flag"]) != "[ true]" || fmt.Sprint(got["parsed_miss"]) != "[ false]" {
+		t.Fatalf("LookupQuery mismatch: %#v", got)
+	}
+
+	// Long query (> maxRawQueryFastScan=4096) exercises QueryValues fallback in LookupQuery.
+	longQ := strings.Repeat("pad=1&", 800) + "needle=found"
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/long-query?"+longQ, nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "found:true" {
+		t.Fatalf("long LookupQuery: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Params iterator on unmatched route yields 0 items.
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	if rec.Code != http.StatusNotFound || rec.Body.String() != "params=0" {
+		t.Fatalf("NotFound Params: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func toStringSlice(v any) []string {
+	raw, _ := v.([]any)
+	out := make([]string, len(raw))
+	for i, item := range raw {
+		out[i], _ = item.(string)
+	}
+	return out
+}
+
+type nonSeekFS struct{}
+
+func (nonSeekFS) Open(name string) (fs.File, error) {
+	if name != "stream.bin" {
+		return nil, fs.ErrNotExist
+	}
+	return &nonSeekFile{r: strings.NewReader("stream-download-bytes"), mod: time.Unix(1000, 0)}, nil
+}
+
+type nonSeekFile struct {
+	r   *strings.Reader
+	mod time.Time
+}
+
+func (f *nonSeekFile) Stat() (fs.FileInfo, error) {
+	return nonSeekFileInfo{size: f.r.Size(), mod: f.mod}, nil
+}
+func (f *nonSeekFile) Read(p []byte) (int, error) { return f.r.Read(p) }
+func (f *nonSeekFile) Close() error               { return nil }
+
+type nonSeekFileInfo struct {
+	size int64
+	mod  time.Time
+}
+
+func (i nonSeekFileInfo) Name() string       { return "stream.bin" }
+func (i nonSeekFileInfo) Size() int64        { return i.size }
+func (i nonSeekFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i nonSeekFileInfo) ModTime() time.Time { return i.mod }
+func (i nonSeekFileInfo) IsDir() bool        { return false }
+func (i nonSeekFileInfo) Sys() any           { return nil }
+
+func TestContextDownloadAndDownloadFSAndStreamNil(t *testing.T) {
+	dir := t.TempDir()
+	localFile := filepath.Join(dir, "report.txt")
+	if err := os.WriteFile(localFile, []byte("annual report content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fsys := fstest.MapFS{
+		"docs/guide.txt": {Data: []byte("guide body")},
+	}
+
+	s := server.New()
+	s.GET("/dl-local", func(c *server.Context) error {
+		return c.Download(localFile, "custom-name.txt")
+	})
+	s.GET("/dl-local-default", func(c *server.Context) error {
+		return c.Download(localFile, "")
+	})
+	s.GET("/dl-local-missing", func(c *server.Context) error {
+		return c.Download(filepath.Join(dir, "missing.txt"), "missing.txt")
+	})
+	s.GET("/dl-local-dir", func(c *server.Context) error {
+		return c.Download(filepath.Join(dir, "subdir"), "subdir.zip")
+	})
+	s.GET("/dl-fs", func(c *server.Context) error {
+		return c.DownloadFS(fsys, "docs/guide.txt", "my guide.txt")
+	})
+	s.GET("/dl-fs-missing", func(c *server.Context) error {
+		return c.DownloadFS(fsys, "docs/nope.txt", "nope.txt")
+	})
+	s.GET("/dl-fs-dir", func(c *server.Context) error {
+		return c.DownloadFS(fsys, "docs", "docs.txt")
+	})
+	s.GET("/dl-fs-nil", func(c *server.Context) error {
+		return c.DownloadFS(nil, "a.txt", "a.txt")
+	})
+	s.GET("/dl-fs-nonseek", func(c *server.Context) error {
+		return c.DownloadFS(nonSeekFS{}, "stream.bin", "")
+	})
+	s.GET("/stream-nil", func(c *server.Context) error {
+		return c.Stream(http.StatusOK, "text/plain", nil)
+	})
+	s.GET("/nocontent-twice", func(c *server.Context) error {
+		if err := c.WriteStatus(http.StatusAccepted); err != nil {
+			return err
+		}
+		return c.NoContent()
+	})
+
+	// Local Download with custom name
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dl-local", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "annual report content" ||
+		!strings.Contains(rec.Header().Get("Content-Disposition"), `filename=custom-name.txt`) {
+		t.Fatalf("/dl-local: code=%d cd=%q body=%q", rec.Code, rec.Header().Get("Content-Disposition"), rec.Body.String())
+	}
+
+	// Local Download with empty filename falls back to file basename
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dl-local-default", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Disposition"), `filename=report.txt`) {
+		t.Fatalf("/dl-local-default: code=%d cd=%q", rec.Code, rec.Header().Get("Content-Disposition"))
+	}
+
+	// Missing file and directories return 404 WITHOUT Content-Disposition
+	for _, path := range []string{"/dl-local-missing", "/dl-local-dir", "/dl-fs-missing", "/dl-fs-dir"} {
+		rec = httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound || rec.Header().Get("Content-Disposition") != "" {
+			t.Fatalf("%s: code=%d cd=%q, want 404 with no Content-Disposition", path, rec.Code, rec.Header().Get("Content-Disposition"))
+		}
+	}
+
+	// DownloadFS success + Range support
+	req := httptest.NewRequest(http.MethodGet, "/dl-fs", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != "guide" ||
+		!strings.Contains(rec.Header().Get("Content-Disposition"), `filename="my guide.txt"`) {
+		t.Fatalf("/dl-fs range: code=%d cd=%q body=%q", rec.Code, rec.Header().Get("Content-Disposition"), rec.Body.String())
+	}
+
+	// Non-ReadSeeker fs.FS falls back to Stream cleanly
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dl-fs-nonseek", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "stream-download-bytes" ||
+		!strings.Contains(rec.Header().Get("Content-Disposition"), `filename=stream.bin`) {
+		t.Fatalf("/dl-fs-nonseek: code=%d cd=%q body=%q", rec.Code, rec.Header().Get("Content-Disposition"), rec.Body.String())
+	}
+
+	// Nil fs.FS & nil Stream reader return 500 cleanly without panicking
+	for _, path := range []string{"/dl-fs-nil", "/stream-nil"} {
+		rec = httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("%s: code=%d, want 500", path, rec.Code)
+		}
+	}
+
+	// NoContent after WriteStatus does not overwrite status
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nocontent-twice", nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("/nocontent-twice: code=%d, want 202", rec.Code)
 	}
 }

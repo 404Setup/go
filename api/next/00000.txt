@@ -28,7 +28,9 @@ pkg net/http/server, const EncodingZstd Encoding #80000
 pkg net/http/server, const RequestIDKey = "server.request_id" #80000
 pkg net/http/server, const RequestIDKey ideal-string #80000
 pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80000
+pkg net/http/server, func AdaptHandler(http.Handler) HandlerFunc #80000
 pkg net/http/server, func BasicAuth(string, func(string, string) bool) HandlerFunc #80000
+pkg net/http/server, func BearerAuth(string, func(*Context, string) bool) HandlerFunc #80000
 pkg net/http/server, func BodyLimit(int64) HandlerFunc #80000
 pkg net/http/server, func CORS(CORSConfig) HandlerFunc #80000
 pkg net/http/server, func Compress() HandlerFunc #80000
@@ -44,8 +46,10 @@ pkg net/http/server, func LoggerWithConfig(LoggerConfig) HandlerFunc #80000
 pkg net/http/server, func MaxInFlight(int) HandlerFunc #80000
 pkg net/http/server, func New() *Server #80000
 pkg net/http/server, func NewDeflateCompressor(int) Compressor #80000
+pkg net/http/server, func NewDeflateDecompressor() Decompressor #80000
 pkg net/http/server, func NewError(int, string) *HTTPError #80000
 pkg net/http/server, func NewGzipCompressor(int) Compressor #80000
+pkg net/http/server, func NewGzipDecompressor() Decompressor #80000
 pkg net/http/server, func NewWithConfig(Config) *Server #80000
 pkg net/http/server, func Recover() HandlerFunc #80000
 pkg net/http/server, func RecoverWithConfig(RecoverConfig) HandlerFunc #80000
@@ -68,9 +72,12 @@ pkg net/http/server, method (*Context) CompressionDisabled() bool #80000
 pkg net/http/server, method (*Context) ContentType() string #80000
 pkg net/http/server, method (*Context) Context() context.Context #80000
 pkg net/http/server, method (*Context) Cookie(string) (*http.Cookie, error) #80000
+pkg net/http/server, method (*Context) Cookies() []*http.Cookie #80000
 pkg net/http/server, method (*Context) DelHeader(string) #80000
 pkg net/http/server, method (*Context) Delete(string) #80000
 pkg net/http/server, method (*Context) DisableCompression() #80000
+pkg net/http/server, method (*Context) Download(string, string) error #80000
+pkg net/http/server, method (*Context) DownloadFS(fs.FS, string, string) error #80000
 pkg net/http/server, method (*Context) File(string) error #80000
 pkg net/http/server, method (*Context) FileFS(fs.FS, string) error #80000
 pkg net/http/server, method (*Context) Flush() error #80000
@@ -80,14 +87,18 @@ pkg net/http/server, method (*Context) Get(string) (interface{}, bool) #80000
 pkg net/http/server, method (*Context) HTML(int, string) error #80000
 pkg net/http/server, method (*Context) HandleError(error) #80000
 pkg net/http/server, method (*Context) Header(string) string #80000
+pkg net/http/server, method (*Context) HeaderValues(string) []string #80000
+pkg net/http/server, method (*Context) Host() string #80000
 pkg net/http/server, method (*Context) JSON(int, interface{}) error #80000
 pkg net/http/server, method (*Context) JSONIndented(int, interface{}, string, string) error #80000
+pkg net/http/server, method (*Context) LookupQuery(string) (string, bool) #80000
 pkg net/http/server, method (*Context) Method() string #80000
 pkg net/http/server, method (*Context) Next() error #80000
 pkg net/http/server, method (*Context) NoContent() error #80000
 pkg net/http/server, method (*Context) Param(string) string #80000
 pkg net/http/server, method (*Context) ParamInt(string) (int, error) #80000
 pkg net/http/server, method (*Context) ParamInt64(string) (int64, error) #80000
+pkg net/http/server, method (*Context) Params() iter.Seq2[string, string] #80000
 pkg net/http/server, method (*Context) ParseForm() (url.Values, error) #80000
 pkg net/http/server, method (*Context) ParseMultipartForm(int64) (*multipart.Form, error) #80000
 pkg net/http/server, method (*Context) Path() string #80000
@@ -98,9 +109,12 @@ pkg net/http/server, method (*Context) QueryInt(string, int) (int, error) #80000
 pkg net/http/server, method (*Context) QueryInt64(string, int64) (int64, error) #80000
 pkg net/http/server, method (*Context) QueryValues() url.Values #80000
 pkg net/http/server, method (*Context) Redirect(int, string) error #80000
+pkg net/http/server, method (*Context) Referer() string #80000
 pkg net/http/server, method (*Context) Request() *http.Request #80000
+pkg net/http/server, method (*Context) ResponseController() *http.ResponseController #80000
 pkg net/http/server, method (*Context) ResponseWriter() http.ResponseWriter #80000
 pkg net/http/server, method (*Context) RoutePattern() string #80000
+pkg net/http/server, method (*Context) SSE() (*SSEWriter, error) #80000
 pkg net/http/server, method (*Context) Scheme() string #80000
 pkg net/http/server, method (*Context) Set(string, interface{}) #80000
 pkg net/http/server, method (*Context) SetAttachment(string) #80000
@@ -111,6 +125,7 @@ pkg net/http/server, method (*Context) SetMaxBodyBytes(int64) #80000
 pkg net/http/server, method (*Context) StatusCode() int #80000
 pkg net/http/server, method (*Context) Stream(int, string, io.Reader) error #80000
 pkg net/http/server, method (*Context) Text(int, string) error #80000
+pkg net/http/server, method (*Context) UserAgent() string #80000
 pkg net/http/server, method (*Context) WriteStatus(int) error #80000
 pkg net/http/server, method (*Context) Written() bool #80000
 pkg net/http/server, method (*Group) Any(string, ...HandlerFunc) #80000
@@ -126,6 +141,7 @@ pkg net/http/server, method (*Group) OPTIONS(string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Group) PATCH(string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Group) POST(string, ...HandlerFunc) #80000
 pkg net/http/server, method (*Group) PUT(string, ...HandlerFunc) #80000
+pkg net/http/server, method (*Group) Prefix() string #80000
 pkg net/http/server, method (*Group) Route(string, func(*Group)) #80000
 pkg net/http/server, method (*Group) StaticDir(string, string, ...StaticConfig) error #80000
 pkg net/http/server, method (*Group) StaticFS(string, fs.FS, ...StaticConfig) #80000
@@ -169,6 +185,11 @@ pkg net/http/server, method (*Server) Shutdown(context.Context) error #80000
 pkg net/http/server, method (*Server) StaticDir(string, string, ...StaticConfig) error #80000
 pkg net/http/server, method (*Server) StaticFS(string, fs.FS, ...StaticConfig) #80000
 pkg net/http/server, method (*Server) Use(...HandlerFunc) #80000
+pkg net/http/server, method (*SSEWriter) Comment(string) error #80000
+pkg net/http/server, method (*SSEWriter) Flush() error #80000
+pkg net/http/server, method (*SSEWriter) Send(SSEEvent) error #80000
+pkg net/http/server, method (*SSEWriter) SendData(string) error #80000
+pkg net/http/server, method (*SSEWriter) SendJSON(string, interface{}) error #80000
 pkg net/http/server, method (CompressorFunc) NewWriter(io.Writer) (io.WriteCloser, error) #80000
 pkg net/http/server, method (DecompressorFunc) NewReader(io.Reader) (io.ReadCloser, error) #80000
 pkg net/http/server, type CORSConfig struct #80000
@@ -236,6 +257,12 @@ pkg net/http/server, type RequestIDConfig struct, TrustIncoming bool #80000
 pkg net/http/server, type RouteInfo struct #80000
 pkg net/http/server, type RouteInfo struct, Method string #80000
 pkg net/http/server, type RouteInfo struct, Pattern string #80000
+pkg net/http/server, type SSEEvent struct #80000
+pkg net/http/server, type SSEEvent struct, Data string #80000
+pkg net/http/server, type SSEEvent struct, Event string #80000
+pkg net/http/server, type SSEEvent struct, ID string #80000
+pkg net/http/server, type SSEEvent struct, Retry time.Duration #80000
+pkg net/http/server, type SSEWriter struct #80000
 pkg net/http/server, type SecurityHeadersConfig struct #80000
 pkg net/http/server, type SecurityHeadersConfig struct, ContentSecurityPolicy string #80000
 pkg net/http/server, type SecurityHeadersConfig struct, ContentTypeOptions string #80000

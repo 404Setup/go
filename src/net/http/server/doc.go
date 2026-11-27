@@ -59,7 +59,15 @@
 //     X-Real-IP, and X-Forwarded-Proto unless the direct peer matches
 //     Config.TrustedProxies.
 //   - [Server.StaticDir] confines filesystem access using [os.OpenRoot] and
-//     disables directory listing by default.
+//     disables directory listing by default; use [Context.DownloadFS] with a
+//     confined [fs.FS] when serving user-selected downloads.
+//
+// # Streaming & Responses
+//
+// In addition to [Context.Text], [Context.HTML], [Context.Bytes], [Context.JSON],
+// [Context.Stream], [Context.FileFS], and [Context.DownloadFS], handlers can
+// stream Server-Sent Events via [Context.SSE] and [SSEWriter] with automatic
+// compression bypass and field-injection protection.
 //
 // # Compression
 //
@@ -70,7 +78,8 @@
 //
 // Use [Server.SetCompressor], [Server.SetDecompressor],
 // [Server.SetCompression], [Server.SetDecompression],
-// [Server.SetCompressionOrder], or [CompressionConfig] to customize, replace,
+// [Server.SetCompressionOrder], [NewGzipDecompressor],
+// [NewDeflateDecompressor], or [CompressionConfig] to customize, replace,
 // or disable encodings (including zstd and brotli). Call
 // [Context.DisableCompression] inside a handler or middleware to disable
 // compression for a single response.

@@ -104,6 +104,18 @@ func classifyError(err error) (code int, msg string, internal bool) {
 	if errors.As(err, &maxBytesErr) {
 		return http.StatusRequestEntityTooLarge, "request body too large", false
 	}
+	if errors.Is(err, ErrBodyTooLarge) {
+		return http.StatusRequestEntityTooLarge, "request body too large", false
+	}
+	if errors.Is(err, ErrUnsupportedMediaType) {
+		return http.StatusUnsupportedMediaType, "unsupported media type", false
+	}
+	if errors.Is(err, ErrInvalidJSON) {
+		return http.StatusBadRequest, "invalid JSON payload", false
+	}
+	if errors.Is(err, ErrInvalidCompressedBody) {
+		return http.StatusBadRequest, "invalid compressed request body", false
+	}
 	return http.StatusInternalServerError, "internal server error", true
 }
 
@@ -113,6 +125,15 @@ var (
 	contentTypeHTML  = []string{"text/html; charset=utf-8"}[:1:1]
 	contentTypeJSON  = []string{"application/json; charset=utf-8"}[:1:1]
 )
+
+func clearStaleErrorHeaders(h http.Header) {
+	delete(h, "Content-Length")
+	delete(h, "Content-Encoding")
+	delete(h, "Content-Disposition")
+	delete(h, "Etag")
+	delete(h, "Last-Modified")
+	delete(h, "Accept-Ranges")
+}
 
 // DefaultErrorHandler writes a plain-text error response with
 // X-Content-Type-Options: nosniff. If a response has already been written, it
@@ -135,8 +156,7 @@ func DefaultErrorHandler(c *Context, err error) {
 		return
 	}
 	h := c.respHeader()
-	delete(h, "Content-Length")
-	delete(h, "Content-Encoding")
+	clearStaleErrorHeaders(h)
 	h["X-Content-Type-Options"] = headerValNosniff
 	h["Content-Type"] = contentTypeText
 	if c.req.Method == http.MethodHead {
@@ -173,8 +193,7 @@ func JSONErrorHandler(c *Context, err error) {
 		return
 	}
 	h := c.respHeader()
-	delete(h, "Content-Length")
-	delete(h, "Content-Encoding")
+	clearStaleErrorHeaders(h)
 	delete(h, "Content-Type")
 	h["X-Content-Type-Options"] = headerValNosniff
 	_ = c.JSON(code, jsonErrorBody{Error: msg})
