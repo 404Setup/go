@@ -88,6 +88,9 @@ func hasSSEControl(s string) bool {
 
 // Send writes ev to the event stream and flushes it immediately.
 func (s *SSEWriter) Send(ev SSEEvent) error {
+	if s == nil || s.w == nil {
+		return errors.New("server: nil SSEWriter")
+	}
 	if hasSSEControl(ev.ID) {
 		return errors.New("server: SSE event ID contains CR, LF, or NUL")
 	}
@@ -138,6 +141,9 @@ func (s *SSEWriter) SendData(data string) error {
 // SendJSON marshals v as JSON and writes it as an SSE event (with optional
 // event name) and flushes it immediately.
 func (s *SSEWriter) SendJSON(event string, v any) error {
+	if s == nil || s.w == nil {
+		return errors.New("server: nil SSEWriter")
+	}
 	if hasSSEControl(event) {
 		return errors.New("server: SSE event name contains CR, LF, or NUL")
 	}
@@ -182,6 +188,9 @@ func (s *SSEWriter) SendJSON(event string, v any) error {
 // Comment writes an SSE comment line (useful for keep-alive heartbeats) and
 // flushes it immediately.
 func (s *SSEWriter) Comment(text string) error {
+	if s == nil || s.w == nil {
+		return errors.New("server: nil SSEWriter")
+	}
 	if strings.IndexByte(text, 0) >= 0 {
 		return errors.New("server: SSE comment contains NUL byte")
 	}
@@ -203,6 +212,9 @@ func (s *SSEWriter) Comment(text string) error {
 
 // Flush flushes buffered SSE data to the underlying connection.
 func (s *SSEWriter) Flush() error {
+	if s == nil || s.rc == nil {
+		return errors.New("server: nil SSEWriter")
+	}
 	err := s.rc.Flush()
 	if errors.Is(err, http.ErrNotSupported) {
 		return nil

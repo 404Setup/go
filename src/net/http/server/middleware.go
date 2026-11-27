@@ -579,12 +579,41 @@ func sanitizeAuthRealm(realm string) string {
 	}, realm)
 }
 
+// BasicAuthConfig configures [BasicAuthWithConfig].
+type BasicAuthConfig struct {
+	// Realm is the HTTP Basic authentication realm. Default is "Restricted".
+	Realm string
+
+	// Validator validates the username and password for the request.
+	// Validators comparing static secrets should use [ConstantTimeEqual].
+	// Required (must be non-nil).
+	Validator func(c *Context, username, password string) bool
+
+	// Skip optionally bypasses authentication for matching requests.
+	Skip func(*Context) bool
+}
+
 // BasicAuth returns HTTP Basic Authentication middleware.
 // The validator function should use [ConstantTimeEqual] when comparing secrets.
 func BasicAuth(realm string, validator func(username, password string) bool) HandlerFunc {
 	if validator == nil {
 		panic("server: nil BasicAuth validator")
 	}
+	return BasicAuthWithConfig(BasicAuthConfig{
+		Realm: realm,
+		Validator: func(_ *Context, username, password string) bool {
+			return validator(username, password)
+		},
+	})
+}
+
+// BasicAuthWithConfig returns HTTP Basic Authentication middleware configured
+// with cfg. It panics if cfg.Validator is nil.
+func BasicAuthWithConfig(cfg BasicAuthConfig) HandlerFunc {
+	if cfg.Validator == nil {
+		panic("server: nil BasicAuth validator")
+	}
+	realm := cfg.Realm
 	if realm == "" {
 		realm = "Restricted"
 	}
@@ -592,8 +621,11 @@ func BasicAuth(realm string, validator func(username, password string) bool) Han
 	wwwAuthSlice := []string{`Basic realm="` + safeRealm + `", charset="UTF-8"`}[:1:1]
 
 	return func(c *Context) error {
+		if cfg.Skip != nil && cfg.Skip(c) {
+			return c.Next()
+		}
 		user, pass, ok := c.BasicAuth()
-		if !ok || !validator(user, pass) {
+		if !ok || !cfg.Validator(c, user, pass) {
 			c.respHeader()["Www-Authenticate"] = wwwAuthSlice
 			return NewError(http.StatusUnauthorized, "unauthorized")
 		}
@@ -601,23 +633,50 @@ func BasicAuth(realm string, validator func(username, password string) bool) Han
 	}
 }
 
+// BearerAuthConfig configures [BearerAuthWithConfig].
+type BearerAuthConfig struct {
+	// Realm optionally sets the realm parameter in the WWW-Authenticate
+	// response header on 401 responses.
+	Realm string
+
+	// Validator validates the extracted bearer token for the request.
+	// Validators comparing static tokens should use [ConstantTimeEqual].
+	// Required (must be non-nil).
+	Validator func(c *Context, token string) bool
+
+	// Skip optionally bypasses authentication for matching requests.
+	Skip func(*Context) bool
+}
+
 // BearerAuth returns HTTP Bearer Token Authentication middleware (RFC 6750).
 // It extracts the token using [Context.BearerToken] and passes it to validator.
 // When comparing static tokens, validator should use [ConstantTimeEqual].
 func BearerAuth(realm string, validator func(c *Context, token string) bool) HandlerFunc {
-	if validator == nil {
+	return BearerAuthWithConfig(BearerAuthConfig{
+		Realm:     realm,
+		Validator: validator,
+	})
+}
+
+// BearerAuthWithConfig returns HTTP Bearer Token Authentication middleware
+// configured with cfg. It panics if cfg.Validator is nil.
+func BearerAuthWithConfig(cfg BearerAuthConfig) HandlerFunc {
+	if cfg.Validator == nil {
 		panic("server: nil BearerAuth validator")
 	}
 	var wwwAuthSlice []string
-	if realm != "" {
-		wwwAuthSlice = []string{`Bearer realm="` + sanitizeAuthRealm(realm) + `", charset="UTF-8"`}[:1:1]
+	if cfg.Realm != "" {
+		wwwAuthSlice = []string{`Bearer realm="` + sanitizeAuthRealm(cfg.Realm) + `", charset="UTF-8"`}[:1:1]
 	} else {
 		wwwAuthSlice = []string{"Bearer"}[:1:1]
 	}
 
 	return func(c *Context) error {
+		if cfg.Skip != nil && cfg.Skip(c) {
+			return c.Next()
+		}
 		tok, ok := c.BearerToken()
-		if !ok || !validator(c, tok) {
+		if !ok || !cfg.Validator(c, tok) {
 			c.respHeader()["Www-Authenticate"] = wwwAuthSlice
 			return NewError(http.StatusUnauthorized, "unauthorized")
 		}
@@ -695,6 +754,11 @@ type allowedHostRule struct {
 	wildcard bool
 }
 
+type ipv6HostRule struct {
+	ip   netip.Addr
+	port string
+}
+
 // AllowHosts returns middleware that validates the incoming request Host
 // against hosts to protect against Host header injection and DNS rebinding.
 //
@@ -712,6 +776,7 @@ func AllowHosts(hosts ...string) HandlerFunc {
 		panic("server: AllowHosts requires at least one host")
 	}
 	rules := make([]allowedHostRule, 0, len(hosts))
+	var ipv6Rules []ipv6HostRule
 	for _, raw := range hosts {
 		if raw == "" || raw == "*" {
 			panic(fmt.Sprintf("server: invalid AllowHosts entry %q", raw))
@@ -725,6 +790,17 @@ func AllowHosts(hosts ...string) HandlerFunc {
 		h, p, ok := parseHostAuthority(norm)
 		if !ok {
 			panic(fmt.Sprintf("server: invalid AllowHosts entry %q", raw))
+		}
+		if h[0] == '[' {
+			addr, err := netip.ParseAddr(h[1 : len(h)-1])
+			if err != nil || !addr.Is6() || addr.Zone() != "" {
+				panic(fmt.Sprintf("server: invalid AllowHosts entry %q", raw))
+			}
+			ipv6Rules = append(ipv6Rules, ipv6HostRule{
+				ip:   addr,
+				port: p,
+			})
+			continue
 		}
 		if strings.HasPrefix(h, "*.") {
 			suffix := h[1:] // ".example.com"
@@ -753,7 +829,16 @@ func AllowHosts(hosts ...string) HandlerFunc {
 		}
 		rawHost := c.req.Host
 		reqHost, reqPort, ok := parseHostAuthority(rawHost)
-		if !ok || hasEmptyDotLabel(reqHost) {
+		if !ok {
+			return NewError(http.StatusBadRequest, "invalid host")
+		}
+		if reqHost[0] == '[' {
+			if matchIPv6Host(reqHost, reqPort, ipv6Rules) {
+				return c.Next()
+			}
+			return NewError(http.StatusForbidden, "host not allowed")
+		}
+		if hasEmptyDotLabel(reqHost) {
 			return NewError(http.StatusBadRequest, "invalid host")
 		}
 		for i := range rules {
@@ -773,6 +858,52 @@ func AllowHosts(hosts ...string) HandlerFunc {
 	}
 }
 
+//go:noinline
+func matchIPv6Host(reqHost, reqPort string, ipv6Rules []ipv6HostRule) bool {
+	if len(ipv6Rules) == 0 {
+		return false
+	}
+	reqIP, err := netip.ParseAddr(reqHost[1 : len(reqHost)-1])
+	if err != nil || !reqIP.Is6() || reqIP.Zone() != "" {
+		return false
+	}
+	for i := range ipv6Rules {
+		r := &ipv6Rules[i]
+		if r.port != "" && r.port != reqPort {
+			continue
+		}
+		if reqIP == r.ip {
+			return true
+		}
+	}
+	return false
+}
+
+//go:noinline
+func parseBracketHostAuthority(s string) (host, port string, ok bool) {
+	closeIdx := strings.IndexByte(s, ']')
+	if closeIdx <= 1 || strings.IndexByte(s[1:closeIdx], '[') >= 0 {
+		return "", "", false
+	}
+	addr, err := netip.ParseAddr(s[1:closeIdx])
+	if err != nil || !addr.Is6() || addr.Zone() != "" {
+		return "", "", false
+	}
+	host = s[:closeIdx+1]
+	rem := s[closeIdx+1:]
+	if rem == "" {
+		return host, "", true
+	}
+	if rem[0] != ':' || len(rem) == 1 {
+		return "", "", false
+	}
+	port = rem[1:]
+	if !isASCIIPort(port) {
+		return "", "", false
+	}
+	return host, port, true
+}
+
 func parseHostAuthority(s string) (host, port string, ok bool) {
 	if s == "" {
 		return "", "", false
@@ -788,23 +919,7 @@ func parseHostAuthority(s string) (host, port string, ok bool) {
 		}
 	}
 	if s[0] == '[' {
-		closeIdx := strings.IndexByte(s, ']')
-		if closeIdx <= 1 || strings.IndexByte(s[1:closeIdx], '[') >= 0 {
-			return "", "", false
-		}
-		host = s[:closeIdx+1]
-		rem := s[closeIdx+1:]
-		if rem == "" {
-			return host, "", true
-		}
-		if rem[0] != ':' || len(rem) == 1 {
-			return "", "", false
-		}
-		port = rem[1:]
-		if !isASCIIPort(port) {
-			return "", "", false
-		}
-		return host, port, true
+		return parseBracketHostAuthority(s)
 	}
 	if strings.IndexByte(s, '[') >= 0 || strings.IndexByte(s, ']') >= 0 {
 		return "", "", false
@@ -827,12 +942,15 @@ func isASCIIPort(p string) bool {
 	if len(p) == 0 || len(p) > 5 {
 		return false
 	}
+	n := 0
 	for i := 0; i < len(p); i++ {
-		if p[i] < '0' || p[i] > '9' {
+		b := p[i]
+		if b < '0' || b > '9' {
 			return false
 		}
+		n = n*10 + int(b-'0')
 	}
-	return true
+	return n >= 1 && n <= 65535
 }
 
 func hasEmptyDotLabel(s string) bool {
@@ -990,9 +1108,14 @@ func RateLimitWithConfig(cfg RateLimitConfig) HandlerFunc {
 			sh.mu.Unlock()
 
 			waitSec := (1.0 - tokens) / rate
-			retryAfter := int(math.Ceil(waitSec))
-			if retryAfter < 1 {
+			ceilSec := math.Ceil(waitSec)
+			var retryAfter int
+			if math.IsNaN(ceilSec) || ceilSec < 1 {
 				retryAfter = 1
+			} else if math.IsInf(ceilSec, 1) || ceilSec >= float64(math.MaxInt) {
+				retryAfter = math.MaxInt
+			} else {
+				retryAfter = int(ceilSec)
 			}
 			if retryAfter == 1 {
 				c.respHeader()["Retry-After"] = headerValRetryOne

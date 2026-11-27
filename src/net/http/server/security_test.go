@@ -1005,3 +1005,80 @@ func TestSecurityHostHeaderInjectionAndRateLimitKeyFlood(t *testing.T) {
 		}
 	}
 }
+
+func TestSecurityBodyReaderVaryAndHostHardening(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.MaxBodyBytes = 64
+	s := server.NewWithConfig(cfg)
+	s.Use(server.AllowHosts("127.0.0.1", "[::1]", "app.example.com"))
+
+	s.POST("/stream-read", func(c *server.Context) error {
+		var buf bytes.Buffer
+		if _, err := buf.ReadFrom(c.BodyReader()); err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, buf.String())
+	})
+	s.GET("/vary", func(c *server.Context) error {
+		c.AddVary("Accept", "X-Bad\r\nInject: 1", "Origin, X-Evil")
+		return c.NoContent()
+	})
+
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	client := ts.Client()
+
+	// 1. Live server BodyReader oversized body returns 413 with Connection: close.
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/stream-read", strings.NewReader(strings.Repeat("a", 256)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !resp.Close {
+		t.Fatalf("oversized BodyReader live: status=%d close=%v", resp.StatusCode, resp.Close)
+	}
+
+	// 2. Compressed decompression bomb through BodyReader returns 413 with Connection: close.
+	var gz bytes.Buffer
+	gw := gzip.NewWriter(&gz)
+	_, _ = gw.Write(bytes.Repeat([]byte("B"), 8192))
+	_ = gw.Close()
+	req, err = http.NewRequest(http.MethodPost, ts.URL+"/stream-read", &gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Encoding", "gzip")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !resp.Close {
+		t.Fatalf("compressed bomb BodyReader live: status=%d close=%v", resp.StatusCode, resp.Close)
+	}
+
+	// 3. AddVary rejects injection vectors.
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://app.example.com/vary", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("/vary code=%d", rec.Code)
+	}
+	if got := strings.Join(rec.Header().Values("Vary"), ","); got != "Accept" || rec.Header().Get("Inject") != "" {
+		t.Fatalf("AddVary failed to filter unsafe tokens: vary=%q hdr=%v", got, rec.Header())
+	}
+
+	// 4. AllowHosts rejects malformed bracketed IPv6, zone IDs, and out-of-range ports with 400.
+	for _, bad := range []string{"[::1%eth0]", "[not-ipv6]", "app.example.com:0", "app.example.com:65536"} {
+		r := httptest.NewRequest(http.MethodGet, "http://placeholder/vary", nil)
+		r.Host = bad
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("AllowHosts(%q) code=%d, want 400", bad, w.Code)
+		}
+	}
+}

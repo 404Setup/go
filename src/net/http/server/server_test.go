@@ -668,3 +668,76 @@ func TestServerMatchAtomicityErrorNilGuardsAndContextChecks(t *testing.T) {
 		}()
 	}
 }
+
+func TestServerAndGroupWithMiddlewareScoping(t *testing.T) {
+	s := server.New()
+	s.Use(func(c *server.Context) error {
+		c.AddHeader("X-Trace", "root")
+		return c.Next()
+	})
+
+	mw := func(tag string) server.HandlerFunc {
+		return func(c *server.Context) error {
+			c.AddHeader("X-Trace", tag)
+			return c.Next()
+		}
+	}
+
+	s.GET("/open", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "open")
+	})
+	s.With(mw("with-root")).GET("/scoped", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "scoped")
+	})
+
+	api := s.Group("/api", mw("api"))
+	authed := api.With(mw("auth"))
+	authed.GET("/me", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "me")
+	})
+	// With() with no args creates an isolated subgroup whose Use does not mutate parent.
+	sub := api.With()
+	sub.Use(mw("sub-only"))
+	sub.GET("/sub", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "sub")
+	})
+	api.GET("/health", func(c *server.Context) error {
+		return c.Text(http.StatusOK, "health")
+	})
+
+	cases := []struct {
+		path  string
+		body  string
+		trace []string
+	}{
+		{"/open", "open", []string{"root"}},
+		{"/scoped", "scoped", []string{"root", "with-root"}},
+		{"/api/me", "me", []string{"root", "api", "auth"}},
+		{"/api/sub", "sub", []string{"root", "api", "sub-only"}},
+		{"/api/health", "health", []string{"root", "api"}},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rec.Code != http.StatusOK || rec.Body.String() != tc.body {
+			t.Fatalf("%s: code=%d body=%q", tc.path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Values("X-Trace"); !slices.Equal(got, tc.trace) {
+			t.Fatalf("%s: X-Trace=%v, want %v", tc.path, got, tc.trace)
+		}
+	}
+
+	for _, fn := range []func(){
+		func() { s.With(nil) },
+		func() { api.With(mw("ok"), nil) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic on nil middleware in With")
+				}
+			}()
+			fn()
+		}()
+	}
+}

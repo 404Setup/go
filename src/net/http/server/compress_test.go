@@ -1590,3 +1590,47 @@ func TestDecompressorConstructorsAndWriteErrorPoolIsolation(t *testing.T) {
 		t.Fatalf("errored compressor was unexpectedly pooled: created=%d code=%d", created.Load(), rec.Code)
 	}
 }
+
+func TestCompressResponseWriterReadFrom(t *testing.T) {
+	s := server.New()
+	largeText := strings.Repeat("streamed-compressible-payload-", 80)
+	largePNG := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x42}, 1500)...)
+
+	s.GET("/stream-text", func(c *server.Context) error {
+		return c.Stream(http.StatusOK, "text/plain; charset=utf-8", strings.NewReader(largeText))
+	})
+	s.GET("/stream-png", func(c *server.Context) error {
+		return c.Stream(http.StatusOK, "image/png", bytes.NewReader(largePNG))
+	})
+	s.GET("/stream-disabled", func(c *server.Context) error {
+		c.DisableCompression()
+		return c.Stream(http.StatusOK, "text/plain; charset=utf-8", strings.NewReader(largeText))
+	})
+
+	// Compressible Stream compresses when Accept-Encoding: gzip.
+	req := httptest.NewRequest(http.MethodGet, "/stream-text", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "gzip" || gunzipBody(t, rec.Body) != largeText {
+		t.Fatalf("stream-text: code=%d ce=%q", rec.Code, rec.Header().Get("Content-Encoding"))
+	}
+
+	// Incompressible PNG Stream bypasses compression via ReadFrom.
+	req = httptest.NewRequest(http.MethodGet, "/stream-png", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "" || !bytes.Equal(rec.Body.Bytes(), largePNG) {
+		t.Fatalf("stream-png: code=%d ce=%q len=%d", rec.Code, rec.Header().Get("Content-Encoding"), rec.Body.Len())
+	}
+
+	// DisableCompression before Stream bypasses compression cleanly.
+	req = httptest.NewRequest(http.MethodGet, "/stream-disabled", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "" || rec.Body.String() != largeText {
+		t.Fatalf("stream-disabled: code=%d ce=%q", rec.Code, rec.Header().Get("Content-Encoding"))
+	}
+}

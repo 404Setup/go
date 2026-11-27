@@ -87,6 +87,9 @@ func (g *Group) StaticFS(prefix string, fsys fs.FS, cfg ...StaticConfig) {
 
 	var ccSlice []string
 	if c.CacheControl != "" {
+		if hasHeaderControl(c.CacheControl) {
+			panic("server: StaticConfig.CacheControl contains control character")
+		}
 		ccSlice = []string{c.CacheControl}[:1:1]
 	}
 

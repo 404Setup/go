@@ -357,6 +357,12 @@ func (s *Server) Group(prefix string, middlewares ...HandlerFunc) *Group {
 	return s.root.Group(prefix, middlewares...)
 }
 
+// With creates a subgroup sharing the server's root prefix and middleware
+// chain, appending middlewares for routes registered on the returned group.
+func (s *Server) With(middlewares ...HandlerFunc) *Group {
+	return s.root.With(middlewares...)
+}
+
 // Route creates a subgroup at prefix and passes it to fn for scoped route
 // registration. It panics if fn is nil.
 func (s *Server) Route(prefix string, fn func(*Group)) {
@@ -504,6 +510,12 @@ func (g *Group) Group(prefix string, middlewares ...HandlerFunc) *Group {
 		prefix:      fullPrefix,
 		middlewares: mws,
 	}
+}
+
+// With creates a subgroup sharing this group's prefix and current middleware
+// slice, appending middlewares for routes registered on the returned group.
+func (g *Group) With(middlewares ...HandlerFunc) *Group {
+	return g.Group("", middlewares...)
 }
 
 // Route creates a nested subgroup at prefix and passes it to fn for scoped

@@ -1378,6 +1378,17 @@ func (w *compressResponseWriter) WriteString(s string) (int, error) {
 	return n, err
 }
 
+func (w *compressResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if w.wroteHeader && w.mode == compressBypassed {
+		if rf, ok := w.rw.(io.ReaderFrom); ok {
+			n, err := rf.ReadFrom(r)
+			w.writtenBytes += n
+			return n, err
+		}
+	}
+	return io.Copy(writerOnly{w}, r)
+}
+
 // FlushError implements the interface recognized by [http.ResponseController.Flush].
 func (w *compressResponseWriter) FlushError() error {
 	if w.mode == compressUndecided {

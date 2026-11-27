@@ -14,8 +14,8 @@
 //
 // Routes are registered on a [*Server] or [*Group] using method helpers such as
 // [Server.GET], [Server.POST], or [Server.Handle], and can be organized into
-// prefixed middleware scopes with [Server.Group] or [Server.Route]. Patterns
-// must start with "/" and support three segment forms:
+// prefixed or middleware-scoped groups with [Server.Group], [Server.Route], or
+// [Server.With]. Patterns must start with "/" and support three segment forms:
 //
 //   - Static literal segments: "/api/v1/health"
 //   - Single-segment parameters: "/users/{id}/posts/{postID}"
@@ -54,7 +54,7 @@
 //   - Bounded request body reading via Config.MaxBodyBytes (default 4 MiB) for
 //     [Context.BindJSON], [Context.BindJSONStrict], [Context.ParseForm],
 //     [Context.FormValue], [Context.ParseMultipartForm], [Context.FormFile],
-//     and [Context.BodyBytes].
+//     [Context.FormFiles], [Context.BodyReader], and [Context.BodyBytes].
 //   - [Context.ClientIP] and [Context.Scheme] ignore X-Forwarded-For,
 //     X-Real-IP, and X-Forwarded-Proto unless the direct peer matches
 //     Config.TrustedProxies.

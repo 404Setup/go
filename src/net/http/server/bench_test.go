@@ -498,3 +498,37 @@ func BenchmarkLookupParam(b *testing.B) {
 		s.ServeHTTP(&w, req)
 	}
 }
+
+func BenchmarkAllowHostsIPv6(b *testing.B) {
+	s := server.New()
+	s.Use(server.AllowHosts("api.example.com", "2001:db8::1"))
+	s.GET("/ok", func(c *server.Context) error {
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://[2001:db8::1]:8443/ok", nil)
+	var w discardResponseWriter
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.ServeHTTP(&w, req)
+	}
+}
+
+func BenchmarkAddVary(b *testing.B) {
+	s := server.New()
+	s.GET("/vary", func(c *server.Context) error {
+		c.AddVary("Accept-Encoding")
+		c.AddVary("Accept-Encoding")
+		return c.NoContent()
+	})
+	req := httptest.NewRequest(http.MethodGet, "/vary", nil)
+	w := &discardResponseWriter{header: make(http.Header, 4)}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		clear(w.header)
+		s.ServeHTTP(w, req)
+	}
+}

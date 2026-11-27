@@ -829,3 +829,146 @@ func TestMiddlewareRateLimitAndConfigValidation(t *testing.T) {
 		t.Fatalf("CORS multi ACRH: code=%d allowHeaders=%q", recPre.Code, recPre.Header().Get("Access-Control-Allow-Headers"))
 	}
 }
+
+func TestMiddlewareAuthConfigsAllowHostsIPv6AndRateLimitOverflow(t *testing.T) {
+	// 1. BasicAuthWithConfig and BearerAuthWithConfig with Context + Skip.
+	s := server.New()
+	s.GET("/basic", server.BasicAuthWithConfig(server.BasicAuthConfig{
+		Realm: `Ops "\r\nZone`,
+		Skip: func(c *server.Context) bool {
+			return c.Query("skip") == "1"
+		},
+		Validator: func(c *server.Context, u, p string) bool {
+			if server.ConstantTimeEqual(u, "ops") && server.ConstantTimeEqual(p, "pw") {
+				c.Set("user", u)
+				return true
+			}
+			return false
+		},
+	}), func(c *server.Context) error {
+		u, _ := server.GetValue[string](c, "user")
+		return c.Text(http.StatusOK, "ok:"+u)
+	})
+
+	s.GET("/bearer", server.BearerAuthWithConfig(server.BearerAuthConfig{
+		Realm: "API",
+		Skip: func(c *server.Context) bool {
+			return c.Query("public") == "1"
+		},
+		Validator: func(c *server.Context, tok string) bool {
+			if server.ConstantTimeEqual(tok, "tok-1") {
+				c.Set("sub", "svc")
+				return true
+			}
+			return false
+		},
+	}), func(c *server.Context) error {
+		sub, _ := server.GetValue[string](c, "sub")
+		return c.Text(http.StatusOK, "ok:"+sub)
+	})
+
+	// Skipped requests succeed without credentials.
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/basic?skip=1", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok:" {
+		t.Fatalf("basic skip: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/bearer?public=1", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok:" {
+		t.Fatalf("bearer skip: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Authenticated requests propagate context values from Validator.
+	req := httptest.NewRequest(http.MethodGet, "/basic", nil)
+	req.SetBasicAuth("ops", "pw")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok:ops" {
+		t.Fatalf("basic authed: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/bearer", nil)
+	req.Header.Set("Authorization", "Bearer tok-1")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok:svc" {
+		t.Fatalf("bearer authed: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Nil validators panic.
+	for _, fn := range []func(){
+		func() { server.BasicAuthWithConfig(server.BasicAuthConfig{}) },
+		func() { server.BearerAuthWithConfig(server.BearerAuthConfig{}) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic for nil validator")
+				}
+			}()
+			fn()
+		}()
+	}
+
+	// 2. AllowHosts IPv6 canonicalization, bracket validation, and port range checks.
+	sHosts := server.New()
+	sHosts.Use(server.AllowHosts("2001:0db8::1", "[::1]:8443"))
+	sHosts.GET("/h", func(c *server.Context) error { return c.NoContent() })
+
+	for _, tc := range []struct {
+		host   string
+		status int
+	}{
+		{"[2001:db8::1]", http.StatusNoContent},
+		{"[2001:0db8:0:0::1]:9000", http.StatusNoContent},
+		{"[0:0:0:0:0:0:0:1]:8443", http.StatusNoContent},
+		{"[::1]:8080", http.StatusForbidden},
+		{"[2001:db8::2]", http.StatusForbidden},
+		{"[not-an-ip]", http.StatusBadRequest},
+		{"[::1%eth0]:8443", http.StatusBadRequest},
+		{"example.com:0", http.StatusBadRequest},
+		{"example.com:99999", http.StatusBadRequest},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://placeholder/h", nil)
+		req.Host = tc.host
+		rec := httptest.NewRecorder()
+		sHosts.ServeHTTP(rec, req)
+		if rec.Code != tc.status {
+			t.Fatalf("AllowHosts(%q): status=%d, want %d", tc.host, rec.Code, tc.status)
+		}
+	}
+
+	for _, bad := range []string{"[not-an-ip]", "[::1%eth0]", "example.com:0", "example.com:65536"} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("expected AllowHosts(%q) panic", bad)
+				}
+			}()
+			server.AllowHosts(bad)
+		}()
+	}
+
+	// 3. RateLimitWithConfig with tiny rate must not overflow Retry-After to 1.
+	sRL := server.New()
+	sRL.Use(server.RateLimitWithConfig(server.RateLimitConfig{
+		Rate:  1e-308,
+		Burst: 1,
+	}))
+	sRL.GET("/rl", func(c *server.Context) error { return c.NoContent() })
+
+	rec = httptest.NewRecorder()
+	sRL.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/rl", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("first tiny-rate req status=%d, want 204", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	sRL.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/rl", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second tiny-rate req status=%d, want 429", rec.Code)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" || ra == "1" || strings.HasPrefix(ra, "-") {
+		t.Fatalf("tiny-rate Retry-After overflowed: %q", ra)
+	}
+}

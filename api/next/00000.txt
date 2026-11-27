@@ -31,7 +31,9 @@ pkg net/http/server, func Adapt(func(http.Handler) http.Handler) HandlerFunc #80
 pkg net/http/server, func AdaptHandler(http.Handler) HandlerFunc #80000
 pkg net/http/server, func AllowHosts(...string) HandlerFunc #80000
 pkg net/http/server, func BasicAuth(string, func(string, string) bool) HandlerFunc #80000
+pkg net/http/server, func BasicAuthWithConfig(BasicAuthConfig) HandlerFunc #80000
 pkg net/http/server, func BearerAuth(string, func(*Context, string) bool) HandlerFunc #80000
+pkg net/http/server, func BearerAuthWithConfig(BearerAuthConfig) HandlerFunc #80000
 pkg net/http/server, func BodyLimit(int64) HandlerFunc #80000
 pkg net/http/server, func CORS(CORSConfig) HandlerFunc #80000
 pkg net/http/server, func Compress() HandlerFunc #80000
@@ -64,11 +66,13 @@ pkg net/http/server, func Timeout(time.Duration) HandlerFunc #80000
 pkg net/http/server, func WrapError(int, string, error) *HTTPError #80000
 pkg net/http/server, method (*Context) Accepts(...string) string #80000
 pkg net/http/server, method (*Context) AddHeader(string, string) #80000
+pkg net/http/server, method (*Context) AddVary(...string) #80000
 pkg net/http/server, method (*Context) BasicAuth() (string, string, bool) #80000
 pkg net/http/server, method (*Context) BearerToken() (string, bool) #80000
 pkg net/http/server, method (*Context) BindJSON(interface{}) error #80000
 pkg net/http/server, method (*Context) BindJSONStrict(interface{}) error #80000
 pkg net/http/server, method (*Context) BodyBytes() ([]uint8, error) #80000
+pkg net/http/server, method (*Context) BodyReader() io.ReadCloser #80000
 pkg net/http/server, method (*Context) Bytes(int, string, []uint8) error #80000
 pkg net/http/server, method (*Context) BytesWritten() int64 #80000
 pkg net/http/server, method (*Context) ClientIP() string #80000
@@ -86,6 +90,7 @@ pkg net/http/server, method (*Context) File(string) error #80000
 pkg net/http/server, method (*Context) FileFS(fs.FS, string) error #80000
 pkg net/http/server, method (*Context) Flush() error #80000
 pkg net/http/server, method (*Context) FormFile(string) (multipart.File, *multipart.FileHeader, error) #80000
+pkg net/http/server, method (*Context) FormFiles(string) ([]*multipart.FileHeader, error) #80000
 pkg net/http/server, method (*Context) FormValue(string) string #80000
 pkg net/http/server, method (*Context) Get(string) (interface{}, bool) #80000
 pkg net/http/server, method (*Context) HTML(int, string) error #80000
@@ -151,6 +156,7 @@ pkg net/http/server, method (*Group) Route(string, func(*Group)) #80000
 pkg net/http/server, method (*Group) StaticDir(string, string, ...StaticConfig) error #80000
 pkg net/http/server, method (*Group) StaticFS(string, fs.FS, ...StaticConfig) #80000
 pkg net/http/server, method (*Group) Use(...HandlerFunc) #80000
+pkg net/http/server, method (*Group) With(...HandlerFunc) *Group #80000
 pkg net/http/server, method (*HTTPError) Error() string #80000
 pkg net/http/server, method (*HTTPError) Unwrap() error #80000
 pkg net/http/server, method (*Server) Any(string, ...HandlerFunc) #80000
@@ -190,6 +196,7 @@ pkg net/http/server, method (*Server) Shutdown(context.Context) error #80000
 pkg net/http/server, method (*Server) StaticDir(string, string, ...StaticConfig) error #80000
 pkg net/http/server, method (*Server) StaticFS(string, fs.FS, ...StaticConfig) #80000
 pkg net/http/server, method (*Server) Use(...HandlerFunc) #80000
+pkg net/http/server, method (*Server) With(...HandlerFunc) *Group #80000
 pkg net/http/server, method (*SSEWriter) Comment(string) error #80000
 pkg net/http/server, method (*SSEWriter) Flush() error #80000
 pkg net/http/server, method (*SSEWriter) Send(SSEEvent) error #80000
@@ -197,6 +204,14 @@ pkg net/http/server, method (*SSEWriter) SendData(string) error #80000
 pkg net/http/server, method (*SSEWriter) SendJSON(string, interface{}) error #80000
 pkg net/http/server, method (CompressorFunc) NewWriter(io.Writer) (io.WriteCloser, error) #80000
 pkg net/http/server, method (DecompressorFunc) NewReader(io.Reader) (io.ReadCloser, error) #80000
+pkg net/http/server, type BasicAuthConfig struct #80000
+pkg net/http/server, type BasicAuthConfig struct, Realm string #80000
+pkg net/http/server, type BasicAuthConfig struct, Skip func(*Context) bool #80000
+pkg net/http/server, type BasicAuthConfig struct, Validator func(*Context, string, string) bool #80000
+pkg net/http/server, type BearerAuthConfig struct #80000
+pkg net/http/server, type BearerAuthConfig struct, Realm string #80000
+pkg net/http/server, type BearerAuthConfig struct, Skip func(*Context) bool #80000
+pkg net/http/server, type BearerAuthConfig struct, Validator func(*Context, string) bool #80000
 pkg net/http/server, type CORSConfig struct #80000
 pkg net/http/server, type CORSConfig struct, AllowCredentials bool #80000
 pkg net/http/server, type CORSConfig struct, AllowHeaders []string #80000

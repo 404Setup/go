@@ -958,6 +958,19 @@ func (c *Context) DelHeader(key string) {
 	c.respHeader().Del(key)
 }
 
+// AddVary appends each valid HTTP header name in tokens to the Vary response
+// header if not already present (case-insensitive), preserving existing tokens.
+func (c *Context) AddVary(tokens ...string) {
+	h := c.respHeader()
+	for _, tok := range tokens {
+		tok = trimOWS(tok)
+		if tok == "" || !isValidHTTPMethod(tok) {
+			continue
+		}
+		addVaryToken(h, tok)
+	}
+}
+
 // Cookie returns the named cookie from the request.
 func (c *Context) Cookie(name string) (*http.Cookie, error) {
 	return c.req.Cookie(name)
@@ -1177,6 +1190,33 @@ func (c *Context) readBodyInto(jrb *jsonReadBuf, limit int64) error {
 	return nil
 }
 
+type errReadCloser struct {
+	err error
+}
+
+func (e errReadCloser) Read([]byte) (int, error) { return 0, e.err }
+func (e errReadCloser) Close() error             { return nil }
+
+// BodyReader returns the request body as an [io.ReadCloser] enforcing the
+// request's effective MaxBodyBytes limit (from Config.MaxBodyBytes, [BodyLimit],
+// or [Context.SetMaxBodyBytes]).
+func (c *Context) BodyReader() io.ReadCloser {
+	if c.req.Body == nil || c.req.Body == http.NoBody {
+		return http.NoBody
+	}
+	limit := c.effectiveMaxBodyBytes()
+	if limit > 0 {
+		if c.req.ContentLength > limit {
+			c.markRequestTooLarge()
+			return errReadCloser{
+				err: WrapError(http.StatusRequestEntityTooLarge, "request body too large", ErrBodyTooLarge),
+			}
+		}
+		c.wrapBodyLimit(limit)
+	}
+	return c.req.Body
+}
+
 // BodyBytes reads and returns the request body, enforcing the configured
 // maximum body size.
 func (c *Context) BodyBytes() ([]byte, error) {
@@ -1283,6 +1323,22 @@ func (c *Context) FormFile(name string) (multipart.File, *multipart.FileHeader, 
 	return c.req.FormFile(name)
 }
 
+// FormFiles returns all uploaded file headers for the provided multipart form
+// key while enforcing the configured maximum body size.
+func (c *Context) FormFiles(name string) ([]*multipart.FileHeader, error) {
+	if c.req.MultipartForm == nil {
+		if _, err := c.ParseMultipartForm(0); err != nil {
+			return nil, err
+		}
+	}
+	if c.req.MultipartForm != nil && c.req.MultipartForm.File != nil {
+		if fhs := c.req.MultipartForm.File[name]; len(fhs) > 0 {
+			return fhs, nil
+		}
+	}
+	return nil, http.ErrMissingFile
+}
+
 // BindJSON decodes a single JSON value from the request body into dst.
 //
 // It enforces Config.MaxBodyBytes (returning 413 on overflow), rejects non-JSON
@@ -1347,6 +1403,10 @@ func (c *Context) bindJSON(dst any, strict bool) error {
 	}
 
 	if decodeErr != nil {
+		var invErr *json.InvalidUnmarshalError
+		if errors.As(decodeErr, &invErr) {
+			return decodeErr
+		}
 		return WrapError(http.StatusBadRequest, "invalid JSON payload", fmt.Errorf("%w: %w", ErrInvalidJSON, decodeErr))
 	}
 	return nil

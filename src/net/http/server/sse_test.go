@@ -145,4 +145,18 @@ func TestContextSSEStreamingAndSecurity(t *testing.T) {
 	if rec.Body.String() != "data: safe\n\n" || strings.Contains(rec.Body.String(), "evil") {
 		t.Fatalf("/inject body = %q", rec.Body.String())
 	}
+
+	// Nil SSEWriter methods return errors cleanly without panicking.
+	var nilSSE *server.SSEWriter
+	for _, err := range []error{
+		nilSSE.Send(server.SSEEvent{Data: "x"}),
+		nilSSE.SendData("x"),
+		nilSSE.SendJSON("ev", map[string]int{"a": 1}),
+		nilSSE.Comment("hb"),
+		nilSSE.Flush(),
+	} {
+		if err == nil {
+			t.Fatal("expected error from nil *SSEWriter")
+		}
+	}
 }

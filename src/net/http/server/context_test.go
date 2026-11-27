@@ -1085,3 +1085,133 @@ func TestContextLookupParamBasicAuthAndRedirect304(t *testing.T) {
 		t.Fatalf("Redirect(304) status = %d, want 500", rec.Code)
 	}
 }
+
+func TestContextBodyReaderFormFilesAddVaryAndBindDestinationError(t *testing.T) {
+	var logBuf bytes.Buffer
+	cfg := server.DefaultConfig()
+	cfg.MaxBodyBytes = 32
+	cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+	s := server.NewWithConfig(cfg)
+
+	s.GET("/vary", func(c *server.Context) error {
+		c.AddVary("Origin", "Accept", "origin", "Accept-Encoding", "", "Bad\r\nHeader", "Bad Header")
+		c.AddVary("ACCEPT")
+		return c.NoContent()
+	})
+	s.POST("/stream-body", func(c *server.Context) error {
+		b, err := io.ReadAll(c.BodyReader())
+		if err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, string(b))
+	})
+	s.POST("/stream-body-unlimited", func(c *server.Context) error {
+		c.SetMaxBodyBytes(-1)
+		b, err := io.ReadAll(c.BodyReader())
+		if err != nil {
+			return err
+		}
+		return c.Text(http.StatusOK, fmt.Sprintf("%d", len(b)))
+	})
+	s.POST("/multi-upload", func(c *server.Context) error {
+		c.SetMaxBodyBytes(2048)
+		fhs, err := c.FormFiles("docs")
+		if err != nil {
+			return err
+		}
+		if _, err := c.FormFiles("missing"); !errors.Is(err, http.ErrMissingFile) {
+			return fmt.Errorf("expected ErrMissingFile, got %v", err)
+		}
+		var names []string
+		for _, fh := range fhs {
+			f, err := fh.Open()
+			if err != nil {
+				return err
+			}
+			b, err := io.ReadAll(f)
+			f.Close()
+			if err != nil {
+				return err
+			}
+			names = append(names, fh.Filename+"="+string(b))
+		}
+		return c.Text(http.StatusOK, strings.Join(names, ","))
+	})
+	s.POST("/bad-dst", func(c *server.Context) error {
+		var s struct{ A int }
+		// Intentionally pass non-pointer destination (programmer bug).
+		return c.BindJSON(s)
+	})
+
+	// 1. AddVary deduplicates case-insensitively and ignores invalid tokens.
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/vary", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("/vary code=%d", rec.Code)
+	}
+	if got := rec.Header().Values("Vary"); !slices.Equal(got, []string{"Origin", "Accept", "Accept-Encoding"}) {
+		t.Fatalf("Vary = %v, want [Origin Accept Accept-Encoding]", got)
+	}
+
+	// 2. BodyReader handles nil/NoBody, valid body, oversized ContentLength, oversized chunked, and SetMaxBodyBytes(-1).
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/stream-body", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "" {
+		t.Fatalf("empty BodyReader: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/stream-body", strings.NewReader("hello")))
+	if rec.Code != http.StatusOK || rec.Body.String() != "hello" {
+		t.Fatalf("valid BodyReader: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/stream-body", strings.NewReader(strings.Repeat("x", 64))))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("known oversized BodyReader: code=%d, want 413", rec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/stream-body", strings.NewReader(strings.Repeat("x", 64)))
+	req.ContentLength = -1
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("chunked oversized BodyReader: code=%d, want 413", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/stream-body-unlimited", strings.NewReader(strings.Repeat("z", 128))))
+	if rec.Code != http.StatusOK || rec.Body.String() != "128" {
+		t.Fatalf("unlimited BodyReader: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// 3. FormFiles reads multiple files and returns ErrMissingFile when absent.
+	boundary := "multi123"
+	mpBody := "--" + boundary + "\r\n" +
+		"Content-Disposition: form-data; name=\"docs\"; filename=\"one.txt\"\r\n\r\n" +
+		"first\r\n" +
+		"--" + boundary + "\r\n" +
+		"Content-Disposition: form-data; name=\"docs\"; filename=\"two.txt\"\r\n\r\n" +
+		"second\r\n" +
+		"--" + boundary + "--\r\n"
+	req = httptest.NewRequest(http.MethodPost, "/multi-upload", strings.NewReader(mpBody))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "one.txt=first,two.txt=second" {
+		t.Fatalf("FormFiles: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// 4. BindJSON with non-pointer destination returns 500 without leaking reflection error.
+	req = httptest.NewRequest(http.MethodPost, "/bad-dst", strings.NewReader(`{"A":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError || rec.Body.String() != "internal server error" {
+		t.Fatalf("BindJSON non-pointer: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logBuf.String(), "InvalidUnmarshalError") && !strings.Contains(logBuf.String(), "non-pointer") {
+		t.Fatalf("expected logged InvalidUnmarshalError, got %q", logBuf.String())
+	}
+}
