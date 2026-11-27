@@ -1364,3 +1364,113 @@ func TestFastV2ReplayCustomUnmarshalerOnceRegression(t *testing.T) {
 		t.Fatalf("C.UnmarshalJSON called %d times, want 1", d.C.calls)
 	}
 }
+
+type v2ErrUnmarshaler struct {
+	err error
+}
+
+func (u *v2ErrUnmarshaler) UnmarshalJSON([]byte) error {
+	return u.err
+}
+
+func TestFastV2AuditRegressions(t *testing.T) {
+	t.Run("AnyCycleAndMaxDepth", func(t *testing.T) {
+		// Depth 10000 containing a scalar is valid per jsontext maxNestingDepth.
+		var validAny any = nil
+		for range 10000 {
+			validAny = []any{validAny}
+		}
+		if _, err := Marshal(validAny); err != nil {
+			t.Fatalf("Marshal depth-10000 []any failed: %v", err)
+		}
+
+		// Depth 10001 must fail with max depth error, even via map[string]any/[]any/custom.
+		tooDeep := any(map[string]any{"x": validAny})
+		if _, err := Marshal(tooDeep); err == nil {
+			t.Fatal("Marshal depth-10001 succeeded, want max depth error")
+		}
+
+		// Cycle via custom/slice nested beyond startDetectingCyclesAfter (1000).
+		type holder struct{ S []any }
+		rootSlice := make([]any, 1)
+		h := &holder{S: rootSlice}
+		var chain any = h
+		for range 1005 {
+			chain = []any{chain}
+		}
+		rootSlice[0] = chain
+		if _, err := Marshal(rootSlice); err == nil {
+			t.Fatal("Marshal deep cycle succeeded, want cycle error")
+		}
+	})
+
+	t.Run("MarshalEncodeErrorKeepsTokenState", func(t *testing.T) {
+		type badStr struct {
+			S string
+		}
+		for _, call := range []func(*jsontext.Encoder) error{
+			func(enc *jsontext.Encoder) error { return MarshalEncode(enc, badStr{S: "\xff"}) },
+			func(enc *jsontext.Encoder) error { return MarshalEncodeOf(enc, badStr{S: "\xff"}) },
+		} {
+			var buf bytes.Buffer
+			enc := jsontext.NewEncoder(&buf)
+			if err := call(enc); err == nil {
+				t.Fatal("expected UTF-8 marshal error")
+			}
+			if ptr := enc.StackPointer(); ptr != "/S" {
+				t.Fatalf("StackPointer = %q, want \"/S\"", ptr)
+			}
+			if err := MarshalEncode(enc, 0); err != nil {
+				t.Fatalf("completing value for /S failed: %v", err)
+			}
+			var serr *jsontext.SyntacticError
+			if err := MarshalEncode(enc, 0); !errors.As(err, &serr) || serr.Err == nil {
+				t.Fatalf("subsequent MarshalEncode at object-name err = %v, want *jsontext.SyntacticError wrapping error", err)
+			}
+		}
+	})
+
+	t.Run("StringTagLegacyInvalidUTF8ErrorType", func(t *testing.T) {
+		type S struct {
+			V string `json:",string"`
+		}
+		_, err := Marshal(S{V: "\xff"}, flagOpt(jsonflags.StringifyWithLegacySemantics))
+		var semErr *SemanticError
+		if !errors.As(err, &semErr) {
+			t.Fatalf("err = %T (%v), want *SemanticError wrapping *jsontext.SyntacticError", err, err)
+		}
+		var synErr *jsontext.SyntacticError
+		if !errors.As(semErr.Err, &synErr) {
+			t.Fatalf("semErr.Err = %T (%v), want *jsontext.SyntacticError", semErr.Err, semErr.Err)
+		}
+	})
+
+	t.Run("CustomLegacyErrorPlusDuplicateNameSyntactic", func(t *testing.T) {
+		type doc struct {
+			A v2ErrUnmarshaler `json:"a"`
+			B int              `json:"b"`
+		}
+		d := doc{A: v2ErrUnmarshaler{err: errors.New("custom boom")}}
+		in := `{"a":1,"b":2,"b":3}`
+		err := Unmarshal([]byte(in), &d, flagOpt(jsonflags.ReportErrorsWithLegacySemantics))
+		if err == nil || !strings.Contains(err.Error(), "duplicate object member name") {
+			t.Fatalf("err = %T (%v), want duplicate object member name SyntaxError", err, err)
+		}
+	})
+
+	t.Run("UnmarshalDecodeErrorDoesNotSkipValue", func(t *testing.T) {
+		type S struct {
+			A int `json:"a"`
+			B int `json:"b"`
+		}
+		dec := jsontext.NewDecoder(strings.NewReader(`{"a":1,"b":"bad"}`))
+		var s S
+		if err := UnmarshalDecode(dec, &s); err == nil {
+			t.Fatal("expected error")
+		}
+		if off := dec.InputOffset(); off >= int64(len(`{"a":1,"b":"bad"}`)) {
+			t.Fatalf("InputOffset = %d consumed past error to end", off)
+		}
+	})
+}
+

@@ -307,28 +307,16 @@ func MarshalEncode(out *jsontext.Encoder, in any, opts ...Options) (err error) {
 		at := e.typ
 		if at != nil {
 			plan := lookupFastMarshalPlan(at)
-			if plan.canFast {
+			if plan.canFast && !plan.hasCustom {
 				origBuf := xe.Buf
-				var b []byte
-				var ferr error
-				if !plan.hasCustom {
-					var ptr unsafe.Pointer
-					if at.IsDirectIface() {
-						ptr = noescape(unsafe.Pointer(&e.data))
-					} else {
-						ptr = noescape(e.data)
-					}
-					b, ferr = plan.marshal(origBuf, ptr, &xe.Struct, 0)
-					runtime.KeepAlive(in)
-				} else if at.Kind() == abi.Pointer && plan.kind == fkPtr {
-					if e.data == nil {
-						b = append(origBuf, "null"...)
-					} else {
-						b, ferr = plan.elemPlan.marshal(origBuf, e.data, &xe.Struct, 0)
-					}
+				var ptr unsafe.Pointer
+				if at.IsDirectIface() {
+					ptr = noescape(unsafe.Pointer(&e.data))
 				} else {
-					b, ferr = marshalFastEface(plan, origBuf, in, &xe.Struct)
+					ptr = noescape(e.data)
 				}
+				b, ferr := plan.marshal(origBuf, ptr, &xe.Struct, 0)
+				runtime.KeepAlive(in)
 				if ferr == nil {
 					xe.CommitBuffer(b)
 					xe.Tokens.Last.Increment()
@@ -340,18 +328,6 @@ func MarshalEncode(out *jsontext.Encoder, in any, opts ...Options) (err error) {
 						return err
 					}
 					return nil
-				}
-				if ferr != errFastFallback {
-					if !xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
-						if p := fastPartialOutput(b, ferr); len(p) > len(origBuf) {
-							xe.CommitBuffer(p)
-						} else {
-							xe.Buf = origBuf
-						}
-					} else {
-						xe.Buf = origBuf
-					}
-					return materializeFastErr(ferr, in, at, len(origBuf), &xe.Struct)
 				}
 				xe.Buf = origBuf
 			}

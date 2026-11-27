@@ -229,35 +229,19 @@ func MarshalEncodeOf[T any](out *jsontext.Encoder, in T, opts ...Options) error 
 						}
 						return nil
 					}
-					return marshalEncodeOfSlowErr(out, origBuf, b2, in, at, ferr, opts)
+					return marshalEncodeOfSlow(out, origBuf, in, opts)
 				}
 			}
 		}
 	}
-	return marshalEncodeOfSlow(out, in, opts)
+	return marshalEncodeOfSlow(out, nil, in, opts)
 }
 
 //go:noinline
-func marshalEncodeOfSlowErr[T any](out *jsontext.Encoder, origBuf, b2 []byte, in T, at *abi.Type, ferr error, opts []Options) error {
-	xe := export.Encoder(out)
-	if ferr != errFastFallback {
-		if !xe.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
-			if p := fastPartialOutput(b2, ferr); len(p) > len(origBuf) {
-				xe.CommitBuffer(p)
-			} else {
-				xe.Buf = origBuf
-			}
-		} else {
-			xe.Buf = origBuf
-		}
-		return materializeFastErr(ferr, in, at, len(origBuf), &xe.Struct)
+func marshalEncodeOfSlow[T any](out *jsontext.Encoder, origBuf []byte, in T, opts []Options) error {
+	if origBuf != nil {
+		export.Encoder(out).Buf = origBuf
 	}
-	xe.Buf = origBuf
-	return MarshalEncode(out, in, opts...)
-}
-
-//go:noinline
-func marshalEncodeOfSlow[T any](out *jsontext.Encoder, in T, opts []Options) error {
 	return MarshalEncode(out, in, opts...)
 }
 

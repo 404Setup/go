@@ -837,13 +837,18 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 		return v1AppendFloat(b, fv, 64), nil
 	case v1fkTime:
 		t := *(*time.Time)(ptr)
-		if y := t.Year(); y < 0 || y >= 10000 {
+		off := len(b)
+		b = append(b, '"')
+		b = t.AppendFormat(b, time.RFC3339Nano)
+		tb := b[off+1:]
+		if len(tb) <= len("9999") || tb[len("9999")] != '-' ||
+			(tb[len(tb)-1] != 'Z' && (len(tb) < len("Z07:00") ||
+				('0' <= tb[len(tb)-len("Z07:00")] && tb[len(tb)-len("Z07:00")] <= '9') ||
+				(tb[len(tb)-len("07:00")]-'0')*10+(tb[len(tb)-len("07:00")+1]-'0') >= 24)) {
 			if _, err := t.MarshalJSON(); err != nil {
 				return nil, &MarshalerError{v1TimeType, err, "MarshalJSON"}
 			}
 		}
-		b = append(b, '"')
-		b = t.AppendFormat(b, time.RFC3339Nano)
 		return append(b, '"'), nil
 	case v1fkBytes:
 		s := *(*[]byte)(ptr)
@@ -1094,9 +1099,11 @@ func (p *v1FastMarshalPlan) marshal(b []byte, ptr unsafe.Pointer, escapeHTML boo
 	return nil, errV1FastFallback
 }
 
-func v1UnsupportedFloatError(rt reflect.Type, ptr unsafe.Pointer, fv float64, bits int) error {
+func v1UnsupportedFloatError(rt reflect.Type, _ unsafe.Pointer, fv float64, bits int) error {
+	rv := reflect.New(rt).Elem()
+	rv.SetFloat(fv)
 	return &UnsupportedValueError{
-		Value: reflect.NewAt(rt, ptr).Elem(),
+		Value: rv,
 		Str:   strconv.FormatFloat(fv, 'g', -1, bits),
 	}
 }

@@ -910,3 +910,65 @@ func TestFastV1TimeInvalidSyntaxRegression(t *testing.T) {
 		t.Fatalf("Unmarshal root time with trailing garbage succeeded unexpectedly: %v", root)
 	}
 }
+
+type fastV1EmbUnmarshaler struct {
+	A int
+}
+
+func (e *fastV1EmbUnmarshaler) UnmarshalJSON([]byte) error {
+	e.A = 999
+	return nil
+}
+
+//go:noinline
+func fastV1CallMarshalOfNaN() error {
+	type S struct{ F float64 }
+	_, err := json.MarshalOf(S{F: math.NaN()})
+	return err
+}
+
+//go:noinline
+func fastV1ClobberStack(a, b, c, d, e, f uint64) uint64 {
+	return a + b + c + d + e + f
+}
+
+func TestFastV1AuditRegressions(t *testing.T) {
+	t.Run("UnsupportedFloatNoStackDangle", func(t *testing.T) {
+		err := fastV1CallMarshalOfNaN()
+		_ = fastV1ClobberStack(0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666)
+		uve, ok := err.(*json.UnsupportedValueError)
+		if !ok {
+			t.Fatalf("err = %T (%v), want *json.UnsupportedValueError", err, err)
+		}
+		if got := uve.Value.Float(); !math.IsNaN(got) {
+			t.Fatalf("UnsupportedValueError.Value.Float() = %v, want NaN", got)
+		}
+	})
+
+	t.Run("UnnamedStructEmbeddedUnmarshalerParity", func(t *testing.T) {
+		type outer struct {
+			Inner struct{ fastV1EmbUnmarshaler }  `json:"inner"`
+			Ptr   *struct{ fastV1EmbUnmarshaler } `json:"ptr"`
+		}
+		var o outer
+		if err := json.Unmarshal([]byte(`{"inner":{"A":1},"ptr":{"A":1}}`), &o); err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if o.Inner.A != 999 {
+			t.Fatalf("o.Inner.A = %d, want 999", o.Inner.A)
+		}
+		if o.Ptr == nil || o.Ptr.A != 999 {
+			t.Fatalf("o.Ptr = %+v, want A=999", o.Ptr)
+		}
+	})
+
+	t.Run("TimeZoneOffsetRangeRejected", func(t *testing.T) {
+		for _, off := range []int{24 * 3600, 25 * 3600, -24 * 3600, 100 * 3600} {
+			tm := time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("bad", off))
+			if b, err := json.Marshal(tm); err == nil {
+				t.Fatalf("Marshal(offset=%d) succeeded with %s, want MarshalerError", off, b)
+			}
+		}
+	})
+}
+

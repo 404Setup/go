@@ -1764,12 +1764,26 @@ func (p *fastMarshalPlan) marshalStruct(b []byte, ptr unsafe.Pointer, mo *jsonop
 					var innerBuf [128]byte
 					inner, ierr := jsonwire.AppendQuoteString(innerBuf[:0], *(*string)(fp), &mo.Flags)
 					if ierr != nil {
-						return b, wrapFastMarshalPartial(wrapFastMarshalPath(newFastSyntacticErr(valStart, ierr), f.name, false), nameEnd)
+						return b, wrapFastMarshalPartial(wrapFastMarshalPath(&fastSemanticError{
+							action:     "marshal",
+							goType:     f.plan.typ,
+							offset:     valStart,
+							synOffset:  valStart,
+							partialEnd: -1,
+							err:        &jsontext.SyntacticError{Err: ierr},
+						}, f.name, false), nameEnd)
 					}
 					var outerFlags jsonflags.Flags
 					b, err = jsonwire.AppendQuoteBytes(b, inner, &outerFlags)
 					if err != nil {
-						return b, wrapFastMarshalPartial(wrapFastMarshalPath(newFastSyntacticErr(valStart, err), f.name, false), nameEnd)
+						return b, wrapFastMarshalPartial(wrapFastMarshalPath(&fastSemanticError{
+							action:     "marshal",
+							goType:     f.plan.typ,
+							offset:     valStart,
+							synOffset:  valStart,
+							partialEnd: -1,
+							err:        &jsontext.SyntacticError{Err: err},
+						}, f.name, false), nameEnd)
 					}
 					break
 				}
@@ -2119,59 +2133,6 @@ func checkDuplicateMapKey(seen map[string]struct{}, quoted []byte, off, partialE
 	}
 	seen[key] = struct{}{}
 	return seen, nil
-}
-
-//go:noinline
-func appendMarshalAnyFallback(b []byte, val any, mo *jsonopts.Struct) ([]byte, error) {
-	start := len(b)
-	moCopy := *mo
-	enc := export.GetBufferedEncoder(&moCopy)
-	xe := export.Encoder(enc)
-	xe.Flags.Set(jsonflags.OmitTopLevelNewline | 1)
-	err := marshalEncode(enc, val, &xe.Struct)
-	if err != nil {
-		partialBuf := make([]byte, len(b)+len(xe.Buf))
-		copy(partialBuf, b)
-		copy(partialBuf[len(b):], xe.Buf)
-		export.PutBufferedEncoder(enc)
-		switch e := err.(type) {
-		case *SemanticError:
-			return b, &fastSemanticError{
-				action:     e.action,
-				goType:     abiTypeOfReflect(e.GoType),
-				offset:     start + int(e.ByteOffset),
-				synOffset:  start,
-				partialEnd: -1,
-				partialBuf: partialBuf,
-				err:        e.Err,
-				lockedAddr: true,
-				jsonKind:   e.JSONKind,
-				jsonValue:  e.JSONValue,
-				suffixPtr:  e.JSONPointer,
-			}
-		case *jsontext.SyntacticError:
-			return b, &fastSemanticError{
-				action:        "marshal",
-				offset:        start + int(e.ByteOffset),
-				partialEnd:    -1,
-				partialBuf:    partialBuf,
-				err:           e.Err,
-				syntacticOnly: true,
-				lockedAddr:    true,
-				suffixPtr:     e.JSONPointer,
-			}
-		default:
-			return b, &fastSemanticError{
-				partialEnd:   -1,
-				partialBuf:   partialBuf,
-				directLegacy: err,
-				lockedAddr:   true,
-			}
-		}
-	}
-	b = append(b, xe.Buf...)
-	export.PutBufferedEncoder(enc)
-	return b, nil
 }
 
 func (p *fastMarshalPlan) marshalMapStringElem(b []byte, ptr unsafe.Pointer, mo *jsonopts.Struct, depth int) ([]byte, error) {
@@ -2626,8 +2587,8 @@ func marshalFastMapStringAny(b []byte, m map[string]any, mo *jsonopts.Struct, de
 
 //go:noinline
 func marshalMapAnyCycle(b []byte, m map[string]any, mo *jsonopts.Struct, depth int, seenPtrs seenPointers) ([]byte, error) {
-	if depth >= 10000 {
-		return b, newFastSyntacticErr(len(b), errors.New("exceeded max depth"))
+	if depth >= 9999 {
+		return b, errFastFallback
 	}
 	rv := reflect.ValueOf(m)
 	if err := visitPointer(&seenPtrs, rv, mo); err != nil {
@@ -2716,8 +2677,8 @@ func marshalMapAnyCycle(b []byte, m map[string]any, mo *jsonopts.Struct, depth i
 
 //go:noinline
 func marshalAnyCycle(b []byte, val any, mo *jsonopts.Struct, depth int, seenPtrs seenPointers) ([]byte, error) {
-	if depth >= 10000 {
-		return b, newFastSyntacticErr(len(b), errors.New("exceeded max depth"))
+	if depth >= 9999 {
+		return b, errFastFallback
 	}
 	switch v := val.(type) {
 	case []any:
@@ -2754,21 +2715,7 @@ func marshalAnyCycle(b []byte, val any, mo *jsonopts.Struct, depth int, seenPtrs
 	case map[string]any:
 		return marshalMapAnyCycle(b, v, mo, depth, seenPtrs)
 	}
-	rv := reflect.ValueOf(val)
-	if rv.IsValid() && (rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map) {
-		if err := visitPointer(&seenPtrs, rv, mo); err != nil {
-			return b, &fastSemanticError{
-				action:     "marshal",
-				goType:     abiTypeOfReflect(rv.Type()),
-				offset:     len(b),
-				partialEnd: -1,
-				err:        err,
-				lockedAddr: true,
-			}
-		}
-		defer leavePointer(&seenPtrs, rv)
-	}
-	return appendMarshalAnyFallback(b, val, mo)
+	return b, errFastFallback
 }
 
 var (
@@ -2784,7 +2731,7 @@ func marshalFastAnyEface(b []byte, val any, mo *jsonopts.Struct, depth int) ([]b
 	}
 	plan := lookupFastMarshalPlan(at)
 	if !plan.canFast {
-		return appendMarshalAnyFallback(b, val, mo)
+		return b, errFastFallback
 	}
 	b, err := plan.marshal(b, ptr, mo, depth+1)
 	runtime.KeepAlive(val)
@@ -4390,7 +4337,7 @@ func (d *fastDecoder) unmarshalCustomUnmarshaler(p *fastUnmarshalPlan, ptr unsaf
 		err = wrapErrUnsupported(err, "UnmarshalJSON method")
 		if d.legacyErr && d.isComposite {
 			if d.firstErr == nil {
-				d.firstErr = internal.TransformUnmarshalError(nil, err)
+				d.firstErr = err
 			}
 			return nil
 		}
@@ -6988,7 +6935,7 @@ func checkTrailingSyntaxErr(in []byte, pos int, uo *jsonopts.Struct) error {
 }
 
 //go:noinline
-func replayFastUnmarshalError(in []byte, rt reflect.Type, ptr unsafe.Pointer, uo *jsonopts.Struct, skipCustom int) error {
+func replayFastUnmarshalError(in []byte, rt reflect.Type, ptr unsafe.Pointer, uo *jsonopts.Struct, skipCustom int) (error, bool) {
 	var uoCopy jsonopts.Struct
 	if uo != nil {
 		uoCopy = *uo
@@ -7014,10 +6961,11 @@ func replayFastUnmarshalError(in []byte, rt reflect.Type, ptr unsafe.Pointer, uo
 	dec := export.GetBufferedDecoder(in, &uoCopy)
 	err := unmarshalDecode(dec, dst, &uoCopy, true)
 	export.PutBufferedDecoder(dec)
+	isFatal := isFatalError(err, uoCopy.Flags)
 	if err != nil && uoCopy.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
-		return internal.TransformUnmarshalError(dst, err)
+		return internal.TransformUnmarshalError(dst, err), isFatal
 	}
-	return err
+	return err, isFatal
 }
 
 // tryFastUnmarshal attempts to unmarshal JSON bytes directly into (at, ptr).
@@ -7038,6 +6986,11 @@ func tryFastUnmarshal(in []byte, at *abi.Type, ptr unsafe.Pointer, uo *jsonopts.
 }
 
 func tryFastUnmarshalCore(in []byte, plan *fastUnmarshalPlan, ptr unsafe.Pointer, uo *jsonopts.Struct, validated bool) (bool, error) {
+	handled, _, err := tryFastUnmarshalCoreImpl(in, plan, ptr, uo, validated)
+	return handled, err
+}
+
+func tryFastUnmarshalCoreImpl(in []byte, plan *fastUnmarshalPlan, ptr unsafe.Pointer, uo *jsonopts.Struct, validated bool) (bool, bool, error) {
 	// Fast scalar path: parse + check EOF BEFORE writing to ptr, so any error
 	// leaves ptr completely untouched and falls back cleanly.
 	switch plan.kind {
@@ -7045,9 +6998,9 @@ func tryFastUnmarshalCore(in []byte, plan *fastUnmarshalPlan, ptr unsafe.Pointer
 		fkUint, fkUint8, fkUint16, fkUint32, fkUint64, fkUintptr,
 		fkFloat32, fkFloat64:
 		if tryFastUnmarshalScalar(in, plan, ptr, uo) {
-			return true, nil
+			return true, false, nil
 		}
-		return false, nil
+		return false, false, nil
 	}
 
 	wasZero := isFastTargetZero(plan, ptr)
@@ -7056,7 +7009,7 @@ func tryFastUnmarshalCore(in []byte, plan *fastUnmarshalPlan, ptr unsafe.Pointer
 		// Pre-validate syntax for non-zero targets (and all legacy custom targets)
 		// so syntax errors never mutate ptr or invoke UnmarshalJSON.
 		if !fastCheckValid(in, uo.Flags.Get(jsonflags.AllowInvalidUTF8)) {
-			return false, nil
+			return false, false, nil
 		}
 	}
 
@@ -7081,40 +7034,48 @@ func tryFastUnmarshalCore(in []byte, plan *fastUnmarshalPlan, ptr unsafe.Pointer
 		isComposite:  isComp,
 	}
 	err := d.unmarshal(plan, ptr, 0)
+	invoked := d.invokedCustom > 0
 	if err == nil {
 		d.skipWS()
 		if d.pos == len(in) {
 			fastStringCachePool.Put(sc)
-			return true, d.firstErr
-		}
-		if d.invokedCustom > 0 {
-			fastStringCachePool.Put(sc)
 			if d.firstErr != nil {
-				return true, d.firstErr
+				outVal := reflect.Zero(reflect.PointerTo(plan.rt)).Interface()
+				return true, invoked, internal.TransformUnmarshalError(outVal, d.firstErr)
 			}
-			return true, checkTrailingSyntaxErr(in, d.pos, uo)
+			return true, invoked, nil
+		}
+		if invoked {
+			fastStringCachePool.Put(sc)
+			synErr := checkTrailingSyntaxErr(in, d.pos, uo)
+			if legacyErr {
+				outVal := reflect.Zero(reflect.PointerTo(plan.rt)).Interface()
+				return true, true, internal.TransformUnmarshalError(outVal, synErr)
+			}
+			return true, true, synErr
 		}
 	}
 	fastStringCachePool.Put(sc)
-	if d.invokedCustom > 0 {
+	if invoked {
+		outVal := reflect.Zero(reflect.PointerTo(plan.rt)).Interface()
 		if err != nil && err != errFastFallback {
-			outVal := reflect.Zero(reflect.PointerTo(plan.rt)).Interface()
-			return true, materializeFastErr(err, outVal, nil, 0, uo)
+			return true, true, materializeFastErr(err, outVal, nil, 0, uo)
 		}
-		if d.firstErr != nil {
-			return true, d.firstErr
+		replayErr, isFatal := replayFastUnmarshalError(in, plan.rt, ptr, uo, d.invokedCustom)
+		if d.firstErr != nil && !isFatal {
+			return true, true, internal.TransformUnmarshalError(outVal, d.firstErr)
 		}
-		return true, replayFastUnmarshalError(in, plan.rt, ptr, uo, d.invokedCustom)
+		return true, true, replayErr
 	}
 	if err != nil && err != errFastFallback {
 		outVal := reflect.Zero(reflect.PointerTo(plan.rt)).Interface()
-		return true, materializeFastErr(err, outVal, nil, 0, uo)
+		return true, false, materializeFastErr(err, outVal, nil, 0, uo)
 	}
 	if wasZero {
 		// Restore zero state before delegating to standard unmarshalDecode!
 		reflect.NewAt(plan.rt, ptr).Elem().SetZero()
 	}
-	return false, nil
+	return false, false, nil
 }
 
 func isZeroMemFast(ptr unsafe.Pointer, n uintptr) bool {
@@ -7124,7 +7085,7 @@ func isZeroMemFast(ptr unsafe.Pointer, n uintptr) bool {
 	b := unsafe.Slice((*byte)(ptr), n)
 	i := uintptr(0)
 	for n-i >= 8 {
-		if *(*uint64)(unsafe.Pointer(&b[i])) != 0 {
+		if byteorder.LEUint64(b[i:]) != 0 {
 			return false
 		}
 		i += 8
@@ -7513,27 +7474,36 @@ func tryFastUnmarshalDecode(in *jsontext.Decoder, at *abi.Type, ptr unsafe.Point
 	}
 
 	valSlice := buf[valStart:valEnd]
-	handled, err := tryFastUnmarshalCore(valSlice, plan, ptr, uo, true)
+	if plan.hasCustom && ((plan.kind != fkUnmarshaler && !last) || (legacyErr && (in.InputOffset() != 0 || valStart != 0))) {
+		return false, nil
+	}
+	handled, invoked, err := tryFastUnmarshalCoreImpl(valSlice, plan, ptr, uo, true)
 	if !handled {
 		return false, nil
 	}
-	if err != nil && !legacyErr && (in.InputOffset() != 0 || valStart != 0) {
-		if !plan.hasCustom {
+	if err != nil {
+		if !invoked {
 			if wasZero {
 				reflect.NewAt(plan.rt, ptr).Elem().SetZero()
 			}
 			return false, nil
 		}
-		baseOff := in.InputOffset() + int64(valStart)
-		switch e := err.(type) {
-		case *SemanticError:
-			e.ByteOffset += baseOff
-		case *jsontext.SyntacticError:
-			e.ByteOffset += baseOff
+		if !legacyErr && (in.InputOffset() != 0 || valStart != 0) {
+			baseOff := in.InputOffset() + int64(valStart)
+			switch e := err.(type) {
+			case *SemanticError:
+				e.ByteOffset += baseOff
+			case *jsontext.SyntacticError:
+				e.ByteOffset += baseOff
+			}
 		}
+		if plan.kind == fkUnmarshaler || last {
+			xd.ConsumeContiguous(valStart, valEnd)
+		}
+		return true, err
 	}
 	xd.ConsumeContiguous(valStart, valEnd)
-	return true, err
+	return true, nil
 }
 
 func init() {

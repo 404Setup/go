@@ -503,7 +503,7 @@ func buildV1FastUnmarshalPlan(rt reflect.Type, at *abi.Type, visiting map[*abi.T
 		return p
 	}
 	if v1HasCustomUnmarshaler(rt) {
-		if reflect.PointerTo(rt).Implements(v1UnmarshalerType) {
+		if rt.Kind() != reflect.Pointer && reflect.PointerTo(rt).Implements(v1UnmarshalerType) {
 			u := reflect.New(rt).Interface().(Unmarshaler)
 			p.ifaceTab = (*[2]unsafe.Pointer)(unsafe.Pointer(&u))[0]
 			p.kind = v1fkUnmarshaler
@@ -3621,7 +3621,7 @@ func v1IsZeroMemFast(ptr unsafe.Pointer, n uintptr) bool {
 	b := unsafe.Slice((*byte)(ptr), n)
 	i := uintptr(0)
 	for n-i >= 8 {
-		if *(*uint64)(unsafe.Pointer(&b[i])) != 0 {
+		if byteorder.LEUint64(b[i:]) != 0 {
 			return false
 		}
 		i += 8
