@@ -438,13 +438,34 @@ func makeSliceMaxStackSize(elem *types.Type) int64 {
 	return maxStackSize
 }
 
+func isStableLocalOrConst(n ir.Node) bool {
+	for n.Op() == ir.OCONVNOP {
+		n = n.(*ir.ConvExpr).X
+	}
+	if n.Op() == ir.OLITERAL {
+		return true
+	}
+	if n.Op() == ir.ONAME {
+		name := n.(*ir.Name)
+		return (name.Class == ir.PAUTO || name.Class == ir.PPARAM || name.Class == ir.PPARAMOUT) &&
+			!name.Addrtaken() && !name.IsClosureVar()
+	}
+	return false
+}
+
 // walkMakeSlice walks an OMAKESLICE node.
 func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 	len := n.Len
 	cap := n.Cap
 	len = w.safeExpr(len, init)
+	if !isStableLocalOrConst(len) {
+		len = w.copyExpr(len, len.Type(), init)
+	}
 	if cap != nil {
 		cap = w.safeExpr(cap, init)
+		if !isStableLocalOrConst(cap) {
+			cap = w.copyExpr(cap, cap.Type(), init)
+		}
 	} else {
 		cap = len
 	}
@@ -540,7 +561,7 @@ func (w *walkState) walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 			arr := ir.NewSelectorExpr(base.Pos, ir.ODOT, store, field)    // arr = store.arr
 			s := ir.NewSliceExpr(base.Pos, ir.OSLICE, arr, nil, len, cap) // store.arr[:len:cap]
 			s.SetBounded(true)
-			nif.Body.Append(ir.NewAssignStmt(base.Pos, slice, s))         // slice = store.arr[:len:cap]
+			nif.Body.Append(ir.NewAssignStmt(base.Pos, slice, s)) // slice = store.arr[:len:cap]
 
 			w.appendWalkStmt(init, typecheck.Stmt(w.curfunc, nif))
 
@@ -585,16 +606,25 @@ func (w *walkState) walkMakeSliceCopy(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 		base.Errorf("%v can't be allocated in Go; it is incomplete (or unallocatable)", t.Elem())
 	}
 
-	length := typecheck.Conv(w.curfunc, n.Len, types.Types[types.TINT])
-	copylen := ir.NewUnaryExpr(base.Pos, ir.OLEN, n.Cap)
-	copyptr := ir.NewUnaryExpr(base.Pos, ir.OSPTR, n.Cap)
+	src := n.Cap
+	lenExpr := n.Len
+	if !isStableLocalOrConst(src) {
+		src = w.copyExpr(w.safeExpr(src, init), src.Type(), init)
+		if n.Bounded() {
+			lenExpr = typecheck.Expr(w.curfunc, ir.NewUnaryExpr(base.Pos, ir.OLEN, src))
+		}
+	}
+	length := typecheck.Conv(w.curfunc, lenExpr, types.Types[types.TINT])
+	copylen := ir.NewUnaryExpr(base.Pos, ir.OLEN, src)
+	copyptr := ir.NewUnaryExpr(base.Pos, ir.OSPTR, src)
 
 	if !t.Elem().HasPointers() && n.Bounded() {
 		// When len(to)==len(from) and elements have no pointers:
 		// replace make+copy with runtime.mallocgc+runtime.memmove,
 		// using an unzeroed stack SBO buffer first when non-escaping.
-		if n.Esc() == ir.EscNone {
-			length = w.safeExpr(length, init)
+		length = w.safeExpr(length, init)
+		if !isStableLocalOrConst(length) {
+			length = w.copyExpr(length, length.Type(), init)
 		}
 
 		// We do not check for overflow of len(to)*elem.Width here

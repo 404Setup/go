@@ -1527,7 +1527,7 @@ func (b *Builder) loadCachedCompiledGoFiles(a *Action) error {
 	list, _, err := cache.GetBytes(c, cache.Subkey(a.actionID, "srcfiles"))
 	if err != nil {
 		p := a.Package
-		if p != nil && !p.UsesCgo() && !p.UsesSwig() && p.Internal.Cover.Mode == "" {
+		if p != nil && p.Error == nil && len(p.GoFiles) > 0 && !p.UsesCgo() && !p.UsesSwig() && p.Internal.Cover.Mode == "" {
 			p.CompiledGoFiles = slices.Clone(p.GoFiles)
 			return nil
 		}

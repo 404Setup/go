@@ -46,7 +46,7 @@ func LZ4CompressIfSmaller(src []byte) ([]byte, bool) {
 	if n < 4096 || n > lz4MaxRawLen {
 		return nil, false
 	}
-	limit := (n*7)/8 - (len(MagicLZ4) + 4)
+	limit := int(int64(n)*7/8) - (len(MagicLZ4) + 4)
 	if limit <= 0 {
 		return nil, false
 	}

@@ -5,6 +5,7 @@
 package test
 
 import (
+	"internal/race"
 	"internal/testenv"
 	"testing"
 	"unsafe"
@@ -82,6 +83,70 @@ func TestStackAllocation(t *testing.T) {
 			tc.f(max + 1)
 		}); n != 1 {
 			t.Fatalf("unexpected allocation: %f", n)
+		}
+	}
+}
+
+var (
+	sharedMakeLen   int
+	sharedMakeSlice []byte
+)
+
+//go:noinline
+func useSharedMake(p *int) {
+	var guard [4]uint64 = [4]uint64{0xdeadbeef, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef}
+	b := make([]byte, sharedMakeLen)
+	for i := range b {
+		b[i] = 0x42
+	}
+	b2 := make([]byte, *p, *p)
+	for i := range b2 {
+		b2[i] = 0x43
+	}
+	b3 := make([]byte, len(sharedMakeSlice))
+	copy(b3, sharedMakeSlice)
+	for _, g := range guard {
+		if g != 0xdeadbeef {
+			panic("stack corruption")
+		}
+	}
+	genericUse(b)
+	genericUse(b2)
+	genericUse(b3)
+}
+
+func TestStackAllocationSharedBounds(t *testing.T) {
+	testenv.SkipIfOptimizationOff(t)
+	if testing.Short() || race.Enabled {
+		t.Skip("skipping concurrent race-safety stress in short or race mode")
+	}
+	var v int = 4
+	small := make([]byte, 8)
+	large := make([]byte, 512)
+	sharedMakeLen = 4
+	sharedMakeSlice = small
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50000; i++ {
+			if i&1 == 0 {
+				sharedMakeLen = 4
+				v = 4
+				sharedMakeSlice = small
+			} else {
+				sharedMakeLen = 512
+				v = 512
+				sharedMakeSlice = large
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			useSharedMake(&v)
 		}
 	}
 }
