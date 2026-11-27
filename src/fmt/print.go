@@ -258,15 +258,15 @@ func Appendf(b []byte, format string, a ...any) []byte {
 	if len(a) == 0 && bytealg.IndexByteString(format, '%') == -1 {
 		return append(b, format...)
 	}
-	origLen := len(b)
-	out, nextI, nextArg, ok := appendPrintfFast(b, format, a)
+	var stackBuf [128]byte
+	out, nextI, nextArg, ok := appendPrintfFast(stackBuf[:0], format, a)
 	if ok {
-		return out
+		return append(b, out...)
 	}
 	p := newPrinter()
-	p.buf = append(p.buf, out[origLen:]...)
+	p.buf = append(p.buf, out...)
 	p.doPrintfFrom(format, a, nextI, nextArg, true)
-	b = append(out[:origLen], p.buf...)
+	b = append(b, p.buf...)
 	p.free()
 	return b
 }
@@ -322,15 +322,15 @@ func Append(b []byte, a ...any) []byte {
 	if len(a) == 0 {
 		return b
 	}
-	origLen := len(b)
-	out, nextArg, prevString, ok := appendPrintFast(b, a, false)
+	var stackBuf [128]byte
+	out, nextArg, prevString, ok := appendPrintFast(stackBuf[:0], a, false)
 	if ok {
-		return out
+		return append(b, out...)
 	}
 	p := newPrinter()
-	p.buf = append(p.buf, out[origLen:]...)
+	p.buf = append(p.buf, out...)
 	p.doPrintFrom(a, nextArg, prevString)
-	b = append(out[:origLen], p.buf...)
+	b = append(b, p.buf...)
 	p.free()
 	return b
 }
@@ -384,15 +384,16 @@ func Appendln(b []byte, a ...any) []byte {
 	if len(a) == 0 {
 		return append(b, '\n')
 	}
-	origLen := len(b)
-	out, nextArg, _, ok := appendPrintFast(b, a, true)
+	var stackBuf [128]byte
+	out, nextArg, _, ok := appendPrintFast(stackBuf[:0], a, true)
 	if ok {
-		return append(out, '\n')
+		out = append(out, '\n')
+		return append(b, out...)
 	}
 	p := newPrinter()
-	p.buf = append(p.buf, out[origLen:]...)
+	p.buf = append(p.buf, out...)
 	p.doPrintlnFrom(a, nextArg)
-	b = append(out[:origLen], p.buf...)
+	b = append(b, p.buf...)
 	p.free()
 	return b
 }
@@ -1896,8 +1897,7 @@ func appendDefaultBytes(dst, f []byte) []byte {
 	if len(f) == 0 {
 		return append(dst, "[]"...)
 	}
-	maxLen := 2 + len(f)*4
-	if cap(dst)-len(dst) >= maxLen {
+	if avail := cap(dst) - len(dst); avail >= 2 && len(f) <= (avail-2)/4 {
 		oldLen := len(dst)
 		out := dst[oldLen:cap(dst)]
 		out[0] = '['

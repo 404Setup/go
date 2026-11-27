@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 type panicStringer struct{}
@@ -801,5 +802,45 @@ func TestAnySliceFormattingRegression(t *testing.T) {
 	wrapFmt := "%w"
 	if got := fmt.Errorf(wrapFmt, []any{nil}).Error(); got != "[%!w(interface {}=<nil>)]" {
 		t.Fatalf("Errorf(%%w, []any{nil}) = %q, want %q", got, "[%!w(interface {}=<nil>)]")
+	}
+}
+
+func TestPerfSecurityAppendAliasing(t *testing.T) {
+	reset := func(s string) []byte {
+		b := make([]byte, len(s), 128)
+		copy(b, s)
+		return b
+	}
+
+	b := reset("hello")
+	if got := string(fmt.Appendf(b[:0], "%x", b)); got != "68656c6c6f" {
+		t.Fatalf("Appendf %%x alias = %q, want %q", got, "68656c6c6f")
+	}
+
+	b = reset("hello")
+	if got := string(fmt.Appendf(b[:0], "ab%s", b)); got != "abhello" {
+		t.Fatalf("Appendf ab%%s alias = %q, want %q", got, "abhello")
+	}
+
+	b = reset("hello")
+	if got := string(fmt.Appendf(b[:0], "%q", b)); got != `"hello"` {
+		t.Fatalf("Appendf %%q alias = %q, want %q", got, `"hello"`)
+	}
+
+	b = reset("hello")
+	if got := string(fmt.Append(b[:0], b)); got != "[104 101 108 108 111]" {
+		t.Fatalf("Append alias = %q, want %q", got, "[104 101 108 108 111]")
+	}
+
+	b = reset("hello")
+	if got := string(fmt.Appendln(b[:0], b)); got != "[104 101 108 108 111]\n" {
+		t.Fatalf("Appendln alias = %q, want %q", got, "[104 101 108 108 111]\n")
+	}
+
+	// Fallback path after fast literal prefix when argument aliases spare cap.
+	b = reset("hello")
+	s := unsafe.String(unsafe.SliceData(b), len(b))
+	if got := string(fmt.Appendf(b[:0], "prefix:%v", fixedStringer(s))); got != "prefix:S(hello)" {
+		t.Fatalf("Appendf fallback alias = %q, want %q", got, "prefix:S(hello)")
 	}
 }

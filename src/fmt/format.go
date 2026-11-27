@@ -93,9 +93,19 @@ func appendPadding(dst []byte, n int, padByte byte) []byte {
 	if n <= 0 {
 		return dst
 	}
+	const maxInt = int(^uint(0) >> 1)
 	oldLen := len(dst)
 	if n > cap(dst)-oldLen {
-		newBuf := make([]byte, oldLen, cap(dst)*2+n)
+		if n > maxInt-oldLen {
+			panic("fmt: buffer too large")
+		}
+		newCap := oldLen + n
+		if cap(dst) <= (maxInt-n)/2 {
+			newCap = cap(dst)*2 + n
+		} else if cap(dst) <= maxInt-n {
+			newCap = maxInt
+		}
+		newBuf := make([]byte, oldLen, newCap)
 		copy(newBuf, dst)
 		dst = newBuf
 	}
@@ -617,6 +627,10 @@ func appendSbx(dst []byte, s string, b []byte, digits string, flags fmtFlags, wi
 	if flags&flagPrecPresent != 0 && prec < length {
 		length = prec
 	}
+	const maxInt = int(^uint(0) >> 1)
+	if length > maxInt/2 {
+		panic("fmt: hex output too large")
+	}
 	sharp := flags&flagSharp != 0
 	space := flags&flagSpace != 0
 	// Compute width of the encoding taking into account the sharp and space flag.
@@ -625,11 +639,19 @@ func appendSbx(dst []byte, s string, b []byte, digits string, flags fmtFlags, wi
 		if space {
 			// Each element encoded by two hexadecimals will get a leading 0x or 0X.
 			if sharp {
+				if length > maxInt/5 {
+					panic("fmt: hex output too large")
+				}
 				width *= 2
+			} else if length > maxInt/3 {
+				panic("fmt: hex output too large")
 			}
 			// Elements will be separated by a space.
 			width += length - 1
 		} else if sharp {
+			if width > maxInt-2 {
+				panic("fmt: hex output too large")
+			}
 			// Only a leading 0x or 0X will be added for the whole string.
 			width += 2
 		}
@@ -654,7 +676,16 @@ func appendSbx(dst []byte, s string, b []byte, digits string, flags fmtFlags, wi
 	// Pre-grow dst once for the entire hex encoding.
 	oldLen := len(dst)
 	if width > cap(dst)-oldLen {
-		newBuf := make([]byte, oldLen, cap(dst)*2+width)
+		if width > maxInt-oldLen {
+			panic("fmt: hex output too large")
+		}
+		newCap := oldLen + width
+		if cap(dst) <= (maxInt-width)/2 {
+			newCap = cap(dst)*2 + width
+		} else if cap(dst) <= maxInt-width {
+			newCap = maxInt
+		}
+		newBuf := make([]byte, oldLen, newCap)
 		copy(newBuf, dst)
 		dst = newBuf
 	}

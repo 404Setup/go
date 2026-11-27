@@ -55,7 +55,7 @@ func Sort(mapValue reflect.Value) SortedMap {
 	// yelling loudly if that happens. See issue 33275.
 	n := mapValue.Len()
 	if n == 0 {
-		return nil
+		return SortedMap{}
 	}
 	sorted := make(SortedMap, 0, n)
 	iter := mapValue.MapRange()
