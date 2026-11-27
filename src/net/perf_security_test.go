@@ -565,3 +565,77 @@ func BenchmarkZoneCacheName(b *testing.B) {
 		}
 	})
 }
+
+func TestDNSCacheAuditRegressions(t *testing.T) {
+	t.Run("CrossTypeZeroTTLDoesNotCache", func(t *testing.T) {
+		var p dnsmessage.Parser
+		msg := dnsmessage.Message{
+			Header: dnsmessage.Header{ID: 1, Response: true, RecursionAvailable: true},
+			Questions: []dnsmessage.Question{{
+				Name:  dnsmessage.MustNewName("cross.example."),
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+			}},
+			Answers: []dnsmessage.Resource{
+				{
+					Header: dnsmessage.ResourceHeader{
+						Name:  dnsmessage.MustNewName("cross.example."),
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+						TTL:   300,
+					},
+					Body: &dnsmessage.AResource{A: [4]byte{192, 0, 2, 1}},
+				},
+				{
+					Header: dnsmessage.ResourceHeader{
+						Name:  dnsmessage.MustNewName("cross.example."),
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
+						TTL:   0,
+					},
+					Body: &dnsmessage.AAAAResource{AAAA: [16]byte{0x20, 0x01, 0x0d, 0xb8, 15: 1}},
+				},
+			},
+		}
+		raw, err := msg.Pack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Start(raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.SkipAllQuestions(); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := extractAnswerMinTTL(p, dnsmessage.TypeA); ok {
+			t.Fatal("extractAnswerMinTTL returned ok=true despite trailing AAAA TTL=0")
+		}
+	})
+
+	t.Run("ClearAndSweepSizeNeverNegative", func(t *testing.T) {
+		var c dnsCache
+		now := int64(1_000_000_000_000)
+		for i := range 200 {
+			c.store(dnsCacheKey{name: string(rune('a'+i%26)) + ".example.", qtype: dnsmessage.TypeA}, &dnsCacheEntry{expireAt: now + 10}, now)
+		}
+		var wg sync.WaitGroup
+		for g := range 4 {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for i := range 100 {
+					if id%2 == 0 {
+						c.clear()
+					} else {
+						c.maybeSweep(now + 100 + int64(i))
+					}
+					if sz := c.size.Load(); sz < 0 {
+						t.Errorf("negative cache size: %d", sz)
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+	})
+}
+

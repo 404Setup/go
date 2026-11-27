@@ -7,6 +7,7 @@ package net
 import (
 	"internal/godebug"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	syncv2 "sync/v2"
 	"time"
@@ -79,7 +80,8 @@ type dnsCache struct {
 	lastCfg   atomic.Pointer[dnsConfig]
 	size      atomic.Int64
 	lastSweep atomic.Int64
-	sweeping  atomic.Bool
+	gen       atomic.Uint64
+	sweepMu   sync.Mutex
 }
 
 type srcAddrCacheEntry struct {
@@ -88,26 +90,28 @@ type srcAddrCacheEntry struct {
 }
 
 var (
-	srcAddrCache         syncv2.Map[netip.Addr, srcAddrCacheEntry]
-	srcAddrCacheSize     atomic.Int64
-	srcAddrCacheClearing atomic.Bool
+	srcAddrCache     syncv2.Map[netip.Addr, srcAddrCacheEntry]
+	srcAddrCacheSize atomic.Int64
+	srcAddrCacheGen  atomic.Uint64
+	srcAddrCacheMu   sync.Mutex
 )
 
 func clearSrcAddrCache() {
-	if srcAddrCacheClearing.CompareAndSwap(false, true) {
-		srcAddrCache.Clear()
-		srcAddrCacheSize.Store(0)
-		srcAddrCacheClearing.Store(false)
-	}
+	srcAddrCacheMu.Lock()
+	srcAddrCacheGen.Add(1)
+	srcAddrCache.Clear()
+	srcAddrCacheSize.Store(0)
+	srcAddrCacheMu.Unlock()
 }
 
 func lookupSrcAddrCache(dst netip.Addr, now int64) (netip.Addr, bool) {
+	g := srcAddrCacheGen.Load()
 	entry, ok := srcAddrCache.Load(dst)
 	if !ok {
 		return netip.Addr{}, false
 	}
 	if now >= entry.expireAt {
-		if srcAddrCache.CompareAndDelete(dst, entry) {
+		if srcAddrCache.CompareAndDelete(dst, entry) && srcAddrCacheGen.Load() == g {
 			srcAddrCacheSize.Add(-1)
 		}
 		return netip.Addr{}, false
@@ -120,7 +124,8 @@ func storeSrcAddrCache(dst, src netip.Addr, now int64) {
 		src:      src,
 		expireAt: now + int64(srcAddrCacheTTL),
 	}
-	if _, loaded := srcAddrCache.Swap(dst, entry); !loaded {
+	g := srcAddrCacheGen.Load()
+	if _, loaded := srcAddrCache.Swap(dst, entry); !loaded && srcAddrCacheGen.Load() == g {
 		if srcAddrCacheSize.Add(1) > maxDNSCacheEntries {
 			clearSrcAddrCache()
 		}
@@ -150,8 +155,11 @@ func (c *dnsCache) checkConfig(cfg *dnsConfig) {
 }
 
 func (c *dnsCache) clear() {
+	c.sweepMu.Lock()
+	c.gen.Add(1)
 	c.entries.Clear()
 	c.size.Store(0)
+	c.sweepMu.Unlock()
 	clearSrcAddrCache()
 }
 
@@ -168,6 +176,7 @@ func (c *dnsCache) getEntryLower(cfg *dnsConfig, name, lname string, qtype dnsme
 	}
 	c.checkConfig(cfg)
 	key := dnsCacheKey{name: lname, qtype: qtype}
+	g := c.gen.Load()
 	entry, ok := c.entries.Load(key)
 	if !ok {
 		return nil, nil, false
@@ -177,7 +186,7 @@ func (c *dnsCache) getEntryLower(cfg *dnsConfig, name, lname string, qtype dnsme
 	}
 	now := dnsCacheNow()
 	if now >= entry.expireAt {
-		if c.entries.CompareAndDelete(key, entry) {
+		if c.entries.CompareAndDelete(key, entry) && c.gen.Load() == g {
 			c.size.Add(-1)
 		}
 		return nil, nil, false
@@ -328,9 +337,10 @@ func (c *dnsCache) store(key dnsCacheKey, entry *dnsCacheEntry, now int64) {
 	if c.lastSweep.Load() == 0 {
 		c.lastSweep.CompareAndSwap(0, now)
 	}
+	g := c.gen.Load()
 	_, loaded := c.entries.Swap(key, entry)
 	var count int64
-	if !loaded {
+	if !loaded && c.gen.Load() == g {
 		count = c.size.Add(1)
 	} else {
 		count = c.size.Load()
@@ -341,10 +351,10 @@ func (c *dnsCache) store(key dnsCacheKey, entry *dnsCacheEntry, now int64) {
 }
 
 func (c *dnsCache) maybeSweep(now int64) {
-	if !c.sweeping.CompareAndSwap(false, true) {
+	if !c.sweepMu.TryLock() {
 		return
 	}
-	defer c.sweeping.Store(false)
+	defer c.sweepMu.Unlock()
 	c.lastSweep.Store(now)
 
 	var live, evicted int64
@@ -370,21 +380,22 @@ func (c *dnsCache) maybeSweep(now int64) {
 		}
 	}
 
-	if evicted > 0 {
-		c.size.Add(-evicted)
-		if live == 0 || evicted >= maxDNSCacheEntries/4 {
-			c.entries.Shrink()
-		}
+	c.size.Store(live)
+	if evicted > 0 && (live == 0 || evicted >= maxDNSCacheEntries/4) {
+		c.entries.Shrink()
 	}
 }
 
 // extractAnswerMinTTL scans the Answer section of p and returns the minimum
-// TTL across all records matching qtype or TypeCNAME.
+// TTL across all records matching qtype, TypeCNAME, or address records
+// extracted by extractCachedAddrs.
 // Per RFC 1035 section 3.2.1 and RFC 2181 section 8, if any relevant record
 // has TTL == 0 or its MSB set, the response must not be cached.
 func extractAnswerMinTTL(p dnsmessage.Parser, qtype dnsmessage.Type) (time.Duration, bool) {
 	var minTTL uint32
 	found := false
+	seenQtype := false
+	checkAddr := qtype == dnsmessage.TypeA || qtype == dnsmessage.TypeAAAA || qtype == dnsmessage.TypeCNAME
 	for {
 		h, err := p.AnswerHeader()
 		if err == dnsmessage.ErrSectionDone {
@@ -393,7 +404,10 @@ func extractAnswerMinTTL(p dnsmessage.Parser, qtype dnsmessage.Type) (time.Durat
 		if err != nil {
 			return 0, false
 		}
-		if h.Type == qtype || h.Type == dnsmessage.TypeCNAME {
+		if h.Type == qtype {
+			seenQtype = true
+		}
+		if h.Type == qtype || h.Type == dnsmessage.TypeCNAME || (seenQtype && checkAddr && (h.Type == dnsmessage.TypeA || h.Type == dnsmessage.TypeAAAA)) {
 			if h.TTL == 0 || h.TTL&0x80000000 != 0 {
 				return 0, false
 			}
