@@ -382,7 +382,11 @@ func Dump(data []byte) string {
 	if len(data) == 0 {
 		return ""
 	}
+	const maxDumpLines = (int(^uint(0)>>1) - 79) / 79
 	fullLines := len(data) / 16
+	if fullLines > maxDumpLines {
+		panic("encoding/hex: dump output length overflow")
+	}
 	rem := len(data) % 16
 	totalLen := fullLines * 79
 	if rem > 0 {

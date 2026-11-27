@@ -48,7 +48,7 @@ TEXT ·encodeAVX2Asm(SB), NOSPLIT, $0-24
 	MOVQ	n+16(FP), R8
 
 	MOVL		$0x0f, AX
-	MOVQ		AX, X15
+	VMOVQ		AX, X15
 	VPBROADCASTB	X15, Y15
 	VMOVDQU		hex_enc_lut<>+0(SB), Y14
 
@@ -137,7 +137,7 @@ TEXT ·decodeAVX2Asm(SB), NOSPLIT, $0-48
 	MOVQ	DI, R11
 
 	MOVL		$0x0f, AX
-	MOVQ		AX, X15
+	VMOVQ		AX, X15
 	VPBROADCASTB	X15, Y15
 	VMOVDQU		hex_dec_lut_lo<>+0(SB), Y14
 	VMOVDQU		hex_dec_lut_hi<>+0(SB), Y13
@@ -243,7 +243,7 @@ dec_avx2_16_check:
 	VPADDB		X2, X1, X0
 	VPMADDUBSW	X11, X0, X0
 	VPACKUSWB	X0, X0, X0
-	MOVQ		X0, (DI)
+	VMOVQ		X0, (DI)
 
 	ADDQ	$16, SI
 	ADDQ	$8, DI
@@ -385,17 +385,17 @@ TEXT ·dumpLinesAVX2Asm(SB), NOSPLIT, $0-28
 	MOVL	offset+24(FP), R9
 
 	MOVL		$0x0f, AX
-	MOVQ		AX, X15
+	VMOVQ		AX, X15
 	VPBROADCASTB	X15, Y15
 	VMOVDQU		hex_enc_lut<>+0(SB), Y14
 	MOVL		$0x60, AX
-	MOVD		AX, X13
+	VMOVD		AX, X13
 	VPBROADCASTB	X13, Y13
 	MOVL		$0xde, AX
-	MOVD		AX, X12
+	VMOVD		AX, X12
 	VPBROADCASTB	X12, Y12
 	MOVL		$0x2e, AX
-	MOVD		AX, X11
+	VMOVD		AX, X11
 	VPBROADCASTB	X11, Y11
 	VMOVDQU		hex_dump_shuf1<>+0(SB), Y10
 	VMOVDQU		hex_dump_sp1<>+0(SB), Y9
@@ -418,7 +418,7 @@ dump_avx2_loop2:
 	VPAND		X15, X0, X2
 	VPUNPCKLBW	X2, X1, X1
 	VPSHUFB		X1, X14, X1
-	MOVQ		X1, (DI)
+	VMOVQ		X1, (DI)
 	MOVW		$0x2020, 8(DI)
 	VPEXTRQ		$1, X1, 79(DI)
 	MOVW		$0x2020, 87(DI)
@@ -478,7 +478,7 @@ dump_avx2_loop2:
 
 dump_avx2_1line_check:
 	TESTQ	CX, CX
-	JZ	dump_avx2_done
+	JLE	dump_avx2_done
 
 	// Single remaining line
 	MOVL		R9, AX
@@ -489,7 +489,7 @@ dump_avx2_1line_check:
 	VPAND		X15, X0, X2
 	VPUNPCKLBW	X2, X1, X1
 	VPSHUFB		X1, X14, X1
-	MOVQ		X1, (DI)
+	VMOVQ		X1, (DI)
 	MOVW		$0x2020, 8(DI)
 
 	VMOVDQU		(SI), X0
@@ -506,7 +506,7 @@ dump_avx2_1line_check:
 	VMOVDQU		X5, 10(DI)
 	VPSHUFB		X8, X3, X6
 	VPOR		X7, X6, X6
-	MOVQ		X6, 26(DI)
+	VMOVQ		X6, 26(DI)
 	MOVB		$0x20, 34(DI)
 
 	VPSHUFB		X10, X4, X5
@@ -514,7 +514,7 @@ dump_avx2_1line_check:
 	VMOVDQU		X5, 35(DI)
 	VPSHUFB		X8, X4, X6
 	VPOR		X7, X6, X6
-	MOVQ		X6, 51(DI)
+	VMOVQ		X6, 51(DI)
 	MOVW		$0x7c20, 59(DI)
 
 	VPADDB		X13, X0, X5
