@@ -249,6 +249,7 @@ func (enc *Encoder) Encode(v any) error {
 			eb.enc.p.prefix = enc.p.prefix
 			eb.enc.p.indent = enc.p.indent
 			eb.enc.p.putNewline = enc.p.putNewline
+			eb.enc.p.seq = enc.p.seq
 			err := eb.enc.p.fastMarshalRoot(plan, ptr, false)
 			runtime.KeepAlive(v)
 			if err != nil {
@@ -256,6 +257,7 @@ func (enc *Encoder) Encode(v any) error {
 				return err
 			}
 			enc.p.putNewline = eb.enc.p.putNewline
+			enc.p.seq = eb.enc.p.seq
 			if len(eb.enc.p.out) > 0 {
 				_, err = enc.p.Write(eb.enc.p.out)
 			}

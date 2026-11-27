@@ -7,8 +7,11 @@ package xml_test
 import (
 	"bytes"
 	. "encoding/xml"
+	"errors"
+	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1478,3 +1481,336 @@ func BenchmarkFastExtended(b *testing.B) {
 		}
 	})
 }
+
+type xmlTestCSVInts []int
+
+func (c xmlTestCSVInts) MarshalText() ([]byte, error) {
+	var parts []string
+	for _, v := range c {
+		parts = append(parts, strconv.Itoa(v))
+	}
+	return []byte(strings.Join(parts, ",")), nil
+}
+
+func (c *xmlTestCSVInts) UnmarshalText(b []byte) error {
+	if len(b) == 0 {
+		*c = nil
+		return nil
+	}
+	parts := strings.Split(string(b), ",")
+	out := make(xmlTestCSVInts, len(parts))
+	for i, p := range parts {
+		v, err := strconv.Atoi(p)
+		if err != nil {
+			return err
+		}
+		out[i] = v
+	}
+	*c = out
+	return nil
+}
+
+type xmlTestAutoCloseItem struct {
+	ID string
+}
+
+func (it *xmlTestAutoCloseItem) UnmarshalXML(d *Decoder, start StartElement) error {
+	var child struct {
+		K string `xml:"k,attr"`
+	}
+	if err := d.Decode(&child); err != nil {
+		return err
+	}
+	if len(start.Attr) > 0 {
+		it.ID = start.Attr[0].Value
+	}
+	return d.Skip()
+}
+
+type xmlTestCommentMutate struct {
+	Comment string
+	Next    string
+}
+
+func (m *xmlTestCommentMutate) UnmarshalXML(d *Decoder, start StartElement) error {
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case Comment:
+			m.Comment = string(t)
+			if len(t) > 0 {
+				t[0] = 'X'
+			}
+		case StartElement:
+			if t.Name.Local == "next" {
+				if err := d.DecodeElement(&m.Next, &t); err != nil {
+					return err
+				}
+			} else if err := d.Skip(); err != nil {
+				return err
+			}
+		case EndElement:
+			if t.Name == start.Name {
+				return nil
+			}
+		}
+	}
+}
+
+type xmlTestCustomAttr string
+
+func (a *xmlTestCustomAttr) UnmarshalXMLAttr(attr Attr) error {
+	*a = xmlTestCustomAttr("attr:" + attr.Value)
+	return nil
+}
+
+type xmlTestReaderFunc func([]byte) (int, error)
+
+func (f xmlTestReaderFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestFastRegressionFixes(t *testing.T) {
+	t.Run("PtrToSliceAttr", func(t *testing.T) {
+		type S struct {
+			A *[]string `xml:"a,attr"`
+		}
+		s := []string{"hello", "world"}
+		got, err := Marshal(S{A: &s})
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		if string(got) != `<S a="hello" a="world"></S>` {
+			t.Fatalf("got %s", got)
+		}
+
+		type PtrS struct {
+			P **string `xml:"p,attr"`
+		}
+		v := "ok"
+		pv := &v
+		got, err = Marshal(PtrS{P: &pv})
+		if err != nil {
+			t.Fatalf("Marshal **string failed: %v", err)
+		}
+		if string(got) != `<PtrS p="ok"></PtrS>` {
+			t.Fatalf("got %s", got)
+		}
+	})
+
+	t.Run("CharsetReaderNoAlias", func(t *testing.T) {
+		payload := `<?xml version="1.0" encoding="latin1"?><root>` + strings.Repeat("\xe9", 64) + `</root>`
+		r := struct{ io.Reader }{strings.NewReader(payload)}
+		dec := NewDecoder(r)
+		dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+			if charset != "latin1" {
+				return nil, fmt.Errorf("unexpected charset %q", charset)
+			}
+			// Streaming reader that expands latin1 0xe9 into 2 UTF-8 bytes in-place in dst.
+			return xmlTestReaderFunc(func(dst []byte) (int, error) {
+				var in [16]byte
+				maxIn := len(dst) / 2
+				if maxIn > len(in) {
+					maxIn = len(in)
+				}
+				if maxIn == 0 {
+					maxIn = 1
+				}
+				n, err := input.Read(in[:maxIn])
+				out := 0
+				for _, b := range in[:n] {
+					if b == 0xe9 {
+						dst[out] = 0xc3
+						dst[out+1] = 0xa9
+						out += 2
+					} else {
+						dst[out] = b
+						out++
+					}
+				}
+				return out, err
+			}), nil
+		}
+		var doc struct {
+			XMLName Name   `xml:"root"`
+			Body    string `xml:",chardata"`
+		}
+		if err := dec.Decode(&doc); err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+		want := strings.Repeat("é", 64)
+		if doc.Body != want {
+			t.Fatalf("got %q len=%d, want len=%d", doc.Body, len(doc.Body), len(want))
+		}
+	})
+
+	t.Run("MultiColonNamesRejected", func(t *testing.T) {
+		for _, raw := range []string{`<a:b:c:d/>`, `<root a:b:c:d="1"/>`} {
+			var v any
+			if err := Unmarshal([]byte(raw), &v); err == nil {
+				t.Fatalf("expected syntax error for %s, got nil", raw)
+			}
+		}
+	})
+
+	t.Run("AutoCloseAttrNoAlias", func(t *testing.T) {
+		d := NewDecoder(strings.NewReader(`<br><item id="good"><child k="bad"/></item>`))
+		d.Strict = false
+		d.AutoClose = HTMLAutoClose
+		var br struct{}
+		if err := d.Decode(&br); err != nil {
+			t.Fatalf("Decode br: %v", err)
+		}
+		tok, err := d.Token()
+		if err != nil {
+			t.Fatalf("Token: %v", err)
+		}
+		se, ok := tok.(StartElement)
+		if !ok {
+			t.Fatalf("expected StartElement, got %T", tok)
+		}
+		var it xmlTestAutoCloseItem
+		if err := d.DecodeElement(&it, &se); err != nil {
+			t.Fatalf("DecodeElement: %v", err)
+		}
+		if it.ID != "good" {
+			t.Fatalf("it.ID = %q, want %q", it.ID, "good")
+		}
+	})
+
+	t.Run("CommentMutateNoInputCorruption", func(t *testing.T) {
+		orig := []byte(`<doc><!--hello--><next>world</next></doc>`)
+		data := append([]byte(nil), orig...)
+		var out xmlTestCommentMutate
+		if err := Unmarshal(data, &out); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if out.Comment != "hello" || out.Next != "world" {
+			t.Fatalf("got %+v", out)
+		}
+		if string(data) != string(orig) {
+			t.Fatalf("caller input slice mutated: %q", data)
+		}
+	})
+
+	t.Run("ShadowedNamespaceSpeculativeMatch", func(t *testing.T) {
+		type S struct {
+			A string `xml:"ns1 a"`
+			C string `xml:"c"`
+			B string `xml:"a"`
+		}
+		var s S
+		if err := Unmarshal([]byte(`<S xmlns="ns1"><a>first</a><c>mid</c><a>second</a></S>`), &s); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if s.A != "second" || s.B != "" || s.C != "mid" {
+			t.Fatalf("got %+v, want A=second C=mid B=''", s)
+		}
+	})
+
+	t.Run("OmitEmptySliceAndArrayElements", func(t *testing.T) {
+		type Doc struct {
+			Tags []string `xml:"tag,omitempty"`
+			Nums [3]int   `xml:"num,omitempty"`
+			Ptrs []*int   `xml:"ptr,omitempty"`
+		}
+		z := 0
+		got, err := Marshal(Doc{
+			Tags: []string{"a", "", "b"},
+			Nums: [3]int{1, 0, 2},
+			Ptrs: []*int{nil, &z},
+		})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		want := `<Doc><tag>a</tag><tag>b</tag><num>1</num><num>2</num><ptr>0</ptr></Doc>`
+		if string(got) != want {
+			t.Fatalf("got %s, want %s", got, want)
+		}
+	})
+
+	t.Run("NamedSliceTextMarshalerAndUnmarshaler", func(t *testing.T) {
+		type Doc struct {
+			Nums xmlTestCSVInts `xml:"nums"`
+		}
+		got, err := Marshal(Doc{Nums: xmlTestCSVInts{1, 2, 3}})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if string(got) != `<Doc><nums>1,2,3</nums></Doc>` {
+			t.Fatalf("got %s", got)
+		}
+		var out Doc
+		if err := Unmarshal(got, &out); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if !slices.Equal(out.Nums, xmlTestCSVInts{1, 2, 3}) {
+			t.Fatalf("got %v", out.Nums)
+		}
+	})
+
+	t.Run("StructSliceTagPathError", func(t *testing.T) {
+		type Bad struct {
+			A string `xml:"x>y"`
+			B string `xml:"x"`
+		}
+		type Doc struct {
+			Items []Bad `xml:"item"`
+		}
+		_, err := Marshal(Doc{Items: []Bad{{A: "1", B: "2"}}})
+		var tpe *TagPathError
+		if !errors.As(err, &tpe) {
+			t.Fatalf("expected *TagPathError, got %v", err)
+		}
+	})
+
+	t.Run("InterfaceCharDataAndAttr", func(t *testing.T) {
+		type SM struct {
+			V any `xml:",chardata"`
+		}
+		ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		b, err := Marshal(SM{V: ts})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if string(b) != `<SM>2026-01-02T03:04:05Z</SM>` {
+			t.Fatalf("got %s", b)
+		}
+		var outTS time.Time
+		sm := SM{V: &outTS}
+		if err := Unmarshal(b, &sm); err != nil {
+			t.Fatalf("Unmarshal chardata interface: %v", err)
+		}
+		if !outTS.Equal(ts) {
+			t.Fatalf("got %v, want %v", outTS, ts)
+		}
+
+		type SA struct {
+			A any `xml:"a,attr"`
+		}
+		var ca xmlTestCustomAttr
+		sa := SA{A: &ca}
+		if err := Unmarshal([]byte(`<SA a="val"/>`), &sa); err != nil {
+			t.Fatalf("Unmarshal attr interface: %v", err)
+		}
+		if ca != "attr:val" {
+			t.Fatalf("got %q, want attr:val", ca)
+		}
+	})
+
+	t.Run("AnyElementNameMatchPrecedence", func(t *testing.T) {
+		type S struct {
+			Any1 string `xml:",any"`
+			Any2 string `xml:",any"`
+		}
+		var s S
+		if err := Unmarshal([]byte(`<S><Any2>hello</Any2></S>`), &s); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if s.Any1 != "" || s.Any2 != "hello" {
+			t.Fatalf("got %+v, want Any1='' Any2='hello'", s)
+		}
+	})
+}
+

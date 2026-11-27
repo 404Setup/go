@@ -69,6 +69,7 @@ type xmlDecodeElem struct {
 	isTime             bool
 	canFastField       bool
 	isScalarSlice      bool
+	shadowedByEarlier  bool
 }
 
 type xmlDecodePlan struct {
@@ -333,11 +334,35 @@ func buildXmlDecodePlan(rt reflect.Type, at *abi.Type, visiting map[*abi.Type]*x
 			}
 		}
 
+		for i := range p.elems {
+			e := &p.elems[i]
+			if e.mode&fElement == 0 {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				prev := &p.elems[j]
+				if prev.mode&fElement == 0 {
+					continue
+				}
+				if len(e.parents) == 0 && len(prev.parents) == 0 {
+					if prev.name.Local == e.name.Local {
+						e.shadowedByEarlier = true
+						e.openTag = ""
+						break
+					}
+				} else if len(e.parents) > 0 && len(prev.parents) > 0 && prev.parents[0] == e.parents[0] {
+					e.shadowedByEarlier = true
+					e.openTag = ""
+					break
+				}
+			}
+		}
+
 		if len(p.elems) > 4 {
 			m := make(map[string]int, len(p.elems))
 			for i := range p.elems {
 				e := &p.elems[i]
-				if e.mode != fElement {
+				if e.mode&fElement == 0 {
 					continue
 				}
 				key := e.name.Local
@@ -451,7 +476,7 @@ func buildXmlDecodeElem(fi *fieldInfo, frt reflect.Type, fat *abi.Type, steps []
 					fe.parentClose = "</" + fe.parents[0] + ">"
 				}
 			}
-		} else if fe.kind == xkSlice && len(fe.parents) == 0 && fe.name.Local != "" {
+		} else if fe.kind == xkSlice && !fe.isTextUnmarshaler && !fe.ptrTextUnmarshaler && len(fe.parents) == 0 && fe.name.Local != "" {
 			ert := frt.Elem()
 			eat := xmlAbiTypeOfReflect(ert)
 			ek := classifyXmlKind(ert, eat)
@@ -1001,6 +1026,9 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 		valBytes = unsafe.Slice(unsafe.StringData(a.Value), len(a.Value))
 	}
 	if fa.isPtr {
+		if fa.elemKind == xkPtr {
+			return d.unmarshalAttr(reflect.NewAt(fa.rt, fptr).Elem(), materializeAttrVal(a, raw))
+		}
 		pp := (*unsafe.Pointer)(fptr)
 		if *pp == nil {
 			*pp = reflect.New(fa.elemRT).UnsafePointer()
@@ -1009,7 +1037,7 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 		if fa.isTime {
 			return (*time.Time)(fptr).UnmarshalText(valBytes)
 		}
-		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm || fa.elemKind == xkSlice || fa.elemKind == xkPtr {
+		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm || fa.elemKind == xkSlice || fa.elemKind == xkInterface {
 			return d.unmarshalAttr(reflect.NewAt(fa.elemRT, fptr).Elem(), materializeAttrVal(a, raw))
 		}
 		if fa.elemKind == xkAttr {
@@ -1019,7 +1047,7 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 		return assignAttrRaw(fa.elemKind, fptr, fa.elemRT, a.Value, raw)
 	}
 
-	if fa.isUnmarshaler || fa.ptrUnmarshaler || fa.isTextUnmarshaler || fa.ptrTextUnmarshaler {
+	if fa.isUnmarshaler || fa.ptrUnmarshaler || fa.isTextUnmarshaler || fa.ptrTextUnmarshaler || fa.kind == xkInterface {
 		if fa.isTime {
 			return (*time.Time)(fptr).UnmarshalText(valBytes)
 		}
@@ -1046,7 +1074,7 @@ func (d *Decoder) fastUnmarshalAttr(fa *xmlDecodeAttr, fptr unsafe.Pointer, a At
 			}
 			return nil
 		}
-		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm || fa.elemKind == xkPtr || fa.elemKind == xkSlice {
+		if fa.elemUnmarsh || fa.elemPtrUnmarsh || fa.elemTextUnmarsh || fa.elemPtrTextUnm || fa.elemKind == xkPtr || fa.elemKind == xkSlice || fa.elemKind == xkInterface {
 			if err := d.unmarshalAttr(reflect.NewAt(fa.elemRT, elemPtr).Elem(), materializeAttrVal(a, raw)); err != nil {
 				sh.len = n
 				return err
@@ -1327,7 +1355,7 @@ Loop:
 			var consumed bool
 			if nextIdx < len(plan.elems) {
 				fe := &plan.elems[nextIdx]
-				if fe.mode == fElement && len(fe.parents) == 0 && fe.name.Local == tok.name.Local && (fe.name.Space == "" || fe.name.Space == tok.name.Space) {
+				if !fe.shadowedByEarlier && fe.mode&fElement != 0 && len(fe.parents) == 0 && fe.name.Local == tok.name.Local && (fe.name.Space == "" || fe.name.Space == tok.name.Space) {
 					fptr := resolveDecodeFieldPtr(ptr, fe.steps, fe.offset)
 					consumed = true
 					if fe.canFastField {
@@ -1438,10 +1466,10 @@ Loop:
 			if err := (*time.Time)(saveDataPtr).UnmarshalText(data); err != nil {
 				return err
 			}
-		} else if saveDataElem.isTextUnmarshaler || saveDataElem.ptrTextUnmarshaler {
+		} else if saveDataElem.isTextUnmarshaler || saveDataElem.ptrTextUnmarshaler || saveDataElem.kind == xkInterface {
 			pv := reflect.NewAt(saveDataElem.rt, saveDataPtr)
 			var handled bool
-			if saveDataElem.isTextUnmarshaler {
+			if saveDataElem.isTextUnmarshaler || saveDataElem.kind == xkInterface {
 				if tu, ok := reflect.TypeAssert[encoding.TextUnmarshaler](pv.Elem()); ok {
 					if err := tu.UnmarshalText(data); err != nil {
 						return err
@@ -1493,7 +1521,7 @@ Loop:
 func (d *Decoder) fastMatchFlatElement(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) (bool, error) {
 	for i := range plan.elems {
 		fe := &plan.elems[i]
-		if fe.mode != fElement || fe.name.Local != startName.Local {
+		if fe.mode&fElement == 0 || fe.name.Local != startName.Local {
 			continue
 		}
 		if fe.name.Space != "" && fe.name.Space != startName.Space {
@@ -1511,7 +1539,7 @@ func (d *Decoder) fastMatchFlatElement(plan *xmlDecodePlan, ptr unsafe.Pointer, 
 func (d *Decoder) fastMatchFlatElementIdx(plan *xmlDecodePlan, ptr unsafe.Pointer, startName Name, startAttr []Attr, startAttrRaw [][]byte) (bool, int, error) {
 	for i := range plan.elems {
 		fe := &plan.elems[i]
-		if fe.mode != fElement || fe.name.Local != startName.Local {
+		if fe.mode&fElement == 0 || fe.name.Local != startName.Local {
 			continue
 		}
 		if fe.name.Space != "" && fe.name.Space != startName.Space {
@@ -1531,7 +1559,7 @@ func (d *Decoder) fastUnmarshalPath(plan *xmlDecodePlan, ptr unsafe.Pointer, par
 Loop:
 	for i := range plan.elems {
 		fe := &plan.elems[i]
-		if fe.mode != fElement || len(fe.parents) < len(parents) || (fe.name.Space != "" && fe.name.Space != startName.Space) {
+		if fe.mode&fElement == 0 || len(fe.parents) < len(parents) || (fe.name.Space != "" && fe.name.Space != startName.Space) {
 			continue
 		}
 		for j := range parents {

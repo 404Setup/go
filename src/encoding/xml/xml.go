@@ -395,10 +395,19 @@ func (d *Decoder) switchToReader(r io.Reader) {
 	if rb, ok := r.(io.ByteReader); ok {
 		d.r = rb
 		d.rRaw = nil
+		d.readBuf = nil
 	} else {
 		d.r = nil
 		d.rRaw = r
 	}
+}
+
+type errOnlyReader struct {
+	err error
+}
+
+func (e errOnlyReader) Read([]byte) (int, error) {
+	return 0, e.err
 }
 
 // Parsing state - stack holds old name space translations
@@ -723,6 +732,9 @@ func (d *Decoder) nextTokenInto(tok *xmlTok) error {
 	if !d.Strict {
 		t := tok.toToken()
 		if t1, ok := d.autoClose(t); ok {
+			if se, ok := t.(StartElement); ok {
+				t = se.Copy()
+			}
 			d.nextToken = t
 			tok.fromToken(t1)
 		}
@@ -954,7 +966,7 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 					}
 					d.offset += int64(end - start)
 					d.pos = end
-					if d.noCopyText || d.rRaw == nil {
+					if d.noCopyText {
 						data = raw
 					} else {
 						d.buf.Reset()
@@ -999,8 +1011,20 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 					if d.r != nil {
 						curReader = d.r.(io.Reader)
 					} else if d.rRaw != nil {
+						var tail []byte
 						if d.pos < len(d.src) {
-							curReader = io.MultiReader(bytes.NewReader(d.src[d.pos:]), d.rRaw)
+							tail = bytes.Clone(d.src[d.pos:])
+						}
+						if d.readErr != nil {
+							if d.readErr == io.EOF {
+								curReader = bytes.NewReader(tail)
+							} else if len(tail) > 0 {
+								curReader = io.MultiReader(bytes.NewReader(tail), errOnlyReader{d.readErr})
+							} else {
+								curReader = errOnlyReader{d.readErr}
+							}
+						} else if len(tail) > 0 {
+							curReader = io.MultiReader(bytes.NewReader(tail), d.rRaw)
 						} else {
 							curReader = d.rRaw
 						}
@@ -1099,7 +1123,7 @@ func (d *Decoder) rawTokenNative(tok *xmlTok, reuseAttr bool) error {
 						}
 						d.offset += int64(end - start)
 						d.pos = end
-						if d.noCopyText || d.rRaw == nil {
+						if d.noCopyText {
 							tok.data = raw
 						} else {
 							d.buf.Reset()
@@ -2255,7 +2279,7 @@ func (d *Decoder) nameBytesFast() ([]byte, int, bool) {
 			break
 		}
 		if c == ':' {
-			if colon < 0 {
+			if colon == -1 {
 				colon = i - d.pos
 			} else {
 				colon = -2
